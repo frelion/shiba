@@ -1,0 +1,7 @@
+comment = 'Single-node incremental materialized views for PostgreSQL'
+default_version = '0.1.0'
+relocatable = false
+schema = 'shiba'
+superuser = true
+module_pathname = '$libdir/shiba'
+

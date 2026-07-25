@@ -1,0 +1,5 @@
+[target.aarch64-apple-darwin]
+# PostgreSQL extensions deliberately leave PostgreSQL server symbols unresolved
+# until the backend loads the module. macOS otherwise rejects the shared module
+# at link time.
+rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]

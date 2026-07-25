@@ -1,0 +1,31 @@
+[package]
+name = "shiba"
+version = "0.1.0"
+edition = "2021"
+license = "PostgreSQL"
+description = "Single-node incremental materialized views for PostgreSQL"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["pg17"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.19.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+pgrx-tests = "=0.19.1"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
