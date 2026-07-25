@@ -73,7 +73,9 @@ impl Parser {
             (None, first)
         };
         if let Some(alias) = alias {
-            self.aliases.insert(alias);
+            // PostgreSQL folds unquoted identifiers to lowercase. Treat aliases
+            // with different source casing as the same input identity.
+            self.aliases.insert(alias.to_ascii_lowercase());
         }
         let column = quote_identifier(&column);
         if self.consume(&Token::Is) {
@@ -260,23 +262,342 @@ pub fn compile_filter_expression(expression: &str) -> JsonB {
 mod tests {
     use super::*;
 
-    #[test]
-    fn compiles_boolean_expression() {
-        let (sql, aliases) =
-            compile("s.amount >= 20 AND (s.item_id = 1 OR NOT s.amount < 100)").unwrap();
-        assert!(sql.contains("AND"));
-        assert!(sql.contains("OR"));
-        assert_eq!(aliases, vec!["s"]);
+    fn compiled(expression: &str) -> (String, Vec<String>) {
+        compile(expression)
+            .unwrap_or_else(|message| panic!("expected {expression:?} to compile, got {message:?}"))
+    }
+
+    fn rejected(expression: &str, expected_message: &str) {
+        let message =
+            compile(expression).expect_err(&format!("expected {expression:?} to be rejected"));
+        assert_eq!(message, expected_message, "expression: {expression:?}");
     }
 
     #[test]
-    fn rejects_function_calls() {
-        assert!(compile("pg_sleep(1) = 1").is_err());
+    fn tokenizer_recognizes_keywords_case_insensitively() {
+        assert_eq!(
+            tokenize("AnD or NOT Is NuLl TRUE false identifier"),
+            Ok(vec![
+                Token::And,
+                Token::Or,
+                Token::Not,
+                Token::Is,
+                Token::Null,
+                Token::Literal("true".into()),
+                Token::Literal("false".into()),
+                Token::Ident("identifier".into()),
+            ])
+        );
     }
 
     #[test]
-    fn compiles_null_test() {
-        let (sql, _) = compile("amount IS NOT NULL").unwrap();
-        assert!(sql.ends_with("IS NOT NULL"));
+    fn tokenizer_recognizes_punctuation_and_all_supported_operators() {
+        assert_eq!(
+            tokenize("(a.b = 1) <> 2 <= 3 >= 4 < 5 > 6"),
+            Ok(vec![
+                Token::LParen,
+                Token::Ident("a".into()),
+                Token::Compare(".".into()),
+                Token::Ident("b".into()),
+                Token::Compare("=".into()),
+                Token::Literal("1".into()),
+                Token::RParen,
+                Token::Compare("<>".into()),
+                Token::Literal("2".into()),
+                Token::Compare("<=".into()),
+                Token::Literal("3".into()),
+                Token::Compare(">=".into()),
+                Token::Literal("4".into()),
+                Token::Compare("<".into()),
+                Token::Literal("5".into()),
+                Token::Compare(">".into()),
+                Token::Literal("6".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenizer_preserves_quoted_strings_and_escaped_quotes() {
+        assert_eq!(
+            tokenize("'plain' 'O''Reilly' '''' ''"),
+            Ok(vec![
+                Token::Literal("'plain'".into()),
+                Token::Literal("'O''Reilly'".into()),
+                Token::Literal("''''".into()),
+                Token::Literal("''".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenizer_accepts_numeric_boundaries() {
+        assert_eq!(
+            tokenize("0 +1 -1 1.25 +.5 -.5 1."),
+            Ok(vec![
+                Token::Literal("0".into()),
+                Token::Literal("+1".into()),
+                Token::Literal("-1".into()),
+                Token::Literal("1.25".into()),
+                Token::Literal("+.5".into()),
+                Token::Literal("-.5".into()),
+                Token::Literal("1.".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenizer_ignores_all_whitespace_between_tokens() {
+        assert_eq!(
+            tokenize("\t\n amount \r\n = \u{2003} 1 "),
+            Ok(vec![
+                Token::Ident("amount".into()),
+                Token::Compare("=".into()),
+                Token::Literal("1".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenizer_rejects_unterminated_strings_and_invalid_numbers() {
+        assert_eq!(
+            tokenize("'unterminated"),
+            Err("unterminated quoted string in filter".into())
+        );
+        for expression in ["+", "-", "+.", "-."] {
+            assert_eq!(
+                tokenize(expression),
+                Err("invalid numeric literal in filter".into()),
+                "expression: {expression:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tokenizer_rejects_every_sql_punctuation_not_in_the_grammar() {
+        for character in [
+            ';', ',', '!', '"', '`', '$', ':', '\\', '/', '*', '[', ']', '{', '}', '@',
+        ] {
+            let expression = character.to_string();
+            assert_eq!(
+                tokenize(&expression),
+                Err(format!("unsupported character '{character}' in filter")),
+                "character: {character:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_precedence_is_not_then_and_then_or() {
+        let (sql, aliases) = compiled("NOT a = 1 OR b = 2 AND NOT c = 3");
+        assert_eq!(
+            sql,
+            "((NOT (input.row).\"a\" = 1) OR ((input.row).\"b\" = 2 AND (NOT (input.row).\"c\" = 3)))"
+        );
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn repeated_boolean_operators_are_left_associative() {
+        assert_eq!(
+            compiled("a = 1 AND b = 2 AND c = 3").0,
+            "(((input.row).\"a\" = 1 AND (input.row).\"b\" = 2) AND (input.row).\"c\" = 3)"
+        );
+        assert_eq!(
+            compiled("a = 1 OR b = 2 OR c = 3").0,
+            "(((input.row).\"a\" = 1 OR (input.row).\"b\" = 2) OR (input.row).\"c\" = 3)"
+        );
+    }
+
+    #[test]
+    fn parentheses_override_precedence_and_can_be_nested() {
+        assert_eq!(
+            compiled("((a = 1 OR b = 2) AND c = 3)").0,
+            "(((((input.row).\"a\" = 1 OR (input.row).\"b\" = 2)) AND (input.row).\"c\" = 3))"
+        );
+    }
+
+    #[test]
+    fn not_is_right_associative() {
+        assert_eq!(
+            compiled("NOT NOT a = true").0,
+            "(NOT (NOT (input.row).\"a\" = true))"
+        );
+    }
+
+    #[test]
+    fn compiles_every_comparison_operator_and_literal_kind() {
+        let cases = [
+            ("a = 0", "(input.row).\"a\" = 0"),
+            ("a <> -1", "(input.row).\"a\" <> -1"),
+            ("a < +1.5", "(input.row).\"a\" < +1.5"),
+            ("a <= 0.5", "(input.row).\"a\" <= 0.5"),
+            ("a > true", "(input.row).\"a\" > true"),
+            ("a >= 'x'", "(input.row).\"a\" >= 'x'"),
+            ("a = FALSE", "(input.row).\"a\" = false"),
+        ];
+        for (expression, expected) in cases {
+            assert_eq!(
+                compiled(expression).0,
+                expected,
+                "expression: {expression:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compiles_null_tests_but_not_null_comparisons() {
+        assert_eq!(
+            compiled("amount IS NULL").0,
+            "(input.row).\"amount\" IS NULL"
+        );
+        assert_eq!(
+            compiled("amount is not null").0,
+            "(input.row).\"amount\" IS NOT NULL"
+        );
+        for expression in ["amount = NULL", "amount <> null"] {
+            rejected(
+                expression,
+                "use IS NULL or IS NOT NULL instead of comparing with NULL",
+            );
+        }
+        for expression in ["amount IS 1", "amount IS NOT true", "amount IS"] {
+            rejected(expression, "IS only supports NULL in a Shiba filter");
+        }
+    }
+
+    #[test]
+    fn aliases_are_deduplicated_and_returned_in_sorted_order() {
+        let (_, aliases) = compiled(
+            "z.amount = 1 AND a.id = 2 AND z.other = 3 AND middle.enabled = true AND a.id <> 4",
+        );
+        assert_eq!(aliases, vec!["a", "middle", "z"]);
+        assert!(compiled("unqualified = 1").1.is_empty());
+    }
+
+    #[test]
+    fn aliases_follow_postgresql_unquoted_case_folding() {
+        let (_, aliases) = compiled("Source.a = 1 AND source.b = 2 AND SOURCE.c = 3");
+        assert_eq!(aliases, vec!["source"]);
+    }
+
+    #[test]
+    fn preserves_identifier_case_and_quotes_generated_column_names() {
+        assert_eq!(
+            compiled("Alias.Mixed_Case = 1").0,
+            "(input.row).\"Mixed_Case\" = 1"
+        );
+        assert_eq!(compiled("_private = 1").0, "(input.row).\"_private\" = 1");
+    }
+
+    #[test]
+    fn quoted_literal_cannot_escape_into_generated_sql() {
+        let payload = "name = '''; DROP TABLE users; --'";
+        let (sql, aliases) = compiled(payload);
+        assert_eq!(sql, "(input.row).\"name\" = '''; DROP TABLE users; --'");
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn rejects_common_sql_injection_shapes_outside_a_literal() {
+        let cases = [
+            (
+                "a = 1; DROP TABLE users",
+                "unsupported character ';' in filter",
+            ),
+            ("a = 1 -- comment", "invalid numeric literal in filter"),
+            ("a = 1 /* comment */", "unsupported character '/' in filter"),
+            ("a = 1 OR 1 = 1", "expected a column reference"),
+            ("pg_sleep(1) = 1", "expected a comparison operator"),
+            ("a::text = 'x'", "unsupported character ':' in filter"),
+            ("a = $1", "unsupported character '$' in filter"),
+            (
+                "a = 1 UNION SELECT secret",
+                "unexpected token after filter expression",
+            ),
+        ];
+        for (expression, message) in cases {
+            rejected(expression, message);
+        }
+    }
+
+    #[test]
+    fn rejects_empty_and_missing_operands() {
+        let cases = [
+            ("", "expected a column reference"),
+            ("NOT", "expected a column reference"),
+            ("()", "expected a column reference"),
+            ("AND a = 1", "expected a column reference"),
+            ("OR a = 1", "expected a column reference"),
+            ("a", "expected a comparison operator"),
+            (
+                "a =",
+                "expected a numeric, boolean, or quoted string literal",
+            ),
+            (
+                "a = AND",
+                "expected a numeric, boolean, or quoted string literal",
+            ),
+            (
+                "a = b",
+                "expected a numeric, boolean, or quoted string literal",
+            ),
+            ("a = 1 AND", "expected a column reference"),
+            ("a = 1 OR", "expected a column reference"),
+            ("a = 1 AND OR b = 2", "expected a column reference"),
+        ];
+        for (expression, message) in cases {
+            rejected(expression, message);
+        }
+    }
+
+    #[test]
+    fn rejects_unbalanced_parentheses() {
+        for expression in ["(a = 1", "((a = 1)", "(a = 1 AND (b = 2)"] {
+            rejected(expression, "missing ')' in filter expression");
+        }
+        for expression in ["a = 1)", "(a = 1))"] {
+            rejected(expression, "unexpected token after filter expression");
+        }
+    }
+
+    #[test]
+    fn rejects_residual_tokens_and_malformed_references() {
+        let cases = [
+            "a = 1 b = 2",
+            "a = 1 2",
+            "a = 1.2.3",
+            "a = 1abc",
+            "a.b.c = 1",
+            "a..b = 1",
+            ".a = 1",
+            "a = 1 NOT",
+            "a == 1",
+            "a <=> 1",
+        ];
+        for expression in cases {
+            assert!(
+                compile(expression).is_err(),
+                "expected {expression:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn keywords_and_literals_cannot_be_used_as_column_or_alias_names() {
+        for expression in [
+            "null = 1",
+            "true = 1",
+            "and = 1",
+            "not = 1",
+            "is = 1",
+            "null.value = 1",
+            "true.value = 1",
+            "alias.null = 1",
+        ] {
+            assert!(
+                compile(expression).is_err(),
+                "expected {expression:?} to be rejected"
+            );
+        }
     }
 }

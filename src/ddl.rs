@@ -26,14 +26,12 @@ unsafe extern "C-unwind" fn shiba_process_utility(
 ) {
     prepare_stream_drops(pstmt);
     let declaration = shiba_table_declaration(pstmt, query_string);
-    let is_stream_declaration = declaration
-        .as_deref()
-        .is_some_and(|statement| statement.to_ascii_lowercase().contains(" as select "));
+    let query_analysis = query_tree::inspect_ctas(pstmt);
+    let is_stream_declaration = declaration.is_some() && query_analysis.is_some();
     if declaration.is_some() && !is_stream_declaration && !pg_sys::creating_extension {
         error!("the shiba schema only accepts CREATE TABLE shiba.name AS SELECT ... stream declarations");
     }
     let declaration = is_stream_declaration.then_some(declaration).flatten();
-    let query_analysis = query_tree::inspect_ctas(pstmt);
     if declaration.is_some() && query_analysis.is_none() {
         error!("Shiba could not access PostgreSQL's analyzed CTAS Query tree");
     }
@@ -277,6 +275,30 @@ unsafe fn shiba_table_declaration(
     if pstmt.is_null() || query_string.is_null() {
         return None;
     }
+    let utility = (*pstmt).utilityStmt;
+    if utility.is_null() {
+        return None;
+    }
+    let target_relation = match (*utility).type_ {
+        pg_sys::NodeTag::T_CreateStmt => utility
+            .cast::<pg_sys::CreateStmt>()
+            .as_ref()
+            .map(|create| create.relation),
+        pg_sys::NodeTag::T_CreateTableAsStmt => utility
+            .cast::<pg_sys::CreateTableAsStmt>()
+            .as_ref()
+            .and_then(|create| create.into.as_ref())
+            .map(|into| into.rel),
+        _ => None,
+    }?;
+    if target_relation.is_null() {
+        return None;
+    }
+    let target_namespace = pg_sys::RangeVarGetCreationNamespace(target_relation);
+    let shiba_namespace = pg_sys::get_namespace_oid(c"shiba".as_ptr(), true);
+    if target_namespace != shiba_namespace || shiba_namespace == pg_sys::InvalidOid {
+        return None;
+    }
     let query_bytes = CStr::from_ptr(query_string).to_bytes();
     let statement_start = (*pstmt).stmt_location;
     if statement_start < 0 || statement_start as usize >= query_bytes.len() {
@@ -293,8 +315,5 @@ unsafe fn shiba_table_declaration(
     let statement = String::from_utf8_lossy(&query_bytes[statement_start..statement_end])
         .trim()
         .to_string();
-    let normalized = statement.to_ascii_lowercase();
-    (normalized.starts_with("create table shiba.")
-        || normalized.starts_with("create table if not exists shiba."))
-    .then_some(statement)
+    Some(statement)
 }

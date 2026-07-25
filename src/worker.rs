@@ -350,3 +350,69 @@ fn tuple_to_json(
 fn format_lsn(lsn: u64) -> String {
     format!("{:X}/{:X}", lsn >> 32, lsn & 0xffff_ffff)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tuple_to_json_preserves_column_order_and_nulls() {
+        let relations = HashMap::from([(
+            42,
+            vec![
+                "id".to_string(),
+                "label".to_string(),
+                "optional".to_string(),
+            ],
+        )]);
+
+        assert_eq!(
+            tuple_to_json(
+                42,
+                vec![Some("7".into()), Some("shiba".into()), None],
+                &relations,
+            ),
+            Ok(json!({"id": "7", "label": "shiba", "optional": null}))
+        );
+    }
+
+    #[test]
+    fn tuple_to_json_rejects_missing_relation_metadata() {
+        assert_eq!(
+            tuple_to_json(42, vec![], &HashMap::new()),
+            Err("no relation message preceded this tuple")
+        );
+    }
+
+    #[test]
+    fn tuple_to_json_rejects_short_and_long_tuples() {
+        let relations = HashMap::from([(42, vec!["id".to_string()])]);
+        assert_eq!(
+            tuple_to_json(42, vec![], &relations),
+            Err("tuple column count does not match relation metadata")
+        );
+        assert_eq!(
+            tuple_to_json(42, vec![None, None], &relations),
+            Err("tuple column count does not match relation metadata")
+        );
+    }
+
+    #[test]
+    fn tuple_to_json_handles_empty_relation() {
+        let relations = HashMap::from([(42, vec![])]);
+        assert_eq!(
+            tuple_to_json(42, vec![], &relations),
+            Ok(Value::Object(Map::new()))
+        );
+    }
+
+    #[test]
+    fn format_lsn_covers_word_boundaries() {
+        assert_eq!(format_lsn(0), "0/0");
+        assert_eq!(format_lsn(1), "0/1");
+        assert_eq!(format_lsn(u32::MAX as u64), "0/FFFFFFFF");
+        assert_eq!(format_lsn(1_u64 << 32), "1/0");
+        assert_eq!(format_lsn(u64::MAX), "FFFFFFFF/FFFFFFFF");
+    }
+}

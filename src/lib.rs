@@ -71,4 +71,250 @@ mod tests {
     fn version_is_available() {
         assert_eq!(version(), "0.1.0");
     }
+
+    #[pg_test]
+    fn routed_transaction_claim_is_idempotent() {
+        let commit_lsn = "0/123456";
+        let first = Spi::get_one::<bool>(&format!(
+            "SELECT shiba._begin_route_transaction('{commit_lsn}'::pg_lsn)"
+        ))
+        .expect("first route claim should execute")
+        .expect("route claim should return a value");
+        let second = Spi::get_one::<bool>(&format!(
+            "SELECT shiba._begin_route_transaction('{commit_lsn}'::pg_lsn)"
+        ))
+        .expect("duplicate route claim should execute")
+        .expect("route claim should return a value");
+        let claims = Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM shiba_internal.routed_transactions \
+             WHERE commit_lsn='{commit_lsn}'::pg_lsn"
+        ))
+        .expect("route claims should be queryable")
+        .expect("count should return a value");
+
+        assert!(first);
+        assert!(!second);
+        assert_eq!(claims, 1);
+    }
+
+    #[pg_test]
+    fn catalog_rejects_invalid_durable_state() {
+        Spi::run(
+            r#"
+            INSERT INTO shiba_internal.stream_views
+                (result_oid, view_kind, source_oid, activation_lsn)
+            VALUES (4000000000::oid, 'aggregate', 4000000001::oid, '0/0');
+
+            DO $block$
+            BEGIN
+              BEGIN
+                INSERT INTO shiba_internal.stream_views
+                    (result_oid, view_kind, source_oid, activation_lsn)
+                VALUES (4000000002::oid, 'unknown', 4000000001::oid, '0/0');
+                RAISE EXCEPTION 'stream_views accepted an invalid view_kind';
+              EXCEPTION WHEN check_violation THEN NULL;
+              END;
+
+              BEGIN
+                INSERT INTO shiba_internal.aggregate_state
+                    (result_oid, group_key, row_count, count_value,
+                     sum_nonnull_count, sum_value)
+                VALUES (4000000000::oid, 'null'::jsonb, -1, 0, 0, 0);
+                RAISE EXCEPTION 'aggregate_state accepted a negative row_count';
+              EXCEPTION WHEN check_violation THEN NULL;
+              END;
+
+              BEGIN
+                INSERT INTO shiba_internal.dag_inbox
+                    (result_oid, commit_lsn, sequence, source_oid, delta, row_data)
+                VALUES (4000000000::oid, '0/1', 0, 4000000001::oid, 1, '{}'::jsonb);
+                RAISE EXCEPTION 'dag_inbox accepted a nonpositive sequence';
+              EXCEPTION WHEN check_violation THEN NULL;
+              END;
+
+              BEGIN
+                INSERT INTO shiba_internal.dag_inbox
+                    (result_oid, commit_lsn, sequence, source_oid, delta, row_data)
+                VALUES (4000000000::oid, '0/1', 1, 4000000001::oid, 0, '{}'::jsonb);
+                RAISE EXCEPTION 'dag_inbox accepted an invalid delta';
+              EXCEPTION WHEN check_violation THEN NULL;
+              END;
+
+              BEGIN
+                INSERT INTO shiba_internal.worker_state (singleton)
+                VALUES (false);
+                RAISE EXCEPTION 'worker_state accepted a false singleton key';
+              EXCEPTION WHEN check_violation THEN NULL;
+              END;
+            END
+            $block$;
+
+            DELETE FROM shiba_internal.stream_views
+            WHERE result_oid=4000000000::oid;
+            "#,
+        )
+        .expect("catalog constraints should reject invalid durable state");
+    }
+
+    #[pg_test]
+    fn ctas_statement_offsets_register_and_drop_all_metadata() {
+        Spi::run(
+            r#"
+            CREATE TABLE tests.pg_boundary_source (
+                group_id integer NOT NULL,
+                amount integer NOT NULL
+            );
+            INSERT INTO tests.pg_boundary_source VALUES (1, 10), (1, 20);
+            CREATE TABLE SHIBA.pg_boundary_result AS
+              SELECT group_id, count(*) AS row_count, sum(amount) AS total
+              FROM tests.pg_boundary_source
+              GROUP BY group_id;
+            "#,
+        )
+        .expect("the hook should isolate and register the final statement");
+
+        let result_oid =
+            Spi::get_one::<i32>("SELECT 'shiba.pg_boundary_result'::regclass::oid::integer")
+                .expect("result oid should be queryable")
+                .expect("result table should exist");
+        let metadata_is_complete = Spi::get_one::<bool>(
+            r#"
+            SELECT EXISTS (
+              SELECT 1
+              FROM shiba_internal.stream_views stream
+              JOIN shiba_internal.stream_graphs graph USING (result_oid)
+              JOIN shiba_internal.view_progress progress USING (result_oid)
+              JOIN shiba_internal.dag_worker_state worker USING (result_oid)
+              WHERE stream.result_oid='shiba.pg_boundary_result'::regclass
+                AND graph.analyzed_query->>'version'='1'
+                AND jsonb_array_length(graph.analyzed_query->'sources')=1
+                AND jsonb_array_length(graph.analyzed_query->'targets')=3
+            )
+            "#,
+        )
+        .expect("registration metadata should be queryable")
+        .expect("metadata check should return a value");
+        let source_is_prepared = Spi::get_one::<bool>(
+            r#"
+            SELECT source.relreplident='f'
+              AND EXISTS (
+                SELECT 1
+                FROM pg_publication publication
+                JOIN pg_publication_rel member
+                  ON member.prpubid=publication.oid
+                WHERE publication.pubname='shiba_publication'
+                  AND member.prrelid=source.oid
+              )
+              AND (
+                SELECT count(*)
+                FROM pg_trigger trigger
+                WHERE trigger.tgrelid=source.oid
+                  AND NOT trigger.tgisinternal
+                  AND trigger.tgname LIKE 'shiba_%'
+              )=2
+            FROM pg_class source
+            WHERE source.oid='tests.pg_boundary_source'::regclass
+            "#,
+        )
+        .expect("source preparation should be queryable")
+        .expect("source table should exist");
+
+        assert!(metadata_is_complete);
+        assert!(source_is_prepared);
+
+        Spi::run("DROP TABLE shiba.pg_boundary_result")
+            .expect("dropping a result should clean its registration");
+
+        let metadata_was_removed = Spi::get_one::<bool>(&format!(
+            "SELECT NOT EXISTS (
+               SELECT 1 FROM shiba_internal.stream_views
+               WHERE result_oid={result_oid}::oid
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM shiba_internal.stream_graphs
+               WHERE result_oid={result_oid}::oid
+             )"
+        ))
+        .expect("cleaned metadata should be queryable")
+        .expect("cleanup check should return a value");
+        let source_was_detached = Spi::get_one::<bool>(
+            r#"
+            SELECT NOT EXISTS (
+                     SELECT 1
+                     FROM pg_publication publication
+                     JOIN pg_publication_rel member
+                       ON member.prpubid=publication.oid
+                     WHERE publication.pubname='shiba_publication'
+                       AND member.prrelid='tests.pg_boundary_source'::regclass
+                   )
+              AND NOT EXISTS (
+                    SELECT 1 FROM pg_trigger trigger
+                    WHERE trigger.tgrelid='tests.pg_boundary_source'::regclass
+                      AND NOT trigger.tgisinternal
+                      AND trigger.tgname LIKE 'shiba_%'
+                  )
+            "#,
+        )
+        .expect("detached source should be queryable")
+        .expect("source cleanup check should return a value");
+
+        assert!(metadata_was_removed);
+        assert!(source_was_detached);
+    }
+
+    #[pg_test(error = "Shiba sources must be persistent ordinary tables outside the shiba schema")]
+    fn temporary_tables_cannot_be_stream_sources() {
+        Spi::run(
+            r#"
+            CREATE TEMP TABLE pg_temp.pg_boundary_source (
+                group_id integer NOT NULL,
+                amount integer NOT NULL
+            );
+            CREATE TABLE shiba.pg_boundary_result AS
+              SELECT group_id, count(*) AS row_count, sum(amount) AS total
+              FROM pg_temp.pg_boundary_source
+              GROUP BY group_id
+            "#,
+        )
+        .expect("the expected PostgreSQL error is handled by the pg_test harness");
+    }
+
+    #[pg_test(error = "Shiba MVP does not support TOASTable source columns")]
+    fn toastable_columns_cannot_be_stream_sources() {
+        Spi::run(
+            r#"
+            CREATE TABLE tests.pg_toastable_source (
+                group_id integer NOT NULL,
+                amount integer NOT NULL,
+                description text
+            );
+            CREATE TABLE shiba.pg_boundary_result AS
+              SELECT group_id, count(*) AS row_count, sum(amount) AS total
+              FROM tests.pg_toastable_source
+              GROUP BY group_id
+            "#,
+        )
+        .expect("the expected PostgreSQL error is handled by the pg_test harness");
+    }
+
+    #[pg_test(
+        error = "the shiba schema only accepts CREATE TABLE shiba.name AS SELECT ... stream declarations"
+    )]
+    fn quoted_schema_name_cannot_bypass_reserved_schema() {
+        Spi::run(r#"CREATE TABLE "shiba".pg_boundary_plain_table (id integer)"#)
+            .expect("the expected PostgreSQL error is handled by the pg_test harness");
+    }
+
+    #[pg_test(
+        error = "the shiba schema only accepts CREATE TABLE shiba.name AS SELECT ... stream declarations"
+    )]
+    fn search_path_cannot_bypass_reserved_schema() {
+        Spi::run(
+            r#"
+            SET LOCAL search_path=shiba,pg_catalog;
+            CREATE TABLE pg_boundary_plain_table (id integer)
+            "#,
+        )
+        .expect("the expected PostgreSQL error is handled by the pg_test harness");
+    }
 }

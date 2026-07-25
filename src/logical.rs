@@ -644,4 +644,84 @@ mod tests {
         };
         assert_eq!(Identity.apply(batch.clone()).unwrap(), vec![batch]);
     }
+
+    #[test]
+    fn logical_plan_round_trips_every_operator_kind() {
+        let operators = vec![
+            OperatorKind::Scan,
+            OperatorKind::Filter,
+            OperatorKind::Project,
+            OperatorKind::InnerJoin,
+            OperatorKind::LeftJoin,
+            OperatorKind::RightJoin,
+            OperatorKind::FullJoin,
+            OperatorKind::SemiJoin,
+            OperatorKind::AntiJoin,
+            OperatorKind::NullAwareAntiJoin,
+            OperatorKind::Distinct,
+            OperatorKind::Aggregate,
+            OperatorKind::Having,
+            OperatorKind::Window,
+            OperatorKind::TopN,
+            OperatorKind::Sink,
+        ];
+        let plan = LogicalPlan {
+            version: 1,
+            nodes: operators
+                .into_iter()
+                .enumerate()
+                .map(|(index, operator)| LogicalNode {
+                    id: format!("node_{index}"),
+                    operator,
+                    config: json!({"index": index}),
+                })
+                .collect(),
+            edges: vec![LogicalEdge {
+                from: "node_0".into(),
+                to: "node_1".into(),
+                input: u16::MAX,
+            }],
+        };
+
+        let serialized = serde_json::to_string(&plan).unwrap();
+        assert!(serialized.contains("\"null_aware_anti_join\""));
+        assert_eq!(
+            serde_json::from_str::<LogicalPlan>(&serialized).unwrap(),
+            plan
+        );
+    }
+
+    #[test]
+    fn push_node_only_adds_an_edge_when_upstream_exists() {
+        let mut nodes = vec![];
+        let mut edges = vec![];
+        push_node(
+            &mut nodes,
+            &mut edges,
+            None,
+            "scan",
+            OperatorKind::Scan,
+            json!({}),
+            0,
+        );
+        push_node(
+            &mut nodes,
+            &mut edges,
+            Some("scan"),
+            "sink",
+            OperatorKind::Sink,
+            json!({}),
+            1,
+        );
+
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(
+            edges,
+            vec![LogicalEdge {
+                from: "scan".into(),
+                to: "sink".into(),
+                input: 1,
+            }]
+        );
+    }
 }
