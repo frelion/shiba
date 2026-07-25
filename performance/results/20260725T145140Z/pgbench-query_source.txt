@@ -1,0 +1,27 @@
+pgbench (17.10 (Homebrew))
+progress: 1.0 s, 634.0 tps, lat 12.480 ms stddev 3.817, 0 failed
+progress: 2.0 s, 620.9 tps, lat 12.891 ms stddev 5.886, 0 failed
+progress: 3.0 s, 599.7 tps, lat 13.343 ms stddev 5.989, 0 failed
+progress: 4.0 s, 588.6 tps, lat 13.558 ms stddev 6.527, 0 failed
+progress: 5.0 s, 588.9 tps, lat 13.594 ms stddev 6.494, 0 failed
+progress: 6.0 s, 580.2 tps, lat 13.759 ms stddev 6.195, 0 failed
+progress: 7.0 s, 578.6 tps, lat 13.861 ms stddev 6.015, 0 failed
+progress: 8.0 s, 569.8 tps, lat 14.066 ms stddev 4.736, 0 failed
+progress: 9.0 s, 561.5 tps, lat 14.208 ms stddev 6.381, 0 failed
+progress: 10.0 s, 556.2 tps, lat 14.335 ms stddev 6.730, 0 failed
+transaction type: /Users/zzhang/Documents/Shiba/benchmarks/query-source.sql
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 10 s
+number of transactions actually processed: 5888
+number of failed transactions: 0 (0.000%)
+latency average = 13.592 ms
+latency stddev = 5.951 ms
+initial connection time = 3.636 ms
+tps = 588.293597 (without initial connection time)
+statement latencies in milliseconds and failures:
+         0.001           0  \set target_group random(0, 9999)
+        13.597           0  SELECT group_id, count(*) AS row_count, sum(amount) AS total_amount

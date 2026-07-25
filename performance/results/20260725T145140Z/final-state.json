@@ -1,0 +1,14 @@
+{
+    "progress": {
+        "updated_at": "2026-07-25T22:52:22.56026+08:00",
+        "applied_lsn": "0/51487C0",
+        "pending_wal_bytes": 23836056
+    },
+    "result_rows": 10140,
+    "source_rows": 324040,
+    "pending_inbox_rows": 0,
+    "result_total_bytes": 1966080,
+    "source_total_bytes": 14393344,
+    "database_size_bytes": 35428019,
+    "extension_state_bytes": 10657792
+}

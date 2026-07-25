@@ -1,0 +1,25 @@
+run_id=20260725T145140Z
+git_commit=b64a90c045d5c4eca70ef7f308604bafb1d89ee6
+git_dirty_files=3
+started_utc=2026-07-25T14:51:40Z
+pg_config=/opt/homebrew/opt/postgresql@17/bin/pg_config
+initial_rows=300000
+group_count=10000
+write_clients=4
+write_tx_per_client=100
+write_batch_size=10
+query_clients=8
+query_seconds=10
+latency_samples=40
+large_tx_rows=20000
+Darwin zzhangdeMacBook-Air.local 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:39:29 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T8142 arm64
+ProductName:		macOS
+ProductVersion:		26.5.1
+BuildVersion:		25F80
+Mac17,3,10,25769803776
+rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo 1.96.0 (30a34c682 2026-05-25)
+postgres (PostgreSQL) 17.10 (Homebrew)
+pgbench (PostgreSQL) 17.10 (Homebrew)
+finished_utc=2026-07-25T14:52:22Z
+cluster_retained=0

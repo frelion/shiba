@@ -1,0 +1,27 @@
+pgbench (17.10 (Homebrew))
+progress: 1.0 s, 200449.0 tps, lat 0.040 ms stddev 0.016, 0 failed
+progress: 2.0 s, 202989.4 tps, lat 0.039 ms stddev 0.012, 0 failed
+progress: 3.0 s, 204467.4 tps, lat 0.039 ms stddev 0.014, 0 failed
+progress: 4.0 s, 203869.2 tps, lat 0.039 ms stddev 0.012, 0 failed
+progress: 5.0 s, 199217.8 tps, lat 0.040 ms stddev 0.017, 0 failed
+progress: 6.0 s, 200206.4 tps, lat 0.040 ms stddev 0.018, 0 failed
+progress: 7.0 s, 201937.2 tps, lat 0.039 ms stddev 0.014, 0 failed
+progress: 8.0 s, 200038.6 tps, lat 0.040 ms stddev 0.015, 0 failed
+progress: 9.0 s, 200169.6 tps, lat 0.040 ms stddev 0.015, 0 failed
+progress: 10.0 s, 202448.3 tps, lat 0.039 ms stddev 0.015, 0 failed
+transaction type: /Users/zzhang/Documents/Shiba/benchmarks/query-shiba.sql
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 10 s
+number of transactions actually processed: 2016500
+number of failed transactions: 0 (0.000%)
+latency average = 0.040 ms
+latency stddev = 0.015 ms
+initial connection time = 4.583 ms
+tps = 201666.960191 (without initial connection time)
+statement latencies in milliseconds and failures:
+         0.000           0  \set target_group random(0, 9999)
+         0.039           0  SELECT group_id, row_count, total_amount
