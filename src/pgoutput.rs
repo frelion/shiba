@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn reads_update_with_key_or_full_old_tuple() {
-        for old_tag in [b'K', b'O'] {
+        for old_tag in *b"KO" {
             assert_eq!(
                 parse(&dml(
                     b'U',
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn reads_delete_with_key_or_full_old_tuple() {
-        for old_tag in [b'K', b'O'] {
+        for old_tag in *b"KO" {
             assert_eq!(
                 parse(&dml(b'D', 12, &[tuple(old_tag, &[Some(b"gone"), None])])),
                 Ok(Message::Delete {
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_dml_tuple_tags_and_missing_update_tuples() {
-        for tag in [b'K', b'O'] {
+        for tag in *b"KO" {
             assert_eq!(
                 parse(&dml(b'I', 1, &[tuple(tag, &[])])),
                 Err("invalid insert tuple tag")
