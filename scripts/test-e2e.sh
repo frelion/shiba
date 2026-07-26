@@ -287,6 +287,23 @@ if psql_e2e -qc "CREATE TABLE shiba.not_a_stream (id integer)" >/dev/null 2>&1; 
   printf 'ordinary table creation in the shiba schema unexpectedly succeeded\n' >&2
   exit 1
 fi
+
+# Source writers do not need privileges on Shiba's internal worker functions.
+# The statement-level wakeup trigger executes with the extension owner's
+# privileges while row data continues to flow exclusively through WAL.
+psql_e2e -qc "CREATE ROLE shiba_writer"
+psql_e2e -qc "GRANT SELECT,INSERT,UPDATE,DELETE ON orders TO shiba_writer"
+psql_e2e -qc "SET SESSION AUTHORIZATION shiba_writer; INSERT INTO orders VALUES (77,5)"
+wait_for_value "1" "SELECT count(*) FROM shiba.order_stats WHERE product_id=77 AND order_count=1 AND total_amount=5"
+psql_e2e -qc "SET SESSION AUTHORIZATION shiba_writer; UPDATE orders SET amount=6 WHERE product_id=77"
+wait_for_value "1" "SELECT count(*) FROM shiba.order_stats WHERE product_id=77 AND order_count=1 AND total_amount=6"
+psql_e2e -qc "SET SESSION AUTHORIZATION shiba_writer; DELETE FROM orders WHERE product_id=77"
+wait_for_value "0" "SELECT count(*) FROM shiba.order_stats WHERE product_id=77"
+if psql_e2e -qc "SET SESSION AUTHORIZATION shiba_writer; SELECT shiba._ensure_worker()" >/dev/null 2>&1; then
+  printf 'source writer unexpectedly executed an internal Shiba worker function\n' >&2
+  exit 1
+fi
+
 psql_e2e -qc "CREATE ROLE shiba_untrusted"
 psql_e2e -qc "GRANT USAGE ON SCHEMA shiba TO shiba_untrusted"
 if psql_e2e -qc "SET SESSION AUTHORIZATION shiba_untrusted; SET shiba.internal_apply = 'on'; UPDATE shiba.order_stats SET total_amount = 0" >/dev/null 2>&1; then

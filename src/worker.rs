@@ -6,7 +6,14 @@ use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const ROUTER_IDLE_WAIT: Duration = Duration::from_millis(100);
+const ROUTER_MAX_BATCHES_PER_ROUND: usize = 16;
+const ROUTER_DRAIN_BUDGET: Duration = Duration::from_millis(50);
+const DAG_IDLE_WAIT: Duration = Duration::from_millis(25);
+const DAG_MAX_COMMITS_PER_ROUND: usize = 64;
+const DAG_DRAIN_BUDGET: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 struct InboxEvent {
@@ -51,27 +58,58 @@ pub extern "C-unwind" fn shiba_background_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::connect_worker_to_spi(Some(&database_name), None);
 
     log!("Shiba WAL Router started for database {database_name}");
-    while BackgroundWorker::wait_latch(Some(Duration::from_millis(100))) {
-        let routed_through = BackgroundWorker::transaction(|| {
-            if !router_is_active() {
-                return None;
+    let mut idle = true;
+    'worker: loop {
+        let wait = if idle {
+            ROUTER_IDLE_WAIT
+        } else {
+            Duration::ZERO
+        };
+        if !BackgroundWorker::wait_latch(Some(wait)) {
+            break;
+        }
+
+        let started = Instant::now();
+        let mut batches = 0;
+        let mut run_maintenance = true;
+        idle = false;
+        while drain_has_capacity(
+            batches,
+            started.elapsed(),
+            ROUTER_MAX_BATCHES_PER_ROUND,
+            ROUTER_DRAIN_BUDGET,
+        ) {
+            let routed_through = BackgroundWorker::transaction(|| {
+                if !router_is_active() {
+                    return None;
+                }
+                let routed_through = peek_and_route_wal_changes();
+                if run_maintenance {
+                    let _ = Spi::run("SELECT shiba._ensure_dag_workers()");
+                    update_router_heartbeat();
+                }
+                Some(routed_through)
+            });
+            run_maintenance = false;
+            match routed_through {
+                None => break 'worker,
+                Some(Some(commit_lsn)) => {
+                    // Routing and slot advancement deliberately remain separate
+                    // transactions.  A crash between them safely replays through
+                    // the durable routing checkpoint.
+                    BackgroundWorker::transaction(|| advance_slot_through(&commit_lsn));
+                    batches += 1;
+                }
+                Some(None) => {
+                    idle = true;
+                    break;
+                }
             }
-            let routed_through = peek_and_route_wal_changes();
-            let _ = Spi::run("SELECT shiba._ensure_dag_workers()");
-            let _ = Spi::run(
-                "UPDATE shiba_internal.worker_state
-                 SET last_heartbeat = clock_timestamp()
-                 WHERE singleton
-                   AND (last_heartbeat IS NULL OR last_heartbeat < clock_timestamp() - interval '1 second')",
-            );
-            Some(routed_through)
-        });
-        match routed_through {
-            None => break,
-            Some(Some(commit_lsn)) => {
-                BackgroundWorker::transaction(|| advance_slot_through(&commit_lsn));
-            }
-            Some(None) => {}
+        }
+        if !idle {
+            // The next round is immediate, but yield after each bounded burst so
+            // a continuously busy router cannot monopolize its scheduler.
+            std::thread::yield_now();
         }
     }
     log!("Shiba WAL Router stopped for database {database_name}");
@@ -89,27 +127,94 @@ pub extern "C-unwind" fn shiba_view_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::connect_worker_to_spi(Some(database_name), None);
 
     log!("Shiba DAG executor started for result {result_oid}");
-    while BackgroundWorker::wait_latch(Some(Duration::from_millis(25))) {
-        let keep_running = BackgroundWorker::transaction(|| {
-            if !dag_is_active(result_oid) {
-                return false;
-            }
-            let _ = process_next_dag_transaction(result_oid);
-            let heartbeat = unsafe { [DatumWithOid::new(result_oid, pg_sys::INT4OID)] };
-            let _ = Spi::run_with_args(
-                "UPDATE shiba_internal.dag_worker_state
-                 SET last_heartbeat = clock_timestamp()
-                 WHERE result_oid = $1::oid
-                   AND (last_heartbeat IS NULL OR last_heartbeat < clock_timestamp() - interval '1 second')",
-                &heartbeat,
-            );
-            true
-        });
-        if !keep_running {
+    let runtime = BackgroundWorker::transaction(|| {
+        logical::DagRuntime::load(pg_sys::Oid::from(result_oid as u32))
+            .expect("Shiba could not load the persisted logical DAG")
+    });
+    let mut idle = true;
+    'worker: loop {
+        let wait = if idle { DAG_IDLE_WAIT } else { Duration::ZERO };
+        if !BackgroundWorker::wait_latch(Some(wait)) {
             break;
+        }
+
+        let started = Instant::now();
+        let mut commits = 0;
+        let mut run_maintenance = true;
+        idle = false;
+        while drain_has_capacity(
+            commits,
+            started.elapsed(),
+            DAG_MAX_COMMITS_PER_ROUND,
+            DAG_DRAIN_BUDGET,
+        ) {
+            let step = BackgroundWorker::transaction(|| {
+                if !dag_is_active(result_oid) {
+                    return DagStep::Inactive;
+                }
+                let processed = process_next_dag_transaction(result_oid, &runtime);
+                if run_maintenance {
+                    update_dag_heartbeat(result_oid);
+                }
+                if processed {
+                    DagStep::Processed
+                } else {
+                    DagStep::Idle
+                }
+            });
+            run_maintenance = false;
+            match step {
+                DagStep::Inactive => break 'worker,
+                DagStep::Processed => commits += 1,
+                DagStep::Idle => {
+                    idle = true;
+                    break;
+                }
+            }
+        }
+        if !idle {
+            // Preserve low backlog latency while giving other PostgreSQL
+            // backends a scheduling opportunity between bounded bursts.
+            std::thread::yield_now();
         }
     }
     log!("Shiba DAG executor stopped for result {result_oid}");
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DagStep {
+    Inactive,
+    Processed,
+    Idle,
+}
+
+fn drain_has_capacity(
+    processed: usize,
+    elapsed: Duration,
+    max_items: usize,
+    time_budget: Duration,
+) -> bool {
+    processed < max_items && elapsed < time_budget
+}
+
+fn update_router_heartbeat() {
+    let _ = Spi::run(
+        "UPDATE shiba_internal.worker_state
+         SET last_heartbeat = clock_timestamp()
+         WHERE singleton
+           AND (last_heartbeat IS NULL OR last_heartbeat < clock_timestamp() - interval '1 second')",
+    );
+}
+
+fn update_dag_heartbeat(result_oid: i32) {
+    let heartbeat = unsafe { [DatumWithOid::new(result_oid, pg_sys::INT4OID)] };
+    let _ = Spi::run_with_args(
+        "UPDATE shiba_internal.dag_worker_state
+         SET last_heartbeat = clock_timestamp()
+         WHERE result_oid = $1::oid
+           AND (last_heartbeat IS NULL OR last_heartbeat < clock_timestamp() - interval '1 second')",
+        &heartbeat,
+    );
 }
 
 fn current_database_name() -> String {
@@ -257,7 +362,7 @@ fn route_transaction(commit_lsn: u64, transaction: &mut Vec<(u32, i32, Value)>) 
     }
 }
 
-fn process_next_dag_transaction(result_oid: i32) -> bool {
+fn process_next_dag_transaction(result_oid: i32, runtime: &logical::DagRuntime) -> bool {
     let result = unsafe { [DatumWithOid::new(result_oid, pg_sys::INT4OID)] };
     Spi::run_with_args("SELECT pg_advisory_xact_lock($1::bigint)", &result)
         .expect("Shiba could not acquire the DAG execution lock");
@@ -299,26 +404,27 @@ fn process_next_dag_transaction(result_oid: i32) -> bool {
             })
             .collect()
     });
-    let Some(commit_lsn) = events.first().map(|event| event.commit_lsn.as_str()) else {
+    let Some(commit_lsn) = events.first().map(|event| event.commit_lsn.clone()) else {
         return false;
     };
-    let runtime = logical::DagRuntime::load(pg_sys::Oid::from(result_oid as u32))
-        .expect("Shiba could not load the persisted logical DAG");
-    for event in &events {
-        let row = serde_json::from_str(&event.row_data).expect("invalid inbox JSON");
-        runtime
-            .apply_source_delta(
-                pg_sys::Oid::from(event.source_oid as u32),
-                &event.commit_lsn,
-                row,
-                event.delta,
-            )
-            .expect("Shiba could not execute a DAG inbox delta");
-    }
+    let rows = events
+        .iter()
+        .map(|event| logical::DeltaRow {
+            input: event.source_oid.to_string(),
+            row: serde_json::from_str(&event.row_data).expect("invalid inbox JSON"),
+            diff: i64::from(event.delta),
+        })
+        .collect();
+    runtime
+        .apply_batch(logical::DeltaBatch {
+            epoch: commit_lsn.clone(),
+            rows,
+        })
+        .expect("Shiba could not execute a DAG inbox transaction");
     let delete = unsafe {
         [
             DatumWithOid::new(result_oid, pg_sys::OIDOID),
-            DatumWithOid::new(commit_lsn, pg_sys::TEXTOID),
+            DatumWithOid::new(commit_lsn.as_str(), pg_sys::TEXTOID),
         ]
     };
     Spi::run_with_args(
@@ -414,5 +520,37 @@ mod tests {
         assert_eq!(format_lsn(u32::MAX as u64), "0/FFFFFFFF");
         assert_eq!(format_lsn(1_u64 << 32), "1/0");
         assert_eq!(format_lsn(u64::MAX), "FFFFFFFF/FFFFFFFF");
+    }
+
+    #[test]
+    fn drain_budget_stops_at_item_limit() {
+        assert!(drain_has_capacity(
+            63,
+            Duration::ZERO,
+            64,
+            Duration::from_millis(50)
+        ));
+        assert!(!drain_has_capacity(
+            64,
+            Duration::ZERO,
+            64,
+            Duration::from_millis(50)
+        ));
+    }
+
+    #[test]
+    fn drain_budget_stops_at_time_limit() {
+        assert!(drain_has_capacity(
+            0,
+            Duration::from_millis(49),
+            64,
+            Duration::from_millis(50)
+        ));
+        assert!(!drain_has_capacity(
+            0,
+            Duration::from_millis(50),
+            64,
+            Duration::from_millis(50)
+        ));
     }
 }

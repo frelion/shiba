@@ -157,6 +157,86 @@ mod tests {
     }
 
     #[pg_test]
+    fn dag_batch_applies_ordered_rows_and_advances_progress_once() {
+        Spi::run(
+            r#"
+            CREATE TABLE tests.batch_source (
+                group_id integer NOT NULL,
+                amount integer NOT NULL
+            );
+            INSERT INTO tests.batch_source VALUES (1, 5);
+            CREATE TABLE tests.batch_result (
+                group_id integer UNIQUE NULLS NOT DISTINCT,
+                row_count bigint NOT NULL,
+                total bigint
+            );
+            INSERT INTO tests.batch_result VALUES (1,1,5);
+            INSERT INTO shiba_internal.stream_views (
+                result_oid,source_oid,group_column,result_group_column,
+                count_column,sum_input_column,sum_column,activation_lsn
+            ) VALUES (
+                'tests.batch_result'::regclass,
+                'tests.batch_source'::regclass,
+                'group_id','group_id','row_count','amount','total','0/0'
+            );
+            INSERT INTO shiba_internal.aggregate_state (
+                result_oid,group_key,row_count,count_value,
+                sum_nonnull_count,sum_value
+            ) VALUES (
+                'tests.batch_result'::regclass,'1'::jsonb,1,1,1,5
+            );
+            INSERT INTO shiba_internal.view_progress(result_oid)
+            VALUES ('tests.batch_result'::regclass);
+
+            CREATE TEMP TABLE batch_progress_writes (marker boolean);
+            CREATE FUNCTION pg_temp.count_batch_progress_write()
+            RETURNS trigger LANGUAGE plpgsql AS $trigger$
+            BEGIN
+              INSERT INTO batch_progress_writes VALUES (true);
+              RETURN NEW;
+            END
+            $trigger$;
+            CREATE TRIGGER count_batch_progress_write
+              AFTER INSERT OR UPDATE ON shiba_internal.view_progress
+              FOR EACH ROW EXECUTE FUNCTION pg_temp.count_batch_progress_write();
+
+            SELECT shiba._apply_dag_delta_batch(
+              'tests.batch_result'::regclass,
+              jsonb_build_array(
+                jsonb_build_object(
+                  'source_oid','tests.batch_source'::regclass::oid,
+                  'row_data',jsonb_build_object('group_id',1,'amount',10),
+                  'delta',1
+                ),
+                jsonb_build_object(
+                  'source_oid','tests.batch_source'::regclass::oid,
+                  'row_data',jsonb_build_object('group_id',1,'amount',20),
+                  'delta',1
+                )
+              ),
+              '0/ABC'
+            );
+            "#,
+        )
+        .expect("ordered DAG batch should execute");
+
+        let result = Spi::get_two::<i64, i64>(
+            "SELECT row_count,total::bigint FROM tests.batch_result WHERE group_id=1",
+        )
+        .expect("batch result should be queryable");
+        let progress = Spi::get_two::<String, i64>(
+            "SELECT applied_lsn::text,
+                    (SELECT count(*) FROM batch_progress_writes)
+             FROM shiba_internal.view_progress
+             WHERE result_oid='tests.batch_result'::regclass",
+        )
+        .expect("batch progress should be queryable");
+
+        assert_eq!(result, (Some(3), Some(35)));
+        assert_eq!(progress, (Some("0/ABC".into()), Some(1)));
+    }
+
+    #[pg_test]
     fn ctas_statement_offsets_register_and_drop_all_metadata() {
         Spi::run(
             r#"

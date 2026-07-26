@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeltaRow {
+    pub input: String,
     pub row: Value,
     pub diff: i64,
 }
@@ -14,7 +15,6 @@ pub struct DeltaRow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeltaBatch {
     pub epoch: String,
-    pub input: String,
     pub rows: Vec<DeltaRow>,
 }
 
@@ -48,63 +48,61 @@ impl DagRuntime {
         Ok(Self { result_oid, plan })
     }
 
-    pub fn apply_source_delta(
-        &self,
-        source_oid: pg_sys::Oid,
-        epoch: &str,
-        row: Value,
-        diff: i32,
-    ) -> Result<(), String> {
-        self.apply_batch(DeltaBatch {
-            epoch: epoch.into(),
-            input: source_oid.to_string(),
-            rows: vec![DeltaRow {
-                row,
-                diff: i64::from(diff),
-            }],
-        })
-    }
-
     pub fn apply_batch(&self, batch: DeltaBatch) -> Result<(), String> {
-        let source_oid_u32 = batch
+        let encoded = encode_batch_events(&self.plan, self.result_oid, batch.rows)?.to_string();
+        let arguments = unsafe {
+            [
+                DatumWithOid::new(self.result_oid, pg_sys::OIDOID),
+                DatumWithOid::new(encoded.as_str(), pg_sys::TEXTOID),
+                DatumWithOid::new(batch.epoch.as_str(), pg_sys::TEXTOID),
+            ]
+        };
+        Spi::run_with_args(
+            "SELECT shiba._apply_dag_delta_batch($1, $2::jsonb, $3)",
+            &arguments,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+fn encode_batch_events(
+    plan: &LogicalPlan,
+    result_oid: pg_sys::Oid,
+    rows: Vec<DeltaRow>,
+) -> Result<Value, String> {
+    if rows.is_empty() {
+        return Err("DAG delta batch must not be empty".into());
+    }
+    let mut encoded = Vec::with_capacity(rows.len());
+    for delta in rows {
+        let source_oid_u32 = delta
             .input
             .parse::<u32>()
-            .map_err(|_| format!("invalid DAG input OID {}", batch.input))?;
-        let source_oid = pg_sys::Oid::from(source_oid_u32);
-        let source_is_planned = self.plan.nodes.iter().any(|node| {
+            .map_err(|_| format!("invalid DAG input OID {}", delta.input))?;
+        let source_is_planned = plan.nodes.iter().any(|node| {
             node.operator == OperatorKind::Scan
                 && node.config["source_oid"].as_u64() == Some(u64::from(source_oid_u32))
         });
         if !source_is_planned {
             return Err(format!(
-                "source OID {source_oid} is not an input of result {}",
-                self.result_oid
+                "source OID {source_oid_u32} is not an input of result {result_oid}"
             ));
         }
-        for delta in batch.rows {
-            let diff = i32::try_from(delta.diff)
-                .map_err(|_| format!("differential weight {} exceeds int32", delta.diff))?;
-            if !matches!(diff, -1 | 1) {
-                return Err(format!("invalid source differential weight {diff}"));
-            }
-            let row = delta.row.to_string();
-            let arguments = unsafe {
-                [
-                    DatumWithOid::new(self.result_oid, pg_sys::OIDOID),
-                    DatumWithOid::new(source_oid, pg_sys::OIDOID),
-                    DatumWithOid::new(row.as_str(), pg_sys::TEXTOID),
-                    DatumWithOid::new(diff, pg_sys::INT4OID),
-                    DatumWithOid::new(batch.epoch.as_str(), pg_sys::TEXTOID),
-                ]
-            };
-            Spi::run_with_args(
-                "SELECT shiba._apply_dag_delta($1, $2, $3::jsonb, $4, $5)",
-                &arguments,
-            )
-            .map_err(|error| error.to_string())?;
+        if !delta.row.is_object() {
+            return Err("source delta row must be a JSON object".into());
         }
-        Ok(())
+        let diff = i32::try_from(delta.diff)
+            .map_err(|_| format!("differential weight {} exceeds int32", delta.diff))?;
+        if !matches!(diff, -1 | 1) {
+            return Err(format!("invalid source differential weight {diff}"));
+        }
+        encoded.push(json!({
+            "source_oid": source_oid_u32,
+            "row_data": delta.row,
+            "delta": diff,
+        }));
     }
+    Ok(Value::Array(encoded))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -636,13 +634,100 @@ mod tests {
     fn operator_preserves_differential_batch() {
         let batch = DeltaBatch {
             epoch: "0/10".into(),
-            input: "left".into(),
             rows: vec![DeltaRow {
+                input: "left".into(),
                 row: json!({"id": 1}),
                 diff: -1,
             }],
         };
         assert_eq!(Identity.apply(batch.clone()).unwrap(), vec![batch]);
+    }
+
+    #[test]
+    fn batch_encoding_preserves_cross_source_wal_order() {
+        let plan = LogicalPlan {
+            version: 1,
+            nodes: vec![
+                LogicalNode {
+                    id: "left".into(),
+                    operator: OperatorKind::Scan,
+                    config: json!({"source_oid": 41}),
+                },
+                LogicalNode {
+                    id: "right".into(),
+                    operator: OperatorKind::Scan,
+                    config: json!({"source_oid": 42}),
+                },
+            ],
+            edges: vec![],
+        };
+        let events = encode_batch_events(
+            &plan,
+            pg_sys::Oid::from(99),
+            vec![
+                DeltaRow {
+                    input: "41".into(),
+                    row: json!({"id": 7, "value": "old"}),
+                    diff: -1,
+                },
+                DeltaRow {
+                    input: "42".into(),
+                    row: json!({"id": 7, "value": "dimension"}),
+                    diff: 1,
+                },
+                DeltaRow {
+                    input: "41".into(),
+                    row: json!({"id": 7, "value": "new"}),
+                    diff: 1,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(events[0]["source_oid"], 41);
+        assert_eq!(events[0]["delta"], -1);
+        assert_eq!(events[1]["source_oid"], 42);
+        assert_eq!(events[2]["row_data"]["value"], "new");
+    }
+
+    #[test]
+    fn batch_encoding_rejects_empty_unplanned_and_non_object_inputs() {
+        let plan = LogicalPlan {
+            version: 1,
+            nodes: vec![LogicalNode {
+                id: "scan".into(),
+                operator: OperatorKind::Scan,
+                config: json!({"source_oid": 41}),
+            }],
+            edges: vec![],
+        };
+        let result_oid = pg_sys::Oid::from(99);
+
+        assert!(encode_batch_events(&plan, result_oid, vec![])
+            .unwrap_err()
+            .contains("must not be empty"));
+        assert!(encode_batch_events(
+            &plan,
+            result_oid,
+            vec![DeltaRow {
+                input: "42".into(),
+                row: json!({"id": 1}),
+                diff: 1,
+            }]
+        )
+        .unwrap_err()
+        .contains("not an input"));
+        assert!(encode_batch_events(
+            &plan,
+            result_oid,
+            vec![DeltaRow {
+                input: "41".into(),
+                row: json!([1, 2]),
+                diff: 1,
+            }]
+        )
+        .unwrap_err()
+        .contains("JSON object"));
     }
 
     #[test]

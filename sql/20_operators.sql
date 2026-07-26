@@ -518,8 +518,6 @@ DECLARE
     state_count_input jsonb;
     count_input_expression text;
 BEGIN
-    PERFORM pg_advisory_xact_lock(stream_view.result_oid::bigint);
-
     SELECT format('%I.%I', source_namespace.nspname, source.relname)
     INTO source_name
     FROM pg_class AS source
@@ -598,7 +596,10 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION shiba._apply_dag_delta(
+-- Apply one ordered source delta without advancing the durable DAG watermark.
+-- Callers must hold the result advisory lock and advance view_progress only
+-- after every delta in the source transaction has been applied successfully.
+CREATE FUNCTION shiba._apply_dag_delta_state(
     result_relation oid,
     source_relation oid,
     row_data jsonb,
@@ -607,7 +608,6 @@ CREATE FUNCTION shiba._apply_dag_delta(
 )
 RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
 SET search_path = pg_catalog, shiba, shiba_internal
 AS $$
 DECLARE
@@ -615,7 +615,6 @@ DECLARE
     join_view shiba_internal.inner_join_views%ROWTYPE;
     input_side text;
 BEGIN
-    PERFORM pg_advisory_xact_lock(result_relation::bigint);
     SELECT * INTO STRICT stream_view FROM shiba_internal.stream_views WHERE result_oid = result_relation;
     row_data := shiba._canonicalize_row(source_relation,row_data);
     IF stream_view.view_kind='window' THEN
@@ -677,11 +676,103 @@ BEGIN
             RETURN;
         END IF;
         PERFORM shiba._apply_logged_delta(stream_view, row_data, delta);
-        INSERT INTO shiba_internal.view_progress (result_oid, applied_lsn, updated_at)
-        VALUES (result_relation, commit_lsn::pg_lsn, clock_timestamp())
-        ON CONFLICT (result_oid) DO UPDATE
-        SET applied_lsn = EXCLUDED.applied_lsn, updated_at = EXCLUDED.updated_at;
     END IF;
+END;
+$$;
+
+CREATE FUNCTION shiba._advance_dag_progress(
+    result_relation oid,
+    commit_lsn text
+)
+RETURNS void
+LANGUAGE sql
+AS $$
+    INSERT INTO shiba_internal.view_progress (result_oid, applied_lsn, updated_at)
+    VALUES (result_relation, commit_lsn::pg_lsn, clock_timestamp())
+    ON CONFLICT (result_oid) DO UPDATE
+    SET applied_lsn = EXCLUDED.applied_lsn,
+        updated_at = EXCLUDED.updated_at
+$$;
+
+-- Compatibility entry point for a single delta. New workers use the batch
+-- entry point below so a source commit crosses SPI and advances progress once.
+CREATE FUNCTION shiba._apply_dag_delta(
+    result_relation oid,
+    source_relation oid,
+    row_data jsonb,
+    delta integer,
+    commit_lsn text
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba, shiba_internal
+AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(result_relation::bigint);
+    PERFORM shiba._apply_dag_delta_state(
+      result_relation,source_relation,row_data,delta,commit_lsn
+    );
+    PERFORM shiba._advance_dag_progress(result_relation,commit_lsn);
+END;
+$$;
+
+-- Commit-level bridge to the existing ordered SQL state transitions. This is
+-- deliberately not described as a vectorized operator: the loop preserves
+-- the WAL order required by UPDATE (-1 followed by +1) and join boundary
+-- semantics. It does, however, remove per-row SPI calls, lock acquisition and
+-- progress writes, and is the stable boundary for future physical operators.
+CREATE FUNCTION shiba._apply_dag_delta_batch(
+    result_relation oid,
+    events jsonb,
+    commit_lsn text
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba, shiba_internal
+AS $$
+DECLARE
+    event record;
+    event_count bigint := 0;
+BEGIN
+    IF jsonb_typeof(events) IS DISTINCT FROM 'array' THEN
+      RAISE EXCEPTION 'Shiba DAG delta batch must be a JSON array'
+        USING ERRCODE='invalid_parameter_value';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(result_relation::bigint);
+    FOR event IN
+      SELECT value,ordinality
+      FROM jsonb_array_elements(events) WITH ORDINALITY input(value,ordinality)
+      ORDER BY ordinality
+    LOOP
+      IF jsonb_typeof(event.value) IS DISTINCT FROM 'object'
+         OR jsonb_typeof(event.value->'row_data') IS DISTINCT FROM 'object'
+         OR (event.value->>'delta') IS NULL
+         OR (event.value->>'source_oid') IS NULL THEN
+        RAISE EXCEPTION 'invalid Shiba DAG event at batch position %',event.ordinality
+          USING ERRCODE='invalid_parameter_value';
+      END IF;
+      IF (event.value->>'delta')::integer NOT IN (-1,1) THEN
+        RAISE EXCEPTION 'invalid Shiba DAG differential weight at batch position %',event.ordinality
+          USING ERRCODE='invalid_parameter_value';
+      END IF;
+      PERFORM shiba._apply_dag_delta_state(
+        result_relation,
+        (event.value->>'source_oid')::oid,
+        event.value->'row_data',
+        (event.value->>'delta')::integer,
+        commit_lsn
+      );
+      event_count := event_count+1;
+    END LOOP;
+
+    IF event_count=0 THEN
+      RAISE EXCEPTION 'Shiba DAG delta batch must not be empty'
+        USING ERRCODE='invalid_parameter_value';
+    END IF;
+    PERFORM shiba._advance_dag_progress(result_relation,commit_lsn);
 END;
 $$;
 
@@ -755,10 +846,6 @@ BEGIN
       CASE topn_view.nulls_first WHEN true THEN 'FIRST' ELSE 'LAST' END,
       topn_view.limit_offset,topn_view.limit_count
     ) USING stream_view.result_oid;
-    INSERT INTO shiba_internal.view_progress(result_oid,applied_lsn,updated_at)
-    VALUES(stream_view.result_oid,commit_lsn::pg_lsn,clock_timestamp())
-    ON CONFLICT(result_oid) DO UPDATE
-    SET applied_lsn=EXCLUDED.applied_lsn,updated_at=EXCLUDED.updated_at;
 END;
 $$;
 
@@ -833,10 +920,6 @@ BEGIN
         WHERE result_oid=stream_view.result_oid AND row_key=state_row_key;
       END IF;
     END IF;
-    INSERT INTO shiba_internal.view_progress(result_oid,applied_lsn,updated_at)
-    VALUES(stream_view.result_oid,commit_lsn::pg_lsn,clock_timestamp())
-    ON CONFLICT(result_oid) DO UPDATE
-    SET applied_lsn=EXCLUDED.applied_lsn,updated_at=EXCLUDED.updated_at;
 END;
 $$;
 
@@ -925,10 +1008,6 @@ BEGIN
       result_name,quoted_outputs,expressions,source_name
     ) USING stream_view.result_oid,state_partition_key;
 
-    INSERT INTO shiba_internal.view_progress(result_oid,applied_lsn,updated_at)
-    VALUES(stream_view.result_oid,commit_lsn::pg_lsn,clock_timestamp())
-    ON CONFLICT(result_oid) DO UPDATE
-    SET applied_lsn=EXCLUDED.applied_lsn,updated_at=EXCLUDED.updated_at;
 END;
 $$;
 
@@ -1143,9 +1222,6 @@ BEGIN
         END IF;
     END IF;
 
-    INSERT INTO shiba_internal.view_progress (result_oid, applied_lsn, updated_at)
-    VALUES (result_relation, commit_lsn::pg_lsn, clock_timestamp())
-    ON CONFLICT (result_oid) DO UPDATE SET applied_lsn = EXCLUDED.applied_lsn, updated_at = EXCLUDED.updated_at;
 END; $$;
 
 CREATE FUNCTION shiba._apply_inner_join_aggregate(

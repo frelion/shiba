@@ -309,8 +309,8 @@ BEGIN
       SELECT EXISTS(SELECT 1 FROM pg_publication_rel pr JOIN pg_publication p ON p.oid=pr.prpubid WHERE p.pubname='shiba_publication' AND pr.prrelid=left_oid) INTO publication_member;
       IF NOT publication_member THEN EXECUTE format('ALTER PUBLICATION shiba_publication ADD TABLE %s',(SELECT format('%I.%I',n.nspname,c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=left_oid)); END IF;
     END LOOP;
-    EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION shiba._request_worker()',format('shiba_wakeup_%s_left',target_oid),left_name);
-    EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION shiba._request_worker()',format('shiba_wakeup_%s_right',target_oid),right_name);
+    EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',format('shiba_wakeup_%s_left',target_oid),left_name);
+    EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',format('shiba_wakeup_%s_right',target_oid),right_name);
     EXECUTE format('CREATE TRIGGER %I BEFORE TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._reject_source_truncate()',format('shiba_no_truncate_%s_left',target_oid),left_name);
     EXECUTE format('CREATE TRIGGER %I BEFORE TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._reject_source_truncate()',format('shiba_no_truncate_%s_right',target_oid),right_name);
     EXECUTE format('CREATE TRIGGER %I BEFORE INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION shiba._protect_result_table()',format('shiba_protect_%s',target_oid),target_name);
@@ -582,7 +582,7 @@ BEGIN
     END IF;
     EXECUTE format(
       'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s
-       FOR EACH ROW EXECUTE FUNCTION shiba._request_worker()',
+       FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',
       format('shiba_wakeup_%s',target_oid),source_name
     );
     EXECUTE format(
@@ -736,7 +736,7 @@ BEGIN
     END IF;
     EXECUTE format(
       'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s
-       FOR EACH ROW EXECUTE FUNCTION shiba._request_worker()',
+       FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',
       format('shiba_wakeup_%s',target_oid),source_name
     );
     EXECUTE format(
@@ -901,7 +901,7 @@ BEGIN
     END IF;
     EXECUTE format(
       'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s
-       FOR EACH ROW EXECUTE FUNCTION shiba._request_worker()',
+       FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',
       format('shiba_wakeup_%s',target_oid),source_name
     );
     EXECUTE format(
@@ -1194,7 +1194,7 @@ BEGIN
 
     trigger_name := format('shiba_wakeup_%s', target_oid);
     EXECUTE format(
-        'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION shiba._request_worker()',
+        'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',
         trigger_name,
         source_name
     );

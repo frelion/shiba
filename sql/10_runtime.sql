@@ -251,6 +251,8 @@ $$;
 CREATE FUNCTION shiba._request_worker()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba_internal
 AS $$
 BEGIN
     IF EXISTS (
@@ -259,10 +261,9 @@ BEGIN
     ) THEN
         PERFORM shiba._ensure_worker();
     END IF;
-    IF TG_OP = 'DELETE' THEN
-        RETURN OLD;
-    END IF;
-    RETURN NEW;
+    -- Wakeup triggers are statement-level and never carry row data. Logical
+    -- decoding remains the only data path, so there is no tuple to return.
+    RETURN NULL;
 END;
 $$;
 
