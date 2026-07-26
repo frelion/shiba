@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  PG_CONFIG: /usr/lib/postgresql/17/bin/pg_config
+
+jobs:
+  package:
+    name: Package PostgreSQL 17 extension
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 17 development files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo \"$VERSION_CODENAME\")-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-server-dev-17
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version 0.19.1 --locked
+
+      - name: Initialize pgrx
+        run: cargo pgrx init --pg17 "$PG_CONFIG"
+
+      - name: Build package
+        run: cargo pgrx package --pg-config "$PG_CONFIG" --out-dir target/package
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          archive="shiba-${GITHUB_REF_NAME}-postgresql17.tar.gz"
+          tar -C target/package -czf "$archive" .
+          sha256sum "$archive" > "${archive}.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            shiba-${{ github.ref_name }}-postgresql17.tar.gz
+            shiba-${{ github.ref_name }}-postgresql17.tar.gz.sha256

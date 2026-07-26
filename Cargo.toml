@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "PostgreSQL"
 description = "Single-node incremental materialized views for PostgreSQL"
+repository = "https://github.com/frelion/shiba"
+readme = "README.md"
+keywords = ["postgresql", "database", "streaming", "materialized-view", "rust"]
+categories = ["database", "api-bindings"]
 
 [lib]
 crate-type = ["cdylib"]
