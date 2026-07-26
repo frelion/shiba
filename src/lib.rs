@@ -200,30 +200,58 @@ mod tests {
               AFTER INSERT OR UPDATE ON shiba_internal.view_progress
               FOR EACH ROW EXECUTE FUNCTION pg_temp.count_batch_progress_write();
 
+            CREATE TEMP TABLE batch_sink_writes (marker boolean);
+            CREATE FUNCTION pg_temp.count_batch_sink_write()
+            RETURNS trigger LANGUAGE plpgsql AS $trigger$
+            BEGIN
+              INSERT INTO batch_sink_writes VALUES (true);
+              RETURN NEW;
+            END
+            $trigger$;
+            CREATE TRIGGER count_batch_sink_write
+              AFTER INSERT OR UPDATE OR DELETE ON tests.batch_result
+              FOR EACH ROW EXECUTE FUNCTION pg_temp.count_batch_sink_write();
+
             SELECT shiba._apply_dag_delta_batch(
               'tests.batch_result'::regclass,
-              jsonb_build_array(
-                jsonb_build_object(
+              (
+                SELECT jsonb_agg(jsonb_build_object(
                   'source_oid','tests.batch_source'::regclass::oid,
                   'row_data',jsonb_build_object('group_id',1,'amount',10),
                   'delta',1
-                ),
-                jsonb_build_object(
-                  'source_oid','tests.batch_source'::regclass::oid,
-                  'row_data',jsonb_build_object('group_id',1,'amount',20),
-                  'delta',1
-                )
+                ) ORDER BY value)
+                FROM generate_series(1,64) value
               ),
               '0/ABC'
+            );
+
+            SELECT shiba._apply_dag_delta_batch(
+              'tests.batch_result'::regclass,
+              (
+                SELECT jsonb_agg(jsonb_build_object(
+                  'source_oid','tests.batch_source'::regclass::oid,
+                  'row_data',jsonb_build_object(
+                    'group_id',CASE WHEN value<=32 THEN 1 ELSE 2 END,
+                    'amount',10
+                  ),
+                  'delta',CASE WHEN value<=32 THEN -1 ELSE 1 END
+                ) ORDER BY value)
+                FROM generate_series(1,64) value
+              ),
+              '0/ABD'
             );
             "#,
         )
         .expect("ordered DAG batch should execute");
 
-        let result = Spi::get_two::<i64, i64>(
+        let first_group = Spi::get_two::<i64, i64>(
             "SELECT row_count,total::bigint FROM tests.batch_result WHERE group_id=1",
         )
         .expect("batch result should be queryable");
+        let second_group = Spi::get_two::<i64, i64>(
+            "SELECT row_count,total::bigint FROM tests.batch_result WHERE group_id=2",
+        )
+        .expect("moved batch result should be queryable");
         let progress = Spi::get_two::<String, i64>(
             "SELECT applied_lsn::text,
                     (SELECT count(*) FROM batch_progress_writes)
@@ -231,9 +259,89 @@ mod tests {
              WHERE result_oid='tests.batch_result'::regclass",
         )
         .expect("batch progress should be queryable");
+        let sink_writes = Spi::get_one::<i64>("SELECT count(*) FROM batch_sink_writes")
+            .expect("batch sink writes should be queryable")
+            .expect("batch sink write count should be available");
 
-        assert_eq!(result, (Some(3), Some(35)));
-        assert_eq!(progress, (Some("0/ABC".into()), Some(1)));
+        assert_eq!(first_group, (Some(33), Some(325)));
+        assert_eq!(second_group, (Some(32), Some(320)));
+        assert_eq!(progress, (Some("0/ABD".into()), Some(2)));
+        assert_eq!(sink_writes, 3);
+    }
+
+    #[pg_test]
+    fn aggregate_batch_deletes_non_finite_zero_row_groups() {
+        Spi::run(
+            r#"
+            CREATE TABLE tests.nonfinite_source (
+              group_id integer NOT NULL,
+              amount numeric NOT NULL
+            );
+            INSERT INTO tests.nonfinite_source
+            VALUES (1,'NaN'::numeric),(2,'Infinity'::numeric);
+            CREATE TABLE tests.nonfinite_result (
+              group_id integer UNIQUE NULLS NOT DISTINCT,
+              row_count bigint NOT NULL,
+              total numeric
+            );
+            INSERT INTO tests.nonfinite_result
+            VALUES (1,1,'NaN'::numeric),(2,1,'Infinity'::numeric);
+            INSERT INTO shiba_internal.stream_views (
+              result_oid,source_oid,group_column,result_group_column,
+              count_column,sum_input_column,sum_column,activation_lsn
+            ) VALUES (
+              'tests.nonfinite_result'::regclass,
+              'tests.nonfinite_source'::regclass,
+              'group_id','group_id','row_count','amount','total','0/0'
+            );
+            INSERT INTO shiba_internal.aggregate_state (
+              result_oid,group_key,row_count,count_value,
+              sum_nonnull_count,sum_value
+            ) VALUES
+              ('tests.nonfinite_result'::regclass,'1'::jsonb,1,1,1,'NaN'),
+              ('tests.nonfinite_result'::regclass,'2'::jsonb,1,1,1,'Infinity');
+            INSERT INTO shiba_internal.view_progress(result_oid)
+            VALUES ('tests.nonfinite_result'::regclass);
+
+            SELECT shiba._apply_dag_delta_batch(
+              'tests.nonfinite_result'::regclass,
+              (
+                SELECT jsonb_agg(jsonb_build_object(
+                  'source_oid','tests.nonfinite_source'::regclass::oid,
+                  'row_data',jsonb_build_object(
+                    'group_id',value,
+                    'amount',CASE value
+                      WHEN 1 THEN 'NaN'
+                      WHEN 2 THEN 'Infinity'
+                      ELSE value::text
+                    END
+                  ),
+                  'delta',CASE WHEN value<=2 THEN -1 ELSE 1 END
+                ) ORDER BY value)
+                FROM generate_series(1,64) value
+              ),
+              '0/AC0'
+            );
+            "#,
+        )
+        .expect("batch should delete zero-row non-finite aggregate groups");
+
+        let result = Spi::get_two::<i64, i64>(
+            "SELECT count(*),sum(row_count)::bigint
+             FROM tests.nonfinite_result",
+        )
+        .expect("non-finite batch result should be queryable");
+        let state = Spi::get_two::<i64, String>(
+            "SELECT count(*),max(applied_lsn)::text
+             FROM shiba_internal.aggregate_state
+             CROSS JOIN shiba_internal.view_progress
+             WHERE aggregate_state.result_oid='tests.nonfinite_result'::regclass
+               AND view_progress.result_oid=aggregate_state.result_oid",
+        )
+        .expect("non-finite batch state should be queryable");
+
+        assert_eq!(result, (Some(62), Some(62)));
+        assert_eq!(state, (Some(62), Some("0/AC0".into())));
     }
 
     #[pg_test]

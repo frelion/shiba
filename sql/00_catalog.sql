@@ -1,6 +1,16 @@
 CREATE SCHEMA shiba_internal;
 REVOKE ALL ON SCHEMA shiba_internal FROM PUBLIC;
 
+-- Rust keeps JSONB as the extension ABI, while PostgreSQL converts every
+-- commit to this typed row shape before a physical operator consumes it.
+-- Keeping the type internal lets physical operators move to set-based SQL
+-- without exposing a user-facing composite type or changing the WAL inbox.
+CREATE TYPE shiba_internal.delta_event AS (
+    source_oid oid,
+    delta integer,
+    row_data jsonb
+);
+
 CREATE TABLE shiba_internal.stream_views (
     result_oid oid PRIMARY KEY,
     view_kind text NOT NULL DEFAULT 'aggregate'
@@ -216,4 +226,3 @@ CREATE TABLE shiba_internal.worker_state (
 );
 
 INSERT INTO shiba_internal.worker_state (singleton) VALUES (true);
-

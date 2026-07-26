@@ -546,6 +546,173 @@ BEGIN
 END;
 $$;
 
+-- Aggregate is commutative within one source transaction when DISTINCT and
+-- JOIN are absent. Convert the JSON transport to typed source rows, combine
+-- all contributions for each group, update state once per group and then
+-- synchronize each affected sink row once. Other physical operators keep the
+-- ordered per-delta path below.
+CREATE FUNCTION shiba._apply_single_source_aggregate_batch(
+    stream_view shiba_internal.stream_views,
+    events jsonb
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, shiba, shiba_internal
+AS $$
+DECLARE
+    source_name text;
+    filter_sql text;
+    affected_groups jsonb[];
+    row_count_deltas bigint[];
+    sum_nonnull_deltas bigint[];
+    sum_deltas numeric[];
+    state_is_valid boolean;
+    affected_group jsonb;
+BEGIN
+    IF stream_view.view_kind <> 'aggregate' OR stream_view.count_distinct THEN
+      RAISE EXCEPTION 'invalid Shiba aggregate batch specialization for result %',
+        stream_view.result_oid
+        USING ERRCODE='data_corrupted';
+    END IF;
+    IF EXISTS (
+      SELECT 1 FROM shiba_internal.inner_join_views
+      WHERE result_oid=stream_view.result_oid
+    ) THEN
+      RAISE EXCEPTION 'Shiba aggregate batch specialization does not accept JOIN results'
+        USING ERRCODE='data_corrupted';
+    END IF;
+
+    SELECT format('%I.%I',source_namespace.nspname,source.relname)
+    INTO STRICT source_name
+    FROM pg_class source
+    JOIN pg_namespace source_namespace ON source_namespace.oid=source.relnamespace
+    WHERE source.oid=stream_view.source_oid;
+    SELECT coalesce((
+      SELECT predicate_sql
+      FROM shiba_internal.stream_filters
+      WHERE result_oid=stream_view.result_oid
+        AND input_side='left'
+        AND phase='pre'
+    ),'true')
+    INTO filter_sql;
+
+    EXECUTE format(
+      $statement$
+      WITH typed_events AS MATERIALIZED (
+        SELECT raw.ordinality,event.delta::bigint AS delta,event.row_data
+        FROM jsonb_array_elements($2) WITH ORDINALITY raw(value,ordinality)
+        CROSS JOIN LATERAL jsonb_populate_record(
+          NULL::shiba_internal.delta_event,raw.value
+        ) event
+        WHERE event.source_oid=$3
+          AND event.delta IN (-1,1)
+          AND jsonb_typeof(event.row_data)='object'
+      ),
+      contributions AS (
+        SELECT coalesce(to_jsonb((input.row).%1$I),'null'::jsonb) AS group_key,
+               sum(event.delta)::bigint AS row_count_delta,
+               sum(
+                 CASE WHEN (input.row).%2$I IS NULL
+                   THEN 0 ELSE event.delta
+                 END
+               )::bigint AS sum_nonnull_delta,
+               sum(
+                 event.delta * coalesce(((input.row).%2$I)::numeric,0)
+               )::numeric AS sum_delta
+        FROM typed_events event
+        CROSS JOIN LATERAL (
+          SELECT jsonb_populate_record(NULL::%3$s,event.row_data) AS row
+        ) input
+        WHERE coalesce((%4$s),false)
+        GROUP BY coalesce(to_jsonb((input.row).%1$I),'null'::jsonb)
+      )
+      SELECT array_agg(group_key ORDER BY group_key::text),
+             array_agg(row_count_delta ORDER BY group_key::text),
+             array_agg(sum_nonnull_delta ORDER BY group_key::text),
+             array_agg(sum_delta ORDER BY group_key::text)
+      FROM contributions
+      WHERE row_count_delta<>0
+         OR sum_nonnull_delta<>0
+         OR sum_delta<>0
+      $statement$,
+      stream_view.group_column,
+      stream_view.sum_input_column,
+      source_name,
+      filter_sql
+    )
+    USING stream_view.result_oid,events,stream_view.source_oid
+    INTO affected_groups,row_count_deltas,sum_nonnull_deltas,sum_deltas;
+
+    IF affected_groups IS NULL THEN
+      RETURN;
+    END IF;
+
+    SELECT coalesce(bool_and(
+             final.row_count>=0
+             AND final.count_value>=0
+             AND final.sum_nonnull_count>=0
+             AND final.count_value=final.row_count
+             AND final.sum_nonnull_count<=final.row_count
+             AND (
+               final.row_count<>0
+               OR (
+                 final.count_value=0
+                 AND final.sum_nonnull_count=0
+               )
+             )
+           ),true)
+    INTO state_is_valid
+    FROM generate_subscripts(affected_groups,1) slot
+    LEFT JOIN shiba_internal.aggregate_state state
+      ON state.result_oid=stream_view.result_oid
+     AND state.group_key=affected_groups[slot]
+    CROSS JOIN LATERAL (
+      SELECT coalesce(state.row_count,0)+row_count_deltas[slot] AS row_count,
+             coalesce(state.count_value,0)+row_count_deltas[slot] AS count_value,
+             coalesce(state.sum_nonnull_count,0)+sum_nonnull_deltas[slot]
+               AS sum_nonnull_count,
+             coalesce(state.sum_value,0)+sum_deltas[slot] AS sum_value
+    ) final;
+    IF NOT state_is_valid THEN
+      RAISE EXCEPTION 'Shiba aggregate batch produced invalid state'
+        USING ERRCODE='data_corrupted';
+    END IF;
+
+    UPDATE shiba_internal.aggregate_state state
+    SET row_count=state.row_count+row_count_deltas[slot],
+        count_value=state.count_value+row_count_deltas[slot],
+        sum_nonnull_count=
+          state.sum_nonnull_count+sum_nonnull_deltas[slot],
+        sum_value=state.sum_value+sum_deltas[slot]
+    FROM generate_subscripts(affected_groups,1) slot
+    WHERE state.result_oid=stream_view.result_oid
+      AND state.group_key=affected_groups[slot];
+    INSERT INTO shiba_internal.aggregate_state
+      (result_oid,group_key,row_count,count_value,sum_nonnull_count,sum_value)
+    SELECT stream_view.result_oid,
+           affected_groups[slot],
+           row_count_deltas[slot],
+           row_count_deltas[slot],
+           sum_nonnull_deltas[slot],
+           sum_deltas[slot]
+    FROM generate_subscripts(affected_groups,1) slot
+    WHERE row_count_deltas[slot]>0
+      AND NOT EXISTS (
+        SELECT 1
+        FROM shiba_internal.aggregate_state state
+        WHERE state.result_oid=stream_view.result_oid
+          AND state.group_key=affected_groups[slot]
+      );
+    DELETE FROM shiba_internal.aggregate_state
+    WHERE result_oid=stream_view.result_oid
+      AND group_key=ANY(affected_groups)
+      AND row_count=0;
+    FOREACH affected_group IN ARRAY affected_groups LOOP
+      PERFORM shiba._sync_aggregate_sink(stream_view,affected_group);
+    END LOOP;
+END;
+$$;
+
 CREATE FUNCTION shiba._route_wal_delta(
     source_relation oid,
     row_data jsonb,
@@ -735,6 +902,8 @@ AS $$
 DECLARE
     event record;
     event_count bigint := 0;
+    stream_view shiba_internal.stream_views%ROWTYPE;
+    use_aggregate_batch boolean := false;
 BEGIN
     IF jsonb_typeof(events) IS DISTINCT FROM 'array' THEN
       RAISE EXCEPTION 'Shiba DAG delta batch must be a JSON array'
@@ -742,6 +911,21 @@ BEGIN
     END IF;
 
     PERFORM pg_advisory_xact_lock(result_relation::bigint);
+    -- Set-based setup is more expensive for small commits. Check the batch
+    -- cardinality before reading metadata so the ordered small-commit path
+    -- does not pay any physical-dispatch query overhead.
+    IF jsonb_array_length(events)>=64 THEN
+      SELECT * INTO STRICT stream_view
+      FROM shiba_internal.stream_views
+      WHERE result_oid=result_relation;
+      use_aggregate_batch :=
+        stream_view.view_kind='aggregate'
+        AND NOT stream_view.count_distinct
+        AND NOT EXISTS (
+          SELECT 1 FROM shiba_internal.inner_join_views
+          WHERE result_oid=result_relation
+        );
+    END IF;
     FOR event IN
       SELECT value,ordinality
       FROM jsonb_array_elements(events) WITH ORDINALITY input(value,ordinality)
@@ -758,19 +942,29 @@ BEGIN
         RAISE EXCEPTION 'invalid Shiba DAG differential weight at batch position %',event.ordinality
           USING ERRCODE='invalid_parameter_value';
       END IF;
-      PERFORM shiba._apply_dag_delta_state(
-        result_relation,
-        (event.value->>'source_oid')::oid,
-        event.value->'row_data',
-        (event.value->>'delta')::integer,
-        commit_lsn
-      );
+      IF use_aggregate_batch THEN
+        IF (event.value->>'source_oid')::oid<>stream_view.source_oid THEN
+          RAISE EXCEPTION 'Shiba DAG inbox source does not belong to result %',result_relation
+            USING ERRCODE='data_corrupted';
+        END IF;
+      ELSE
+        PERFORM shiba._apply_dag_delta_state(
+          result_relation,
+          (event.value->>'source_oid')::oid,
+          event.value->'row_data',
+          (event.value->>'delta')::integer,
+          commit_lsn
+        );
+      END IF;
       event_count := event_count+1;
     END LOOP;
 
     IF event_count=0 THEN
       RAISE EXCEPTION 'Shiba DAG delta batch must not be empty'
         USING ERRCODE='invalid_parameter_value';
+    END IF;
+    IF use_aggregate_batch THEN
+      PERFORM shiba._apply_single_source_aggregate_batch(stream_view,events);
     END IF;
     PERFORM shiba._advance_dag_progress(result_relation,commit_lsn);
 END;
