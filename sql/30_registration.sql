@@ -36,10 +36,12 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     explained jsonb;
+    logical jsonb;
 BEGIN
     EXECUTE 'EXPLAIN (VERBOSE, FORMAT JSON) ' || definition INTO explained;
+    logical := shiba.compile_logical_plan(result_relation)::jsonb;
     INSERT INTO shiba_internal.stream_graphs (result_oid, plan, logical_plan)
-    VALUES (result_relation, explained, shiba.compile_logical_plan(result_relation))
+    VALUES (result_relation, explained, logical)
     ON CONFLICT (result_oid) DO UPDATE
     SET plan = EXCLUDED.plan, logical_plan = EXCLUDED.logical_plan;
 
@@ -53,7 +55,7 @@ BEGIN
              ('distinct', 'aggregate', 'window', 'top_n', 'inner_join', 'left_join',
               'right_join', 'full_join', 'semi_join', 'anti_join',
               'null_aware_anti_join')
-    FROM jsonb_array_elements(shiba.compile_logical_plan(result_relation)::jsonb -> 'nodes') node;
+    FROM jsonb_array_elements(logical -> 'nodes') node;
 
     WITH RECURSIVE walk(node_id, parent_id, plan_node) AS (
         SELECT 'n0'::text, NULL::text, explained -> 0 -> 'Plan'
@@ -88,12 +90,138 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION shiba._prepare_stream_registration(
+    result_relation oid,
+    definition text
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba_internal, public
+AS $$
+BEGIN
+    INSERT INTO shiba_internal.view_progress (result_oid)
+    VALUES (result_relation);
+    INSERT INTO shiba_internal.dag_worker_state (result_oid)
+    VALUES (result_relation);
+    PERFORM shiba._compile_stream_graph(result_relation, definition);
+END;
+$$;
+
+CREATE FUNCTION shiba._finalize_stream_registration(
+    result_relation oid,
+    target_name text,
+    source_relations oid[],
+    source_names text[],
+    source_roles text[]
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba_internal, public
+AS $$
+DECLARE
+    source_index integer;
+    source_in_publication boolean;
+    trigger_suffix text;
+BEGIN
+    IF result_relation IS NULL
+       OR target_name IS NULL
+       OR btrim(target_name) = ''
+       OR source_relations IS NULL
+       OR source_names IS NULL
+       OR source_roles IS NULL
+       OR cardinality(source_relations) = 0
+       OR array_ndims(source_relations) IS DISTINCT FROM 1
+       OR array_ndims(source_names) IS DISTINCT FROM 1
+       OR array_ndims(source_roles) IS DISTINCT FROM 1
+       OR array_lower(source_relations, 1) IS DISTINCT FROM 1
+       OR array_lower(source_names, 1) IS DISTINCT FROM 1
+       OR array_lower(source_roles, 1) IS DISTINCT FROM 1
+       OR cardinality(source_relations) IS DISTINCT FROM cardinality(source_names)
+       OR cardinality(source_relations) IS DISTINCT FROM cardinality(source_roles)
+       OR array_position(source_relations, NULL) IS NOT NULL
+       OR array_position(source_names, NULL) IS NOT NULL
+       OR array_position(source_roles, NULL) IS NOT NULL
+       OR EXISTS (
+           SELECT 1
+           FROM unnest(source_names) AS source_name(value)
+           WHERE btrim(source_name.value) = ''
+       )
+       OR EXISTS (
+           SELECT 1
+           FROM unnest(source_roles) AS source_role(value)
+           WHERE source_role.value NOT IN ('', 'left', 'right')
+       )
+       OR cardinality(source_relations) IS DISTINCT FROM (
+           SELECT count(DISTINCT source_relation.value)
+           FROM unnest(source_relations) AS source_relation(value)
+       ) THEN
+        RAISE EXCEPTION 'invalid Shiba registration sources'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    FOR source_index IN 1..cardinality(source_relations) LOOP
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_publication_rel AS publication_relation
+            JOIN pg_publication AS publication
+              ON publication.oid = publication_relation.prpubid
+            WHERE publication.pubname = 'shiba_publication'
+              AND publication_relation.prrelid = source_relations[source_index]
+        ) INTO source_in_publication;
+        IF NOT source_in_publication THEN
+            EXECUTE format(
+                'ALTER PUBLICATION shiba_publication ADD TABLE %s',
+                source_names[source_index]
+            );
+        END IF;
+    END LOOP;
+
+    FOR source_index IN 1..cardinality(source_relations) LOOP
+        trigger_suffix := CASE
+            WHEN source_roles[source_index] = '' THEN ''
+            ELSE '_' || source_roles[source_index]
+        END;
+        EXECUTE format(
+            'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',
+            format('shiba_wakeup_%s%s', result_relation, trigger_suffix),
+            source_names[source_index]
+        );
+    END LOOP;
+
+    FOR source_index IN 1..cardinality(source_relations) LOOP
+        trigger_suffix := CASE
+            WHEN source_roles[source_index] = '' THEN ''
+            ELSE '_' || source_roles[source_index]
+        END;
+        EXECUTE format(
+            'CREATE TRIGGER %I BEFORE TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._reject_source_truncate()',
+            format('shiba_no_truncate_%s%s', result_relation, trigger_suffix),
+            source_names[source_index]
+        );
+    END LOOP;
+
+    EXECUTE format(
+        'CREATE TRIGGER %I BEFORE INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION shiba._protect_result_table()',
+        format('shiba_protect_%s', result_relation),
+        target_name
+    );
+    EXECUTE format('GRANT SELECT ON %s TO %I', target_name, session_user);
+    EXECUTE format(
+        'ALTER TABLE %s OWNER TO %I',
+        target_name,
+        shiba_internal.extension_owner()
+    );
+END;
+$$;
+
 CREATE FUNCTION shiba._register_inner_join_stream_table(query_text text, analysis jsonb)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, shiba_internal, public AS $$
 DECLARE
     normalized text; d text[]; left_oid oid; right_oid oid; target_oid oid;
-    left_name text; right_name text; target_name text; group_side text; publication_member boolean;
+    left_name text; right_name text; target_name text; group_side text;
     activation_lsn_value pg_lsn; sum_is_not_null boolean;
     definition text; predicate_sql text; predicate_source oid;
     result_group_name name; filter_side text; filter_source_oid oid;
@@ -299,23 +427,14 @@ BEGIN
           USING ERRCODE='feature_not_supported';
       END IF;
     END IF;
-    INSERT INTO shiba_internal.view_progress (result_oid) VALUES (target_oid);
-    INSERT INTO shiba_internal.dag_worker_state (result_oid) VALUES (target_oid);
-    PERFORM shiba._compile_stream_graph(target_oid,d[3]);
+    PERFORM shiba._prepare_stream_registration(target_oid,d[3]);
     PERFORM shiba._initialize_aggregate_state(target_oid);
     EXECUTE format('INSERT INTO shiba_internal.join_arrangements SELECT %s,''left'',coalesce(j.row->>%L,''''),j.row,count(*) FROM %s x CROSS JOIN LATERAL (SELECT jsonb_object_agg(key,value) row FROM jsonb_each_text(to_jsonb(x))) j WHERE shiba._row_passes_filter(%s,''left'',j.row) GROUP BY j.row->>%L,j.row',target_oid,left_join_column_name,left_name,target_oid,left_join_column_name);
     EXECUTE format('INSERT INTO shiba_internal.join_arrangements SELECT %s,''right'',coalesce(j.row->>%L,''''),j.row,count(*) FROM %s x CROSS JOIN LATERAL (SELECT jsonb_object_agg(key,value) row FROM jsonb_each_text(to_jsonb(x))) j WHERE shiba._row_passes_filter(%s,''right'',j.row) GROUP BY j.row->>%L,j.row',target_oid,right_join_column_name,right_name,target_oid,right_join_column_name);
-    FOREACH left_oid IN ARRAY ARRAY[left_oid,right_oid] LOOP
-      SELECT EXISTS(SELECT 1 FROM pg_publication_rel pr JOIN pg_publication p ON p.oid=pr.prpubid WHERE p.pubname='shiba_publication' AND pr.prrelid=left_oid) INTO publication_member;
-      IF NOT publication_member THEN EXECUTE format('ALTER PUBLICATION shiba_publication ADD TABLE %s',(SELECT format('%I.%I',n.nspname,c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=left_oid)); END IF;
-    END LOOP;
-    EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',format('shiba_wakeup_%s_left',target_oid),left_name);
-    EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',format('shiba_wakeup_%s_right',target_oid),right_name);
-    EXECUTE format('CREATE TRIGGER %I BEFORE TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._reject_source_truncate()',format('shiba_no_truncate_%s_left',target_oid),left_name);
-    EXECUTE format('CREATE TRIGGER %I BEFORE TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._reject_source_truncate()',format('shiba_no_truncate_%s_right',target_oid),right_name);
-    EXECUTE format('CREATE TRIGGER %I BEFORE INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION shiba._protect_result_table()',format('shiba_protect_%s',target_oid),target_name);
-    EXECUTE format('GRANT SELECT ON %s TO %I', target_name, session_user);
-    EXECUTE format('ALTER TABLE %s OWNER TO %I', target_name, shiba_internal.extension_owner());
+    PERFORM shiba._finalize_stream_registration(
+      target_oid,target_name,ARRAY[left_oid,right_oid],
+      ARRAY[left_name,right_name],ARRAY['left','right']
+    );
 END; $$;
 
 CREATE FUNCTION shiba._register_subquery_stream_table(query_text text, analysis jsonb)
@@ -401,7 +520,6 @@ DECLARE
     window_suffix text;
     predicate_sql text;
     activation_lsn_value pg_lsn;
-    source_in_publication boolean;
 BEGIN
     IF (analysis ->> 'has_sublinks')::boolean
        OR (analysis ->> 'has_aggregates')::boolean
@@ -569,34 +687,10 @@ BEGIN
        GROUP BY x.%I,canonical.row',
       partition_column_name,source_name,partition_column_name
     ) USING target_oid;
-    INSERT INTO shiba_internal.view_progress(result_oid) VALUES(target_oid);
-    INSERT INTO shiba_internal.dag_worker_state(result_oid) VALUES(target_oid);
-    PERFORM shiba._compile_stream_graph(target_oid,definition);
-
-    SELECT EXISTS(
-      SELECT 1 FROM pg_publication_rel pr JOIN pg_publication p ON p.oid=pr.prpubid
-      WHERE p.pubname='shiba_publication' AND pr.prrelid=source_oid
-    ) INTO source_in_publication;
-    IF NOT source_in_publication THEN
-      EXECUTE format('ALTER PUBLICATION shiba_publication ADD TABLE %s',source_name);
-    END IF;
-    EXECUTE format(
-      'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s
-       FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',
-      format('shiba_wakeup_%s',target_oid),source_name
+    PERFORM shiba._prepare_stream_registration(target_oid,definition);
+    PERFORM shiba._finalize_stream_registration(
+      target_oid,target_name,ARRAY[source_oid],ARRAY[source_name],ARRAY['']
     );
-    EXECUTE format(
-      'CREATE TRIGGER %I BEFORE TRUNCATE ON %s
-       FOR EACH STATEMENT EXECUTE FUNCTION shiba._reject_source_truncate()',
-      format('shiba_no_truncate_%s',target_oid),source_name
-    );
-    EXECUTE format(
-      'CREATE TRIGGER %I BEFORE INSERT OR UPDATE OR DELETE ON %s
-       FOR EACH ROW EXECUTE FUNCTION shiba._protect_result_table()',
-      format('shiba_protect_%s',target_oid),target_name
-    );
-    EXECUTE format('GRANT SELECT ON %s TO %I',target_name,session_user);
-    EXECUTE format('ALTER TABLE %s OWNER TO %I',target_name,shiba_internal.extension_owner());
 END;
 $$;
 
@@ -622,7 +716,6 @@ DECLARE
     key_arguments text;
     predicate_sql text;
     activation_lsn_value pg_lsn;
-    source_in_publication boolean;
 BEGIN
     IF (analysis ->> 'has_distinct_on')::boolean
        OR (analysis ->> 'has_window_functions')::boolean
@@ -724,33 +817,10 @@ BEGIN
        GROUP BY projected.row_key',
       key_arguments,source_name
     ) USING target_oid;
-    INSERT INTO shiba_internal.view_progress(result_oid) VALUES(target_oid);
-    INSERT INTO shiba_internal.dag_worker_state(result_oid) VALUES(target_oid);
-    PERFORM shiba._compile_stream_graph(target_oid,definition);
-    SELECT EXISTS(
-      SELECT 1 FROM pg_publication_rel pr JOIN pg_publication p ON p.oid=pr.prpubid
-      WHERE p.pubname='shiba_publication' AND pr.prrelid=source_oid
-    ) INTO source_in_publication;
-    IF NOT source_in_publication THEN
-      EXECUTE format('ALTER PUBLICATION shiba_publication ADD TABLE %s',source_name);
-    END IF;
-    EXECUTE format(
-      'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s
-       FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',
-      format('shiba_wakeup_%s',target_oid),source_name
+    PERFORM shiba._prepare_stream_registration(target_oid,definition);
+    PERFORM shiba._finalize_stream_registration(
+      target_oid,target_name,ARRAY[source_oid],ARRAY[source_name],ARRAY['']
     );
-    EXECUTE format(
-      'CREATE TRIGGER %I BEFORE TRUNCATE ON %s
-       FOR EACH STATEMENT EXECUTE FUNCTION shiba._reject_source_truncate()',
-      format('shiba_no_truncate_%s',target_oid),source_name
-    );
-    EXECUTE format(
-      'CREATE TRIGGER %I BEFORE INSERT OR UPDATE OR DELETE ON %s
-       FOR EACH ROW EXECUTE FUNCTION shiba._protect_result_table()',
-      format('shiba_protect_%s',target_oid),target_name
-    );
-    EXECUTE format('GRANT SELECT ON %s TO %I',target_name,session_user);
-    EXECUTE format('ALTER TABLE %s OWNER TO %I',target_name,shiba_internal.extension_owner());
 END;
 $$;
 
@@ -777,7 +847,6 @@ DECLARE
     actual_outputs name[];
     predicate_sql text;
     activation_lsn_value pg_lsn;
-    source_in_publication boolean;
     limit_value bigint;
     offset_value bigint;
 BEGIN
@@ -889,33 +958,10 @@ BEGIN
        GROUP BY canonical.row',
       source_name
     ) USING target_oid;
-    INSERT INTO shiba_internal.view_progress(result_oid) VALUES(target_oid);
-    INSERT INTO shiba_internal.dag_worker_state(result_oid) VALUES(target_oid);
-    PERFORM shiba._compile_stream_graph(target_oid,definition);
-    SELECT EXISTS(
-      SELECT 1 FROM pg_publication_rel pr JOIN pg_publication p ON p.oid=pr.prpubid
-      WHERE p.pubname='shiba_publication' AND pr.prrelid=source_oid
-    ) INTO source_in_publication;
-    IF NOT source_in_publication THEN
-      EXECUTE format('ALTER PUBLICATION shiba_publication ADD TABLE %s',source_name);
-    END IF;
-    EXECUTE format(
-      'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s
-       FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',
-      format('shiba_wakeup_%s',target_oid),source_name
+    PERFORM shiba._prepare_stream_registration(target_oid,definition);
+    PERFORM shiba._finalize_stream_registration(
+      target_oid,target_name,ARRAY[source_oid],ARRAY[source_name],ARRAY['']
     );
-    EXECUTE format(
-      'CREATE TRIGGER %I BEFORE TRUNCATE ON %s
-       FOR EACH STATEMENT EXECUTE FUNCTION shiba._reject_source_truncate()',
-      format('shiba_no_truncate_%s',target_oid),source_name
-    );
-    EXECUTE format(
-      'CREATE TRIGGER %I BEFORE INSERT OR UPDATE OR DELETE ON %s
-       FOR EACH ROW EXECUTE FUNCTION shiba._protect_result_table()',
-      format('shiba_protect_%s',target_oid),target_name
-    );
-    EXECUTE format('GRANT SELECT ON %s TO %I',target_name,session_user);
-    EXECUTE format('ALTER TABLE %s OWNER TO %I',target_name,shiba_internal.extension_owner());
 END;
 $$;
 
@@ -941,11 +987,9 @@ DECLARE
     source_name text;
     target_name text;
     target_oid oid;
-    trigger_name text;
     key_constraint_name text;
     output_columns name[];
     sum_is_not_null boolean;
-    source_in_publication boolean;
     activation_lsn_value pg_lsn;
 BEGIN
     IF coalesce((analysis ->> 'has_aggregate_filters')::boolean,false)
@@ -1176,39 +1220,10 @@ BEGIN
             target_oid, 'left', source_oid, predicate_sql
         );
     END IF;
-    INSERT INTO shiba_internal.view_progress (result_oid) VALUES (target_oid);
-    INSERT INTO shiba_internal.dag_worker_state (result_oid) VALUES (target_oid);
-    PERFORM shiba._compile_stream_graph(target_oid, definition);
+    PERFORM shiba._prepare_stream_registration(target_oid, definition);
     PERFORM shiba._initialize_aggregate_state(target_oid);
-
-    SELECT EXISTS (
-        SELECT 1
-        FROM pg_publication_rel AS publication_relation
-        JOIN pg_publication AS publication ON publication.oid = publication_relation.prpubid
-        WHERE publication.pubname = 'shiba_publication'
-          AND publication_relation.prrelid = source_oid
-    ) INTO source_in_publication;
-    IF NOT source_in_publication THEN
-        EXECUTE format('ALTER PUBLICATION shiba_publication ADD TABLE %s', source_name);
-    END IF;
-
-    trigger_name := format('shiba_wakeup_%s', target_oid);
-    EXECUTE format(
-        'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',
-        trigger_name,
-        source_name
+    PERFORM shiba._finalize_stream_registration(
+        target_oid, target_name, ARRAY[source_oid], ARRAY[source_name], ARRAY['']
     );
-    EXECUTE format(
-        'CREATE TRIGGER %I BEFORE TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._reject_source_truncate()',
-        format('shiba_no_truncate_%s', target_oid),
-        source_name
-    );
-    EXECUTE format(
-        'CREATE TRIGGER %I BEFORE INSERT OR UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION shiba._protect_result_table()',
-        format('shiba_protect_%s', target_oid),
-        target_name
-    );
-    EXECUTE format('GRANT SELECT ON %s TO %I', target_name, session_user);
-    EXECUTE format('ALTER TABLE %s OWNER TO %I', target_name, shiba_internal.extension_owner());
 END;
 $$;

@@ -47,3 +47,6 @@ cargo pgrx test pg17
 ```
 
 The end-to-end script packages and installs the extension into an actual PostgreSQL 17 installation, starts an isolated database cluster, and runs SQL assertions against it. See [docs/TESTING.md](docs/TESTING.md).
+
+For a code-oriented tour—from PostgreSQL's analyzed query tree through the
+durable inbox and operator state—see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

@@ -26,18 +26,35 @@ unsafe extern "C-unwind" fn shiba_process_utility(
 ) {
     prepare_stream_drops(pstmt);
     let declaration = shiba_table_declaration(pstmt, query_string);
-    let query_analysis = query_tree::inspect_ctas(pstmt);
-    let is_stream_declaration = declaration.is_some() && query_analysis.is_some();
+    let inspection = query_tree::inspect_ctas(pstmt);
+    let is_stream_declaration = declaration.is_some() && inspection.is_some();
     if declaration.is_some() && !is_stream_declaration && !pg_sys::creating_extension {
         error!("the shiba schema only accepts CREATE TABLE shiba.name AS SELECT ... stream declarations");
     }
     let declaration = is_stream_declaration.then_some(declaration).flatten();
-    if declaration.is_some() && query_analysis.is_none() {
+    if declaration.is_some() && inspection.is_none() {
         error!("Shiba could not access PostgreSQL's analyzed CTAS Query tree");
     }
-    if declaration.is_some() {
-        let query_analysis = query_analysis.as_deref().expect("checked above");
-        let argument = DatumWithOid::new(query_analysis, pg_sys::TEXTOID);
+    let inspection = if declaration.is_some() {
+        Some(match inspection.expect("checked above") {
+            Ok(inspection) => inspection,
+            Err(error) => error!("Shiba cannot execute this stream declaration: {error}"),
+        })
+    } else {
+        None
+    };
+    if let Some(inspection) = &inspection {
+        let lock_analysis = serde_json::json!({
+            "sources": inspection
+                .validated
+                .sources()
+                .into_iter()
+                .map(|oid| serde_json::json!({ "oid": oid }))
+                .collect::<Vec<_>>(),
+            "subqueries": [],
+        })
+        .to_string();
+        let argument = DatumWithOid::new(lock_analysis.as_str(), pg_sys::TEXTOID);
         Spi::run_with_args(
             "SELECT shiba._lock_sources_for_analysis($1::jsonb)",
             &[argument],
@@ -68,7 +85,7 @@ unsafe extern "C-unwind" fn shiba_process_utility(
         );
     }
     if let Some(declaration) = declaration {
-        let query_analysis = query_analysis.expect("checked above");
+        let query_analysis = inspection.expect("checked above").wire_json;
         let arguments = [
             DatumWithOid::new(declaration.as_str(), pg_sys::TEXTOID),
             DatumWithOid::new(query_analysis.as_str(), pg_sys::TEXTOID),

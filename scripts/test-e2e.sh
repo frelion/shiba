@@ -65,6 +65,48 @@ test "$(psql_e2e -Atqc "SELECT count(*) || ':' || count(*) FILTER (WHERE statefu
 test "$(psql_e2e -Atqc "SELECT row_count || ':' || sum_value FROM shiba_internal.aggregate_state WHERE result_oid = 'shiba.order_stats'::regclass AND group_key = '1'::jsonb")" = "2:30"
 test "$(psql_e2e -Atqc "SELECT (analyzed_query->>'has_aggregates') || ':' || jsonb_array_length(analyzed_query->'sources') || ':' || jsonb_array_length(analyzed_query->'targets') FROM shiba_internal.stream_graphs WHERE result_oid = 'shiba.order_stats'::regclass")" = "true:1:3"
 test "$(psql_e2e -Atqc "SELECT (analyzed_query->'targets'->0->>'expression') || ':' || (analyzed_query->'targets'->1->>'aggregate') || ':' || (analyzed_query->'targets'->2->>'aggregate') || ':' || (analyzed_query->'targets'->2->>'input_column') FROM shiba_internal.stream_graphs WHERE result_oid = 'shiba.order_stats'::regclass")" = "column:count:sum:2"
+# The internal JSON ABI accepts integer text as well as JSON numbers. A
+# string "-1" must select the ordered-prefix path, never the insertion-only
+# fast path. Sixty-four events force batch specialization.
+if psql_e2e -qc "
+  WITH event_rows AS (
+    SELECT 1 AS sequence,
+           jsonb_build_object('product_id',999,'amount',1) AS row_data,
+           to_jsonb('-1'::text) AS delta
+    UNION ALL
+    SELECT 2,jsonb_build_object('product_id',999,'amount',1),to_jsonb(1)
+    UNION ALL
+    SELECT 2+n*2,
+           jsonb_build_object('product_id',1000+n,'amount',1),to_jsonb(1)
+    FROM generate_series(1,31) n
+    UNION ALL
+    SELECT 3+n*2,
+           jsonb_build_object('product_id',1000+n,'amount',1),to_jsonb(-1)
+    FROM generate_series(1,31) n
+  ),
+  payload AS (
+    SELECT jsonb_agg(
+             jsonb_build_object(
+               'source_oid','orders'::regclass::oid,
+               'row_data',row_data,
+               'delta',delta
+             )
+             ORDER BY sequence
+           ) AS events
+    FROM event_rows
+  )
+  SELECT shiba._apply_dag_delta_batch(
+    'shiba.order_stats'::regclass,
+    shiba._logical_execution_descriptor('shiba.order_stats'::regclass),
+    events,
+    '0/1'
+  )
+  FROM payload
+" >/dev/null 2>&1; then
+  printf 'aggregate batch accepted a string retraction before insertion\n' >&2
+  exit 1
+fi
+test "$(psql_e2e -Atqc "SELECT row_count || ':' || sum_value FROM shiba_internal.aggregate_state WHERE result_oid = 'shiba.order_stats'::regclass AND group_key = '1'::jsonb")" = "2:30"
 psql_e2e -qc "CREATE MATERIALIZED VIEW public.native_snapshot AS SELECT count(*) AS order_count FROM orders"
 if psql_e2e -qc "CREATE TABLE shiba.unsupported AS SELECT product_id, count(*) AS order_count, sum(amount) AS total_amount, row_number() OVER (ORDER BY product_id) AS position FROM orders GROUP BY product_id" >/dev/null 2>&1; then
   printf 'unsupported Shiba query unexpectedly succeeded\n' >&2
@@ -153,6 +195,101 @@ psql_e2e -qc "INSERT INTO allowed_products VALUES (10,1),(11,1)"
 psql_e2e -qc "CREATE TABLE shiba.allowed_order_stats AS SELECT o.product_id, count(*) AS order_count, sum(o.amount) AS total_amount FROM sub_orders o WHERE EXISTS (SELECT 1 FROM allowed_products a WHERE a.product_id=o.product_id) GROUP BY o.product_id"
 wait_for_value "1" "SELECT count(*) FROM shiba.allowed_order_stats WHERE product_id=1 AND order_count=2 AND total_amount=12"
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid='shiba.allowed_order_stats'::regclass")" = "scan,scan,semi_join,aggregate,project,sink"
+# The executor reuses one backend for many commits. Exercise two explicit
+# begin/finish cycles on one connection and verify that the temp batch context
+# is reused without retaining active state or affected groups.
+psql_e2e -qc "
+  BEGIN;
+  SELECT shiba._begin_join_batch('shiba.allowed_order_stats'::regclass);
+  SELECT shiba._finish_join_batch('shiba.allowed_order_stats'::regclass);
+  COMMIT;
+  BEGIN;
+  SELECT shiba._begin_join_batch('shiba.allowed_order_stats'::regclass);
+  SELECT shiba._finish_join_batch('shiba.allowed_order_stats'::regclass);
+  DO \$block\$
+  BEGIN
+    IF EXISTS (SELECT 1 FROM pg_temp.shiba_join_batch_groups) THEN
+      RAISE EXCEPTION 'join batch temp state leaked across commits';
+    END IF;
+  END
+  \$block\$;
+  COMMIT;
+"
+# Compare the public ordered single-delta compatibility path with one
+# commit-level batch on identical starting state. Both executions run in
+# rolled-back subtransactions, so the registered semi join remains unchanged.
+psql_e2e -qc "
+  DO \$oracle\$
+  DECLARE
+    reference_state jsonb;
+    batch_state jsonb;
+    states_differ boolean := false;
+    batch_events jsonb := jsonb_build_array(
+      jsonb_build_object(
+        'source_oid','allowed_products'::regclass::oid,
+        'row_data',jsonb_build_object('permit_id',901,'product_id',2),
+        'delta',1
+      ),
+      jsonb_build_object(
+        'source_oid','allowed_products'::regclass::oid,
+        'row_data',jsonb_build_object('permit_id',902,'product_id',2),
+        'delta',1
+      )
+    );
+  BEGIN
+    BEGIN
+      PERFORM shiba._apply_dag_delta(
+        'shiba.allowed_order_stats'::regclass,
+        'allowed_products'::regclass,
+        jsonb_build_object('permit_id',901,'product_id',2),1,'0/2'
+      );
+      PERFORM shiba._apply_dag_delta(
+        'shiba.allowed_order_stats'::regclass,
+        'allowed_products'::regclass,
+        jsonb_build_object('permit_id',902,'product_id',2),1,'0/2'
+      );
+      SELECT jsonb_build_object(
+        'sink',(SELECT jsonb_agg(to_jsonb(s) ORDER BY product_id::text)
+                FROM shiba.allowed_order_stats s),
+        'aggregate',(SELECT jsonb_agg(to_jsonb(a) ORDER BY group_key::text)
+                     FROM shiba_internal.aggregate_state a
+                     WHERE result_oid='shiba.allowed_order_stats'::regclass),
+        'arrangements',(SELECT jsonb_agg(to_jsonb(a)
+                           ORDER BY input_side,join_key,row_data::text)
+                        FROM shiba_internal.join_arrangements a
+                        WHERE result_oid='shiba.allowed_order_stats'::regclass)
+      ) INTO reference_state;
+      RAISE EXCEPTION 'rollback ordered oracle';
+    EXCEPTION WHEN raise_exception THEN
+      IF SQLERRM<>'rollback ordered oracle' THEN RAISE; END IF;
+    END;
+
+    BEGIN
+      PERFORM shiba._apply_dag_delta_batch(
+        'shiba.allowed_order_stats'::regclass,batch_events,'0/2'
+      );
+      SELECT jsonb_build_object(
+        'sink',(SELECT jsonb_agg(to_jsonb(s) ORDER BY product_id::text)
+                FROM shiba.allowed_order_stats s),
+        'aggregate',(SELECT jsonb_agg(to_jsonb(a) ORDER BY group_key::text)
+                     FROM shiba_internal.aggregate_state a
+                     WHERE result_oid='shiba.allowed_order_stats'::regclass),
+        'arrangements',(SELECT jsonb_agg(to_jsonb(a)
+                           ORDER BY input_side,join_key,row_data::text)
+                        FROM shiba_internal.join_arrangements a
+                        WHERE result_oid='shiba.allowed_order_stats'::regclass)
+      ) INTO batch_state;
+      states_differ := batch_state IS DISTINCT FROM reference_state;
+      RAISE EXCEPTION 'rollback batch oracle';
+    EXCEPTION WHEN raise_exception THEN
+      IF SQLERRM<>'rollback batch oracle' THEN RAISE; END IF;
+    END;
+    IF states_differ THEN
+      RAISE EXCEPTION 'join batch state differs from ordered reference';
+    END IF;
+  END
+  \$oracle\$;
+"
 psql_e2e -qc "DELETE FROM allowed_products WHERE permit_id=10"
 wait_for_value "1" "SELECT count(*) FROM shiba.allowed_order_stats WHERE product_id=1 AND order_count=2 AND total_amount=12"
 psql_e2e -qc "DELETE FROM allowed_products WHERE permit_id=11"
@@ -202,6 +339,17 @@ psql_e2e -qc "INSERT INTO window_events VALUES (1,1,10),(2,1,20),(3,1,20)"
 psql_e2e -qc "CREATE TABLE shiba.event_windows AS SELECT event_id,category_id,score,row_number() OVER w AS position,rank() OVER w AS ranking,dense_rank() OVER w AS dense_ranking,count(*) OVER w AS running_count,sum(score) OVER w AS running_sum,avg(score) OVER w AS running_avg,min(score) OVER w AS running_min,max(score) OVER w AS running_max FROM window_events WINDOW w AS (PARTITION BY category_id ORDER BY score)"
 wait_for_value "1" "SELECT count(*) FROM shiba.event_windows WHERE event_id=1 AND position=1 AND ranking=1 AND dense_ranking=1 AND running_count=1 AND running_sum=10 AND running_avg=10 AND running_min=10 AND running_max=10"
 wait_for_value "2" "SELECT count(*) FROM shiba.event_windows WHERE score=20 AND ranking=2 AND dense_ranking=2 AND running_count=3 AND running_sum=50"
+if psql_e2e -qc "SELECT shiba._apply_dag_delta_batch(
+  'shiba.event_windows'::regclass,
+  jsonb_build_array(
+    jsonb_build_object('source_oid','window_events'::regclass::oid,'row_data',jsonb_build_object('event_id',999,'category_id',9,'score',999),'delta',-1),
+    jsonb_build_object('source_oid','window_events'::regclass::oid,'row_data',jsonb_build_object('event_id',999,'category_id',9,'score',999),'delta',1)
+  ),
+  '0/1'
+)" >/dev/null 2>&1; then
+  printf 'window batch accepted a retraction-before-insertion from zero state\n' >&2
+  exit 1
+fi
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid='shiba.event_windows'::regclass")" = "scan,window,project,sink"
 test "$(psql_e2e -Atqc "SELECT count(*) || ':' || count(*) FILTER (WHERE stateful) FROM shiba_internal.operator_instances WHERE result_oid='shiba.event_windows'::regclass")" = "4:1"
 psql_e2e -qc "INSERT INTO window_events VALUES (4,1,15)"
@@ -223,6 +371,11 @@ psql_e2e -qc "INSERT INTO frame_events VALUES (4,1,25)"
 wait_for_value "30,55,75,55" "SELECT string_agg(nearby_sum::text,',' ORDER BY score) FROM shiba.frame_windows"
 psql_e2e -qc "DELETE FROM frame_events WHERE event_id=2"
 wait_for_value "35,65,55" "SELECT string_agg(nearby_sum::text,',' ORDER BY score) FROM shiba.frame_windows"
+# One source commit moves two rows into another partition. The old and new
+# partitions must each be rebuilt once from their final commit state.
+psql_e2e -qc "UPDATE frame_events SET category_id=2,score=score+100 WHERE event_id IN (1,4)"
+wait_for_value "30" "SELECT nearby_sum FROM shiba.frame_windows WHERE category_id=1"
+wait_for_value "235,235" "SELECT string_agg(nearby_sum::text,',' ORDER BY score) FROM shiba.frame_windows WHERE category_id=2"
 psql_e2e -qc "DROP TABLE shiba.frame_windows"
 psql_e2e -qc "CREATE TABLE filtered_window_events (event_id integer NOT NULL,category_id integer NOT NULL,score integer NOT NULL,active boolean NOT NULL)"
 if psql_e2e -qc "CREATE TABLE shiba.filtered_windows AS SELECT event_id,category_id,score,sum(score) FILTER (WHERE active) OVER (PARTITION BY category_id ORDER BY score) AS running_sum FROM filtered_window_events" >/dev/null 2>&1; then
@@ -235,6 +388,17 @@ psql_e2e -qc "CREATE TABLE distinct_rows (row_id integer NOT NULL, category_id i
 psql_e2e -qc "INSERT INTO distinct_rows VALUES (1,1,10),(2,1,10),(3,1,20),(4,NULL,30)"
 psql_e2e -qc "CREATE TABLE shiba.unique_labels AS SELECT DISTINCT category_id,label FROM distinct_rows"
 wait_for_value "3" "SELECT count(*) FROM shiba.unique_labels"
+if psql_e2e -qc "SELECT shiba._apply_dag_delta_batch(
+  'shiba.unique_labels'::regclass,
+  jsonb_build_array(
+    jsonb_build_object('source_oid','distinct_rows'::regclass::oid,'row_data',jsonb_build_object('row_id',999,'category_id',9,'label',999),'delta',-1),
+    jsonb_build_object('source_oid','distinct_rows'::regclass::oid,'row_data',jsonb_build_object('row_id',999,'category_id',9,'label',999),'delta',1)
+  ),
+  '0/1'
+)" >/dev/null 2>&1; then
+  printf 'DISTINCT batch accepted a retraction-before-insertion from zero state\n' >&2
+  exit 1
+fi
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid='shiba.unique_labels'::regclass")" = "scan,distinct,project,sink"
 test "$(psql_e2e -Atqc "SELECT multiplicity FROM shiba_internal.projection_state WHERE result_oid='shiba.unique_labels'::regclass AND row_key=jsonb_build_object('category_id',1,'label',10)")" = "2"
 psql_e2e -qc "INSERT INTO distinct_rows VALUES (5,1,10)"
@@ -247,6 +411,15 @@ wait_for_value "0" "SELECT count(*) FROM shiba.unique_labels WHERE category_id=1
 psql_e2e -qc "UPDATE distinct_rows SET category_id=2,label=40 WHERE row_id=3"
 wait_for_value "1" "SELECT count(*) FROM shiba.unique_labels WHERE category_id=2 AND label=40"
 wait_for_value "1" "SELECT count(*) FROM shiba.unique_labels WHERE category_id IS NULL AND label=30"
+# Multiple rows in one commit collide on existing projected keys, then one row
+# migrates between keys. Net multiplicity and zero-boundary sink changes must
+# be computed per projected key.
+psql_e2e -qc "INSERT INTO distinct_rows VALUES (6,2,40),(7,NULL,30),(8,NULL,99)"
+wait_for_value "2" "SELECT multiplicity FROM shiba_internal.projection_state WHERE result_oid='shiba.unique_labels'::regclass AND row_key=jsonb_build_object('category_id',2,'label',40)"
+wait_for_value "2" "SELECT multiplicity FROM shiba_internal.projection_state WHERE result_oid='shiba.unique_labels'::regclass AND row_key=jsonb_build_object('category_id',NULL,'label',30)"
+psql_e2e -qc "UPDATE distinct_rows SET label=99 WHERE row_id=6"
+wait_for_value "4" "SELECT count(*) FROM shiba.unique_labels"
+wait_for_value "1" "SELECT multiplicity FROM shiba_internal.projection_state WHERE result_oid='shiba.unique_labels'::regclass AND row_key=jsonb_build_object('category_id',2,'label',99)"
 psql_e2e -qc "DROP TABLE shiba.unique_labels"
 wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
 
@@ -256,6 +429,17 @@ psql_e2e -qc "CREATE TABLE scored_rows (row_id integer NOT NULL, score integer)"
 psql_e2e -qc "INSERT INTO scored_rows VALUES (1,10),(2,20),(3,15),(4,NULL)"
 psql_e2e -qc "CREATE TABLE shiba.top_scores AS SELECT row_id,score FROM scored_rows ORDER BY score DESC NULLS LAST LIMIT 3"
 wait_for_value "2,3,1" "SELECT string_agg(row_id::text,',' ORDER BY score DESC NULLS LAST) FROM shiba.top_scores"
+if psql_e2e -qc "SELECT shiba._apply_dag_delta_batch(
+  'shiba.top_scores'::regclass,
+  jsonb_build_array(
+    jsonb_build_object('source_oid','scored_rows'::regclass::oid,'row_data',jsonb_build_object('row_id',999,'score',999),'delta',-1),
+    jsonb_build_object('source_oid','scored_rows'::regclass::oid,'row_data',jsonb_build_object('row_id',999,'score',999),'delta',1)
+  ),
+  '0/1'
+)" >/dev/null 2>&1; then
+  printf 'TopN batch accepted a retraction-before-insertion from zero state\n' >&2
+  exit 1
+fi
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid='shiba.top_scores'::regclass")" = "scan,top_n,project,sink"
 psql_e2e -qc "INSERT INTO scored_rows VALUES (5,25)"
 wait_for_value "5,2,3" "SELECT string_agg(row_id::text,',' ORDER BY score DESC NULLS LAST) FROM shiba.top_scores"
@@ -265,6 +449,11 @@ psql_e2e -qc "UPDATE scored_rows SET score=30 WHERE row_id=1"
 wait_for_value "1,5,3" "SELECT string_agg(row_id::text,',' ORDER BY score DESC NULLS LAST) FROM shiba.top_scores"
 psql_e2e -qc "CREATE TABLE shiba.offset_scores AS SELECT row_id,score FROM scored_rows ORDER BY score DESC NULLS LAST OFFSET 1 LIMIT 2"
 wait_for_value "5,3" "SELECT string_agg(row_id::text,',' ORDER BY score DESC NULLS LAST) FROM shiba.offset_scores"
+# A single commit crosses both TopN boundaries and moves a row to NULL. Each
+# DAG rewrites its bounded sink only after all net state changes are applied.
+psql_e2e -qc "UPDATE scored_rows SET score=CASE row_id WHEN 3 THEN 40 WHEN 4 THEN 35 WHEN 5 THEN NULL END WHERE row_id IN (3,4,5)"
+wait_for_value "3,4,1" "SELECT string_agg(row_id::text,',' ORDER BY score DESC NULLS LAST) FROM shiba.top_scores"
+wait_for_value "4,1" "SELECT string_agg(row_id::text,',' ORDER BY score DESC NULLS LAST) FROM shiba.offset_scores"
 psql_e2e -qc "DROP TABLE shiba.offset_scores"
 psql_e2e -qc "DROP TABLE shiba.top_scores"
 wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"

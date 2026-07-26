@@ -4,6 +4,7 @@ mod ddl;
 mod filter;
 mod logical;
 mod pgoutput;
+pub mod query_analysis;
 mod query_tree;
 mod worker;
 
@@ -22,15 +23,45 @@ pgrx::extension_sql_file!(
 );
 
 pgrx::extension_sql_file!(
-    "../sql/20_operators.sql",
-    name = "shiba_operators",
+    "../sql/20_operator_filters.sql",
+    name = "shiba_operator_filters",
     requires = ["shiba_runtime"],
+);
+
+pgrx::extension_sql_file!(
+    "../sql/21_operator_aggregate.sql",
+    name = "shiba_operator_aggregate",
+    requires = ["shiba_operator_filters"],
+);
+
+pgrx::extension_sql_file!(
+    "../sql/22_operator_unary_batches.sql",
+    name = "shiba_operator_unary_batches",
+    requires = ["shiba_operator_aggregate"],
+);
+
+pgrx::extension_sql_file!(
+    "../sql/23_operator_join_batch.sql",
+    name = "shiba_operator_join_batch",
+    requires = ["shiba_operator_unary_batches"],
+);
+
+pgrx::extension_sql_file!(
+    "../sql/24_operator_dispatch.sql",
+    name = "shiba_operator_dispatch",
+    requires = ["shiba_operator_join_batch"],
+);
+
+pgrx::extension_sql_file!(
+    "../sql/25_operator_compat.sql",
+    name = "shiba_operator_compat",
+    requires = ["shiba_operator_dispatch"],
 );
 
 pgrx::extension_sql_file!(
     "../sql/30_registration.sql",
     name = "shiba_registration",
-    requires = ["shiba_operators"],
+    requires = ["shiba_operator_compat"],
 );
 
 pgrx::extension_sql_file!(
@@ -54,6 +85,7 @@ fn version() -> &'static str {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
+#[allow(dead_code)]
 mod pg_test {
     pub fn setup(_options: Vec<&str>) {}
 

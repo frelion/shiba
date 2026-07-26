@@ -20,11 +20,15 @@ run_gate "PostgreSQL asynchronous acceptance test" \
   "${project_root}/scripts/test-e2e.sh"
 run_gate "Single-source deterministic differential test" \
   "${project_root}/scripts/test-differential-single.sh"
+run_gate "Aggregate batch COUNT(DISTINCT) test" \
+  "${project_root}/scripts/test-aggregate-batch-distinct.sh"
 run_gate "Join and subquery deterministic differential test" \
   "${project_root}/scripts/test-join-differential.sh"
 run_gate "Concurrency, transaction, and recovery test" \
   "${project_root}/scripts/test-concurrency-recovery.sh"
 run_gate "Executor architecture and backlog test" \
   "${project_root}/scripts/test-executor-architecture.sh"
+run_gate "Deterministic worker failpoint recovery test" \
+  "${project_root}/scripts/test-failpoint-recovery.sh"
 
 printf '\nAll Shiba correctness gates passed.\n'

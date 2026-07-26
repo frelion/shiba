@@ -1,126 +1,34 @@
 //! Extraction of stable facts from PostgreSQL's analyzed CTAS `Query`.
 
 use pgrx::pg_sys;
-use serde::Serialize;
 use std::collections::BTreeSet;
 use std::ffi::CStr;
 
-#[derive(Serialize)]
-struct QueryAnalysis {
-    version: u32,
-    has_aggregates: bool,
-    has_window_functions: bool,
-    has_sublinks: bool,
-    has_distinct: bool,
-    has_distinct_on: bool,
-    has_having: bool,
-    has_set_operations: bool,
-    has_ordering: bool,
-    has_limit: bool,
-    has_aggregate_filters: bool,
-    has_window_filters: bool,
-    limit_with_ties: bool,
-    limit_count: Option<i64>,
-    limit_offset: Option<i64>,
-    group_keys: usize,
-    sources: Vec<Source>,
-    joins: Vec<Join>,
-    subqueries: Vec<Subquery>,
-    windows: Vec<WindowSpec>,
-    ordering: Vec<OrderSpec>,
-    targets: Vec<Target>,
-    where_predicate: Option<PredicateAnalysis>,
-    having_predicate: Option<PredicateAnalysis>,
-    having_distinct_inputs: Vec<ColumnInput>,
-    having_sum_inputs: Vec<ColumnInput>,
+use crate::query_analysis::{
+    AnalysisVersion, ColumnInput, ColumnNumber, Join, JoinKind, OrderSpec, PredicateAnalysis,
+    QueryAnalysis, RelationOid, SortDirection, Source, Subquery, SubqueryKind, Target,
+    TargetExpression, ValidatedQuery, ValidationError, WindowSpec,
+};
+
+fn one_based_list_index(number: i32, length: i32) -> Option<i32> {
+    (number > 0 && number <= length).then(|| number - 1)
 }
 
-#[derive(Serialize)]
-struct PredicateAnalysis {
-    sql: Option<String>,
-    source_oids: Vec<u32>,
-    error: Option<String>,
+fn is_cast_function_format(format: pg_sys::CoercionForm::Type) -> bool {
+    matches!(
+        format,
+        pg_sys::CoercionForm::COERCE_EXPLICIT_CAST | pg_sys::CoercionForm::COERCE_IMPLICIT_CAST
+    )
 }
 
-#[derive(Serialize, Ord, PartialOrd, Eq, PartialEq)]
-struct ColumnInput {
-    table_oid: u32,
-    column: i16,
-}
-
-#[derive(Serialize)]
-struct Source {
-    oid: u32,
-    alias: Option<String>,
-}
-
-#[derive(Serialize)]
-struct Join {
-    kind: &'static str,
-    operator: Option<String>,
-    left_table_oid: u32,
-    left_column: i16,
-    right_table_oid: u32,
-    right_column: i16,
-}
-
-#[derive(Serialize)]
-struct Subquery {
-    kind: &'static str,
-    source_oid: u32,
-    left_table_oid: u32,
-    left_column: i16,
-    right_table_oid: u32,
-    right_column: i16,
-}
-
-#[derive(Serialize)]
-struct Target {
-    name: Option<String>,
-    expression: &'static str,
-    type_oid: u32,
-    origin_table_oid: u32,
-    origin_column: i16,
-    grouping_reference: u32,
-    aggregate: Option<String>,
-    aggregate_star: bool,
-    aggregate_distinct: bool,
-    input_table_oid: u32,
-    input_column: i16,
-    resjunk: bool,
-    window_function: Option<String>,
-    window_star: bool,
-    window_ref: u32,
-}
-
-#[derive(Serialize)]
-struct WindowSpec {
-    window_ref: u32,
-    partition_keys: usize,
-    order_keys: usize,
-    partition_table_oid: u32,
-    partition_column: i16,
-    order_table_oid: u32,
-    order_column: i16,
-    order_direction: &'static str,
-    nulls_first: bool,
-    frame_options: i32,
-    frame_clause: Option<String>,
-    frame_error: Option<String>,
-}
-
-#[derive(Serialize)]
-struct OrderSpec {
-    table_oid: u32,
-    column: i16,
-    direction: &'static str,
-    nulls_first: bool,
-}
-
+/// # Safety
+/// `pointer` must be null or point to a live, NUL-terminated PostgreSQL string.
 unsafe fn optional_c_string(pointer: *const std::ffi::c_char) -> Option<String> {
     (!pointer.is_null()).then(|| CStr::from_ptr(pointer).to_string_lossy().into_owned())
 }
 
+/// # Safety
+/// `node` must be null or a live PostgreSQL expression node in the current memory context.
 unsafe fn integer_constant(node: *mut pg_sys::Node) -> Option<i64> {
     if node.is_null() {
         return None;
@@ -130,13 +38,24 @@ unsafe fn integer_constant(node: *mut pg_sys::Node) -> Option<i64> {
             let relabel = node.cast::<pg_sys::RelabelType>();
             return integer_constant((*relabel).arg.cast());
         }
+        pg_sys::NodeTag::T_CoerceViaIO => {
+            let coercion = node.cast::<pg_sys::CoerceViaIO>();
+            return integer_constant((*coercion).arg.cast());
+        }
+        pg_sys::NodeTag::T_CoerceToDomain => {
+            let coercion = node.cast::<pg_sys::CoerceToDomain>();
+            return integer_constant((*coercion).arg.cast());
+        }
         pg_sys::NodeTag::T_FuncExpr => {
-            let function = node.cast::<pg_sys::FuncExpr>();
-            let arguments: Vec<_> = list_items((*function).args).collect();
-            if arguments.len() == 1 {
-                return integer_constant(arguments[0].cast());
+            let coercion = node.cast::<pg_sys::FuncExpr>();
+            if !is_cast_function_format((*coercion).funcformat) {
+                return None;
             }
-            return None;
+            let arguments: Vec<_> = list_items((*coercion).args).collect();
+            let [argument] = arguments.as_slice() else {
+                return None;
+            };
+            return integer_constant((*argument).cast());
         }
         pg_sys::NodeTag::T_Const => {}
         _ => return None,
@@ -152,6 +71,8 @@ unsafe fn integer_constant(node: *mut pg_sys::Node) -> Option<i64> {
     CStr::from_ptr(output).to_string_lossy().parse().ok()
 }
 
+/// # Safety
+/// `window` must point to a live analyzed PostgreSQL `WindowClause`.
 unsafe fn window_frame_clause(
     window: *mut pg_sys::WindowClause,
 ) -> (Option<String>, Option<String>) {
@@ -244,11 +165,15 @@ unsafe fn window_frame_clause(
     (Some(clause), None)
 }
 
+/// # Safety
+/// `list` must be null or a live PostgreSQL list that outlives the returned iterator.
 unsafe fn list_items(list: *mut pg_sys::List) -> impl Iterator<Item = *mut std::ffi::c_void> {
     let length = pg_sys::list_length(list);
     (0..length).map(move |index| pg_sys::list_nth(list, index))
 }
 
+/// # Safety
+/// `pstmt` must be null or point to a live `PlannedStmt` supplied by PostgreSQL.
 unsafe fn analyzed_query(pstmt: *mut pg_sys::PlannedStmt) -> Option<*mut pg_sys::Query> {
     if pstmt.is_null() || (*pstmt).utilityStmt.is_null() {
         return None;
@@ -264,22 +189,30 @@ unsafe fn analyzed_query(pstmt: *mut pg_sys::PlannedStmt) -> Option<*mut pg_sys:
     Some((*ctas).query.cast::<pg_sys::Query>())
 }
 
+/// # Safety
+/// `query` and `node` must belong to the same live analyzed PostgreSQL query tree.
 unsafe fn var_origin(query: *mut pg_sys::Query, node: *mut pg_sys::Node) -> (u32, i16) {
-    if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_Var {
+    if query.is_null() || node.is_null() || (*node).type_ != pg_sys::NodeTag::T_Var {
         return (0, 0);
     }
     let variable = node.cast::<pg_sys::Var>();
-    let rte_index = (*variable).varno - 1;
-    if rte_index < 0 {
+    let Some(rte_index) =
+        one_based_list_index((*variable).varno, pg_sys::list_length((*query).rtable))
+    else {
+        return (0, 0);
+    };
+    let rte = pg_sys::list_nth((*query).rtable, rte_index).cast::<pg_sys::RangeTblEntry>();
+    if rte.is_null() {
         return (0, 0);
     }
-    let rte = pg_sys::list_nth((*query).rtable, rte_index).cast::<pg_sys::RangeTblEntry>();
     if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
         return (0, 0);
     }
     ((*rte).relid.to_u32(), (*variable).varattno)
 }
 
+/// # Safety
+/// All pointers must belong to the same live outer/inner analyzed query tree.
 unsafe fn scoped_var_origin(
     query: *mut pg_sys::Query,
     outer_query: *mut pg_sys::Query,
@@ -294,17 +227,27 @@ unsafe fn scoped_var_origin(
         1 => (outer_query, true),
         _ => return (0, 0, false),
     };
-    let rte_index = (*variable).varno - 1;
-    if rte_index < 0 {
+    if scope.is_null() {
         return (0, 0, false);
     }
+    let Some(rte_index) =
+        one_based_list_index((*variable).varno, pg_sys::list_length((*scope).rtable))
+    else {
+        return (0, 0, false);
+    };
     let rte = pg_sys::list_nth((*scope).rtable, rte_index).cast::<pg_sys::RangeTblEntry>();
+    if rte.is_null() {
+        return (0, 0, false);
+    }
     if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
         return (0, 0, false);
     }
     ((*rte).relid.to_u32(), (*variable).varattno, is_outer)
 }
 
+/// # Safety
+/// `outer_query` and `node` must be live nodes in the same analyzed query tree,
+/// and `node` must point to a `SubLink`.
 unsafe fn parse_sublink(
     outer_query: *mut pg_sys::Query,
     node: *mut pg_sys::Node,
@@ -354,12 +297,16 @@ unsafe fn parse_sublink(
                 return Err("EXISTS equality does not reference ordinary source columns".into());
             }
             Ok(Subquery {
-                kind: if negated { "anti" } else { "semi" },
-                source_oid,
-                left_table_oid: outer.0,
-                left_column: outer.1,
-                right_table_oid: inner.0,
-                right_column: inner.1,
+                kind: if negated {
+                    SubqueryKind::Anti
+                } else {
+                    SubqueryKind::Semi
+                },
+                source_oid: RelationOid(source_oid),
+                left_table_oid: RelationOid(outer.0),
+                left_column: ColumnNumber(outer.1),
+                right_table_oid: RelationOid(inner.0),
+                right_column: ColumnNumber(inner.1),
             })
         }
         pg_sys::SubLinkType::ANY_SUBLINK => {
@@ -390,18 +337,24 @@ unsafe fn parse_sublink(
                 return Err("IN output must be one ordinary inner source column".into());
             }
             Ok(Subquery {
-                kind: if negated { "null_anti" } else { "semi" },
-                source_oid,
-                left_table_oid: outer.0,
-                left_column: outer.1,
-                right_table_oid: inner.0,
-                right_column: inner.1,
+                kind: if negated {
+                    SubqueryKind::NullAnti
+                } else {
+                    SubqueryKind::Semi
+                },
+                source_oid: RelationOid(source_oid),
+                left_table_oid: RelationOid(outer.0),
+                left_column: ColumnNumber(outer.1),
+                right_table_oid: RelationOid(inner.0),
+                right_column: ColumnNumber(inner.1),
             })
         }
         _ => Err("only EXISTS, NOT EXISTS, and IN subqueries are supported".into()),
     }
 }
 
+/// # Safety
+/// `outer_query` and `node` must be live nodes in the same analyzed query tree.
 unsafe fn collect_sublinks(
     outer_query: *mut pg_sys::Query,
     node: *mut pg_sys::Node,
@@ -448,6 +401,8 @@ unsafe fn collect_sublinks(
     Ok(())
 }
 
+/// # Safety
+/// `query` and `node` must belong to the same live analyzed PostgreSQL query tree.
 unsafe fn compile_predicate_node(
     query: *mut pg_sys::Query,
     node: *mut pg_sys::Node,
@@ -553,6 +508,8 @@ unsafe fn compile_predicate_node(
     }
 }
 
+/// # Safety
+/// `query` and `node` must belong to the same live analyzed PostgreSQL query tree.
 unsafe fn compile_having_node(
     query: *mut pg_sys::Query,
     node: *mut pg_sys::Node,
@@ -585,7 +542,10 @@ unsafe fn compile_having_node(
                             "HAVING COUNT(DISTINCT) input must be an ordinary source column".into(),
                         );
                     }
-                    distinct_inputs.insert(ColumnInput { table_oid, column });
+                    distinct_inputs.insert(ColumnInput {
+                        table_oid: RelationOid(table_oid),
+                        column: ColumnNumber(column),
+                    });
                     Ok("state.count_value".into())
                 }
                 "sum" if (*aggregate).aggdistinct.is_null() => {
@@ -597,7 +557,10 @@ unsafe fn compile_having_node(
                     if table_oid == 0 || column <= 0 {
                         return Err("HAVING SUM input must be an ordinary source column".into());
                     }
-                    sum_inputs.insert(ColumnInput { table_oid, column });
+                    sum_inputs.insert(ColumnInput {
+                        table_oid: RelationOid(table_oid),
+                        column: ColumnNumber(column),
+                    });
                     Ok(
                         "(CASE WHEN state.sum_nonnull_count=0 THEN NULL ELSE state.sum_value END)"
                             .into(),
@@ -668,7 +631,13 @@ unsafe fn compile_having_node(
     }
 }
 
-pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
+/// Extract the safe analysis model from PostgreSQL-owned query tree nodes.
+///
+/// # Safety
+/// `pstmt` must be null or point to the live `PlannedStmt` currently supplied to
+/// the ProcessUtility hook. PostgreSQL must keep its memory context alive for
+/// the duration of this call.
+unsafe fn analyze_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<QueryAnalysis> {
     let query = analyzed_query(pstmt)?;
     let mut sources = Vec::new();
     let mut joins = Vec::new();
@@ -676,7 +645,7 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
         let rte = item.cast::<pg_sys::RangeTblEntry>();
         match (*rte).rtekind {
             pg_sys::RTEKind::RTE_RELATION => sources.push(Source {
-                oid: (*rte).relid.to_u32(),
+                oid: RelationOid((*rte).relid.to_u32()),
                 alias: if (*rte).eref.is_null() {
                     None
                 } else {
@@ -685,19 +654,19 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
             }),
             pg_sys::RTEKind::RTE_JOIN => joins.push(Join {
                 kind: match (*rte).jointype {
-                    pg_sys::JoinType::JOIN_INNER => "inner",
-                    pg_sys::JoinType::JOIN_LEFT => "left",
-                    pg_sys::JoinType::JOIN_FULL => "full",
-                    pg_sys::JoinType::JOIN_RIGHT => "right",
-                    pg_sys::JoinType::JOIN_SEMI => "semi",
-                    pg_sys::JoinType::JOIN_ANTI => "anti",
-                    _ => "other",
+                    pg_sys::JoinType::JOIN_INNER => JoinKind::Inner,
+                    pg_sys::JoinType::JOIN_LEFT => JoinKind::Left,
+                    pg_sys::JoinType::JOIN_FULL => JoinKind::Full,
+                    pg_sys::JoinType::JOIN_RIGHT => JoinKind::Right,
+                    pg_sys::JoinType::JOIN_SEMI => JoinKind::Semi,
+                    pg_sys::JoinType::JOIN_ANTI => JoinKind::Anti,
+                    _ => JoinKind::Other,
                 },
                 operator: None,
-                left_table_oid: 0,
-                left_column: 0,
-                right_table_oid: 0,
-                right_column: 0,
+                left_table_oid: RelationOid(0),
+                left_column: ColumnNumber(0),
+                right_table_oid: RelationOid(0),
+                right_column: ColumnNumber(0),
             }),
             _ => {}
         }
@@ -718,10 +687,10 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
                             var_origin(query, right.cast::<pg_sys::Node>());
                         joins[0].operator =
                             optional_c_string(pg_sys::get_opname((*operation).opno));
-                        joins[0].left_table_oid = left_table_oid;
-                        joins[0].left_column = left_column;
-                        joins[0].right_table_oid = right_table_oid;
-                        joins[0].right_column = right_column;
+                        joins[0].left_table_oid = RelationOid(left_table_oid);
+                        joins[0].left_column = ColumnNumber(left_column);
+                        joins[0].right_table_oid = RelationOid(right_table_oid);
+                        joins[0].right_column = ColumnNumber(right_column);
                     }
                 }
             }
@@ -731,7 +700,7 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
         .map(|item| {
             let target = item.cast::<pg_sys::TargetEntry>();
             let expression = (*target).expr.cast::<pg_sys::Node>();
-            let mut expression_kind = "other";
+            let mut expression_kind = TargetExpression::Other;
             let mut aggregate = None;
             let mut aggregate_star = false;
             let mut aggregate_distinct = false;
@@ -741,9 +710,9 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
             let mut window_star = false;
             let mut window_ref = 0;
             if (*expression).type_ == pg_sys::NodeTag::T_Var {
-                expression_kind = "column";
+                expression_kind = TargetExpression::Column;
             } else if (*expression).type_ == pg_sys::NodeTag::T_Aggref {
-                expression_kind = "aggregate";
+                expression_kind = TargetExpression::Aggregate;
                 let aggregate_ref = expression.cast::<pg_sys::Aggref>();
                 aggregate = optional_c_string(pg_sys::get_func_name((*aggregate_ref).aggfnoid));
                 aggregate_star = (*aggregate_ref).aggstar;
@@ -751,21 +720,10 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
                 if let Some(argument) = list_items((*aggregate_ref).args).next() {
                     let argument = argument.cast::<pg_sys::TargetEntry>();
                     let argument_expression = (*argument).expr.cast::<pg_sys::Node>();
-                    if (*argument_expression).type_ == pg_sys::NodeTag::T_Var {
-                        let variable = argument_expression.cast::<pg_sys::Var>();
-                        let rte_index = (*variable).varno - 1;
-                        if rte_index >= 0 {
-                            let rte = pg_sys::list_nth((*query).rtable, rte_index)
-                                .cast::<pg_sys::RangeTblEntry>();
-                            if (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
-                                input_table_oid = (*rte).relid.to_u32();
-                                input_column = (*variable).varattno;
-                            }
-                        }
-                    }
+                    (input_table_oid, input_column) = var_origin(query, argument_expression);
                 }
             } else if (*expression).type_ == pg_sys::NodeTag::T_WindowFunc {
-                expression_kind = "window";
+                expression_kind = TargetExpression::Window;
                 let function = expression.cast::<pg_sys::WindowFunc>();
                 window_function = optional_c_string(pg_sys::get_func_name((*function).winfnoid));
                 window_star = (*function).winstar;
@@ -778,15 +736,15 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
             Target {
                 name: optional_c_string((*target).resname),
                 expression: expression_kind,
-                type_oid: pg_sys::exprType((*target).expr.cast()).to_u32(),
-                origin_table_oid: (*target).resorigtbl.to_u32(),
-                origin_column: (*target).resorigcol,
+                type_oid: RelationOid(pg_sys::exprType((*target).expr.cast()).to_u32()),
+                origin_table_oid: RelationOid((*target).resorigtbl.to_u32()),
+                origin_column: ColumnNumber((*target).resorigcol),
                 grouping_reference: (*target).ressortgroupref,
                 aggregate,
                 aggregate_star,
                 aggregate_distinct,
-                input_table_oid,
-                input_column,
+                input_table_oid: RelationOid(input_table_oid),
+                input_column: ColumnNumber(input_column),
                 resjunk: (*target).resjunk,
                 window_function,
                 window_star,
@@ -832,14 +790,14 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
                 window_ref: (*window).winref,
                 partition_keys: pg_sys::list_length((*window).partitionClause) as usize,
                 order_keys: pg_sys::list_length((*window).orderClause) as usize,
-                partition_table_oid,
-                partition_column,
-                order_table_oid,
-                order_column,
+                partition_table_oid: RelationOid(partition_table_oid),
+                partition_column: ColumnNumber(partition_column),
+                order_table_oid: RelationOid(order_table_oid),
+                order_column: ColumnNumber(order_column),
                 order_direction: if order_operator.as_deref() == Some(">") {
-                    "desc"
+                    SortDirection::Desc
                 } else {
-                    "asc"
+                    SortDirection::Asc
                 },
                 nulls_first: (*order).nulls_first,
                 frame_options: (*window).frameOptions,
@@ -857,12 +815,12 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
             let (table_oid, column) = var_origin(query, (*target).expr.cast());
             let operator = optional_c_string(pg_sys::get_opname((*order).sortop));
             Some(OrderSpec {
-                table_oid,
-                column,
+                table_oid: RelationOid(table_oid),
+                column: ColumnNumber(column),
                 direction: if operator.as_deref() == Some(">") {
-                    "desc"
+                    SortDirection::Desc
                 } else {
-                    "asc"
+                    SortDirection::Asc
                 },
                 nulls_first: (*order).nulls_first,
             })
@@ -887,12 +845,12 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
         match compile_predicate_node(query, (*(*query).jointree).quals, &mut predicate_sources) {
             Ok(sql) => Some(PredicateAnalysis {
                 sql: Some(sql),
-                source_oids: predicate_sources.into_iter().collect(),
+                source_oids: predicate_sources.into_iter().map(RelationOid).collect(),
                 error: None,
             }),
             Err(error) => Some(PredicateAnalysis {
                 sql: None,
-                source_oids: predicate_sources.into_iter().collect(),
+                source_oids: predicate_sources.into_iter().map(RelationOid).collect(),
                 error: Some(error),
             }),
         }
@@ -921,7 +879,7 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
         }
     };
     let analysis = QueryAnalysis {
-        version: 1,
+        version: AnalysisVersion::CURRENT,
         has_aggregates: (*query).hasAggs,
         has_window_functions: (*query).hasWindowFuncs,
         has_sublinks: (*query).hasSubLinks,
@@ -948,5 +906,66 @@ pub unsafe fn inspect_ctas(pstmt: *mut pg_sys::PlannedStmt) -> Option<String> {
         having_distinct_inputs: having_distinct_inputs.into_iter().collect(),
         having_sum_inputs: having_sum_inputs.into_iter().collect(),
     };
-    Some(serde_json::to_string(&analysis).expect("Shiba Query analysis is not serializable"))
+    Some(analysis)
+}
+
+/// A validated CTAS inspection and the byte-stable JSON protocol sent to SQL.
+pub struct InspectedCtas {
+    pub validated: ValidatedQuery,
+    pub wire_json: String,
+}
+
+/// Inspect and validate a PostgreSQL CTAS before PostgreSQL executes it.
+///
+/// # Safety
+/// The pointer requirements are identical to [`analyze_ctas`].
+pub unsafe fn inspect_ctas(
+    pstmt: *mut pg_sys::PlannedStmt,
+) -> Option<Result<InspectedCtas, ValidationError>> {
+    analyze_ctas(pstmt).map(|analysis| {
+        let wire_json = analysis
+            .to_wire_json()
+            .expect("Shiba Query analysis is not serializable");
+        let validated = analysis.validate()?;
+        Ok(InspectedCtas {
+            validated,
+            wire_json,
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_indexes_are_checked_before_postgres_access() {
+        for (number, length, expected) in [
+            (0, 3, None),
+            (1, 3, Some(0)),
+            (3, 3, Some(2)),
+            (4, 3, None),
+            (1, 0, None),
+            (1, -1, None),
+            (i32::MAX, 3, None),
+        ] {
+            assert_eq!(one_based_list_index(number, length), expected);
+        }
+    }
+
+    #[test]
+    fn only_cast_func_exprs_can_wrap_integer_constants() {
+        assert!(is_cast_function_format(
+            pg_sys::CoercionForm::COERCE_EXPLICIT_CAST
+        ));
+        assert!(is_cast_function_format(
+            pg_sys::CoercionForm::COERCE_IMPLICIT_CAST
+        ));
+        assert!(!is_cast_function_format(
+            pg_sys::CoercionForm::COERCE_EXPLICIT_CALL
+        ));
+        assert!(!is_cast_function_format(
+            pg_sys::CoercionForm::COERCE_SQL_SYNTAX
+        ));
+    }
 }

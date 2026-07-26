@@ -1,108 +1,163 @@
 # Architecture
 
-## Boundary with PostgreSQL materialized views
+This document is a map of Shiba's execution path and its invariants. It is
+intended to be useful even if you are new to Rust, PostgreSQL extensions, or
+incremental view maintenance.
 
-Native PostgreSQL materialized views use full `REFRESH MATERIALIZED VIEW`. Shiba does not intercept or alter them. Instead, it reserves the `shiba` schema: each table declared with `CREATE TABLE shiba.<name> AS SELECT ...` is a Shiba-owned streaming result. Source tables belong outside `shiba`.
+## One declaration, two phases
 
-For each supported declaration, Shiba creates:
+A streaming table starts as normal SQL:
 
-1. a result table at `shiba.<name>`, backfilled by PostgreSQL CTAS and protected by a `UNIQUE NULLS NOT DISTINCT` group key;
-2. metadata in `shiba_internal.stream_views`;
-3. a durable, inspectable operator graph in `shiba_internal.stream_graphs`, `stream_graph_nodes`, and `stream_graph_edges`, compiled from PostgreSQL's analyzed Query tree;
-4. a `pgoutput` logical replication slot, a `shiba_publication` publication, and `shiba_internal.view_progress` watermark;
-5. one row-level source wakeup trigger, which starts a missing worker but never carries row data;
-6. one database-level dynamic WAL Router, plus one dynamic executor worker for each Shiba result DAG. Both have persisted leases and heartbeats.
-
-The session-preloaded utility hook acquires a short source-table lock before CTAS, retains it through result registration, sets `REPLICA IDENTITY FULL`, adds the source to the publication, and then installs the wakeup trigger. This closes the backfill-to-stream handoff without a parser fork. The public relation is always the Shiba table created by CTAS.
-
-The CTAS hook reads PostgreSQL's analyzed `Query` tree before execution. It
-extracts relation OIDs and aliases, typed targets, aggregate and window
-identities, grouping references, join kind/operator/column origins, predicates,
-subqueries, ordering, frames, and limits. Registration uses these resolved
-facts instead of deriving topology from SQL text. SQL text is retained only to
-identify the target CTAS declaration and to ask PostgreSQL for a diagnostic
-physical plan.
-
-The graph compiler retains PostgreSQL's `EXPLAIN (VERBOSE, FORMAT JSON)` plan
-for diagnostics, but also persists a versioned Shiba logical plan. The stable
-plan has explicit `scan`, `filter`, inner/outer/semi/anti join, `distinct`,
-`aggregate`, `having`, `window`, `top_n`, `project`, and `sink` nodes with
-numbered input edges. PostgreSQL may represent these operations differently in
-its physical plan, so that plan is diagnostic data rather than Shiba's durable
-execution contract.
-
-Each DAG worker loads the persisted plan, validates every WAL source against
-its Scan nodes, and applies a `DeltaBatch` through transactional operator
-functions. A Rust predicate compiler accepts a restricted expression AST and
-emits controlled SQL that invokes PostgreSQL's typed comparison operators.
-Stateful operators own durable tables: aggregate accumulators, distinct
-multiplicities, join arrangements, window partition rows, and TopN rows.
-Project maps source columns to sink aliases without losing their PostgreSQL
-types.
-
-## Runtime flow
-
-```text
-source-table DML
-  -> transaction commit
-  -> PostgreSQL WAL
-  -> one per-database pgoutput logical slot
-  -> WAL Router: decode and atomically route to durable per-DAG inboxes
-  -> one executor worker per result DAG
-  -> lock one result OID, consume one commit from its inbox
-  -> evaluate typed pre/post Filter predicates
-  -> update/probe JOIN, DISTINCT, aggregate, window, or TopN state
-  -> emit only affected differential rows or rebuild one state-owned partition
-  -> Project into the protected public result table
-  -> acknowledge inbox commit + update result watermark atomically
-  -> SELECT from shiba.<table>
+```sql
+CREATE TABLE shiba.sales_by_product AS
+SELECT product_id, count(*) AS rows, sum(amount) AS total
+FROM sales
+GROUP BY product_id;
 ```
 
-No source-table scan or `REFRESH MATERIALIZED VIEW` occurs during maintenance. The data path is PostgreSQL logical decoding; the source wakeup trigger contains no row capture or outbox fallback. Updates are decoded as old-row `-1` plus new-row `+1`, and the commit LSN becomes the result watermark.
+Shiba handles it in two phases:
 
-One Router owns the logical slot for the database. Every result table has one
-executor worker and a durable inbox. Executors serialize on a result-OID
-transaction advisory lock. DDL teardown acquires that same result lock before
-source locks and disables the DAG, so DROP and apply use one lock order instead
-of forming a source/result inversion.
+1. **Declaration and backfill.** The DDL hook validates the query, PostgreSQL
+   creates and fills the result table, and registration persists the operator
+   graph and initial state.
+2. **Incremental maintenance.** The WAL Router copies committed source changes
+   into durable per-result inboxes. A DAG executor applies one source commit
+   atomically and then acknowledges it.
 
-The Router uses a two-phase durability protocol. It first peeks a bounded set of
-logical changes and commits the unique commit-LSN checkpoints plus all derived
-inbox rows. Only after that transaction is durable does a second transaction
-advance the slot through the corresponding pgoutput end LSN. A crash between
-the phases replays the same WAL prefix; commit-LSN checkpoints make rerouting a
-no-op before the slot advances. Thus a routing failure retains WAL instead of
-losing an increment.
+The result is asynchronous: a source commit may become visible before its
+Shiba result catches up. `view_progress.applied_lsn` records the durable
+watermark.
 
-Each DAG executor consumes and deletes one complete inbox commit in the same
-transaction as its result updates; a crash therefore rolls both actions back.
-A result additionally ignores commits at or before its activation LSN, because
-its CTAS snapshot already contains them. Initial rows and pgoutput rows pass
-through one typed canonical encoding before becoming operator-state keys.
-`shiba.progress(regclass)` is the public observation surface for the result
-commit LSN and pending WAL bytes; metadata remains in `shiba_internal`.
+## Declaration path
 
-## Extension lifecycle
+```text
+PostgreSQL analyzed Query
+  -> query_tree (unsafe PostgreSQL pointer adapter)
+  -> QueryAnalysis (owned, stable wire model)
+  -> ValidatedQuery (closed, operator-specific legal states)
+  -> SQL registration and initial state
+  -> LogicalPlan
+  -> validated ExecutionDescriptor
+```
 
-`session_preload_libraries = 'shiba'` loads the CTAS declaration hook into each
-client backend. `CREATE EXTENSION shiba` installs the catalog; a subsequent
-one-time `SELECT shiba.activate()` creates the logical slot and starts the
-Router, because PostgreSQL does not permit slot creation within the
-extension-install transaction. The Router starts or restarts stale DAG
-executors. Source ALTER, TRUNCATE, and DROP are rejected while dependent
-results exist. Before removing the extension, drop all results and call
-`shiba.deactivate()`; it removes the slot and publication. `DROP EXTENSION
-shiba` is rejected while that slot still exists, preventing abandoned slots
-from retaining WAL. The workers do not need `shared_preload_libraries`, but
-`max_worker_processes` must have capacity for one Router plus each active Shiba
-result.
+The important boundary is between `query_tree` and `query_analysis`:
 
-## Development sequence
+- `src/query_tree.rs` is the PostgreSQL adapter. Raw pointers and PostgreSQL
+  node walking stay here.
+- `src/query_analysis.rs` contains ordinary safe Rust data. Validation turns
+  an open analysis record into one of the supported query families:
+  Aggregate, Join, decorrelated subquery, Window, Distinct, or TopN.
+- `src/ddl.rs` requires validation before PostgreSQL executes a Shiba CTAS.
+  The validated source OIDs are also used for the pre-backfill locks.
 
-1. Extension packaging, table-style DDL registration, and real installation test. ✓
-2. `pgoutput` logical decoding, asynchronous dynamic worker, commit-LSN watermark, and one-source `COUNT`/`SUM` operators. ✓
-3. Inner/outer/semi/anti joins, Filter, Project, Aggregate, Having, and
-   multiplicity state. ✓
-4. Top-level DISTINCT, TopN, windows and explicit frames. ✓
-5. Broader grouped aggregates, set operations, recovery tooling, and cascading
-   result graphs.
+Registration lives in `sql/30_registration.sql`. Operator-specific metadata is
+prepared there, while common lifecycle work is centralized in:
+
+- `_prepare_stream_registration`
+- `_finalize_stream_registration`
+
+These helpers keep source preparation, activation LSN capture, publications,
+triggers, ownership, permissions, and worker activation in one order.
+
+## Plans and execution authority
+
+The Rust logical layer is split by responsibility:
+
+- `src/logical/model.rs` — stable plan and delta wire types.
+- `src/logical/compile.rs` — plan builder and compiler.
+- `src/logical/validate.rs` — closed plan grammar, typed operator configs, and
+  the execution descriptor.
+- `src/logical/runtime.rs` — the PostgreSQL/SPI bridge used by a DAG worker.
+
+The persisted `LogicalPlan` is the execution authority. A worker loads it once,
+validates its exact topology and config shapes, and derives an
+`ExecutionDescriptor` containing the physical pipeline, source ports, and Join
+subtype. SQL catalog rows provide physical state and configuration; they are
+checked against the descriptor and do not select a different route.
+
+## Incremental path
+
+```text
+logical replication slot
+  -> WAL Router
+  -> routed_transactions checkpoint
+  -> dag_inbox rows
+  -> per-result DAG executor
+  -> operator state and result sink
+  -> view_progress and inbox acknowledgement
+```
+
+`src/worker.rs` contains the two worker loops:
+
+- The **WAL Router** owns the logical slot. Routing a transaction and recording
+  its checkpoint are one database transaction. Slot advancement is a separate
+  transaction, so a crash between them causes a harmless replay.
+- A **DAG executor** owns no slot. It locks the oldest inbox commit, calls
+  `DagRuntime::apply_batch`, and deletes the inbox rows in the same database
+  transaction.
+
+The SQL execution layer is split into `sql/20_operator_filters.sql` through
+`sql/25_operator_compat.sql`: common filters, Aggregate, unary batch kernels,
+Join batch context, the dispatcher, and ordered compatibility kernels. A
+source commit crosses Rust/SPI once and advances progress once.
+
+Current batch strategies are:
+
+- Aggregate: combine contributions per group; large batches also combine
+  `COUNT(DISTINCT)` transitions per `(group, value)`.
+- Distinct: combine projected-key multiplicities and update the sink only at a
+  zero/nonzero boundary.
+- TopN: combine row multiplicities and rebuild the bounded sink once per
+  commit.
+- Window: combine row changes and rebuild each affected partition once.
+- Join: preserve ordered first/last-match transitions for outer, semi, anti,
+  and null-aware anti semantics, while deduplicating sink synchronization to
+  once per affected aggregate group.
+
+Ordered-prefix checks matter even for a net-zero batch: an absent-row
+retraction followed by an insertion is corruption, not a valid no-op.
+
+## Transaction and recovery invariants
+
+These rules are more important than any individual optimization:
+
+1. A source transaction is never partially visible in a Shiba result.
+2. Operator state, result rows, `view_progress`, and inbox acknowledgement
+   commit or roll back together.
+3. A routed WAL transaction is idempotent by commit LSN.
+4. The replication slot advances only after durable routing.
+5. A replay must either find the original inbox rows or reproduce exactly the
+   same inbox rows.
+6. Multiplicity, aggregate counts, and ordered prefixes must never become
+   negative.
+7. Runtime routing comes from the validated persisted plan.
+
+The `pg_test`-only recovery failpoints exercise the two critical crash windows:
+executor apply-before-ack and router route-before-slot-advance. They are
+compiled out of production builds.
+
+## Adding an operator
+
+Keep changes moving through the same boundaries:
+
+1. Add the analyzed shape and a closed validated spec in
+   `query_analysis.rs`.
+2. Add the logical `OperatorKind`, typed config, compiler shape, and exact
+   validation grammar.
+3. Add registration metadata and initial-state construction.
+4. Add a batch kernel with explicit state invariants. Preserve source-commit
+   order wherever visibility depends on first/last transitions.
+5. Route it only through the `ExecutionDescriptor`; catalog strings must not
+   become a second dispatcher.
+6. Add plan-shape tests, batch-vs-reference tests, E2E SQL, transaction and
+   restart recovery coverage, and performance-matrix operator coverage.
+
+Run the complete correctness gates with:
+
+```bash
+./scripts/test-all.sh
+```
+
+Performance acceptance uses the unfiltered formal matrix in
+`scripts/performance-matrix.py`; a filtered run is useful for diagnosis but is
+not final evidence.

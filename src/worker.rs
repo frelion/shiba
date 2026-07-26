@@ -97,6 +97,18 @@ pub extern "C-unwind" fn shiba_background_worker_main(_arg: pg_sys::Datum) {
                     // Routing and slot advancement deliberately remain separate
                     // transactions.  A crash between them safely replays through
                     // the durable routing checkpoint.
+                    #[cfg(any(test, feature = "pg_test"))]
+                    {
+                        let failpoint = BackgroundWorker::transaction(|| {
+                            test_failpoints::claim("router_before_slot_advance", None, None)
+                        });
+                        if let Some(pause) = failpoint {
+                            std::thread::sleep(pause);
+                            panic!(
+                                "Shiba test failpoint: router exited after routing and before slot advancement"
+                            );
+                        }
+                    }
                     BackgroundWorker::transaction(|| advance_slot_through(&commit_lsn));
                     batches += 1;
                 }
@@ -421,6 +433,20 @@ fn process_next_dag_transaction(result_oid: i32, runtime: &logical::DagRuntime) 
             rows,
         })
         .expect("Shiba could not execute a DAG inbox transaction");
+    #[cfg(any(test, feature = "pg_test"))]
+    if let Some(pause) = test_failpoints::claim(
+        "executor_before_ack",
+        Some(result_oid),
+        Some(commit_lsn.as_str()),
+    ) {
+        log!(
+            "Shiba test failpoint reached: executor_before_ack result {result_oid} commit {commit_lsn}"
+        );
+        std::thread::sleep(pause);
+        panic!(
+            "Shiba test failpoint: executor exited after applying commit {commit_lsn} and before acknowledgement"
+        );
+    }
     let delete = unsafe {
         [
             DatumWithOid::new(result_oid, pg_sys::OIDOID),
@@ -433,6 +459,71 @@ fn process_next_dag_transaction(result_oid: i32, runtime: &logical::DagRuntime) 
     )
     .expect("Shiba could not acknowledge a DAG inbox transaction");
     true
+}
+
+/// Deterministic crash injection used only by pgrx and recovery-test builds.
+///
+/// Tests create `public.shiba_worker_failpoints` themselves. Keeping both the
+/// code and its catalog contract behind `pg_test` means production workers
+/// have no failpoint branch, SPI lookup, shared state, or runtime overhead.
+#[cfg(any(test, feature = "pg_test"))]
+mod test_failpoints {
+    use super::*;
+
+    pub(super) fn claim(
+        kind: &str,
+        result_oid: Option<i32>,
+        commit_lsn: Option<&str>,
+    ) -> Option<Duration> {
+        let available = Spi::get_one::<bool>(
+            "SELECT to_regclass('public.shiba_worker_failpoints') IS NOT NULL",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        if !available {
+            return None;
+        }
+
+        let result_oid = result_oid.unwrap_or_default();
+        let commit_lsn = commit_lsn.unwrap_or("0/0");
+        let arguments = unsafe {
+            [
+                DatumWithOid::new(kind, pg_sys::TEXTOID),
+                DatumWithOid::new(result_oid, pg_sys::INT4OID),
+                DatumWithOid::new(commit_lsn, pg_sys::TEXTOID),
+            ]
+        };
+        let pause_ms = Spi::get_one_with_args::<i32>(
+            "SELECT max(pause_ms)
+             FROM public.shiba_worker_failpoints
+             WHERE kind = $1
+               AND NOT fired
+               AND (worker_pid IS NULL OR worker_pid = pg_backend_pid())
+               AND (result_oid IS NULL OR result_oid = $2::oid)
+               AND (commit_lsn IS NULL OR commit_lsn = $3::pg_lsn)",
+            &arguments,
+        )
+        .expect("Shiba could not inspect its test worker failpoint");
+        if pause_ms.is_some() {
+            Spi::run_with_args(
+                "UPDATE public.shiba_worker_failpoints
+                 SET worker_pid = pg_backend_pid(), fired = true
+                 WHERE kind = $1
+                   AND NOT fired
+                   AND (worker_pid IS NULL OR worker_pid = pg_backend_pid())
+                   AND (result_oid IS NULL OR result_oid = $2::oid)
+                   AND (commit_lsn IS NULL OR commit_lsn = $3::pg_lsn)",
+                &arguments,
+            )
+            .expect("Shiba could not claim its test worker failpoint");
+        }
+        pause_ms.map(|milliseconds| {
+            Duration::from_millis(
+                u64::try_from(milliseconds).expect("negative Shiba test failpoint pause"),
+            )
+        })
+    }
 }
 
 fn tuple_to_json(

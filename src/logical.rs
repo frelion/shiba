@@ -1,666 +1,49 @@
-//! Stable Shiba logical plan and common delta/operator contracts.
+//! Stable logical-plan API.
+//!
+//! The module is split by responsibility so readers can follow the data flow:
+//! persisted model -> compiler -> validator -> PostgreSQL runtime bridge.
 
-use pgrx::datum::{DatumWithOid, JsonB};
-use pgrx::prelude::*;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+mod compile;
+mod model;
+mod runtime;
+mod validate;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DeltaRow {
-    pub input: String,
-    pub row: Value,
-    pub diff: i64,
-}
+#[allow(unused_imports)]
+pub use compile::compile_logical_plan;
+#[allow(unused_imports)]
+pub use model::{DeltaBatch, DeltaRow, LogicalEdge, LogicalNode, LogicalPlan, OperatorKind};
+pub use runtime::DagRuntime;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DeltaBatch {
-    pub epoch: String,
-    pub rows: Vec<DeltaRow>,
-}
-
-/// Every physical operator consumes and emits differential batches. Stateful
-/// implementations receive a transaction-scoped state handle when execution
-/// migrates from the current SQL dispatcher.
-#[allow(dead_code)]
-pub trait Operator {
-    fn apply(&mut self, input: DeltaBatch) -> Result<Vec<DeltaBatch>, String>;
-}
-
-/// Transactional bridge used while physical operators are moved out of the
-/// SQL dispatcher one by one. It already makes the persisted logical plan the
-/// authority for accepted source inputs.
-pub struct DagRuntime {
-    result_oid: pg_sys::Oid,
-    plan: LogicalPlan,
-}
-
-impl DagRuntime {
-    pub fn load(result_oid: pg_sys::Oid) -> Result<Self, String> {
-        let argument = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
-        let serialized = Spi::get_one_with_args::<String>(
-            "SELECT logical_plan::text FROM shiba_internal.stream_graphs WHERE result_oid = $1",
-            &argument,
-        )
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("result OID {result_oid} has no logical plan"))?;
-        let plan = serde_json::from_str(&serialized)
-            .map_err(|error| format!("invalid logical plan: {error}"))?;
-        Ok(Self { result_oid, plan })
-    }
-
-    pub fn apply_batch(&self, batch: DeltaBatch) -> Result<(), String> {
-        let encoded = encode_batch_events(&self.plan, self.result_oid, batch.rows)?.to_string();
-        let arguments = unsafe {
-            [
-                DatumWithOid::new(self.result_oid, pg_sys::OIDOID),
-                DatumWithOid::new(encoded.as_str(), pg_sys::TEXTOID),
-                DatumWithOid::new(batch.epoch.as_str(), pg_sys::TEXTOID),
-            ]
-        };
-        Spi::run_with_args(
-            "SELECT shiba._apply_dag_delta_batch($1, $2::jsonb, $3)",
-            &arguments,
-        )
-        .map_err(|error| error.to_string())
-    }
-}
-
-fn encode_batch_events(
-    plan: &LogicalPlan,
-    result_oid: pg_sys::Oid,
-    rows: Vec<DeltaRow>,
-) -> Result<Value, String> {
-    if rows.is_empty() {
-        return Err("DAG delta batch must not be empty".into());
-    }
-    let mut encoded = Vec::with_capacity(rows.len());
-    for delta in rows {
-        let source_oid_u32 = delta
-            .input
-            .parse::<u32>()
-            .map_err(|_| format!("invalid DAG input OID {}", delta.input))?;
-        let source_is_planned = plan.nodes.iter().any(|node| {
-            node.operator == OperatorKind::Scan
-                && node.config["source_oid"].as_u64() == Some(u64::from(source_oid_u32))
-        });
-        if !source_is_planned {
-            return Err(format!(
-                "source OID {source_oid_u32} is not an input of result {result_oid}"
-            ));
-        }
-        if !delta.row.is_object() {
-            return Err("source delta row must be a JSON object".into());
-        }
-        let diff = i32::try_from(delta.diff)
-            .map_err(|_| format!("differential weight {} exceeds int32", delta.diff))?;
-        if !matches!(diff, -1 | 1) {
-            return Err(format!("invalid source differential weight {diff}"));
-        }
-        encoded.push(json!({
-            "source_oid": source_oid_u32,
-            "row_data": delta.row,
-            "delta": diff,
-        }));
-    }
-    Ok(Value::Array(encoded))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LogicalPlan {
-    pub version: u32,
-    pub nodes: Vec<LogicalNode>,
-    pub edges: Vec<LogicalEdge>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LogicalNode {
-    pub id: String,
-    pub operator: OperatorKind,
-    pub config: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum OperatorKind {
-    Scan,
-    Filter,
-    Project,
-    InnerJoin,
-    LeftJoin,
-    RightJoin,
-    FullJoin,
-    SemiJoin,
-    AntiJoin,
-    NullAwareAntiJoin,
-    Distinct,
-    Aggregate,
-    Having,
-    Window,
-    TopN,
-    Sink,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LogicalEdge {
-    pub from: String,
-    pub to: String,
-    pub input: u16,
-}
-
-fn push_node(
-    nodes: &mut Vec<LogicalNode>,
-    edges: &mut Vec<LogicalEdge>,
-    upstream: Option<&str>,
-    id: &str,
-    operator: OperatorKind,
-    config: Value,
-    input: u16,
-) {
-    nodes.push(LogicalNode {
-        id: id.into(),
-        operator,
-        config,
-    });
-    if let Some(from) = upstream {
-        edges.push(LogicalEdge {
-            from: from.into(),
-            to: id.into(),
-            input,
-        });
-    }
-}
-
-#[pg_extern]
-pub fn compile_logical_plan(result_oid: pg_sys::Oid) -> JsonB {
-    let argument = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
-    let metadata = Spi::get_one_with_args::<String>(
-        "SELECT jsonb_build_object(
-             'left_source', v.source_oid::integer,
-             'view_kind', v.view_kind,
-             'source_group', v.group_column,
-             'result_group', v.result_group_column,
-             'count_column', v.count_column,
-             'count_distinct', v.count_distinct,
-             'count_input_source', v.count_input_source,
-             'count_input_column', v.count_input_column,
-             'sum_input', v.sum_input_column,
-             'sum_column', v.sum_column,
-             'having', (
-                 SELECT predicate_sql FROM shiba_internal.stream_having
-                 WHERE result_oid = v.result_oid
-             ),
-             'left_filter', (
-                 SELECT predicate_sql FROM shiba_internal.stream_filters
-                 WHERE result_oid = v.result_oid AND input_side = 'left'
-             ),
-             'left_filter_phase', (
-                 SELECT phase FROM shiba_internal.stream_filters
-                 WHERE result_oid = v.result_oid AND input_side = 'left'
-             ),
-             'right_source', j.right_source_oid::integer,
-             'join_type', j.join_type,
-             'left_join_column', j.left_join_column,
-             'right_join_column', j.right_join_column,
-             'group_source', j.group_source,
-             'right_filter', (
-                 SELECT predicate_sql FROM shiba_internal.stream_filters
-                 WHERE result_oid = v.result_oid AND input_side = 'right'
-             )
-             ,
-             'right_filter_phase', (
-                 SELECT phase FROM shiba_internal.stream_filters
-                 WHERE result_oid = v.result_oid AND input_side = 'right'
-             ),
-             'join_filter', (
-               SELECT predicate_sql
-               FROM shiba_internal.stream_join_filters
-               WHERE result_oid=v.result_oid
-             ),
-             'window', (
-               SELECT jsonb_build_object(
-                 'partition_column',w.partition_column,
-                 'result_partition_column',w.result_partition_column,
-                 'order_column',w.order_column,
-                 'order_direction',w.order_direction,
-                 'nulls_first',w.nulls_first,
-                 'output_columns',w.output_columns,
-                 'target_expressions',w.target_expressions
-               )
-               FROM shiba_internal.window_views w
-               WHERE w.result_oid=v.result_oid
-             ),
-             'distinct_projection', (
-               SELECT jsonb_build_object(
-                 'source_columns',d.source_columns,
-                 'output_columns',d.output_columns
-               )
-               FROM shiba_internal.distinct_views d
-               WHERE d.result_oid=v.result_oid
-             ),
-             'topn', (
-               SELECT jsonb_build_object(
-                 'order_column',t.order_column,
-                 'order_direction',t.order_direction,
-                 'nulls_first',t.nulls_first,
-                 'limit_count',t.limit_count,
-                 'limit_offset',t.limit_offset,
-                 'source_columns',t.source_columns,
-                 'output_columns',t.output_columns
-               )
-               FROM shiba_internal.topn_views t
-               WHERE t.result_oid=v.result_oid
-             )
-         )::text
-         FROM shiba_internal.stream_views v
-         LEFT JOIN shiba_internal.inner_join_views j USING (result_oid)
-         WHERE v.result_oid = $1::oid",
-        &argument,
-    )
-    .expect("Shiba could not read logical-plan metadata")
-    .unwrap_or_else(|| error!("Shiba result OID {result_oid} is not registered"));
-    let metadata: Value =
-        serde_json::from_str(&metadata).expect("Shiba logical-plan metadata is invalid JSON");
-
-    let mut nodes = Vec::new();
-    let mut edges = Vec::new();
-    if metadata["view_kind"] == "topn" {
-        push_node(
-            &mut nodes,
-            &mut edges,
-            None,
-            "scan_left",
-            OperatorKind::Scan,
-            json!({ "source_oid": metadata["left_source"] }),
-            0,
-        );
-        let mut tail = "scan_left";
-        if !metadata["left_filter"].is_null() {
-            push_node(
-                &mut nodes,
-                &mut edges,
-                Some(tail),
-                "filter_left",
-                OperatorKind::Filter,
-                json!({ "predicate_sql": metadata["left_filter"] }),
-                0,
-            );
-            tail = "filter_left";
-        }
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some(tail),
-            "topn",
-            OperatorKind::TopN,
-            metadata["topn"].clone(),
-            0,
-        );
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some("topn"),
-            "project",
-            OperatorKind::Project,
-            metadata["topn"].clone(),
-            0,
-        );
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some("project"),
-            "sink",
-            OperatorKind::Sink,
-            json!({ "result_oid": result_oid.to_u32() }),
-            0,
-        );
-        return JsonB(
-            serde_json::to_value(LogicalPlan {
-                version: 1,
-                nodes,
-                edges,
-            })
-            .expect("Shiba logical plan is not serializable"),
-        );
-    }
-    if metadata["view_kind"] == "distinct" {
-        push_node(
-            &mut nodes,
-            &mut edges,
-            None,
-            "scan_left",
-            OperatorKind::Scan,
-            json!({ "source_oid": metadata["left_source"] }),
-            0,
-        );
-        let mut tail = "scan_left";
-        if !metadata["left_filter"].is_null() {
-            push_node(
-                &mut nodes,
-                &mut edges,
-                Some(tail),
-                "filter_left",
-                OperatorKind::Filter,
-                json!({ "predicate_sql": metadata["left_filter"] }),
-                0,
-            );
-            tail = "filter_left";
-        }
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some(tail),
-            "distinct",
-            OperatorKind::Distinct,
-            metadata["distinct_projection"].clone(),
-            0,
-        );
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some("distinct"),
-            "project",
-            OperatorKind::Project,
-            metadata["distinct_projection"].clone(),
-            0,
-        );
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some("project"),
-            "sink",
-            OperatorKind::Sink,
-            json!({ "result_oid": result_oid.to_u32() }),
-            0,
-        );
-        return JsonB(
-            serde_json::to_value(LogicalPlan {
-                version: 1,
-                nodes,
-                edges,
-            })
-            .expect("Shiba logical plan is not serializable"),
-        );
-    }
-    if metadata["view_kind"] == "window" {
-        push_node(
-            &mut nodes,
-            &mut edges,
-            None,
-            "scan_left",
-            OperatorKind::Scan,
-            json!({ "source_oid": metadata["left_source"] }),
-            0,
-        );
-        let mut tail = "scan_left";
-        if !metadata["left_filter"].is_null() {
-            push_node(
-                &mut nodes,
-                &mut edges,
-                Some(tail),
-                "filter_left",
-                OperatorKind::Filter,
-                json!({ "predicate_sql": metadata["left_filter"] }),
-                0,
-            );
-            tail = "filter_left";
-        }
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some(tail),
-            "window",
-            OperatorKind::Window,
-            metadata["window"].clone(),
-            0,
-        );
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some("window"),
-            "project",
-            OperatorKind::Project,
-            json!({ "output_columns": metadata["window"]["output_columns"] }),
-            0,
-        );
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some("project"),
-            "sink",
-            OperatorKind::Sink,
-            json!({ "result_oid": result_oid.to_u32() }),
-            0,
-        );
-        return JsonB(
-            serde_json::to_value(LogicalPlan {
-                version: 1,
-                nodes,
-                edges,
-            })
-            .expect("Shiba logical plan is not serializable"),
-        );
-    }
-    push_node(
-        &mut nodes,
-        &mut edges,
-        None,
-        "scan_left",
-        OperatorKind::Scan,
-        json!({ "source_oid": metadata["left_source"] }),
-        0,
-    );
-    let mut left_tail = "scan_left";
-    let join_operator = match metadata["join_type"].as_str() {
-        Some("left") => OperatorKind::LeftJoin,
-        Some("right") => OperatorKind::RightJoin,
-        Some("full") => OperatorKind::FullJoin,
-        Some("semi") => OperatorKind::SemiJoin,
-        Some("anti") => OperatorKind::AntiJoin,
-        Some("null_anti") => OperatorKind::NullAwareAntiJoin,
-        _ => OperatorKind::InnerJoin,
-    };
-    if !metadata["left_filter"].is_null() && metadata["left_filter_phase"] != "post" {
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some(left_tail),
-            "filter_left",
-            OperatorKind::Filter,
-            json!({ "predicate_sql": metadata["left_filter"] }),
-            0,
-        );
-        left_tail = "filter_left";
-    }
-
-    let aggregate_input;
-    if !metadata["right_source"].is_null() {
-        push_node(
-            &mut nodes,
-            &mut edges,
-            None,
-            "scan_right",
-            OperatorKind::Scan,
-            json!({ "source_oid": metadata["right_source"] }),
-            0,
-        );
-        let mut right_tail = "scan_right";
-        if !metadata["right_filter"].is_null() && metadata["right_filter_phase"] != "post" {
-            push_node(
-                &mut nodes,
-                &mut edges,
-                Some(right_tail),
-                "filter_right",
-                OperatorKind::Filter,
-                json!({ "predicate_sql": metadata["right_filter"] }),
-                0,
-            );
-            right_tail = "filter_right";
-        }
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some(left_tail),
-            "join",
-            join_operator,
-            json!({
-                "left_key": metadata["left_join_column"],
-                "right_key": metadata["right_join_column"]
-            }),
-            0,
-        );
-        edges.push(LogicalEdge {
-            from: right_tail.into(),
-            to: "join".into(),
-            input: 1,
-        });
-        let mut join_tail = "join";
-        if metadata["left_filter_phase"] == "post"
-            || metadata["right_filter_phase"] == "post"
-            || !metadata["join_filter"].is_null()
-        {
-            push_node(
-                &mut nodes,
-                &mut edges,
-                Some(join_tail),
-                "filter_join",
-                OperatorKind::Filter,
-                json!({
-                    "left_predicate_sql": metadata["left_filter"],
-                    "right_predicate_sql": metadata["right_filter"],
-                    "join_predicate_sql": metadata["join_filter"]
-                }),
-                0,
-            );
-            join_tail = "filter_join";
-        }
-        aggregate_input = join_tail;
-    } else {
-        aggregate_input = left_tail;
-    }
-    let mut aggregate_input = aggregate_input;
-    if metadata["count_distinct"] == true {
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some(aggregate_input),
-            "distinct",
-            OperatorKind::Distinct,
-            json!({
-                "group_source": metadata["group_source"],
-                "group_column": metadata["source_group"],
-                "value_source": metadata["count_input_source"],
-                "value_column": metadata["count_input_column"]
-            }),
-            0,
-        );
-        aggregate_input = "distinct";
-    }
-    push_node(
-        &mut nodes,
-        &mut edges,
-        Some(aggregate_input),
-        "aggregate",
-        OperatorKind::Aggregate,
-        json!({
-            "group_source": metadata["group_source"],
-            "group_column": metadata["source_group"],
-            "count_column": metadata["count_column"],
-            "count_distinct": metadata["count_distinct"],
-            "count_input_source": metadata["count_input_source"],
-            "count_input_column": metadata["count_input_column"],
-            "sum_input": metadata["sum_input"],
-            "sum_column": metadata["sum_column"]
-        }),
-        0,
-    );
-    let mut aggregate_tail = "aggregate";
-    if !metadata["having"].is_null() {
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some(aggregate_tail),
-            "having",
-            OperatorKind::Having,
-            json!({ "predicate_sql": metadata["having"] }),
-            0,
-        );
-        aggregate_tail = "having";
-    }
-    push_node(
-        &mut nodes,
-        &mut edges,
-        Some(aggregate_tail),
-        "project",
-        OperatorKind::Project,
-        json!({
-            "source_group": metadata["source_group"],
-            "result_group": metadata["result_group"]
-        }),
-        0,
-    );
-    push_node(
-        &mut nodes,
-        &mut edges,
-        Some("project"),
-        "sink",
-        OperatorKind::Sink,
-        json!({ "result_oid": result_oid.to_u32() }),
-        0,
-    );
-
-    JsonB(
-        serde_json::to_value(LogicalPlan {
-            version: 1,
-            nodes,
-            edges,
-        })
-        .expect("Shiba logical plan is not serializable"),
-    )
-}
+#[cfg(test)]
+use compile::{build_logical_plan, LogicalPlanBuilder};
+#[cfg(test)]
+use model::LOGICAL_PLAN_VERSION;
+#[cfg(test)]
+use runtime::encode_batch_events;
+#[cfg(test)]
+use validate::{ExecutionDescriptor, ExecutionJoinType, ExecutionPipeline, ExecutionPlan};
+#[cfg(test)]
+use {pgrx::pg_sys, serde_json::json, serde_json::Value};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct Identity;
-
-    impl Operator for Identity {
-        fn apply(&mut self, input: DeltaBatch) -> Result<Vec<DeltaBatch>, String> {
-            Ok(vec![input])
+    fn test_execution(source_oids: &[u32]) -> ExecutionPlan {
+        ExecutionPlan {
+            descriptor: ExecutionDescriptor {
+                pipeline: ExecutionPipeline::Aggregate,
+                left_source_oid: source_oids[0],
+                right_source_oid: source_oids.get(1).copied(),
+                join_type: None,
+            },
+            source_oids: source_oids.iter().copied().collect(),
         }
     }
 
     #[test]
-    fn operator_preserves_differential_batch() {
-        let batch = DeltaBatch {
-            epoch: "0/10".into(),
-            rows: vec![DeltaRow {
-                input: "left".into(),
-                row: json!({"id": 1}),
-                diff: -1,
-            }],
-        };
-        assert_eq!(Identity.apply(batch.clone()).unwrap(), vec![batch]);
-    }
-
-    #[test]
     fn batch_encoding_preserves_cross_source_wal_order() {
-        let plan = LogicalPlan {
-            version: 1,
-            nodes: vec![
-                LogicalNode {
-                    id: "left".into(),
-                    operator: OperatorKind::Scan,
-                    config: json!({"source_oid": 41}),
-                },
-                LogicalNode {
-                    id: "right".into(),
-                    operator: OperatorKind::Scan,
-                    config: json!({"source_oid": 42}),
-                },
-            ],
-            edges: vec![],
-        };
+        let plan = test_execution(&[41, 42]);
         let events = encode_batch_events(
             &plan,
             pg_sys::Oid::from(99),
@@ -692,15 +75,7 @@ mod tests {
 
     #[test]
     fn batch_encoding_rejects_empty_unplanned_and_non_object_inputs() {
-        let plan = LogicalPlan {
-            version: 1,
-            nodes: vec![LogicalNode {
-                id: "scan".into(),
-                operator: OperatorKind::Scan,
-                config: json!({"source_oid": 41}),
-            }],
-            edges: vec![],
-        };
+        let plan = test_execution(&[41]);
         let result_oid = pg_sys::Oid::from(99);
 
         assert!(encode_batch_events(&plan, result_oid, vec![])
@@ -777,36 +152,493 @@ mod tests {
     }
 
     #[test]
-    fn push_node_only_adds_an_edge_when_upstream_exists() {
-        let mut nodes = vec![];
-        let mut edges = vec![];
-        push_node(
-            &mut nodes,
-            &mut edges,
-            None,
-            "scan",
-            OperatorKind::Scan,
-            json!({}),
-            0,
-        );
-        push_node(
-            &mut nodes,
-            &mut edges,
-            Some("scan"),
-            "sink",
-            OperatorKind::Sink,
-            json!({}),
-            1,
-        );
+    fn plan_builder_only_adds_edges_for_connected_nodes() {
+        let mut builder = LogicalPlanBuilder::default();
+        builder.root("scan", OperatorKind::Scan, json!({}));
+        builder.node("sink", OperatorKind::Sink, json!({}), Some(("scan", 1)));
+        let plan = builder.finish();
 
-        assert_eq!(nodes.len(), 2);
+        assert_eq!(plan.nodes.len(), 2);
         assert_eq!(
-            edges,
+            plan.edges,
             vec![LogicalEdge {
                 from: "scan".into(),
                 to: "sink".into(),
                 input: 1,
             }]
         );
+    }
+
+    fn node_shape(plan: &LogicalPlan) -> Vec<(&str, &OperatorKind)> {
+        plan.nodes
+            .iter()
+            .map(|node| (node.id.as_str(), &node.operator))
+            .collect()
+    }
+
+    #[test]
+    fn topn_plan_shape_preserves_filter_projection_and_sink() {
+        let topn = json!({
+            "order_column": "score",
+            "order_direction": "DESC",
+            "nulls_first": false,
+            "limit_count": 10,
+            "limit_offset": 2,
+            "source_columns": ["id", "score"],
+            "output_columns": ["id", "score"]
+        });
+        let metadata = json!({
+            "view_kind": "topn",
+            "left_source": 41,
+            "left_filter": "score > 0",
+            "topn": topn
+        });
+
+        let plan = build_logical_plan(&metadata, 99);
+
+        assert_eq!(
+            node_shape(&plan),
+            vec![
+                ("scan_left", &OperatorKind::Scan),
+                ("filter_left", &OperatorKind::Filter),
+                ("topn", &OperatorKind::TopN),
+                ("project", &OperatorKind::Project),
+                ("sink", &OperatorKind::Sink),
+            ]
+        );
+        assert_eq!(plan.nodes[2].config, topn);
+        assert_eq!(plan.nodes[3].config, topn);
+        assert_eq!(plan.nodes[4].config, json!({"result_oid": 99}));
+        assert_eq!(
+            plan.edges,
+            vec![
+                LogicalEdge {
+                    from: "scan_left".into(),
+                    to: "filter_left".into(),
+                    input: 0,
+                },
+                LogicalEdge {
+                    from: "filter_left".into(),
+                    to: "topn".into(),
+                    input: 0,
+                },
+                LogicalEdge {
+                    from: "topn".into(),
+                    to: "project".into(),
+                    input: 0,
+                },
+                LogicalEdge {
+                    from: "project".into(),
+                    to: "sink".into(),
+                    input: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn join_plan_shape_preserves_input_numbers_and_post_filter_order() {
+        let metadata = json!({
+            "view_kind": "aggregate",
+            "left_source": 41,
+            "right_source": 42,
+            "join_type": "left",
+            "left_join_column": "customer_id",
+            "right_join_column": "id",
+            "left_filter": "orders.active",
+            "left_filter_phase": "pre",
+            "right_filter": "customers.enabled",
+            "right_filter_phase": "post",
+            "join_filter": "orders.region = customers.region",
+            "group_source": "left",
+            "source_group": "region",
+            "result_group": "region",
+            "count_column": "row_count",
+            "count_distinct": true,
+            "count_input_source": "left",
+            "count_input_column": "customer_id",
+            "sum_input": "amount",
+            "sum_column": "total",
+            "having": "row_count > 1"
+        });
+
+        let plan = build_logical_plan(&metadata, 99);
+
+        assert_eq!(
+            node_shape(&plan),
+            vec![
+                ("scan_left", &OperatorKind::Scan),
+                ("filter_left", &OperatorKind::Filter),
+                ("scan_right", &OperatorKind::Scan),
+                ("join", &OperatorKind::LeftJoin),
+                ("filter_join", &OperatorKind::Filter),
+                ("distinct", &OperatorKind::Distinct),
+                ("aggregate", &OperatorKind::Aggregate),
+                ("having", &OperatorKind::Having),
+                ("project", &OperatorKind::Project),
+                ("sink", &OperatorKind::Sink),
+            ]
+        );
+        assert_eq!(
+            plan.edges[1],
+            LogicalEdge {
+                from: "filter_left".into(),
+                to: "join".into(),
+                input: 0,
+            }
+        );
+        assert_eq!(
+            plan.edges[2],
+            LogicalEdge {
+                from: "scan_right".into(),
+                to: "join".into(),
+                input: 1,
+            }
+        );
+        assert_eq!(
+            plan.nodes[4].config,
+            json!({
+                "left_predicate_sql": "orders.active",
+                "right_predicate_sql": "customers.enabled",
+                "join_predicate_sql": "orders.region = customers.region"
+            })
+        );
+    }
+
+    #[test]
+    fn window_and_distinct_plans_keep_their_existing_project_configs() {
+        let window = json!({
+            "partition_column": "account_id",
+            "output_columns": ["account_id", "rank"],
+            "target_expressions": ["account_id", "rank()"]
+        });
+        let window_plan = build_logical_plan(
+            &json!({
+                "view_kind": "window",
+                "left_source": 41,
+                "left_filter": null,
+                "window": window
+            }),
+            99,
+        );
+        assert_eq!(window_plan.nodes[1].config, window);
+        assert_eq!(
+            window_plan.nodes[2].config,
+            json!({"output_columns": ["account_id", "rank"]})
+        );
+
+        let projection = json!({
+            "source_columns": ["account_id"],
+            "output_columns": ["account_id"]
+        });
+        let distinct_plan = build_logical_plan(
+            &json!({
+                "view_kind": "distinct",
+                "left_source": 41,
+                "left_filter": null,
+                "distinct_projection": projection
+            }),
+            99,
+        );
+        assert_eq!(distinct_plan.nodes[1].config, projection);
+        assert_eq!(distinct_plan.nodes[2].config, projection);
+    }
+
+    fn aggregate_metadata() -> Value {
+        json!({
+            "view_kind": "aggregate",
+            "left_source": 41,
+            "right_source": null,
+            "join_type": null,
+            "left_join_column": null,
+            "right_join_column": null,
+            "left_filter": null,
+            "left_filter_phase": null,
+            "right_filter": null,
+            "right_filter_phase": null,
+            "join_filter": null,
+            "group_source": "left",
+            "source_group": "region",
+            "result_group": "region",
+            "count_column": "row_count",
+            "count_distinct": false,
+            "count_input_source": null,
+            "count_input_column": null,
+            "sum_input": "amount",
+            "sum_column": "total",
+            "having": null
+        })
+    }
+
+    #[test]
+    fn validated_plan_selects_every_physical_pipeline() {
+        let aggregate = build_logical_plan(&aggregate_metadata(), 99);
+        assert_eq!(
+            aggregate.validate_for(99).unwrap().descriptor.pipeline,
+            ExecutionPipeline::Aggregate
+        );
+
+        for (join_type, execution_join_type) in [
+            ("inner", ExecutionJoinType::Inner),
+            ("left", ExecutionJoinType::Left),
+            ("right", ExecutionJoinType::Right),
+            ("full", ExecutionJoinType::Full),
+            ("semi", ExecutionJoinType::Semi),
+            ("anti", ExecutionJoinType::Anti),
+            ("null_anti", ExecutionJoinType::NullAnti),
+        ] {
+            let mut metadata = aggregate_metadata();
+            metadata["right_source"] = json!(42);
+            metadata["join_type"] = json!(join_type);
+            metadata["left_join_column"] = json!("customer_id");
+            metadata["right_join_column"] = json!("id");
+            metadata["left_filter"] = json!("active");
+            metadata["left_filter_phase"] = json!("post");
+            metadata["count_distinct"] = json!(true);
+            metadata["count_input_source"] = json!("left");
+            metadata["count_input_column"] = json!("customer_id");
+            metadata["having"] = json!("row_count > 1");
+            let descriptor = build_logical_plan(&metadata, 99)
+                .validate_for(99)
+                .unwrap()
+                .descriptor;
+            assert_eq!(descriptor.pipeline, ExecutionPipeline::Join, "{join_type}");
+            assert_eq!(descriptor.left_source_oid, 41);
+            assert_eq!(descriptor.right_source_oid, Some(42));
+            assert_eq!(descriptor.join_type, Some(execution_join_type));
+        }
+
+        for (view_kind, pipeline, field, config) in [
+            (
+                "window",
+                ExecutionPipeline::Window,
+                "window",
+                json!({
+                    "partition_column": "account_id",
+                    "result_partition_column": "account_id",
+                    "order_column": "created_at",
+                    "order_direction": "asc",
+                    "nulls_first": false,
+                    "output_columns": ["account_id", "rank"],
+                    "target_expressions": ["account_id", "rank()"]
+                }),
+            ),
+            (
+                "distinct",
+                ExecutionPipeline::Distinct,
+                "distinct_projection",
+                json!({
+                    "source_columns": ["account_id"],
+                    "output_columns": ["account_id"]
+                }),
+            ),
+            (
+                "topn",
+                ExecutionPipeline::TopN,
+                "topn",
+                json!({
+                    "order_column": "score",
+                    "order_direction": "desc",
+                    "nulls_first": false,
+                    "limit_count": 10,
+                    "limit_offset": 0,
+                    "source_columns": ["id", "score"],
+                    "output_columns": ["id", "score"]
+                }),
+            ),
+        ] {
+            let mut metadata = json!({
+                "view_kind": view_kind,
+                "left_source": 41,
+                "left_filter": null
+            });
+            metadata[field] = config;
+            let descriptor = build_logical_plan(&metadata, 99)
+                .validate_for(99)
+                .unwrap()
+                .descriptor;
+            assert_eq!(descriptor.pipeline, pipeline);
+            assert_eq!(
+                serde_json::to_value(&descriptor).unwrap()["pipeline"],
+                view_kind
+            );
+        }
+    }
+
+    #[test]
+    fn validator_rejects_duplicate_or_orphan_nodes_and_wrong_sink() {
+        let valid = build_logical_plan(&aggregate_metadata(), 99);
+
+        let mut duplicate = valid.clone();
+        duplicate.nodes[1].id = duplicate.nodes[0].id.clone();
+        assert!(duplicate
+            .validate_for(99)
+            .unwrap_err()
+            .contains("duplicate"));
+
+        let mut orphan = valid.clone();
+        orphan.nodes.push(LogicalNode {
+            id: "orphan".into(),
+            operator: OperatorKind::Project,
+            config: json!({}),
+        });
+        assert!(orphan.validate_for(99).unwrap_err().contains("unreachable"));
+
+        let mut wrong_sink = valid;
+        wrong_sink
+            .nodes
+            .iter_mut()
+            .find(|node| node.operator == OperatorKind::Sink)
+            .unwrap()
+            .config = json!({"result_oid": 100});
+        assert!(wrong_sink
+            .validate_for(99)
+            .unwrap_err()
+            .contains("wrong result OID"));
+    }
+
+    #[test]
+    fn validator_rejects_cycles_even_when_all_nodes_have_inputs() {
+        let plan = LogicalPlan {
+            version: LOGICAL_PLAN_VERSION,
+            nodes: vec![
+                LogicalNode {
+                    id: "scan".into(),
+                    operator: OperatorKind::Scan,
+                    config: json!({"source_oid": 41}),
+                },
+                LogicalNode {
+                    id: "aggregate".into(),
+                    operator: OperatorKind::Aggregate,
+                    config: json!({}),
+                },
+                LogicalNode {
+                    id: "sink".into(),
+                    operator: OperatorKind::Sink,
+                    config: json!({"result_oid": 99}),
+                },
+                LogicalNode {
+                    id: "cycle_a".into(),
+                    operator: OperatorKind::Filter,
+                    config: json!({}),
+                },
+                LogicalNode {
+                    id: "cycle_b".into(),
+                    operator: OperatorKind::Project,
+                    config: json!({}),
+                },
+            ],
+            edges: vec![
+                LogicalEdge {
+                    from: "scan".into(),
+                    to: "aggregate".into(),
+                    input: 0,
+                },
+                LogicalEdge {
+                    from: "aggregate".into(),
+                    to: "sink".into(),
+                    input: 0,
+                },
+                LogicalEdge {
+                    from: "cycle_a".into(),
+                    to: "cycle_b".into(),
+                    input: 0,
+                },
+                LogicalEdge {
+                    from: "cycle_b".into(),
+                    to: "cycle_a".into(),
+                    input: 0,
+                },
+            ],
+        };
+        assert!(plan.validate_for(99).unwrap_err().contains("cycle"));
+    }
+
+    fn join_metadata_for_validation() -> Value {
+        let mut metadata = aggregate_metadata();
+        metadata["right_source"] = json!(42);
+        metadata["join_type"] = json!("left");
+        metadata["left_join_column"] = json!("customer_id");
+        metadata["right_join_column"] = json!("id");
+        metadata
+    }
+
+    #[test]
+    fn validator_rejects_swapped_join_inputs_and_wrong_operator_order() {
+        let mut swapped = build_logical_plan(&join_metadata_for_validation(), 99);
+        let mut join_edges: Vec<_> = swapped
+            .edges
+            .iter_mut()
+            .filter(|edge| edge.to == "join")
+            .collect();
+        join_edges[0].input = 1;
+        join_edges[1].input = 0;
+        assert!(swapped
+            .validate_for(99)
+            .unwrap_err()
+            .contains("operator order"));
+
+        let mut wrong_order = build_logical_plan(&aggregate_metadata(), 99);
+        let aggregate = wrong_order
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "aggregate")
+            .unwrap();
+        aggregate.operator = OperatorKind::Project;
+        let project = wrong_order
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "project")
+            .unwrap();
+        project.operator = OperatorKind::Aggregate;
+        assert!(wrong_order.validate_for(99).is_err());
+    }
+
+    #[test]
+    fn validator_rejects_two_execution_cores_and_incomplete_config() {
+        let mut double_core = build_logical_plan(&aggregate_metadata(), 99);
+        double_core
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "project")
+            .unwrap()
+            .operator = OperatorKind::Aggregate;
+        assert!(double_core
+            .validate_for(99)
+            .unwrap_err()
+            .contains("exactly one"));
+
+        let mut incomplete = build_logical_plan(&join_metadata_for_validation(), 99);
+        incomplete
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "join")
+            .unwrap()
+            .config = json!({"left_key": "customer_id"});
+        assert!(incomplete
+            .validate_for(99)
+            .unwrap_err()
+            .contains("incomplete"));
+    }
+
+    #[test]
+    fn validator_decodes_configs_into_closed_typed_shapes() {
+        let mut unknown_field = build_logical_plan(&aggregate_metadata(), 99);
+        unknown_field
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "aggregate")
+            .unwrap()
+            .config["unexpected"] = json!(true);
+        assert!(unknown_field.validate_for(99).is_err());
+
+        let mut invalid_side = build_logical_plan(&join_metadata_for_validation(), 99);
+        invalid_side
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "aggregate")
+            .unwrap()
+            .config["group_source"] = json!("middle");
+        assert!(invalid_side.validate_for(99).is_err());
     }
 }

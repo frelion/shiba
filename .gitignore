@@ -1,4 +1,4 @@
 /target/
+/performance/matrix-results/
 *.log
 .DS_Store
-
