@@ -49,6 +49,12 @@ jobs:
       - name: Initialize pgrx for PostgreSQL 17
         run: cargo pgrx init --pg17 "$PG_CONFIG"
 
+      - name: Allow pgrx test extension installation
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" \
+            "$("$PG_CONFIG" --sharedir)/extension" \
+            "$("$PG_CONFIG" --pkglibdir)"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
