@@ -1136,6 +1136,7 @@ DECLARE
     output_columns name[] := ARRAY[]::name[];
     actual_outputs name[];
     key_arguments text;
+    sink_index_columns text;
     predicate_sql text;
     activation_lsn_value pg_lsn;
 BEGIN
@@ -1201,6 +1202,14 @@ BEGIN
       RAISE EXCEPTION 'Shiba DISTINCT output metadata does not match the CTAS result'
         USING ERRCODE='data_exception';
     END IF;
+    SELECT string_agg(format('%I',output_column),',' ORDER BY ordinal)
+    INTO STRICT sink_index_columns
+    FROM unnest(output_columns) WITH ORDINALITY columns(output_column,ordinal);
+    EXECUTE format(
+      'ALTER TABLE %s ADD CONSTRAINT %I UNIQUE NULLS NOT DISTINCT (%s)',
+      target_name,format('shiba_distinct_key_%s',target_oid),
+      sink_index_columns
+    );
 
     PERFORM shiba._validate_source_table(source_oid);
     PERFORM shiba._ensure_replica_identity_full(source_oid);

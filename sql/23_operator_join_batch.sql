@@ -78,11 +78,16 @@ DECLARE
     consume_name name := format(
       'shiba_join_consume_r%s_p%s',result_relation,physical_plan_id
     )::name;
+    preflight_name name := format(
+      'shiba_join_preflight_r%s_p%s',result_relation,physical_plan_id
+    )::name;
 BEGIN
     FOR prepared_name IN
       SELECT name
       FROM pg_prepared_statements
-      WHERE name IN (stage_name::text,consume_name::text)
+      WHERE name IN (
+        stage_name::text,consume_name::text,preflight_name::text
+      )
       ORDER BY name
     LOOP
       EXECUTE format('DEALLOCATE %I',prepared_name);
@@ -121,17 +126,30 @@ DECLARE
     having_sql text;
     visible_sql text;
     applicable_events bigint;
+    left_event_count bigint;
+    right_event_count bigint;
+    left_arrangement_rows bigint;
+    right_arrangement_rows bigint;
+    candidate_screen_upper_bound numeric;
+    candidate_upper_bound numeric;
+    candidate_preflight_sql text;
     physical_plan_id bigint;
+    preflight_plan_name name;
     stage_plan_name name;
     consume_plan_name name;
     prepared_count integer;
     prepared_name text;
     stage_statement_sql text;
     consume_statement_sql text;
+    preflight_execute_sql text;
     stage_execute_sql text;
     consume_execute_sql text;
     staged_rows bigint;
     arrangement_rows bigint;
+    max_stage_rows bigint := coalesce(
+      nullif(current_setting('shiba.max_stage_rows',true),'')::bigint,
+      1000000
+    );
 BEGIN
     SELECT * INTO STRICT stream_view
     FROM shiba_internal.stream_views
@@ -151,7 +169,10 @@ BEGIN
         USING ERRCODE='P0S01';
     END IF;
 
-    SELECT count(*) INTO applicable_events
+    SELECT count(*),
+           count(*) FILTER (WHERE event.source_oid=left_source_oid),
+           count(*) FILTER (WHERE event.source_oid=right_source_oid)
+    INTO applicable_events,left_event_count,right_event_count
     FROM shiba_internal.change_log event
     WHERE event.commit_lsn=p_commit_lsn
       AND event.source_oid IN (left_source_oid,right_source_oid);
@@ -161,16 +182,39 @@ BEGIN
         result_relation,p_commit_lsn
         USING ERRCODE='P0S01';
     END IF;
+    SELECT
+      count(*) FILTER (WHERE input_side='left'),
+      count(*) FILTER (WHERE input_side='right')
+    INTO left_arrangement_rows,right_arrangement_rows
+    FROM shiba_internal.join_arrangements
+    WHERE result_oid=result_relation;
+    candidate_screen_upper_bound :=
+        left_event_count::numeric*right_arrangement_rows::numeric
+      + right_event_count::numeric*left_arrangement_rows::numeric
+      + left_event_count::numeric*right_event_count::numeric;
+    IF join_view.join_type<>'inner' THEN
+      candidate_screen_upper_bound := candidate_screen_upper_bound
+        +left_arrangement_rows+right_arrangement_rows
+        +left_event_count+right_event_count;
+    END IF;
 
     SELECT plan.plan_id INTO STRICT physical_plan_id
     FROM shiba_internal.physical_plans AS plan
     WHERE plan.result_oid=result_relation;
+    preflight_plan_name :=
+      format('shiba_join_preflight_r%s_p%s',
+             result_relation,physical_plan_id)::name;
     stage_plan_name :=
       format('shiba_join_stage_r%s_p%s',
              result_relation,physical_plan_id)::name;
     consume_plan_name :=
       format('shiba_join_consume_r%s_p%s',
              result_relation,physical_plan_id)::name;
+    preflight_execute_sql := format(
+      'EXECUTE %I (%s::oid,%s::oid,%s::oid,%L::pg_lsn)',
+      preflight_plan_name,result_relation,left_source_oid,right_source_oid,
+      p_commit_lsn::text
+    );
     stage_execute_sql := format(
       'EXECUTE %I (%s::oid,%s::oid,%s::oid,%L::pg_lsn)',
       stage_plan_name,result_relation,left_source_oid,right_source_oid,
@@ -192,9 +236,29 @@ BEGIN
 
     SELECT count(*) INTO prepared_count
     FROM pg_prepared_statements
-    WHERE name IN (stage_plan_name::text,consume_plan_name::text);
-    IF prepared_count=2 THEN
+    WHERE name IN (
+      preflight_plan_name::text,stage_plan_name::text,consume_plan_name::text
+    );
+    IF prepared_count=3 THEN
+      IF candidate_screen_upper_bound>max_stage_rows THEN
+        EXECUTE preflight_execute_sql INTO STRICT candidate_upper_bound;
+        IF candidate_upper_bound>max_stage_rows THEN
+          RAISE EXCEPTION
+            'Shiba JOIN commit % for result % may generate % candidates, limit %',
+            p_commit_lsn,result_relation::regclass,
+            candidate_upper_bound,max_stage_rows
+            USING ERRCODE='53400',
+                  HINT='Increase shiba.max_stage_rows, split the source transaction, or reduce JOIN fanout.';
+        END IF;
+      END IF;
       EXECUTE stage_execute_sql INTO STRICT staged_rows,arrangement_rows;
+      IF staged_rows>max_stage_rows THEN
+        RAISE EXCEPTION
+          'Shiba JOIN commit % for result % produced % Stage rows, limit %',
+          p_commit_lsn,result_relation::regclass,staged_rows,max_stage_rows
+          USING ERRCODE='53400',
+                HINT='Increase shiba.max_stage_rows or reduce JOIN fanout.';
+      END IF;
       IF staged_rows>=1024 THEN
         EXECUTE format('ANALYZE %s',stage_name);
       END IF;
@@ -208,16 +272,6 @@ BEGIN
       PERFORM shiba_internal._compact_physical_stages(result_relation);
       RETURN;
     END IF;
-    -- A failed first compilation can leave only one session plan. Rebuild the
-    -- pair as one physical-program generation.
-    FOR prepared_name IN
-      SELECT name
-      FROM pg_prepared_statements
-      WHERE name IN (stage_plan_name::text,consume_plan_name::text)
-      ORDER BY name
-    LOOP
-      EXECUTE format('DEALLOCATE %I',prepared_name);
-    END LOOP;
 
     SELECT format('%I.%I',n.nspname,c.relname) INTO STRICT left_name
     FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
@@ -277,6 +331,293 @@ BEGIN
       );
     END IF;
     post_filter_sql := coalesce(post_filter_sql,'true');
+
+    -- Bound the candidate set before constructing it.  Count unique changed
+    -- rows and retained rows per affected join key, rather than multiplying
+    -- each side's event count by the entire opposite arrangement.  The latter
+    -- badly overestimates sparse one-to-one updates and can quarantine healthy
+    -- DAGs.  This preflight only groups the bounded commit payload and scans
+    -- indexed arrangement keys; it never enumerates the Cartesian candidates.
+    candidate_preflight_sql := format(
+      $candidate_preflight$
+      WITH left_event_rows AS MATERIALIZED (
+        SELECT coalesce(
+                 to_jsonb((input.row).%2$I),'null'::jsonb
+               ) AS join_key,
+               event.row_data,
+               sum(event.delta)::bigint AS weight
+        FROM shiba_internal.change_log event
+        CROSS JOIN LATERAL (
+          SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
+        ) input
+        WHERE event.commit_lsn=$4
+          AND event.source_oid=$2
+          AND event.delta IN (-1,1)
+          AND jsonb_typeof(event.row_data)='object'
+          AND coalesce((%3$s),false)
+        GROUP BY 1,event.row_data
+        HAVING sum(event.delta)<>0
+      ),
+      right_event_rows AS MATERIALIZED (
+        SELECT coalesce(
+                 to_jsonb((input.row).%5$I),'null'::jsonb
+               ) AS join_key,
+               event.row_data,
+               sum(event.delta)::bigint AS weight
+        FROM shiba_internal.change_log event
+        CROSS JOIN LATERAL (
+          SELECT jsonb_populate_record(NULL::%4$s,event.row_data) AS row
+        ) input
+        WHERE event.commit_lsn=$4
+          AND event.source_oid=$3
+          AND event.delta IN (-1,1)
+          AND jsonb_typeof(event.row_data)='object'
+          AND coalesce((%6$s),false)
+        GROUP BY 1,event.row_data
+        HAVING sum(event.delta)<>0
+      ),
+      affected_keys AS MATERIALIZED (
+        SELECT join_key FROM left_event_rows
+        UNION
+        SELECT join_key FROM right_event_rows
+      ),
+      right_global AS MATERIALIZED (
+        SELECT
+          coalesce(sum(state.multiplicity),0)::bigint AS old_any_count,
+          coalesce(sum(state.multiplicity)
+            FILTER (WHERE state.join_key='null'::jsonb),0)::bigint
+            AS old_null_count,
+          coalesce((SELECT sum(weight) FROM right_event_rows),0)::bigint
+            AS any_delta,
+          coalesce((SELECT sum(weight) FROM right_event_rows
+                    WHERE join_key='null'::jsonb),0)::bigint AS null_delta
+        FROM shiba_internal.join_arrangements state
+        WHERE %7$L='null_anti'
+          AND state.result_oid=$1
+          AND state.input_side='right'
+      ),
+      expanded_keys AS MATERIALIZED (
+        SELECT join_key FROM affected_keys
+        UNION
+        SELECT DISTINCT state.join_key
+        FROM shiba_internal.join_arrangements state
+        CROSS JOIN right_global global
+        WHERE %7$L='null_anti'
+          AND state.result_oid=$1
+          AND state.input_side='left'
+          AND (global.old_null_count>0)
+                IS DISTINCT FROM
+              (global.old_null_count+global.null_delta>0)
+        UNION
+        SELECT 'null'::jsonb
+        FROM right_global global
+        WHERE %7$L='null_anti'
+          AND (global.old_any_count>0)
+                IS DISTINCT FROM
+              (global.old_any_count+global.any_delta>0)
+      ),
+      left_event_counts AS (
+        SELECT join_key,count(*)::numeric AS row_count,
+               sum(weight)::bigint AS weight
+        FROM left_event_rows GROUP BY join_key
+      ),
+      right_event_counts AS (
+        SELECT join_key,count(*)::numeric AS row_count,
+               sum(weight)::bigint AS weight
+        FROM right_event_rows GROUP BY join_key
+      ),
+      left_state_counts AS (
+        SELECT key.join_key,
+               count(state.*)::numeric AS row_count,
+               coalesce(sum(state.multiplicity),0)::bigint
+                 AS multiplicity
+        FROM expanded_keys key
+        LEFT JOIN shiba_internal.join_arrangements state
+          ON state.result_oid=$1
+         AND state.input_side='left'
+         AND state.join_key=key.join_key
+        GROUP BY key.join_key
+      ),
+      right_state_counts AS (
+        SELECT key.join_key,
+               count(state.*)::numeric AS row_count,
+               coalesce(sum(state.multiplicity),0)::bigint
+                 AS multiplicity
+        FROM expanded_keys key
+        LEFT JOIN shiba_internal.join_arrangements state
+          ON state.result_oid=$1
+         AND state.input_side='right'
+         AND state.join_key=key.join_key
+        GROUP BY key.join_key
+      ),
+      key_presence AS (
+        SELECT key.join_key,
+               left_state.row_count AS left_rows,
+               left_state.multiplicity AS old_left_count,
+               (
+                 left_state.multiplicity
+                   +coalesce(left_event.weight,0)
+               )::bigint AS new_left_count,
+               right_state.row_count AS right_rows,
+               right_state.multiplicity AS old_right_count,
+               (
+                 right_state.multiplicity
+                   +coalesce(right_event.weight,0)
+               )::bigint AS new_right_count,
+               coalesce(left_event.row_count,0)::numeric
+                 AS left_event_rows,
+               coalesce(right_event.row_count,0)::numeric
+                 AS right_event_rows
+        FROM expanded_keys key
+        JOIN left_state_counts left_state USING(join_key)
+        JOIN right_state_counts right_state USING(join_key)
+        LEFT JOIN left_event_counts left_event USING(join_key)
+        LEFT JOIN right_event_counts right_event USING(join_key)
+      ),
+      visibility AS (
+        SELECT presence.*,
+               CASE %7$L
+                 WHEN 'left' THEN
+                   presence.join_key='null'::jsonb
+                     OR presence.old_right_count=0
+                 WHEN 'full' THEN
+                   presence.join_key='null'::jsonb
+                     OR presence.old_right_count=0
+                 WHEN 'semi' THEN
+                   presence.join_key<>'null'::jsonb
+                     AND presence.old_right_count>0
+                 WHEN 'anti' THEN
+                   presence.join_key='null'::jsonb
+                     OR presence.old_right_count=0
+                 WHEN 'null_anti' THEN
+                   global.old_any_count=0
+                   OR (
+                     presence.join_key<>'null'::jsonb
+                     AND global.old_null_count=0
+                     AND presence.old_right_count=0
+                   )
+                 ELSE false
+               END AS old_left_visible,
+               CASE %7$L
+                 WHEN 'left' THEN
+                   presence.join_key='null'::jsonb
+                     OR presence.new_right_count=0
+                 WHEN 'full' THEN
+                   presence.join_key='null'::jsonb
+                     OR presence.new_right_count=0
+                 WHEN 'semi' THEN
+                   presence.join_key<>'null'::jsonb
+                     AND presence.new_right_count>0
+                 WHEN 'anti' THEN
+                   presence.join_key='null'::jsonb
+                     OR presence.new_right_count=0
+                 WHEN 'null_anti' THEN
+                   global.old_any_count+global.any_delta=0
+                   OR (
+                     presence.join_key<>'null'::jsonb
+                     AND global.old_null_count+global.null_delta=0
+                     AND presence.new_right_count=0
+                   )
+                 ELSE false
+               END AS new_left_visible,
+               (
+                 presence.join_key='null'::jsonb
+                   OR presence.old_left_count=0
+               ) AS old_right_visible,
+               (
+                 presence.join_key='null'::jsonb
+                   OR presence.new_left_count=0
+               ) AS new_right_visible
+        FROM key_presence presence
+        CROSS JOIN right_global global
+      ),
+      matched_candidates AS (
+        SELECT CASE
+          WHEN %7$L IN ('inner','left','right','full') THEN
+            coalesce((
+              SELECT sum(left_event_rows*right_rows)
+              FROM visibility
+              WHERE join_key<>'null'::jsonb
+            ),0)
+            +coalesce((
+              SELECT sum(right_event_rows*left_rows)
+              FROM visibility
+              WHERE join_key<>'null'::jsonb
+            ),0)
+            +coalesce((
+              SELECT sum(left_event_rows*right_event_rows)
+              FROM visibility
+              WHERE join_key<>'null'::jsonb
+            ),0)
+          ELSE 0::numeric
+        END AS row_count
+      ),
+      boundary_candidates AS (
+        SELECT
+          coalesce(sum(
+            CASE
+              WHEN %7$L IN ('left','full','semi','anti','null_anti')
+                   AND new_left_visible
+              THEN left_event_rows ELSE 0
+            END
+            +CASE
+               WHEN %7$L IN ('left','full','semi','anti','null_anti')
+                    AND old_left_visible IS DISTINCT FROM new_left_visible
+               THEN left_rows ELSE 0
+             END
+            +CASE
+               WHEN %7$L IN ('right','full') AND new_right_visible
+               THEN right_event_rows ELSE 0
+             END
+            +CASE
+               WHEN %7$L IN ('right','full')
+                    AND old_right_visible IS DISTINCT FROM new_right_visible
+               THEN right_rows ELSE 0
+             END
+          ),0)::numeric AS row_count
+        FROM visibility
+      )
+      SELECT matched.row_count+boundary.row_count
+      FROM matched_candidates matched
+      CROSS JOIN boundary_candidates boundary
+      $candidate_preflight$,
+      left_name,
+      join_view.left_join_column,
+      left_pre_filter_sql,
+      right_name,
+      join_view.right_join_column,
+      right_pre_filter_sql,
+      join_view.join_type
+    );
+    -- A failed first compilation can leave a partial program generation.
+    -- Rebuild preflight, Stage, and consume plans together.
+    FOR prepared_name IN
+      SELECT name
+      FROM pg_prepared_statements
+      WHERE name IN (
+        preflight_plan_name::text,
+        stage_plan_name::text,
+        consume_plan_name::text
+      )
+      ORDER BY name
+    LOOP
+      EXECUTE format('DEALLOCATE %I',prepared_name);
+    END LOOP;
+    EXECUTE format(
+      'PREPARE %I (oid,oid,oid,pg_lsn) AS %s',
+      preflight_plan_name,candidate_preflight_sql
+    );
+    IF candidate_screen_upper_bound>max_stage_rows THEN
+      EXECUTE preflight_execute_sql INTO STRICT candidate_upper_bound;
+      IF candidate_upper_bound>max_stage_rows THEN
+        RAISE EXCEPTION
+          'Shiba JOIN commit % for result % may generate % candidates, limit %',
+          p_commit_lsn,result_relation::regclass,
+          candidate_upper_bound,max_stage_rows
+          USING ERRCODE='53400',
+                HINT='Increase shiba.max_stage_rows, split the source transaction, or reduce JOIN fanout.';
+      END IF;
+    END IF;
 
     stage_statement_sql := format(
       $stage_statement$
@@ -786,6 +1127,13 @@ BEGIN
       stage_plan_name,stage_statement_sql
     );
     EXECUTE stage_execute_sql INTO STRICT staged_rows,arrangement_rows;
+    IF staged_rows>max_stage_rows THEN
+      RAISE EXCEPTION
+        'Shiba JOIN commit % for result % produced % Stage rows, limit %',
+        p_commit_lsn,result_relation::regclass,staged_rows,max_stage_rows
+        USING ERRCODE='53400',
+              HINT='Increase shiba.max_stage_rows or reduce JOIN fanout.';
+    END IF;
     IF staged_rows>=1024 THEN
       EXECUTE format('ANALYZE %s',stage_name);
     END IF;

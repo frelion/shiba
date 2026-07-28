@@ -25,6 +25,7 @@ CREATE TABLE shiba_internal.stream_views (
     sum_input_column name,
     sum_column name,
     activation_lsn pg_lsn NOT NULL,
+    creator_oid oid NOT NULL DEFAULT (session_user::regrole::oid),
     -- Composite-to-JSONB identity must use the same type-output settings at
     -- registration/backfill and later Runtime apply.
     execution_settings jsonb NOT NULL DEFAULT jsonb_build_object(
@@ -181,6 +182,45 @@ CREATE TABLE shiba_internal.distinct_state (
     PRIMARY KEY(result_oid,group_key,value_key)
 );
 
+-- Shared, rebuildable fold Stages for single-source aggregates.  They are
+-- keyed by result and source commit so a Runtime replay cannot mix summaries
+-- from different DAG commits.  UNLOGGED avoids WAL duplication; PostgreSQL
+-- transaction rollback still makes state/sink application atomic.
+CREATE UNLOGGED TABLE shiba_internal.aggregate_group_fold_stage (
+    result_oid oid NOT NULL
+        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
+    commit_lsn pg_lsn NOT NULL,
+    group_key jsonb NOT NULL,
+    row_count_delta bigint NOT NULL,
+    row_count_min_prefix bigint NOT NULL,
+    count_value_delta bigint NOT NULL DEFAULT 0,
+    sum_nonnull_delta bigint NOT NULL,
+    sum_nonnull_min_prefix bigint NOT NULL,
+    sum_delta numeric NOT NULL,
+    PRIMARY KEY (result_oid,commit_lsn,group_key)
+);
+
+CREATE UNLOGGED TABLE shiba_internal.aggregate_distinct_fold_stage (
+    result_oid oid NOT NULL
+        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
+    commit_lsn pg_lsn NOT NULL,
+    group_key jsonb NOT NULL,
+    value_key jsonb NOT NULL,
+    multiplicity_delta bigint NOT NULL,
+    multiplicity_min_prefix bigint NOT NULL,
+    PRIMARY KEY (result_oid,commit_lsn,group_key,value_key)
+);
+
+CREATE UNLOGGED TABLE shiba_internal.distinct_fold_stage (
+    result_oid oid NOT NULL
+        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
+    commit_lsn pg_lsn NOT NULL,
+    row_key jsonb NOT NULL,
+    multiplicity_delta bigint NOT NULL,
+    minimum_prefix bigint NOT NULL,
+    PRIMARY KEY (result_oid,commit_lsn,row_key)
+);
+
 CREATE TABLE shiba_internal.window_views (
     result_oid oid PRIMARY KEY REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
     partition_column name NOT NULL,
@@ -245,6 +285,8 @@ CREATE TABLE shiba_internal.view_progress (
 -- one transaction.  This row is the transaction header used by bounded GC.
 CREATE TABLE shiba_internal.routed_transactions (
     commit_lsn pg_lsn PRIMARY KEY,
+    event_count bigint NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+    payload_bytes bigint NOT NULL DEFAULT 0 CHECK (payload_bytes >= 0),
     routed_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 

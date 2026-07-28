@@ -351,6 +351,16 @@ DECLARE
     source_commit_lsn pg_lsn := commit_lsn;
     use_unary_batch boolean :=
       execution_pipeline IN ('window','distinct','topn');
+    commit_event_count bigint;
+    commit_payload_bytes bigint;
+    max_commit_rows bigint := coalesce(
+      nullif(current_setting('shiba.max_commit_rows',true),'')::bigint,
+      1000000
+    );
+    max_commit_bytes bigint := coalesce(
+      nullif(current_setting('shiba.max_commit_bytes',true),'')::bigint,
+      1073741824
+    );
 BEGIN
     IF jsonb_typeof(execution_descriptor) IS DISTINCT FROM 'object'
        OR left_source_oid IS NULL
@@ -397,6 +407,20 @@ BEGIN
         'logical plan left input disagrees with metadata for result %',
         result_relation
         USING ERRCODE='P0S01';
+    END IF;
+
+    SELECT routed.event_count,routed.payload_bytes
+    INTO STRICT commit_event_count,commit_payload_bytes
+    FROM shiba_internal.routed_transactions routed
+    WHERE routed.commit_lsn=source_commit_lsn;
+    IF commit_event_count>max_commit_rows
+       OR commit_payload_bytes>max_commit_bytes THEN
+      RAISE EXCEPTION
+        'Shiba source commit % exceeds Runtime admission: % rows/% bytes, limits %/%',
+        source_commit_lsn,commit_event_count,commit_payload_bytes,
+        max_commit_rows,max_commit_bytes
+        USING ERRCODE='53400',
+              HINT='Increase shiba.max_commit_rows/max_commit_bytes or split the source transaction.';
     END IF;
 
     IF execution_pipeline='aggregate' THEN
@@ -519,9 +543,27 @@ BEGIN
           error_detail = PG_EXCEPTION_DETAIL,
           error_hint = PG_EXCEPTION_HINT;
 
-        -- Resource exhaustion, operator intervention, and system failures are
-        -- Runtime/backend failures rather than deterministic DAG failures.
-        -- Propagate them so PostgreSQL can abort/restart the singleton Runtime.
+        -- A configured resource ceiling is a per-DAG pause, not a Runtime
+        -- crash.  The exception block has rolled back every operator mutation,
+        -- so retaining the inbox row and disabling this DAG is atomic.  An
+        -- administrator can raise the ceiling and explicitly resume it.
+        IF error_state='53400' THEN
+          UPDATE shiba_internal.dag_runtime_state
+          SET active = false,
+              last_error = concat_ws(
+                E'\n',
+                format('[%s] %s', error_state, error_message),
+                nullif(error_detail, ''),
+                nullif(error_hint, '')
+              ),
+              failed_at = clock_timestamp()
+          WHERE result_oid = result_relation;
+          RETURN 'resource_blocked';
+        END IF;
+
+        -- Uncontrolled resource exhaustion, operator intervention, and system
+        -- failures remain Runtime/backend failures. Propagate them so
+        -- PostgreSQL can abort/restart the singleton Runtime.
         -- PL/pgSQL's OTHERS does not catch query_canceled, so 57014 already
         -- propagates without reaching this branch.
         IF left(error_state,2) IN ('40','53','54','57','58','XX') THEN

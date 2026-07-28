@@ -1,5 +1,6 @@
 use pgrx::prelude::*;
 
+mod config;
 mod ddl;
 mod filter;
 mod logical;
@@ -80,6 +81,7 @@ pgrx::extension_sql_file!(
 #[allow(non_snake_case)]
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    config::init();
     unsafe {
         ddl::install_process_utility_hook();
         worker::install_runtime_wakeup_callback();
@@ -109,6 +111,52 @@ mod tests {
     #[pg_test]
     fn version_is_available() {
         assert_eq!(version(), "0.1.0");
+    }
+
+    #[pg_test]
+    fn runtime_resource_gucs_are_registered_and_apply_to_the_session() {
+        assert_eq!(
+            Spi::get_one::<i32>("SELECT current_setting('shiba.stage_chunk_rows', true)::integer")
+                .expect("stage_chunk_rows should be readable"),
+            Some(2_048)
+        );
+        assert_eq!(
+            Spi::get_one::<i32>("SELECT current_setting('shiba.max_stage_rows', true)::integer")
+                .expect("max_stage_rows should be readable"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            Spi::get_one::<i32>("SELECT current_setting('shiba.max_cached_dags', true)::integer")
+                .expect("max_cached_dags should be readable"),
+            Some(128)
+        );
+        assert_eq!(
+            Spi::get_one::<i32>("SELECT current_setting('shiba.max_commit_rows', true)::integer")
+                .expect("max_commit_rows should be readable"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            Spi::get_one::<i32>("SELECT current_setting('shiba.max_commit_bytes', true)::integer")
+                .expect("max_commit_bytes should be readable"),
+            Some(1_073_741_824)
+        );
+
+        worker::configure_runtime_session();
+
+        let settings = Spi::get_three::<String, String, String>(
+            "SELECT current_setting('work_mem'),
+                    current_setting('temp_file_limit'),
+                    current_setting('plan_cache_mode')",
+        )
+        .expect("Runtime session settings should be readable");
+        assert_eq!(settings.0.as_deref(), Some("16MB"));
+        assert_eq!(settings.1.as_deref(), Some("1GB"));
+        assert_eq!(settings.2.as_deref(), Some("force_generic_plan"));
+        assert_eq!(
+            Spi::get_one::<f64>("SELECT current_setting('hash_mem_multiplier')::double precision")
+                .expect("hash_mem_multiplier should be readable"),
+            Some(1.0)
+        );
     }
 
     #[pg_test]

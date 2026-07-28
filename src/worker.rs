@@ -4,12 +4,13 @@
 //! garbage collection are bounded phases of one SPI-connected PostgreSQL
 //! backend. A DAG runtime is plan metadata, never a process or thread.
 
-use crate::{logical, pgoutput};
+use crate::{config, logical, pgoutput};
 use pgrx::bgworkers::*;
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -144,13 +145,12 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
     {
         return;
     }
-    BackgroundWorker::transaction(|| {
-        Spi::run("SET plan_cache_mode=force_generic_plan")
-            .expect("Shiba Runtime could not configure its physical plan cache");
-    });
+    BackgroundWorker::transaction(configure_runtime_session);
 
     log!("Shiba Runtime started for database {database_name}");
-    let runtimes = Mutex::new(HashMap::<pg_sys::Oid, logical::DagRuntime>::new());
+    let runtimes = Mutex::new(DeterministicLru::<pg_sys::Oid, logical::DagRuntime>::new(
+        config::max_cached_dags(),
+    ));
     let mut round_robin_cursor = None;
     let mut idle = false;
     let mut next_gc = Instant::now();
@@ -171,12 +171,12 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
             RuntimePhase::Worked(count) => count,
         };
 
-        let Some((active_dags, ready_dags)) = BackgroundWorker::transaction(|| {
+        let Some(ready_dags) = BackgroundWorker::transaction(|| {
             if !runtime_is_active() {
                 return None;
             }
             update_runtime_heartbeat();
-            Some((active_dag_generations(), ready_dag_oids()))
+            Some(ready_dag_oids(round_robin_cursor))
         }) else {
             break 'runtime;
         };
@@ -184,17 +184,11 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
             let mut runtimes = runtimes
                 .lock()
                 .expect("Shiba DAG runtime cache mutex was poisoned");
-            let mut obsolete = Vec::new();
-            runtimes.retain(|result_oid, runtime| {
-                let keep = active_dags
-                    .get(result_oid)
-                    .is_some_and(|generation| runtime.matches_generation(generation));
-                if !keep {
-                    obsolete.push((*result_oid, runtime.generation().to_owned()));
-                }
-                keep
-            });
-            obsolete
+            runtimes
+                .set_capacity(config::max_cached_dags())
+                .into_iter()
+                .map(|(result_oid, runtime)| (result_oid, runtime.generation().to_owned()))
+                .collect::<Vec<_>>()
         };
         if !obsolete_runtimes.is_empty() {
             BackgroundWorker::transaction(|| {
@@ -288,6 +282,7 @@ enum DagStep {
     Inactive,
     Retry,
     Processed { has_more: bool },
+    ResourceBlocked,
     Quarantined,
     Idle,
 }
@@ -301,7 +296,7 @@ enum ApplyPhase {
 }
 
 fn apply_ready_dags_bounded(
-    runtimes: &Mutex<HashMap<pg_sys::Oid, logical::DagRuntime>>,
+    runtimes: &Mutex<DeterministicLru<pg_sys::Oid, logical::DagRuntime>>,
     round_robin_cursor: &mut Option<pg_sys::Oid>,
     mut ready_dags: Vec<pg_sys::Oid>,
 ) -> ApplyPhase {
@@ -341,7 +336,7 @@ fn apply_ready_dags_bounded(
                     ready_dags.push_back(result_oid);
                 }
             }
-            DagStep::Quarantined => {
+            DagStep::ResourceBlocked | DagStep::Quarantined => {
                 worked += 1;
             }
             // Retry once in this round, then give other DAGs and Runtime phases
@@ -358,7 +353,7 @@ fn apply_ready_dags_bounded(
 }
 
 fn apply_one_dag_transaction(
-    runtimes: &Mutex<HashMap<pg_sys::Oid, logical::DagRuntime>>,
+    runtimes: &Mutex<DeterministicLru<pg_sys::Oid, logical::DagRuntime>>,
     result_oid: pg_sys::Oid,
 ) -> DagStep {
     let step = BackgroundWorker::transaction(|| {
@@ -379,7 +374,7 @@ fn apply_one_dag_transaction(
         let generation =
             dag_generation(result_oid).expect("active Shiba DAG has no runtime generation");
         if runtimes
-            .get(&result_oid)
+            .peek(&result_oid)
             .is_some_and(|runtime| !runtime.matches_generation(&generation))
         {
             if let Some(runtime) = runtimes.remove(&result_oid) {
@@ -388,10 +383,14 @@ fn apply_one_dag_transaction(
                     .expect("Shiba could not release a superseded physical program");
             }
         }
-        if let std::collections::hash_map::Entry::Vacant(entry) = runtimes.entry(result_oid) {
+        if !runtimes.contains_key(&result_oid) {
             match logical::DagRuntime::load(result_oid) {
                 Ok(logical::LoadOutcome::Loaded(runtime)) => {
-                    entry.insert(runtime);
+                    for (_, evicted) in runtimes.insert(result_oid, runtime) {
+                        evicted
+                            .release_physical_programs()
+                            .expect("Shiba could not release an evicted physical program");
+                    }
                 }
                 Ok(logical::LoadOutcome::Retry) => return DagStep::Retry,
                 Ok(logical::LoadOutcome::Quarantined) => return DagStep::Quarantined,
@@ -402,11 +401,16 @@ fn apply_one_dag_transaction(
                 }
             }
         }
-        let runtime = runtimes
-            .get(&result_oid)
-            .expect("Shiba DAG runtime cache lost a loaded DAG");
-        let outcome = process_next_dag_transaction(result_oid, runtime);
-        if matches!(outcome, DagStep::Inactive | DagStep::Quarantined) {
+        let outcome = {
+            let runtime = runtimes
+                .get(&result_oid)
+                .expect("Shiba DAG runtime cache lost a loaded DAG");
+            process_next_dag_transaction(result_oid, runtime)
+        };
+        if matches!(
+            outcome,
+            DagStep::Inactive | DagStep::ResourceBlocked | DagStep::Quarantined
+        ) {
             if let Some(runtime) = runtimes.remove(&result_oid) {
                 runtime
                     .release_physical_programs()
@@ -431,6 +435,7 @@ fn process_next_dag_transaction(result_oid: pg_sys::Oid, runtime: &logical::DagR
         .expect("Shiba could not execute the next DAG inbox transaction");
     match apply_result.outcome {
         logical::NextApplyOutcome::Retry => return DagStep::Retry,
+        logical::NextApplyOutcome::ResourceBlocked => return DagStep::ResourceBlocked,
         logical::NextApplyOutcome::Quarantined => return DagStep::Quarantined,
         logical::NextApplyOutcome::Inactive => return DagStep::Inactive,
         logical::NextApplyOutcome::Idle => return DagStep::Idle,
@@ -473,14 +478,17 @@ fn process_next_dag_transaction(result_oid: pg_sys::Oid, runtime: &logical::DagR
 }
 
 fn gc_change_log() -> i64 {
-    Spi::get_one_with_args::<i64>("SELECT shiba._gc_change_log($1)", unsafe {
+    let collected = Spi::get_one_with_args::<i64>("SELECT shiba._gc_change_log($1)", unsafe {
         &[DatumWithOid::new(
             GC_MAX_TRANSACTIONS_PER_ROUND,
             pg_sys::INT4OID,
         )]
     })
     .expect("Shiba could not garbage-collect its change log")
-    .unwrap_or(0)
+    .unwrap_or(0);
+    Spi::run("SELECT shiba_internal._compact_shared_fold_stages()")
+        .expect("Shiba could not compact its empty shared fold Stages");
+    collected
 }
 
 fn rotate_after_cursor(result_oids: &mut [pg_sys::Oid], cursor: Option<pg_sys::Oid>) {
@@ -496,6 +504,130 @@ fn reload_config_if_requested() {
         unsafe {
             pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
         }
+        BackgroundWorker::transaction(configure_runtime_session);
+    }
+}
+
+pub(crate) fn configure_runtime_session() {
+    let work_mem = config::format_kilobytes(config::runtime_work_mem_kb());
+    let temp_file_limit = config::format_kilobytes(config::runtime_temp_file_limit_kb());
+    let arguments = unsafe {
+        [
+            DatumWithOid::new(work_mem.as_str(), pg_sys::TEXTOID),
+            DatumWithOid::new(temp_file_limit.as_str(), pg_sys::TEXTOID),
+        ]
+    };
+    Spi::run_with_args(
+        "SELECT set_config('plan_cache_mode', 'force_generic_plan', false),
+                set_config('work_mem', $1, false),
+                set_config('temp_file_limit', $2, false),
+                set_config('hash_mem_multiplier', '1', false)",
+        &arguments,
+    )
+    .expect("Shiba Runtime could not configure its PostgreSQL session");
+}
+
+struct CachedValue<V> {
+    value: V,
+    last_used: u64,
+}
+
+/// A deterministic backend-local LRU.
+///
+/// The monotonically increasing access sequence uniquely defines recency,
+/// making capacity shrink and defensive clock rollover stable.
+struct DeterministicLru<K, V> {
+    entries: HashMap<K, CachedValue<V>>,
+    capacity: usize,
+    access_sequence: u64,
+}
+
+impl<K, V> DeterministicLru<K, V>
+where
+    K: Copy + Eq + Hash,
+{
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "LRU capacity must be positive");
+        Self {
+            entries: HashMap::new(),
+            capacity,
+            access_sequence: 0,
+        }
+    }
+
+    fn contains_key(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn peek(&self, key: &K) -> Option<&V> {
+        self.entries.get(key).map(|cached| &cached.value)
+    }
+
+    fn get(&mut self, key: &K) -> Option<&V> {
+        let sequence = self.next_sequence();
+        let cached = self.entries.get_mut(key)?;
+        cached.last_used = sequence;
+        Some(&cached.value)
+    }
+
+    fn insert(&mut self, key: K, value: V) -> Vec<(K, V)> {
+        let sequence = self.next_sequence();
+        self.entries.insert(
+            key,
+            CachedValue {
+                value,
+                last_used: sequence,
+            },
+        );
+        self.evict_to_capacity()
+    }
+
+    fn remove(&mut self, key: &K) -> Option<V> {
+        self.entries.remove(key).map(|cached| cached.value)
+    }
+
+    fn set_capacity(&mut self, capacity: usize) -> Vec<(K, V)> {
+        assert!(capacity > 0, "LRU capacity must be positive");
+        self.capacity = capacity;
+        self.evict_to_capacity()
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        if self.access_sequence == u64::MAX {
+            let mut recency = self
+                .entries
+                .iter()
+                .map(|(key, cached)| (*key, cached.last_used))
+                .collect::<Vec<_>>();
+            recency.sort_by_key(|(_, last_used)| *last_used);
+            for (index, (key, _)) in recency.into_iter().enumerate() {
+                self.entries
+                    .get_mut(&key)
+                    .expect("LRU key disappeared during clock normalization")
+                    .last_used = u64::try_from(index + 1).expect("LRU cache is too large");
+            }
+            self.access_sequence =
+                u64::try_from(self.entries.len()).expect("LRU cache is too large");
+        }
+        self.access_sequence += 1;
+        self.access_sequence
+    }
+
+    fn evict_to_capacity(&mut self) -> Vec<(K, V)> {
+        let mut evicted = Vec::new();
+        while self.entries.len() > self.capacity {
+            let key = self
+                .entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(key, _)| *key)
+                .expect("over-capacity LRU had no eviction candidate");
+            let value = self
+                .remove(&key)
+                .expect("LRU eviction candidate disappeared");
+            evicted.push((key, value));
+        }
+        evicted
     }
 }
 
@@ -708,54 +840,62 @@ fn dag_generation(result_oid: pg_sys::Oid) -> Option<String> {
     .expect("Shiba could not inspect the DAG runtime generation")
 }
 
-fn ready_dag_oids() -> Vec<pg_sys::Oid> {
+fn ready_dag_oids(cursor: Option<pg_sys::Oid>) -> Vec<pg_sys::Oid> {
+    let limit = i32::try_from(APPLY_MAX_TRANSACTIONS_PER_ROUND)
+        .expect("apply transaction round limit exceeds integer");
+    let mut ready = ready_dag_oids_in_range(cursor, true, limit);
+    if cursor.is_some() && ready.len() < APPLY_MAX_TRANSACTIONS_PER_ROUND {
+        let remaining = i32::try_from(APPLY_MAX_TRANSACTIONS_PER_ROUND - ready.len())
+            .expect("remaining ready DAG limit exceeds integer");
+        ready.extend(ready_dag_oids_in_range(cursor, false, remaining));
+    }
+    ready
+}
+
+fn ready_dag_oids_in_range(
+    cursor: Option<pg_sys::Oid>,
+    after_cursor: bool,
+    limit: i32,
+) -> Vec<pg_sys::Oid> {
     Spi::connect_mut(|client| {
+        let (predicate, arguments) = match cursor {
+            Some(cursor) => {
+                let comparison = if after_cursor { ">" } else { "<=" };
+                (
+                    format!("AND runtime.result_oid {comparison} $1::oid"),
+                    unsafe {
+                        vec![
+                            DatumWithOid::new(cursor, pg_sys::OIDOID),
+                            DatumWithOid::new(limit, pg_sys::INT4OID),
+                        ]
+                    },
+                )
+            }
+            None => (String::new(), unsafe {
+                vec![DatumWithOid::new(limit, pg_sys::INT4OID)]
+            }),
+        };
+        let limit_parameter = if cursor.is_some() { "$2" } else { "$1" };
+        let query = format!(
+            "SELECT runtime.result_oid
+             FROM shiba_internal.dag_runtime_state runtime
+             WHERE runtime.active
+               {predicate}
+               AND EXISTS (
+                   SELECT 1
+                   FROM shiba_internal.dag_inbox inbox
+                   WHERE inbox.result_oid = runtime.result_oid
+               )
+             ORDER BY runtime.result_oid
+             LIMIT {limit_parameter}"
+        );
         client
-            .update(
-                "SELECT runtime.result_oid
-                 FROM shiba_internal.dag_runtime_state runtime
-                 WHERE runtime.active
-                   AND EXISTS (
-                       SELECT 1
-                       FROM shiba_internal.dag_inbox inbox
-                       WHERE inbox.result_oid = runtime.result_oid
-                   )
-                 ORDER BY runtime.result_oid",
-                None,
-                &[],
-            )
+            .update(&query, None, &arguments)
             .expect("Shiba could not discover ready DAGs")
             .map(|row| {
                 row.get::<pg_sys::Oid>(1)
                     .expect("invalid ready DAG OID")
                     .expect("NULL ready DAG OID")
-            })
-            .collect()
-    })
-}
-
-fn active_dag_generations() -> HashMap<pg_sys::Oid, String> {
-    Spi::connect_mut(|client| {
-        client
-            .update(
-                "SELECT runtime.result_oid,physical.plan_id::text
-                 FROM shiba_internal.dag_runtime_state runtime
-                 JOIN shiba_internal.physical_plans physical USING(result_oid)
-                 WHERE runtime.active",
-                None,
-                &[],
-            )
-            .expect("Shiba could not discover active DAGs")
-            .map(|row| {
-                let result_oid = row
-                    .get::<pg_sys::Oid>(1)
-                    .expect("invalid active DAG OID")
-                    .expect("NULL active DAG OID");
-                let generation = row
-                    .get::<String>(2)
-                    .expect("invalid active DAG generation")
-                    .expect("NULL active DAG generation");
-                (result_oid, generation)
             })
             .collect()
     })
@@ -1195,5 +1335,41 @@ mod tests {
                 .map(pg_sys::Oid::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn runtime_cache_evicts_the_least_recently_used_dag() {
+        let mut cache = DeterministicLru::new(2);
+        assert!(cache.insert(20_u32, "twenty").is_empty());
+        assert!(cache.insert(10_u32, "ten").is_empty());
+        assert_eq!(cache.get(&20), Some(&"twenty"));
+
+        assert_eq!(cache.insert(30, "thirty"), vec![(10, "ten")]);
+        assert!(cache.contains_key(&20));
+        assert!(cache.contains_key(&30));
+        assert!(!cache.contains_key(&10));
+    }
+
+    #[test]
+    fn runtime_cache_capacity_shrink_is_deterministic() {
+        let mut cache = DeterministicLru::new(4);
+        assert!(cache.insert(30_u32, "thirty").is_empty());
+        assert!(cache.insert(10_u32, "ten").is_empty());
+        assert!(cache.insert(20_u32, "twenty").is_empty());
+        assert_eq!(cache.get(&30), Some(&"thirty"));
+
+        assert_eq!(cache.set_capacity(1), vec![(10, "ten"), (20, "twenty")]);
+        assert_eq!(cache.peek(&30), Some(&"thirty"));
+    }
+
+    #[test]
+    fn runtime_cache_replacement_refreshes_recency() {
+        let mut cache = DeterministicLru::new(2);
+        assert!(cache.insert(10_u32, "old").is_empty());
+        assert!(cache.insert(20_u32, "twenty").is_empty());
+        assert!(cache.insert(10_u32, "new").is_empty());
+
+        assert_eq!(cache.insert(30, "thirty"), vec![(20, "twenty")]);
+        assert_eq!(cache.peek(&10), Some(&"new"));
     }
 }

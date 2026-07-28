@@ -25,6 +25,7 @@ pub enum LoadOutcome {
 pub enum NextApplyOutcome {
     Applied,
     Retry,
+    ResourceBlocked,
     Quarantined,
     Inactive,
     Idle,
@@ -121,7 +122,10 @@ impl DagRuntime {
             let outcome = parse_next_apply_outcome(&outcome)?;
             if matches!(
                 outcome,
-                NextApplyOutcome::Applied | NextApplyOutcome::Retry | NextApplyOutcome::Quarantined
+                NextApplyOutcome::Applied
+                    | NextApplyOutcome::Retry
+                    | NextApplyOutcome::ResourceBlocked
+                    | NextApplyOutcome::Quarantined
             ) != commit_lsn.is_some()
             {
                 return Err(format!(
@@ -175,6 +179,7 @@ fn parse_next_apply_outcome(outcome: &str) -> Result<NextApplyOutcome, String> {
     match outcome {
         "applied" => Ok(NextApplyOutcome::Applied),
         "retry" => Ok(NextApplyOutcome::Retry),
+        "resource_blocked" => Ok(NextApplyOutcome::ResourceBlocked),
         "quarantined" => Ok(NextApplyOutcome::Quarantined),
         "inactive" => Ok(NextApplyOutcome::Inactive),
         "idle" => Ok(NextApplyOutcome::Idle),
@@ -215,6 +220,10 @@ mod tests {
         assert_eq!(
             parse_next_apply_outcome("retry"),
             Ok(NextApplyOutcome::Retry)
+        );
+        assert_eq!(
+            parse_next_apply_outcome("resource_blocked"),
+            Ok(NextApplyOutcome::ResourceBlocked)
         );
         assert_eq!(
             parse_next_apply_outcome("quarantined"),
