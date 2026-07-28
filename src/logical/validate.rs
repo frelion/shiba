@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::model::{LogicalNode, LogicalPlan, OperatorKind, LOGICAL_PLAN_VERSION};
+use super::physical::PhysicalDagPlan;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -42,14 +43,8 @@ pub(super) struct ExecutionDescriptor {
     pub(super) join_type: Option<ExecutionJoinType>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct ExecutionPlan {
-    pub(super) descriptor: ExecutionDescriptor,
-    pub(super) source_oids: HashSet<u32>,
-}
-
 impl LogicalPlan {
-    pub(super) fn validate_for(&self, result_oid: u32) -> Result<ExecutionPlan, String> {
+    pub(super) fn validate_for(&self, result_oid: u32) -> Result<PhysicalDagPlan, String> {
         if self.version != LOGICAL_PLAN_VERSION {
             return Err(format!(
                 "unsupported logical plan version {} (expected {LOGICAL_PLAN_VERSION})",
@@ -168,7 +163,7 @@ impl LogicalPlan {
         &self,
         node_indexes: &HashMap<&str, usize>,
         source_oids: HashSet<u32>,
-    ) -> Result<ExecutionPlan, String> {
+    ) -> Result<PhysicalDagPlan, String> {
         let join_nodes: Vec<_> = self
             .nodes
             .iter()
@@ -356,15 +351,16 @@ impl LogicalPlan {
         if source_oids != expected_sources {
             return Err("logical plan scan sources do not match its execution inputs".into());
         }
-        Ok(ExecutionPlan {
-            descriptor: ExecutionDescriptor {
+        PhysicalDagPlan::compile(
+            self,
+            ExecutionDescriptor {
                 pipeline,
                 left_source_oid,
                 right_source_oid,
                 join_type,
             },
             source_oids,
-        })
+        )
     }
 }
 

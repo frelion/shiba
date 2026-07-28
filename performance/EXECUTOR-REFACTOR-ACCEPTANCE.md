@@ -1,81 +1,122 @@
-# Executor 重构验收标准
+# Single Runtime 重构验收标准
 
-本文档定义 executor 调度和批处理重构的阻断门槛。它补充全算子性能矩阵，
-不以最终结果一致性替代事务边界、原子性和 backlog 调度检查。
+本文档保留原文件名以维持已有链接，内容定义单 Runtime、共享 change log
+重构的阻断门槛。算子状态改为 `UNLOGGED` 不属于本次重构。
+
+## 目标资源与数据模型
+
+- 每个 active database 恰好有一个真实 PostgreSQL background worker，
+  backend type 为 `shiba runtime`。
+- Router、scheduler、DAG apply 和 GC 是该 backend 内串行执行的阶段，不是
+  独立进程或 Rust 线程。
+- 每个 DAG 只对应一个缓存的逻辑 `DagRuntime`；增加 DAG 不能增加 backend
+  数量。
+- `change_log(commit_lsn, sequence, source_oid, delta, row_data)` 对每个源
+  delta 只保存一次 payload。
+- `dag_inbox(result_oid, commit_lsn)` 对每个相关 DAG/source transaction
+  只保存一个轻量待办。
+- 算子 SQL 直接读取 `change_log`；Rust 不得把一个 source transaction
+  收集成 payload `Vec` 或重新编码为完整 JSON 数组。
+
+完整设计契约见 `docs/SINGLE-RUNTIME-DESIGN.md`。
 
 ## 可直接运行的命令
 
-最小架构 gate：
-
 ```bash
 ./scripts/test-executor-architecture.sh
-```
-
-完整正确性 gate：
-
-```bash
 ./scripts/test-all.sh
+./scripts/performance-matrix.py
 ```
 
-全算子可复现性能矩阵：
-
-```bash
-python3 scripts/performance-matrix.py
-```
-
-缩短开发反馈时间时，可以降低已有差分测试轮次，但不能用于最终验收：
-
-```bash
-SHIBA_DIFF_ROUNDS=20 ./scripts/test-differential-single.sh
-```
+脚本 `test-executor-architecture.sh` 暂时保留历史文件名。正式性能验收必须使用
+完整未过滤 scenario 集、默认规模和三次 randomized repetitions；smoke、
+filtered 或 aggregate-only 运行只能作为开发反馈。
 
 ## 阻断条件
 
-以下任何一项失败都必须阻断合并：
+以下任一项失败都阻断提交：
 
-1. 一个 source commit 在 `dag_inbox` 中出现多个 `commit_lsn`，或同一
-   DAG/commit 的 `sequence` 不唯一、非正数、没有保持相关事件的 WAL 相对顺序。
-   `sequence` 是整个 source transaction 的全局事件序号；某个 DAG 只接收其
-   相关事件时，起始值不为 1 或存在 gap 都是合法的。
-2. UPDATE 的旧行 `-1` 和新行 `+1` 不属于同一 `commit_lsn`，顺序不是
-   `-1,+1`，或中间穿插其他事件。
-3. executor 可见地删除了 `commit_lsn <= applied_lsn` 范围内的一部分 inbox
-   行，说明 progress 与 inbox acknowledgement 不在同一个原子事务。
-4. backlog drain 后结果与 PostgreSQL 从 source 全量重算的 `EXCEPT ALL`
-   比较不为零。
-5. backlog drain 低于 60 commits/s。该默认门槛明确高于旧实现
-   `25ms wait × 每轮一个 commit` 的约 40 commits/s 结构上限；机器较慢时
-   可以通过环境变量调整开发运行门槛，但正式结果必须保留默认值和原始输出。
-6. 测试 PostgreSQL 日志出现 `WARNING`、`ERROR`、`FATAL` 或 `PANIC`。
-7. `scripts/test-all.sh` 或全算子矩阵的正确性、inbox 清空检查失败。
+1. `runtime_state.owner_pid` 与 `pg_stat_activity` 中的唯一
+   `shiba runtime` 不一致，或仍出现 `shiba worker`、`shiba dag worker`、
+   `shiba router`、`shiba executor`。
+2. DAG 数量或 backlog 增长导致 Shiba backend 数量增长。
+3. 一个源 delta 因多个 DAG 订阅而在 `change_log` 中复制 payload。
+4. 同一 DAG/source transaction 出现多个 inbox 行，或者 transaction 内
+   sequence、UPDATE 的 `-1,+1` 相对顺序丢失。
+5. Rust apply 路径按事件数量构造 `Vec<InboxEvent>`、`Vec<DeltaRow>` 或整批
+   JSON；正式大事务测试必须观测到受控 RSS。
+6. 持续积压 DAG 能饿死另一个 runnable DAG。调度只能在完整 source
+   transaction 之间轮转，不宣称事务内抢占。
+7. 一次 apply 没有将 state、result、`view_progress` 和 inbox acknowledgement
+   一起提交或一起回滚。
+8. transient error 删除待办或部分提交；deterministic error 终止 Runtime、
+   删除 poison 待办、阻止健康 DAG，或 `activate()` 自动清除 quarantine。
+9. Router 在 durable change log/inbox 提交前推进 logical slot，或 crash
+   replay 生成重复 payload/待办。
+10. GC 删除仍被任一 DAG inbox 引用的 change-log transaction；DROP 后无引用
+    payload 又无法被最终清理。
+11. backlog drain 后与 PostgreSQL 全量重算的 `EXCEPT ALL` 不为零。
+12. 普通 correctness/performance 日志出现未预期的 `WARNING`、`ERROR`、
+    `FATAL` 或 `PANIC`；failpoint 只允许精确武装的 Runtime crash。
+13. 未运行完整 correctness gate 和匹配环境的正式性能对比，或存在未解释、
+    未明确接受的统计上有意义性能回归。
 
-## 必须保持的执行语义
+## 必须保持的事务语义
 
-- busy-drain 可以连续领取 commit，但每个 source commit 必须是一个独立的
-  PostgreSQL executor 事务。不要把多个 source commit 包在一个
-  `BackgroundWorker::transaction` 中。
-- 一个 commit 内的 delta 必须严格按 `sequence` 执行；commit N+1 不能在
-  commit N 成功提交前执行。
-- state、sink、`view_progress` 更新和当前 commit 的 inbox 删除必须一起
-  提交或一起回滚。
-- worker crash 后允许重新执行仍在 inbox 中的完整 commit，不能只保留或确认
-  它的一部分。
-- 性能测量必须从 backlog 已经完整路由且 worker 停止的状态开始，到 inbox
-  为零结束；生产 source commit 的时间不能混入 drain 时间。
+Router routing 与 DAG apply 使用不同 PostgreSQL transactions。Router 原子写
+`routed_transactions`、共享 payload 和所有 DAG 待办，提交后才能推进 slot。
 
-## 已知覆盖边界
+每个 DAG apply transaction 只处理一个 `(result_oid, commit_lsn)`：
 
-架构 gate 通过反复读取 MVCC 快照验证可见的 progress/inbox 原子关系，并由
-已有 recovery gate 验证 PostgreSQL immediate restart 后的完整恢复。要精确
-命中“算子已经修改 state、但事务尚未 commit”的进程终止窗口，需要 executor
-提供仅测试构建启用的 failpoint。加入 failpoint 后，应再增加：
+1. 锁定并复核待办；
+2. 按 sequence 从 `change_log` 关系读取相关事件；
+3. 更新 state 和 result；
+4. 推进 progress；
+5. 删除该 DAG 的 inbox 行；
+6. 原子提交。
 
-1. 在指定 commit 的第 N 个 delta 后终止 worker；
-2. 断言 sink、state 和 progress 保持 commit 前快照；
-3. 断言该 commit 的全部 inbox 行仍存在；
-4. 重启 worker，断言只重放一次且最终 `EXCEPT ALL=0`。
+失败重试必须从完整事务边界开始。一个大 source transaction 是不可抢占单元，
+因此性能报告必须单独记录其 cross-DAG blocking latency，而不能用调度
+round-robin 掩盖。
 
-在 failpoint 落地前，不应宣称已经完成确定性的 mid-commit crash 注入覆盖。
-Router 的“inbox 路由事务已提交、slot advance 尚未提交”精确窗口同样还没有
-确定性 failpoint；现有 persistent-slot recovery gate 覆盖进程重启与重放，
-但不能替代对这一条指令边界的定点终止测试。
+## 恢复与 GC 覆盖
+
+确定性 failpoint 至少覆盖：
+
+- route 已提交、slot 尚未推进时 Runtime crash，重启后无重复 payload/待办；
+- apply 已修改 state/result、提交前 Runtime crash，所有效果回滚且待办保留；
+- replacement Runtime 重放一次，最终结果正确；
+- poison DAG quarantine、健康 DAG 继续、修复后显式 retry；
+- PostgreSQL postmaster restart 后由 source statement 或 `activate()` 恢复
+  dynamic Runtime；
+- 最后一个 DAG reference 消失前 payload 不被 GC，消失后最终被清理。
+
+## 正式性能对比
+
+最终报告至少逐场景提供：
+
+- source-write 和 apply/backlog-drain throughput；
+- visibility latency 的中位数和尾延迟；
+- source/result query throughput；
+- PostgreSQL CPU、Runtime RSS、WAL 和 I/O；
+- 大事务峰值 RSS；
+- change-log payload 行数/字节数与 DAG fanout；
+- correctness、失败事务、日志和最终 inbox/change-log 数量；
+- 相对匹配 baseline 的绝对值、百分比变化和三轮离散程度。
+
+矩阵中的 fanout case 必须先将所有参与 DAG 标记为 inactive，等待暂停状态
+可见，再提交源事务。恢复 DAG 前必须从同一个 `commit_lsn` 记录并断言：
+
+- `change_log` 行数等于源 delta 数，`payload_rows_per_source_delta=1`；
+- `dag_inbox` 行数等于参与 DAG 数，
+  `inbox_references_per_dag_transaction=1`。
+
+大事务 case 默认单事务写入 5,000 行，并在暂停 DAG 后覆盖 route 和重新启用后
+apply 的完整区间。`resources.csv` 必须同时含 PostgreSQL 进程树
+`rss_kib` 和唯一 Runtime PID 的 `runtime_rss_kib`；汇总必须输出
+`rss_peak` 与 `runtime_rss_peak`。改变大事务规模会使结果不能与默认正式
+baseline 直接比较。
+
+比较必须保持机器、power mode、PostgreSQL/Rust/pgrx 版本、数据库配置、
+workload checksum、场景规模和重复次数一致。历史 per-result 或
+Router+Executor 报告只能作为历史背景，不能证明 Single Runtime 通过。

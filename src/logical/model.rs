@@ -9,19 +9,6 @@ use serde_json::Value;
 pub const LOGICAL_PLAN_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DeltaRow {
-    pub input: String,
-    pub row: Value,
-    pub diff: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DeltaBatch {
-    pub epoch: String,
-    pub rows: Vec<DeltaRow>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LogicalPlan {
     pub version: u32,
     pub nodes: Vec<LogicalNode>,

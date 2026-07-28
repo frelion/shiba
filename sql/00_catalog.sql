@@ -25,6 +25,20 @@ CREATE TABLE shiba_internal.stream_views (
     sum_input_column name,
     sum_column name,
     activation_lsn pg_lsn NOT NULL,
+    -- Composite-to-JSONB identity must use the same type-output settings at
+    -- registration/backfill and later Runtime apply.
+    execution_settings jsonb NOT NULL DEFAULT jsonb_build_object(
+      'TimeZone',current_setting('TimeZone'),
+      'DateStyle',current_setting('DateStyle'),
+      'IntervalStyle',current_setting('IntervalStyle'),
+      'extra_float_digits',current_setting('extra_float_digits'),
+      'bytea_output',current_setting('bytea_output')
+    ) CHECK (
+      jsonb_typeof(execution_settings)='object'
+      AND execution_settings ?& ARRAY[
+        'TimeZone','DateStyle','IntervalStyle','extra_float_digits','bytea_output'
+      ]
+    ),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
@@ -64,7 +78,9 @@ CREATE TABLE shiba_internal.inner_join_views (
 CREATE TABLE shiba_internal.join_arrangements (
     result_oid oid NOT NULL REFERENCES shiba_internal.inner_join_views(result_oid) ON DELETE CASCADE,
     input_side text NOT NULL CHECK (input_side IN ('left', 'right')),
-    join_key text NOT NULL,
+    -- JSONB preserves SQL NULL separately from an empty string and retains
+    -- equality semantics for typed scalar keys such as numeric 1 and 1.0.
+    join_key jsonb NOT NULL,
     row_data jsonb NOT NULL,
     multiplicity bigint NOT NULL CHECK (multiplicity > 0),
     PRIMARY KEY (result_oid, input_side, join_key, row_data)
@@ -111,6 +127,40 @@ CREATE TABLE shiba_internal.operator_instances (
     config jsonb NOT NULL,
     stateful boolean NOT NULL,
     PRIMARY KEY (result_oid, node_id)
+);
+
+-- A logical graph has one versioned physical plan.  plan_id is a stable,
+-- database-wide identity; version identifies the physical-plan format.
+CREATE TABLE shiba_internal.physical_plans (
+    result_oid oid PRIMARY KEY
+        REFERENCES shiba_internal.stream_graphs(result_oid) ON DELETE CASCADE,
+    plan_id bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
+    version integer NOT NULL CHECK (version > 0),
+    plan jsonb NOT NULL CHECK (jsonb_typeof(plan) = 'object'),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (result_oid, plan_id)
+);
+
+-- Every cataloged v1 Stage relation is typed and UNLOGGED. Inline and
+-- statement-materialized Stages live only in the physical-plan descriptor.
+-- A relation-backed Stage is a rebuildable commit-scoped cache, never durable
+-- operator state.
+CREATE TABLE shiba_internal.physical_stages (
+    result_oid oid NOT NULL,
+    plan_id bigint NOT NULL,
+    stage_id integer NOT NULL CHECK (stage_id >= 0),
+    stage_name text NOT NULL CHECK (btrim(stage_name) <> ''),
+    storage text NOT NULL CHECK (storage = 'unlogged'),
+    relation_oid oid NOT NULL UNIQUE,
+    relation_name name NOT NULL,
+    schema_spec jsonb NOT NULL CHECK (jsonb_typeof(schema_spec) = 'array'),
+    index_spec jsonb NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(index_spec) = 'array'),
+    PRIMARY KEY (result_oid, stage_id),
+    UNIQUE (result_oid, stage_name),
+    FOREIGN KEY (result_oid, plan_id)
+        REFERENCES shiba_internal.physical_plans(result_oid, plan_id)
+        ON DELETE CASCADE
 );
 
 CREATE TABLE shiba_internal.aggregate_state (
@@ -191,38 +241,69 @@ CREATE TABLE shiba_internal.view_progress (
 );
 
 -- Logical slots can replay committed transactions after a crash.  The Router
--- records its routing decision with the inbox rows in one transaction.
+-- records its routing decision with the shared payload and DAG references in
+-- one transaction.  This row is the transaction header used by bounded GC.
 CREATE TABLE shiba_internal.routed_transactions (
     commit_lsn pg_lsn PRIMARY KEY,
     routed_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
--- Each result DAG receives a private, durable, commit-ordered input stream.
-CREATE TABLE shiba_internal.dag_inbox (
-    result_oid oid NOT NULL REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
+-- Every decoded row delta is stored once, independent of the number of DAGs
+-- that consume it. Routing normalizes pgoutput text fields to typed JSONB once
+-- after the complete commit is present. Operator state and results remain
+-- LOGGED.
+CREATE TABLE shiba_internal.change_log (
     commit_lsn pg_lsn NOT NULL,
     sequence integer NOT NULL CHECK (sequence > 0),
     source_oid oid NOT NULL,
     delta integer NOT NULL CHECK (delta IN (-1, 1)),
     row_data jsonb NOT NULL,
-    PRIMARY KEY (result_oid, commit_lsn, sequence)
+    PRIMARY KEY (commit_lsn, sequence),
+    FOREIGN KEY (commit_lsn)
+        REFERENCES shiba_internal.routed_transactions(commit_lsn)
+        ON DELETE CASCADE
 );
 
-CREATE INDEX shiba_dag_inbox_pending_idx
-    ON shiba_internal.dag_inbox (result_oid, commit_lsn, sequence);
+-- A DAG inbox row is transaction-level work, not another payload copy.
+-- RESTRICT makes deleting a routed transaction (and therefore its change-log
+-- payload) impossible while any DAG still needs that source transaction.
+CREATE TABLE shiba_internal.dag_inbox (
+    result_oid oid NOT NULL
+        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
+    commit_lsn pg_lsn NOT NULL
+        REFERENCES shiba_internal.routed_transactions(commit_lsn) ON DELETE RESTRICT,
+    PRIMARY KEY (result_oid, commit_lsn)
+);
 
-CREATE TABLE shiba_internal.dag_worker_state (
+CREATE INDEX shiba_dag_inbox_commit_idx
+    ON shiba_internal.dag_inbox (commit_lsn);
+
+-- DAGs are logical runtimes scheduled cooperatively by the Runtime.  This
+-- table intentionally contains no PostgreSQL-process lease or heartbeat.
+CREATE TABLE shiba_internal.dag_runtime_state (
     result_oid oid PRIMARY KEY REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
     active boolean NOT NULL DEFAULT true,
-    last_heartbeat timestamptz,
-    last_requested_at timestamptz
+    last_scheduled_at timestamptz,
+    last_error text,
+    failed_at timestamptz,
+    CHECK ((last_error IS NULL) = (failed_at IS NULL))
 );
 
-CREATE TABLE shiba_internal.worker_state (
+-- One dynamic "shiba runtime" process owns routing, DAG scheduling, apply, and
+-- change-log GC for this database.
+CREATE TABLE shiba_internal.runtime_state (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     active boolean NOT NULL DEFAULT false,
+    owner_pid integer CHECK (owner_pid > 0),
+    started_at timestamptz,
     last_heartbeat timestamptz,
-    last_requested_at timestamptz
+    last_requested_at timestamptz,
+    launch_generation bigint NOT NULL DEFAULT 0 CHECK (launch_generation >= 0),
+    pending_launch_xid xid8,
+    pending_since timestamptz,
+    CHECK ((owner_pid IS NULL) = (started_at IS NULL)),
+    CHECK ((pending_launch_xid IS NULL) = (pending_since IS NULL)),
+    CHECK (owner_pid IS NULL OR pending_launch_xid IS NULL)
 );
 
-INSERT INTO shiba_internal.worker_state (singleton) VALUES (true);
+INSERT INTO shiba_internal.runtime_state (singleton) VALUES (true);

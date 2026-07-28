@@ -1,203 +1,502 @@
-//! Background workers: one database-level WAL Router and one executor per DAG.
+//! One database-level Runtime background worker.
+//!
+//! WAL routing, DAG scheduling, relational operator execution, and change-log
+//! garbage collection are bounded phases of one SPI-connected PostgreSQL
+//! backend. A DAG runtime is plan metadata, never a process or thread.
 
 use crate::{logical, pgoutput};
 use pgrx::bgworkers::*;
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const ROUTER_IDLE_WAIT: Duration = Duration::from_millis(100);
-const ROUTER_MAX_BATCHES_PER_ROUND: usize = 16;
-const ROUTER_DRAIN_BUDGET: Duration = Duration::from_millis(50);
-const DAG_IDLE_WAIT: Duration = Duration::from_millis(25);
-const DAG_MAX_COMMITS_PER_ROUND: usize = 64;
-const DAG_DRAIN_BUDGET: Duration = Duration::from_millis(50);
+const RUNTIME_IDLE_WAIT: Duration = Duration::from_millis(25);
+const ROUTE_MAX_TRANSACTIONS_PER_ROUND: usize = 64;
+const ROUTE_MAX_DECODED_CHANGES: i32 = 2048;
+const ROUTE_TIME_BUDGET: Duration = Duration::from_millis(50);
+const APPLY_MAX_TRANSACTIONS_PER_ROUND: usize = 64;
+const APPLY_TIME_BUDGET: Duration = Duration::from_millis(50);
+const GC_MAX_TRANSACTIONS_PER_ROUND: i32 = 64;
+const GC_INTERVAL: Duration = Duration::from_millis(250);
+const LAUNCH_TRANSACTION_WAIT: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const PROC_ARRAY_LWLOCK_INDEX_PG17: usize = 4;
 
-#[derive(Debug)]
-struct InboxEvent {
-    commit_lsn: String,
-    source_oid: i32,
-    delta: i32,
-    row_data: String,
+// Backend-local: one pending wakeup per top-level source transaction,
+// regardless of statement count or how many DAG triggers share a source.
+static PENDING_RUNTIME_WAKE_PID: AtomicI32 = AtomicI32::new(0);
+
+unsafe extern "C-unwind" fn runtime_sigterm(signal: i32) {
+    unsafe {
+        pg_sys::die(signal);
+    }
 }
 
-/// Start the one per-database worker that owns the logical replication slot.
+/// Start the one Runtime process for the current database.
 #[pg_extern]
-pub fn start_worker() -> bool {
+pub fn start_runtime(launch_generation: i64) -> bool {
+    if launch_generation <= 0 {
+        return false;
+    }
     let database_name = current_database_name();
-    BackgroundWorkerBuilder::new("shiba worker")
+    let launch_xid = current_transaction_id();
+    let worker_extra = format!("{database_name}:{launch_xid}:{launch_generation}");
+    BackgroundWorkerBuilder::new("shiba runtime")
         .set_library("shiba")
-        .set_function("shiba_background_worker_main")
-        .set_extra(&database_name)
+        .set_function("shiba_runtime_main")
+        .set_extra(&worker_extra)
+        .set_restart_time(Some(Duration::from_secs(1)))
         .enable_spi_access()
         .load_dynamic()
         .is_ok()
 }
 
-/// Start one executor for a result DAG.  Its input is the durable dag_inbox,
-/// never the logical replication slot itself.
+/// Schedule a latch wakeup only after the caller's source transaction commits.
+///
+/// The SQL wrapper supplies the current Runtime owner PID from protected
+/// catalog state. No row payload crosses this process-only signal.
 #[pg_extern]
-pub fn start_view_worker(result_oid: i32) -> bool {
-    let worker_extra = format!("{}:{result_oid}", current_database_name());
-    BackgroundWorkerBuilder::new("shiba dag worker")
-        .set_library("shiba")
-        .set_function("shiba_view_worker_main")
-        .set_extra(&worker_extra)
-        .enable_spi_access()
-        .load_dynamic()
-        .is_ok()
+pub fn wake_runtime_on_commit(owner_pid: i32) -> bool {
+    if owner_pid <= 0 {
+        return false;
+    }
+    PENDING_RUNTIME_WAKE_PID.store(owner_pid, Ordering::Release);
+    true
+}
+
+pub unsafe fn install_runtime_wakeup_callback() {
+    pg_sys::RegisterXactCallback(Some(runtime_wakeup_xact_callback), std::ptr::null_mut());
 }
 
 #[pg_guard]
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn shiba_background_worker_main(_arg: pg_sys::Datum) {
-    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    let database_name = BackgroundWorker::get_extra().to_owned();
-    BackgroundWorker::connect_worker_to_spi(Some(&database_name), None);
+unsafe extern "C-unwind" fn runtime_wakeup_xact_callback(
+    event: pg_sys::XactEvent::Type,
+    _arg: *mut std::ffi::c_void,
+) {
+    match event {
+        pg_sys::XactEvent::XACT_EVENT_COMMIT | pg_sys::XactEvent::XACT_EVENT_PARALLEL_COMMIT => {
+            let owner_pid = PENDING_RUNTIME_WAKE_PID.swap(0, Ordering::AcqRel);
+            if owner_pid > 0 {
+                wake_backend_latch(owner_pid);
+            }
+        }
+        pg_sys::XactEvent::XACT_EVENT_ABORT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT
+        | pg_sys::XactEvent::XACT_EVENT_PREPARE => {
+            // COMMIT PREPARED can run in another backend. The Runtime's
+            // bounded idle poll is the recovery path for that uncommon case.
+            PENDING_RUNTIME_WAKE_PID.store(0, Ordering::Release);
+        }
+        _ => {}
+    }
+}
 
-    log!("Shiba WAL Router started for database {database_name}");
-    let mut idle = true;
-    'worker: loop {
+#[cfg(not(test))]
+unsafe fn wake_backend_latch(owner_pid: i32) {
+    // PostgreSQL 17's generated lwlocknames.h assigns ProcArrayLock index 4.
+    // Shiba supports PG17 only; hold that lock from PID lookup through
+    // SetLatch so a retiring PGPROC cannot be reused underneath the signal.
+    let proc_array_lock =
+        std::ptr::addr_of_mut!((*pg_sys::MainLWLockArray.add(PROC_ARRAY_LWLOCK_INDEX_PG17)).lock);
+    pg_sys::LWLockAcquire(proc_array_lock, pg_sys::LWLockMode::LW_SHARED);
+    let process = pg_sys::BackendPidGetProcWithLock(owner_pid);
+    if !process.is_null() {
+        pg_sys::SetLatch(std::ptr::addr_of_mut!((*process).procLatch));
+    }
+    pg_sys::LWLockRelease(proc_array_lock);
+}
+
+// Plain Rust unit-test executables are not loaded by a PostgreSQL postmaster
+// and therefore cannot resolve or exercise its MainLWLockArray symbol.
+#[cfg(test)]
+unsafe fn wake_backend_latch(_owner_pid: i32) {}
+
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGINT);
+    // Use PostgreSQL's normal backend SIGTERM handler. The pgrx deferred
+    // handler only wakes our outer latch; if SIGTERM arrives inside logical
+    // decoding, fast shutdown can wait forever because that C call never sees
+    // ProcDiePending. `die` marks the current transaction for safe abort at
+    // PostgreSQL's next interrupt check.
+    unsafe {
+        pg_sys::pqsignal(pg_sys::SIGTERM as i32, Some(runtime_sigterm));
+    }
+    let extra = BackgroundWorker::get_extra().to_owned();
+    let (database_and_xid, launch_generation) = extra
+        .rsplit_once(':')
+        .expect("Shiba Runtime received invalid startup data");
+    let (database_name, launch_xid) = database_and_xid
+        .rsplit_once(':')
+        .expect("Shiba Runtime received invalid startup data");
+    let launch_generation = launch_generation
+        .parse::<i64>()
+        .expect("Shiba Runtime received invalid launch generation");
+
+    BackgroundWorker::connect_worker_to_spi(Some(database_name), None);
+    if !wait_for_launch_transaction(launch_xid)
+        || !wait_to_claim_runtime_identity(launch_xid, launch_generation)
+    {
+        return;
+    }
+    BackgroundWorker::transaction(|| {
+        Spi::run("SET plan_cache_mode=force_generic_plan")
+            .expect("Shiba Runtime could not configure its physical plan cache");
+    });
+
+    log!("Shiba Runtime started for database {database_name}");
+    let runtimes = Mutex::new(HashMap::<pg_sys::Oid, logical::DagRuntime>::new());
+    let mut round_robin_cursor = None;
+    let mut idle = false;
+    let mut next_gc = Instant::now();
+
+    'runtime: loop {
         let wait = if idle {
-            ROUTER_IDLE_WAIT
+            RUNTIME_IDLE_WAIT
         } else {
             Duration::ZERO
         };
-        if !BackgroundWorker::wait_latch(Some(wait)) {
+        if !BackgroundWorker::wait_latch(Some(wait)) || BackgroundWorker::sigint_received() {
             break;
         }
+        reload_config_if_requested();
 
-        let started = Instant::now();
-        let mut batches = 0;
-        let mut run_maintenance = true;
-        idle = false;
-        while drain_has_capacity(
-            batches,
-            started.elapsed(),
-            ROUTER_MAX_BATCHES_PER_ROUND,
-            ROUTER_DRAIN_BUDGET,
-        ) {
-            let routed_through = BackgroundWorker::transaction(|| {
-                if !router_is_active() {
-                    return None;
-                }
-                let routed_through = peek_and_route_wal_changes();
-                if run_maintenance {
-                    let _ = Spi::run("SELECT shiba._ensure_dag_workers()");
-                    update_router_heartbeat();
-                }
-                Some(routed_through)
-            });
-            run_maintenance = false;
-            match routed_through {
-                None => break 'worker,
-                Some(Some(commit_lsn)) => {
-                    // Routing and slot advancement deliberately remain separate
-                    // transactions.  A crash between them safely replays through
-                    // the durable routing checkpoint.
-                    #[cfg(any(test, feature = "pg_test"))]
-                    {
-                        let failpoint = BackgroundWorker::transaction(|| {
-                            test_failpoints::claim("router_before_slot_advance", None, None)
-                        });
-                        if let Some(pause) = failpoint {
-                            std::thread::sleep(pause);
-                            panic!(
-                                "Shiba test failpoint: router exited after routing and before slot advancement"
-                            );
-                        }
-                    }
-                    BackgroundWorker::transaction(|| advance_slot_through(&commit_lsn));
-                    batches += 1;
-                }
-                Some(None) => {
-                    idle = true;
-                    break;
-                }
+        let routed = match route_bounded_burst() {
+            RuntimePhase::Inactive => break 'runtime,
+            RuntimePhase::Worked(count) => count,
+        };
+
+        let Some((active_dags, ready_dags)) = BackgroundWorker::transaction(|| {
+            if !runtime_is_active() {
+                return None;
             }
+            update_runtime_heartbeat();
+            Some((active_dag_generations(), ready_dag_oids()))
+        }) else {
+            break 'runtime;
+        };
+        let obsolete_runtimes = {
+            let mut runtimes = runtimes
+                .lock()
+                .expect("Shiba DAG runtime cache mutex was poisoned");
+            let mut obsolete = Vec::new();
+            runtimes.retain(|result_oid, runtime| {
+                let keep = active_dags
+                    .get(result_oid)
+                    .is_some_and(|generation| runtime.matches_generation(generation));
+                if !keep {
+                    obsolete.push((*result_oid, runtime.generation().to_owned()));
+                }
+                keep
+            });
+            obsolete
+        };
+        if !obsolete_runtimes.is_empty() {
+            BackgroundWorker::transaction(|| {
+                for (result_oid, generation) in &obsolete_runtimes {
+                    logical::release_physical_programs(*result_oid, generation)
+                        .expect("Shiba could not release an obsolete physical program");
+                }
+            });
         }
+
+        let apply_phase = apply_ready_dags_bounded(&runtimes, &mut round_robin_cursor, ready_dags);
+        match apply_phase {
+            ApplyPhase::RuntimeInactive | ApplyPhase::SignalReceived => break 'runtime,
+            ApplyPhase::Worked | ApplyPhase::Idle => {}
+        }
+
+        let collected = if Instant::now() >= next_gc {
+            let count = BackgroundWorker::transaction(gc_change_log);
+            next_gc = Instant::now() + GC_INTERVAL;
+            count
+        } else {
+            0
+        };
+        idle = routed == 0 && apply_phase != ApplyPhase::Worked && collected == 0;
+
         if !idle {
-            // The next round is immediate, but yield after each bounded burst so
-            // a continuously busy router cannot monopolize its scheduler.
+            // Each phase is bounded and each source transaction has already
+            // committed. Give other PostgreSQL backends a scheduling chance.
             std::thread::yield_now();
         }
     }
-    log!("Shiba WAL Router stopped for database {database_name}");
+
+    clear_runtime_owner();
+    log!("Shiba Runtime stopped for database {database_name}");
 }
 
-#[pg_guard]
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn shiba_view_worker_main(_arg: pg_sys::Datum) {
-    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    let extra = BackgroundWorker::get_extra().to_owned();
-    let (database_name, result_oid) = extra
-        .rsplit_once(':')
-        .and_then(|(database, oid)| oid.parse::<i32>().ok().map(|oid| (database, oid)))
-        .expect("Shiba DAG worker received invalid startup data");
-    BackgroundWorker::connect_worker_to_spi(Some(database_name), None);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimePhase {
+    Inactive,
+    Worked(usize),
+}
 
-    log!("Shiba DAG executor started for result {result_oid}");
-    let runtime = BackgroundWorker::transaction(|| {
-        logical::DagRuntime::load(pg_sys::Oid::from(result_oid as u32))
-            .expect("Shiba could not load the persisted logical DAG")
-    });
-    let mut idle = true;
-    'worker: loop {
-        let wait = if idle { DAG_IDLE_WAIT } else { Duration::ZERO };
-        if !BackgroundWorker::wait_latch(Some(wait)) {
-            break;
-        }
-
-        let started = Instant::now();
-        let mut commits = 0;
-        let mut run_maintenance = true;
-        idle = false;
-        while drain_has_capacity(
-            commits,
-            started.elapsed(),
-            DAG_MAX_COMMITS_PER_ROUND,
-            DAG_DRAIN_BUDGET,
-        ) {
-            let step = BackgroundWorker::transaction(|| {
-                if !dag_is_active(result_oid) {
-                    return DagStep::Inactive;
-                }
-                let processed = process_next_dag_transaction(result_oid, &runtime);
-                if run_maintenance {
-                    update_dag_heartbeat(result_oid);
-                }
-                if processed {
-                    DagStep::Processed
-                } else {
-                    DagStep::Idle
-                }
-            });
-            run_maintenance = false;
-            match step {
-                DagStep::Inactive => break 'worker,
-                DagStep::Processed => commits += 1,
-                DagStep::Idle => {
-                    idle = true;
-                    break;
-                }
+fn route_bounded_burst() -> RuntimePhase {
+    let started = Instant::now();
+    let mut routed = 0;
+    while drain_has_capacity(
+        routed,
+        started.elapsed(),
+        ROUTE_MAX_TRANSACTIONS_PER_ROUND,
+        ROUTE_TIME_BUDGET,
+    ) {
+        let next = BackgroundWorker::transaction(|| {
+            if !runtime_is_active() {
+                return None;
             }
-        }
-        if !idle {
-            // Preserve low backlog latency while giving other PostgreSQL
-            // backends a scheduling opportunity between bounded bursts.
-            std::thread::yield_now();
+            update_runtime_heartbeat();
+            Some(peek_and_route_wal_transactions(
+                ROUTE_MAX_TRANSACTIONS_PER_ROUND - routed,
+            ))
+        });
+        match next {
+            None => return RuntimePhase::Inactive,
+            Some(Some(routed_burst)) => {
+                // Routing and slot advancement are separate transactions. A
+                // crash between them replays through routed_transactions.
+                #[cfg(any(test, feature = "pg_test"))]
+                if let Some(pause) = BackgroundWorker::transaction(|| {
+                    test_failpoints::claim(
+                        "runtime_route_before_slot_advance",
+                        None,
+                        Some(routed_burst.commit_lsn.as_str()),
+                    )
+                }) {
+                    std::thread::sleep(pause);
+                    panic!(
+                        "Shiba test failpoint: runtime exited after routing and before slot advancement"
+                    );
+                }
+                BackgroundWorker::transaction(|| advance_slot_through(&routed_burst.end_lsn));
+                routed += routed_burst.transaction_count;
+            }
+            Some(None) => break,
         }
     }
-    log!("Shiba DAG executor stopped for result {result_oid}");
+    RuntimePhase::Worked(routed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DagStep {
+    RuntimeInactive,
     Inactive,
-    Processed,
+    Retry,
+    Processed { has_more: bool },
+    Quarantined,
     Idle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplyPhase {
+    RuntimeInactive,
+    SignalReceived,
+    Worked,
+    Idle,
+}
+
+fn apply_ready_dags_bounded(
+    runtimes: &Mutex<HashMap<pg_sys::Oid, logical::DagRuntime>>,
+    round_robin_cursor: &mut Option<pg_sys::Oid>,
+    mut ready_dags: Vec<pg_sys::Oid>,
+) -> ApplyPhase {
+    rotate_after_cursor(&mut ready_dags, *round_robin_cursor);
+    let mut ready_dags = VecDeque::from(ready_dags);
+    let started = Instant::now();
+    let mut attempted = 0;
+    let mut worked = 0;
+
+    while drain_has_capacity(
+        attempted,
+        started.elapsed(),
+        APPLY_MAX_TRANSACTIONS_PER_ROUND,
+        APPLY_TIME_BUDGET,
+    ) {
+        let Some(result_oid) = ready_dags.pop_front() else {
+            break;
+        };
+        if !BackgroundWorker::wait_latch(Some(Duration::ZERO))
+            || BackgroundWorker::sigint_received()
+        {
+            return ApplyPhase::SignalReceived;
+        }
+        reload_config_if_requested();
+
+        *round_robin_cursor = Some(result_oid);
+        attempted += 1;
+        let step = apply_one_dag_transaction(runtimes, result_oid);
+        match step {
+            DagStep::RuntimeInactive => return ApplyPhase::RuntimeInactive,
+            DagStep::Processed { has_more } => {
+                worked += 1;
+                if has_more {
+                    // Routing does not run during this bounded phase. Requeue a
+                    // DAG with known backlog at the tail to preserve fairness
+                    // without opening a later empty apply transaction.
+                    ready_dags.push_back(result_oid);
+                }
+            }
+            DagStep::Quarantined => {
+                worked += 1;
+            }
+            // Retry once in this round, then give other DAGs and Runtime phases
+            // a chance before taking a fresh transaction snapshot.
+            DagStep::Retry | DagStep::Inactive | DagStep::Idle => {}
+        }
+    }
+
+    if worked == 0 {
+        ApplyPhase::Idle
+    } else {
+        ApplyPhase::Worked
+    }
+}
+
+fn apply_one_dag_transaction(
+    runtimes: &Mutex<HashMap<pg_sys::Oid, logical::DagRuntime>>,
+    result_oid: pg_sys::Oid,
+) -> DagStep {
+    let step = BackgroundWorker::transaction(|| {
+        let mut runtimes = runtimes
+            .lock()
+            .expect("Shiba DAG runtime cache mutex was poisoned");
+        if !runtime_is_active() {
+            return DagStep::RuntimeInactive;
+        }
+        if !dag_is_active(result_oid) {
+            if let Some(runtime) = runtimes.remove(&result_oid) {
+                runtime
+                    .release_physical_programs()
+                    .expect("Shiba could not release an inactive physical program");
+            }
+            return DagStep::Inactive;
+        }
+        let generation =
+            dag_generation(result_oid).expect("active Shiba DAG has no runtime generation");
+        if runtimes
+            .get(&result_oid)
+            .is_some_and(|runtime| !runtime.matches_generation(&generation))
+        {
+            if let Some(runtime) = runtimes.remove(&result_oid) {
+                runtime
+                    .release_physical_programs()
+                    .expect("Shiba could not release a superseded physical program");
+            }
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = runtimes.entry(result_oid) {
+            match logical::DagRuntime::load(result_oid) {
+                Ok(logical::LoadOutcome::Loaded(runtime)) => {
+                    entry.insert(runtime);
+                }
+                Ok(logical::LoadOutcome::Retry) => return DagStep::Retry,
+                Ok(logical::LoadOutcome::Quarantined) => return DagStep::Quarantined,
+                Err(error) => {
+                    logical::DagRuntime::quarantine(result_oid, &error)
+                        .expect("Shiba could not quarantine an unloadable DAG");
+                    return DagStep::Quarantined;
+                }
+            }
+        }
+        let runtime = runtimes
+            .get(&result_oid)
+            .expect("Shiba DAG runtime cache lost a loaded DAG");
+        let outcome = process_next_dag_transaction(result_oid, runtime);
+        if matches!(outcome, DagStep::Inactive | DagStep::Quarantined) {
+            if let Some(runtime) = runtimes.remove(&result_oid) {
+                runtime
+                    .release_physical_programs()
+                    .expect("Shiba could not release a stopped physical program");
+            }
+        }
+        outcome
+    });
+
+    if matches!(step, DagStep::RuntimeInactive) {
+        runtimes
+            .lock()
+            .expect("Shiba DAG runtime cache mutex was poisoned")
+            .remove(&result_oid);
+    }
+    step
+}
+
+fn process_next_dag_transaction(result_oid: pg_sys::Oid, runtime: &logical::DagRuntime) -> DagStep {
+    let apply_result = runtime
+        .apply_next_transaction()
+        .expect("Shiba could not execute the next DAG inbox transaction");
+    match apply_result.outcome {
+        logical::NextApplyOutcome::Retry => return DagStep::Retry,
+        logical::NextApplyOutcome::Quarantined => return DagStep::Quarantined,
+        logical::NextApplyOutcome::Inactive => return DagStep::Inactive,
+        logical::NextApplyOutcome::Idle => return DagStep::Idle,
+        logical::NextApplyOutcome::Applied => {}
+    }
+    #[cfg(any(test, feature = "pg_test"))]
+    {
+        let commit_lsn = apply_result
+            .commit_lsn
+            .as_deref()
+            .expect("applied Shiba DAG transaction returned no commit LSN");
+        if let Some(pause) = test_failpoints::claim(
+            "runtime_apply_before_ack",
+            Some(result_oid),
+            Some(commit_lsn),
+        ) {
+            log!(
+                "Shiba test failpoint reached: runtime_apply_before_ack result {result_oid} commit {commit_lsn}"
+            );
+            std::thread::sleep(pause);
+            panic!(
+                "Shiba test failpoint: runtime exited after applying commit {commit_lsn} and before acknowledgement"
+            );
+        }
+    }
+
+    let result = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
+    let has_more = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM shiba_internal.dag_inbox
+             WHERE result_oid = $1::oid
+         )",
+        &result,
+    )
+    .expect("Shiba could not inspect the remaining DAG inbox backlog")
+    .expect("Shiba DAG inbox backlog check returned NULL");
+    update_dag_last_scheduled(result_oid);
+    DagStep::Processed { has_more }
+}
+
+fn gc_change_log() -> i64 {
+    Spi::get_one_with_args::<i64>("SELECT shiba._gc_change_log($1)", unsafe {
+        &[DatumWithOid::new(
+            GC_MAX_TRANSACTIONS_PER_ROUND,
+            pg_sys::INT4OID,
+        )]
+    })
+    .expect("Shiba could not garbage-collect its change log")
+    .unwrap_or(0)
+}
+
+fn rotate_after_cursor(result_oids: &mut [pg_sys::Oid], cursor: Option<pg_sys::Oid>) {
+    let Some(cursor) = cursor else {
+        return;
+    };
+    let split = result_oids.partition_point(|result_oid| result_oid.to_u32() <= cursor.to_u32());
+    result_oids.rotate_left(split);
+}
+
+fn reload_config_if_requested() {
+    if BackgroundWorker::sighup_received() {
+        unsafe {
+            pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
+        }
+    }
 }
 
 fn drain_has_capacity(
@@ -209,24 +508,157 @@ fn drain_has_capacity(
     processed < max_items && elapsed < time_budget
 }
 
-fn update_router_heartbeat() {
+fn current_transaction_id() -> String {
+    Spi::get_one::<String>("SELECT pg_current_xact_id()::text")
+        .expect("Shiba could not identify the launch transaction")
+        .expect("pg_current_xact_id() returned NULL")
+}
+
+fn wait_for_launch_transaction(launch_xid: &str) -> bool {
+    let arguments = unsafe { [DatumWithOid::new(launch_xid, pg_sys::TEXTOID)] };
+    loop {
+        let status = BackgroundWorker::transaction(|| {
+            Spi::get_one_with_args::<String>("SELECT pg_xact_status($1::xid8)", &arguments)
+                .expect("Shiba could not inspect its launch transaction")
+                .expect("pg_xact_status() returned NULL")
+        });
+        match status.as_str() {
+            "committed" => return true,
+            "aborted" => return false,
+            "in progress" => {}
+            unexpected => panic!("Shiba received unknown launch transaction status {unexpected}"),
+        }
+        if !BackgroundWorker::wait_latch(Some(LAUNCH_TRANSACTION_WAIT)) {
+            return false;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentityClaim {
+    Claimed,
+    Retry,
+    Rejected,
+}
+
+fn wait_to_claim_runtime_identity(launch_xid: &str, launch_generation: i64) -> bool {
+    loop {
+        match claim_runtime_identity(launch_xid, launch_generation) {
+            IdentityClaim::Claimed => return true,
+            IdentityClaim::Rejected => return false,
+            IdentityClaim::Retry => {}
+        }
+        if !BackgroundWorker::wait_latch(Some(LAUNCH_TRANSACTION_WAIT)) {
+            return false;
+        }
+    }
+}
+
+fn claim_runtime_identity(launch_xid: &str, launch_generation: i64) -> IdentityClaim {
+    let arguments = unsafe {
+        [
+            DatumWithOid::new(launch_xid, pg_sys::TEXTOID),
+            DatumWithOid::new(launch_generation, pg_sys::INT8OID),
+        ]
+    };
+    BackgroundWorker::transaction(|| {
+        let claimed = Spi::get_one::<bool>(
+            "SELECT pg_try_advisory_lock(
+                 shiba_internal.identity_lock_namespace(), 0
+             )",
+        )
+        .expect("Shiba could not acquire the Runtime process identity")
+        .expect("Runtime process identity lock returned NULL");
+        if !claimed {
+            let still_launchable = Spi::get_one_with_args::<bool>(
+                "SELECT active
+                        AND owner_pid IS NULL
+                        AND launch_generation = $2
+                        AND (
+                          pending_launch_xid = $1::xid8
+                          OR pending_launch_xid IS NULL
+                        )
+                 FROM shiba_internal.runtime_state
+                 WHERE singleton",
+                &arguments,
+            )
+            .expect("Shiba could not inspect the busy Runtime identity")
+            .unwrap_or(false);
+            // A live owner already holds the session lock, or a newer launch
+            // generation superseded this automatic BGW restart. Do not leave
+            // the stale registration waiting forever behind the singleton.
+            return if still_launchable {
+                IdentityClaim::Retry
+            } else {
+                IdentityClaim::Rejected
+            };
+        }
+        // A replacement process from this dynamic registration carries the
+        // original generation after the initial owner cleared pending_launch_xid.
+        // A newer registration increments the generation and therefore rejects
+        // this old process even after it acquires the released session lock.
+        let recorded = Spi::get_one_with_args::<bool>(
+            "UPDATE shiba_internal.runtime_state
+             SET owner_pid = pg_backend_pid(),
+                 started_at = clock_timestamp(),
+                 last_heartbeat = clock_timestamp(),
+                 pending_launch_xid = NULL,
+                 pending_since = NULL
+             WHERE singleton
+               AND active
+               AND launch_generation = $2
+               AND (
+                   pending_launch_xid = $1::xid8
+                   OR pending_launch_xid IS NULL
+               )
+             RETURNING true",
+            &arguments,
+        )
+        .expect("Shiba could not record the Runtime owner")
+        .unwrap_or(false);
+        if recorded {
+            IdentityClaim::Claimed
+        } else {
+            let _ = Spi::run(
+                "SELECT pg_advisory_unlock(
+                     shiba_internal.identity_lock_namespace(), 0
+                 )",
+            );
+            IdentityClaim::Rejected
+        }
+    })
+}
+
+fn clear_runtime_owner() {
+    BackgroundWorker::transaction(|| {
+        let _ = Spi::run(
+            "UPDATE shiba_internal.runtime_state
+             SET owner_pid = NULL, started_at = NULL, last_heartbeat = NULL
+             WHERE singleton AND owner_pid = pg_backend_pid()",
+        );
+    });
+}
+
+fn update_runtime_heartbeat() {
     let _ = Spi::run(
-        "UPDATE shiba_internal.worker_state
+        "UPDATE shiba_internal.runtime_state
          SET last_heartbeat = clock_timestamp()
          WHERE singleton
-           AND (last_heartbeat IS NULL OR last_heartbeat < clock_timestamp() - interval '1 second')",
+           AND owner_pid = pg_backend_pid()
+           AND (last_heartbeat IS NULL
+                OR last_heartbeat < clock_timestamp() - interval '1 second')",
     );
 }
 
-fn update_dag_heartbeat(result_oid: i32) {
-    let heartbeat = unsafe { [DatumWithOid::new(result_oid, pg_sys::INT4OID)] };
-    let _ = Spi::run_with_args(
-        "UPDATE shiba_internal.dag_worker_state
-         SET last_heartbeat = clock_timestamp()
-         WHERE result_oid = $1::oid
-           AND (last_heartbeat IS NULL OR last_heartbeat < clock_timestamp() - interval '1 second')",
-        &heartbeat,
-    );
+fn update_dag_last_scheduled(result_oid: pg_sys::Oid) {
+    let result = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
+    Spi::run_with_args(
+        "UPDATE shiba_internal.dag_runtime_state
+         SET last_scheduled_at = clock_timestamp()
+         WHERE result_oid = $1::oid",
+        &result,
+    )
+    .expect("Shiba could not update DAG scheduling state");
 }
 
 fn current_database_name() -> String {
@@ -235,23 +667,27 @@ fn current_database_name() -> String {
         .expect("current_database() returned NULL")
 }
 
-fn router_is_active() -> bool {
+fn runtime_is_active() -> bool {
     Spi::get_one::<bool>(
-        "SELECT to_regclass('shiba_internal.worker_state') IS NOT NULL
-          AND EXISTS (SELECT 1 FROM shiba_internal.worker_state WHERE singleton AND active)",
+        "SELECT to_regclass('shiba_internal.runtime_state') IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM shiba_internal.runtime_state
+              WHERE singleton AND active
+          )",
     )
     .ok()
     .flatten()
     .unwrap_or(false)
 }
 
-fn dag_is_active(result_oid: i32) -> bool {
-    let arguments = unsafe { [DatumWithOid::new(result_oid, pg_sys::INT4OID)] };
+fn dag_is_active(result_oid: pg_sys::Oid) -> bool {
+    let arguments = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
     Spi::get_one_with_args::<bool>(
         "SELECT EXISTS (
-             SELECT 1 FROM shiba_internal.worker_state router
-             JOIN shiba_internal.dag_worker_state dag ON true
-             WHERE router.singleton AND router.active AND dag.result_oid = $1::oid AND dag.active
+             SELECT 1
+             FROM shiba_internal.dag_runtime_state
+             WHERE result_oid = $1::oid AND active
          )",
         &arguments,
     )
@@ -260,70 +696,251 @@ fn dag_is_active(result_oid: i32) -> bool {
     .unwrap_or(false)
 }
 
-fn peek_and_route_wal_changes() -> Option<String> {
-    let messages: Vec<Vec<u8>> = Spi::connect_mut(|client| {
+fn dag_generation(result_oid: pg_sys::Oid) -> Option<String> {
+    let arguments = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
+    Spi::get_one_with_args::<String>(
+        "SELECT physical.plan_id::text
+         FROM shiba_internal.dag_runtime_state runtime
+         JOIN shiba_internal.physical_plans physical USING(result_oid)
+         WHERE runtime.result_oid = $1::oid AND runtime.active",
+        &arguments,
+    )
+    .expect("Shiba could not inspect the DAG runtime generation")
+}
+
+fn ready_dag_oids() -> Vec<pg_sys::Oid> {
+    Spi::connect_mut(|client| {
         client
             .update(
-                "SELECT data FROM pg_logical_slot_peek_binary_changes(
-                 shiba_internal.slot_name(), NULL, 2048,
-                 'proto_version', '1', 'publication_names', 'shiba_publication')",
+                "SELECT runtime.result_oid
+                 FROM shiba_internal.dag_runtime_state runtime
+                 WHERE runtime.active
+                   AND EXISTS (
+                       SELECT 1
+                       FROM shiba_internal.dag_inbox inbox
+                       WHERE inbox.result_oid = runtime.result_oid
+                   )
+                 ORDER BY runtime.result_oid",
                 None,
                 &[],
             )
-            .expect("Shiba could not read its logical replication slot")
+            .expect("Shiba could not discover ready DAGs")
             .map(|row| {
-                row.get::<Vec<u8>>(1)
-                    .expect("invalid bytea")
-                    .expect("NULL message")
+                row.get::<pg_sys::Oid>(1)
+                    .expect("invalid ready DAG OID")
+                    .expect("NULL ready DAG OID")
             })
             .collect()
+    })
+}
+
+fn active_dag_generations() -> HashMap<pg_sys::Oid, String> {
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                "SELECT runtime.result_oid,physical.plan_id::text
+                 FROM shiba_internal.dag_runtime_state runtime
+                 JOIN shiba_internal.physical_plans physical USING(result_oid)
+                 WHERE runtime.active",
+                None,
+                &[],
+            )
+            .expect("Shiba could not discover active DAGs")
+            .map(|row| {
+                let result_oid = row
+                    .get::<pg_sys::Oid>(1)
+                    .expect("invalid active DAG OID")
+                    .expect("NULL active DAG OID");
+                let generation = row
+                    .get::<String>(2)
+                    .expect("invalid active DAG generation")
+                    .expect("NULL active DAG generation");
+                (result_oid, generation)
+            })
+            .collect()
+    })
+}
+
+/// Peek and durably route at most one complete source transaction.
+///
+/// The SPI cursor is detached between one-row fetches so pgrx can release each
+/// tuple table. `Begin.final_lsn` gives the transaction LSN before its payload,
+/// allowing each delta to be inserted directly into `change_log` without a
+/// transaction-sized Rust collection.
+fn peek_and_route_wal_transactions(max_transactions: usize) -> Option<RoutedBurst> {
+    debug_assert!(max_transactions > 0);
+    let cursor_name = Spi::connect_mut(|client| {
+        client
+            .open_cursor_mut(
+                "SELECT data
+                 FROM pg_logical_slot_peek_binary_changes(
+                     shiba_internal.slot_name(), NULL, $1,
+                     'proto_version', '1',
+                     'publication_names', 'shiba_publication'
+                 )",
+                unsafe {
+                    &[DatumWithOid::new(
+                        ROUTE_MAX_DECODED_CHANGES,
+                        pg_sys::INT4OID,
+                    )]
+                },
+            )
+            .detach_into_name()
     });
 
-    let mut relations: HashMap<u32, Vec<String>> = HashMap::new();
-    let mut transaction: Vec<(u32, i32, Value)> = Vec::new();
-    let mut routed_through = None;
-    for bytes in messages {
+    let mut relations = HashMap::<u32, Vec<String>>::new();
+    let mut route = None::<RouteTransaction>;
+    let mut routed_through = None::<RoutedBurst>;
+    let mut transaction_count = 0;
+
+    while let Some(bytes) = fetch_cursor_message(&cursor_name) {
         match pgoutput::parse(&bytes).expect("Shiba received an unsupported pgoutput message") {
-            pgoutput::Message::Begin { .. } => {
-                if !transaction.is_empty() {
+            pgoutput::Message::Begin { final_lsn, .. } => {
+                if route.is_some() {
                     panic!("Shiba received a new logical transaction before commit");
                 }
+                let commit_lsn = format_lsn(final_lsn);
+                let is_new = begin_route_transaction(&commit_lsn);
+                route = Some(RouteTransaction {
+                    commit_lsn,
+                    next_sequence: 1,
+                    is_new,
+                });
             }
             pgoutput::Message::Relation { relid, columns } => {
                 relations.insert(relid, columns);
             }
-            pgoutput::Message::Insert { relid, row } => transaction.push((
-                relid,
-                1,
-                tuple_to_json(relid, row, &relations).expect("invalid inserted tuple"),
-            )),
-            pgoutput::Message::Update { relid, old, new } => {
-                transaction.push((
-                    relid,
-                    -1,
-                    tuple_to_json(relid, old, &relations).expect("invalid old tuple"),
-                ));
-                transaction.push((
-                    relid,
-                    1,
-                    tuple_to_json(relid, new, &relations).expect("invalid new tuple"),
-                ));
+            pgoutput::Message::Insert { relid, row } => {
+                let row = tuple_to_json(relid, row, &relations).expect("invalid inserted tuple");
+                route_delta(&mut route, relid, 1, row);
             }
-            pgoutput::Message::Delete { relid, old } => transaction.push((
-                relid,
-                -1,
-                tuple_to_json(relid, old, &relations).expect("invalid deleted tuple"),
-            )),
+            pgoutput::Message::Update { relid, old, new } => {
+                let old = tuple_to_json(relid, old, &relations).expect("invalid old tuple");
+                route_delta(&mut route, relid, -1, old);
+                let new = tuple_to_json(relid, new, &relations).expect("invalid new tuple");
+                route_delta(&mut route, relid, 1, new);
+            }
+            pgoutput::Message::Delete { relid, old } => {
+                let row = tuple_to_json(relid, old, &relations).expect("invalid deleted tuple");
+                route_delta(&mut route, relid, -1, row);
+            }
             pgoutput::Message::Commit {
                 commit_lsn,
                 end_lsn,
             } => {
-                route_transaction(commit_lsn, &mut transaction);
-                routed_through = Some(format_lsn(end_lsn));
+                let transaction = route
+                    .take()
+                    .expect("Shiba received a logical commit without begin");
+                assert_eq!(
+                    transaction.commit_lsn,
+                    format_lsn(commit_lsn),
+                    "Shiba pgoutput begin/commit LSN mismatch"
+                );
+                if transaction.is_new {
+                    canonicalize_route_transaction(&transaction.commit_lsn);
+                }
+                routed_through = Some(RoutedBurst {
+                    #[cfg(any(test, feature = "pg_test"))]
+                    commit_lsn: transaction.commit_lsn,
+                    end_lsn: format_lsn(end_lsn),
+                    transaction_count: transaction_count + 1,
+                });
+                transaction_count += 1;
+                if transaction_count >= max_transactions {
+                    break;
+                }
             }
         }
     }
+    if route.is_some() {
+        panic!("Shiba logical decoding cursor ended before transaction commit");
+    }
     routed_through
+}
+
+struct RouteTransaction {
+    commit_lsn: String,
+    next_sequence: i32,
+    is_new: bool,
+}
+
+struct RoutedBurst {
+    #[cfg(any(test, feature = "pg_test"))]
+    commit_lsn: String,
+    end_lsn: String,
+    transaction_count: usize,
+}
+
+fn fetch_cursor_message(cursor_name: &str) -> Option<Vec<u8>> {
+    Spi::connect_mut(|client| {
+        let mut cursor = client
+            .find_cursor(cursor_name)
+            .expect("Shiba could not resume its logical decoding cursor");
+        let message = {
+            let table = cursor
+                .fetch(1)
+                .expect("Shiba could not fetch a logical decoding message");
+            if table.is_empty() {
+                None
+            } else {
+                table
+                    .first()
+                    .get_one::<Vec<u8>>()
+                    .expect("Shiba received an invalid logical decoding bytea")
+            }
+        };
+        if message.is_some() {
+            cursor.detach_into_name();
+        }
+        message
+    })
+}
+
+fn begin_route_transaction(commit_lsn: &str) -> bool {
+    let checkpoint = unsafe { [DatumWithOid::new(commit_lsn, pg_sys::TEXTOID)] };
+    Spi::get_one_with_args::<bool>(
+        "SELECT shiba._begin_route_transaction($1::pg_lsn)",
+        &checkpoint,
+    )
+    .expect("Shiba could not checkpoint a routed transaction")
+    .expect("Shiba routing checkpoint returned NULL")
+}
+
+fn canonicalize_route_transaction(commit_lsn: &str) {
+    let arguments = unsafe { [DatumWithOid::new(commit_lsn, pg_sys::TEXTOID)] };
+    Spi::run_with_args(
+        "SELECT shiba._canonicalize_change_log_commit($1::pg_lsn)",
+        &arguments,
+    )
+    .expect("Shiba could not canonicalize a routed source transaction");
+}
+
+fn route_delta(transaction: &mut Option<RouteTransaction>, relid: u32, delta: i32, row: Value) {
+    let transaction = transaction
+        .as_mut()
+        .expect("Shiba received a logical row outside a transaction");
+    let sequence = transaction.next_sequence;
+    transaction.next_sequence = sequence
+        .checked_add(1)
+        .expect("Shiba transaction has too many row deltas");
+    if !transaction.is_new {
+        return;
+    }
+    let row = row.to_string();
+    let arguments = unsafe {
+        [
+            DatumWithOid::new(pg_sys::Oid::from(relid), pg_sys::OIDOID),
+            DatumWithOid::new(row.as_str(), pg_sys::TEXTOID),
+            DatumWithOid::new(delta, pg_sys::INT4OID),
+            DatumWithOid::new(transaction.commit_lsn.as_str(), pg_sys::TEXTOID),
+            DatumWithOid::new(sequence, pg_sys::INT4OID),
+        ]
+    };
+    Spi::run_with_args(
+        "SELECT shiba._route_change_log_delta($1, $2::jsonb, $3, $4, $5)",
+        &arguments,
+    )
+    .expect("Shiba could not route a logical WAL delta");
 }
 
 fn advance_slot_through(commit_lsn: &str) {
@@ -331,9 +948,12 @@ fn advance_slot_through(commit_lsn: &str) {
     Spi::connect_mut(|client| {
         client
             .update(
-                "SELECT 1 FROM pg_logical_slot_get_binary_changes(
-                   shiba_internal.slot_name(), $1::pg_lsn, NULL,
-                   'proto_version', '1', 'publication_names', 'shiba_publication')",
+                "SELECT 1
+                 FROM pg_logical_slot_get_binary_changes(
+                     shiba_internal.slot_name(), $1::pg_lsn, NULL,
+                     'proto_version', '1',
+                     'publication_names', 'shiba_publication'
+                 )",
                 None,
                 &arguments,
             )
@@ -342,141 +962,18 @@ fn advance_slot_through(commit_lsn: &str) {
     });
 }
 
-fn route_transaction(commit_lsn: u64, transaction: &mut Vec<(u32, i32, Value)>) {
-    let lsn = format_lsn(commit_lsn);
-    let checkpoint = unsafe { [DatumWithOid::new(lsn.as_str(), pg_sys::TEXTOID)] };
-    let is_new = Spi::get_one_with_args::<bool>(
-        "SELECT shiba._begin_route_transaction($1::pg_lsn)",
-        &checkpoint,
-    )
-    .expect("Shiba could not checkpoint a routed transaction")
-    .expect("Shiba routing checkpoint returned NULL");
-    if !is_new {
-        transaction.clear();
-        return;
-    }
-    for (index, (relid, delta, row)) in transaction.drain(..).enumerate() {
-        let sequence = i32::try_from(index + 1).expect("Shiba transaction has too many row deltas");
-        let arguments = unsafe {
-            [
-                DatumWithOid::new(relid as i32, pg_sys::OIDOID),
-                DatumWithOid::new(row.to_string(), pg_sys::TEXTOID),
-                DatumWithOid::new(delta, pg_sys::INT4OID),
-                DatumWithOid::new(lsn.as_str(), pg_sys::TEXTOID),
-                DatumWithOid::new(sequence, pg_sys::INT4OID),
-            ]
-        };
-        Spi::run_with_args(
-            "SELECT shiba._route_wal_delta($1, $2::jsonb, $3, $4, $5)",
-            &arguments,
-        )
-        .expect("Shiba could not route a logical WAL delta");
-    }
-}
-
-fn process_next_dag_transaction(result_oid: i32, runtime: &logical::DagRuntime) -> bool {
-    let result = unsafe { [DatumWithOid::new(result_oid, pg_sys::INT4OID)] };
-    Spi::run_with_args("SELECT pg_advisory_xact_lock($1::bigint)", &result)
-        .expect("Shiba could not acquire the DAG execution lock");
-    if !dag_is_active(result_oid) {
-        return false;
-    }
-    let events: Vec<InboxEvent> = Spi::connect_mut(|client| {
-        client
-            .update(
-                "SELECT commit_lsn::text, source_oid::integer, delta, row_data::text
-             FROM shiba_internal.dag_inbox
-             WHERE result_oid = $1::oid
-               AND commit_lsn = (
-                   SELECT min(commit_lsn) FROM shiba_internal.dag_inbox WHERE result_oid = $1::oid
-               )
-             ORDER BY sequence
-             FOR UPDATE",
-                None,
-                &result,
-            )
-            .expect("Shiba could not lock DAG inbox rows")
-            .map(|row| InboxEvent {
-                commit_lsn: row
-                    .get::<String>(1)
-                    .expect("invalid inbox LSN")
-                    .expect("NULL inbox LSN"),
-                source_oid: row
-                    .get::<i32>(2)
-                    .expect("invalid inbox source")
-                    .expect("NULL inbox source"),
-                delta: row
-                    .get::<i32>(3)
-                    .expect("invalid inbox delta")
-                    .expect("NULL inbox delta"),
-                row_data: row
-                    .get::<String>(4)
-                    .expect("invalid inbox data")
-                    .expect("NULL inbox data"),
-            })
-            .collect()
-    });
-    let Some(commit_lsn) = events.first().map(|event| event.commit_lsn.clone()) else {
-        return false;
-    };
-    let rows = events
-        .iter()
-        .map(|event| logical::DeltaRow {
-            input: event.source_oid.to_string(),
-            row: serde_json::from_str(&event.row_data).expect("invalid inbox JSON"),
-            diff: i64::from(event.delta),
-        })
-        .collect();
-    runtime
-        .apply_batch(logical::DeltaBatch {
-            epoch: commit_lsn.clone(),
-            rows,
-        })
-        .expect("Shiba could not execute a DAG inbox transaction");
-    #[cfg(any(test, feature = "pg_test"))]
-    if let Some(pause) = test_failpoints::claim(
-        "executor_before_ack",
-        Some(result_oid),
-        Some(commit_lsn.as_str()),
-    ) {
-        log!(
-            "Shiba test failpoint reached: executor_before_ack result {result_oid} commit {commit_lsn}"
-        );
-        std::thread::sleep(pause);
-        panic!(
-            "Shiba test failpoint: executor exited after applying commit {commit_lsn} and before acknowledgement"
-        );
-    }
-    let delete = unsafe {
-        [
-            DatumWithOid::new(result_oid, pg_sys::OIDOID),
-            DatumWithOid::new(commit_lsn.as_str(), pg_sys::TEXTOID),
-        ]
-    };
-    Spi::run_with_args(
-        "DELETE FROM shiba_internal.dag_inbox WHERE result_oid = $1 AND commit_lsn = $2::pg_lsn",
-        &delete,
-    )
-    .expect("Shiba could not acknowledge a DAG inbox transaction");
-    true
-}
-
 /// Deterministic crash injection used only by pgrx and recovery-test builds.
-///
-/// Tests create `public.shiba_worker_failpoints` themselves. Keeping both the
-/// code and its catalog contract behind `pg_test` means production workers
-/// have no failpoint branch, SPI lookup, shared state, or runtime overhead.
 #[cfg(any(test, feature = "pg_test"))]
 mod test_failpoints {
     use super::*;
 
     pub(super) fn claim(
         kind: &str,
-        result_oid: Option<i32>,
+        result_oid: Option<pg_sys::Oid>,
         commit_lsn: Option<&str>,
     ) -> Option<Duration> {
         let available = Spi::get_one::<bool>(
-            "SELECT to_regclass('public.shiba_worker_failpoints') IS NOT NULL",
+            "SELECT to_regclass('public.shiba_runtime_failpoints') IS NOT NULL",
         )
         .ok()
         .flatten()
@@ -485,21 +982,21 @@ mod test_failpoints {
             return None;
         }
 
-        let result_oid = result_oid.unwrap_or_default();
+        let result_oid = result_oid.unwrap_or(pg_sys::InvalidOid);
         let commit_lsn = commit_lsn.unwrap_or("0/0");
         let arguments = unsafe {
             [
                 DatumWithOid::new(kind, pg_sys::TEXTOID),
-                DatumWithOid::new(result_oid, pg_sys::INT4OID),
+                DatumWithOid::new(result_oid, pg_sys::OIDOID),
                 DatumWithOid::new(commit_lsn, pg_sys::TEXTOID),
             ]
         };
         let pause_ms = Spi::get_one_with_args::<i32>(
             "SELECT max(pause_ms)
-             FROM public.shiba_worker_failpoints
+             FROM public.shiba_runtime_failpoints
              WHERE kind = $1
                AND NOT fired
-               AND (worker_pid IS NULL OR worker_pid = pg_backend_pid())
+               AND (runtime_pid IS NULL OR runtime_pid = pg_backend_pid())
                AND (result_oid IS NULL OR result_oid = $2::oid)
                AND (commit_lsn IS NULL OR commit_lsn = $3::pg_lsn)",
             &arguments,
@@ -507,11 +1004,13 @@ mod test_failpoints {
         .expect("Shiba could not inspect its test worker failpoint");
         if pause_ms.is_some() {
             Spi::run_with_args(
-                "UPDATE public.shiba_worker_failpoints
-                 SET worker_pid = pg_backend_pid(), fired = true
+                "UPDATE public.shiba_runtime_failpoints
+                 SET runtime_pid = pg_backend_pid(),
+                     commit_lsn = COALESCE(commit_lsn, $3::pg_lsn),
+                     fired = true
                  WHERE kind = $1
                    AND NOT fired
-                   AND (worker_pid IS NULL OR worker_pid = pg_backend_pid())
+                   AND (runtime_pid IS NULL OR runtime_pid = pg_backend_pid())
                    AND (result_oid IS NULL OR result_oid = $2::oid)
                    AND (commit_lsn IS NULL OR commit_lsn = $3::pg_lsn)",
                 &arguments,
@@ -614,17 +1113,32 @@ mod tests {
     }
 
     #[test]
+    fn runtime_wakeup_is_deduplicated_and_prepare_clears_it() {
+        PENDING_RUNTIME_WAKE_PID.store(0, Ordering::Release);
+        assert!(wake_runtime_on_commit(101));
+        assert!(wake_runtime_on_commit(202));
+        assert_eq!(PENDING_RUNTIME_WAKE_PID.load(Ordering::Acquire), 202);
+        unsafe {
+            runtime_wakeup_xact_callback(
+                pg_sys::XactEvent::XACT_EVENT_PREPARE,
+                std::ptr::null_mut(),
+            );
+        }
+        assert_eq!(PENDING_RUNTIME_WAKE_PID.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn drain_budget_stops_at_item_limit() {
         assert!(drain_has_capacity(
-            63,
+            15,
             Duration::ZERO,
-            64,
+            16,
             Duration::from_millis(50)
         ));
         assert!(!drain_has_capacity(
-            64,
+            16,
             Duration::ZERO,
-            64,
+            16,
             Duration::from_millis(50)
         ));
     }
@@ -634,14 +1148,52 @@ mod tests {
         assert!(drain_has_capacity(
             0,
             Duration::from_millis(49),
-            64,
+            16,
             Duration::from_millis(50)
         ));
         assert!(!drain_has_capacity(
             0,
             Duration::from_millis(50),
-            64,
+            16,
             Duration::from_millis(50)
         ));
+    }
+
+    #[test]
+    fn ready_dags_rotate_after_previous_cursor() {
+        let mut result_oids: Vec<_> = [10, 20, 30, 40]
+            .into_iter()
+            .map(pg_sys::Oid::from)
+            .collect();
+        rotate_after_cursor(&mut result_oids, Some(pg_sys::Oid::from(20)));
+        assert_eq!(
+            result_oids,
+            [30, 40, 10, 20]
+                .into_iter()
+                .map(pg_sys::Oid::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ready_dag_rotation_handles_missing_cursor() {
+        let mut result_oids: Vec<_> = [10, 20, 30].into_iter().map(pg_sys::Oid::from).collect();
+        rotate_after_cursor(&mut result_oids, Some(pg_sys::Oid::from(25)));
+        assert_eq!(
+            result_oids,
+            [30, 10, 20]
+                .into_iter()
+                .map(pg_sys::Oid::from)
+                .collect::<Vec<_>>()
+        );
+
+        rotate_after_cursor(&mut result_oids, None);
+        assert_eq!(
+            result_oids,
+            [30, 10, 20]
+                .into_iter()
+                .map(pg_sys::Oid::from)
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -1,9 +1,29 @@
--- DISTINCT is a threshold over projected keys. Decode and filter the source
--- commit once, combine collisions, update multiplicities once per key, and
--- touch the sink only when a key crosses the zero boundary.
+-- Raise from inside a MATERIALIZED transition relation before any unary
+-- operator state or sink change can be derived from an invalid prefix.
+CREATE FUNCTION shiba._assert_unary_batch_transition(
+    p_valid boolean,
+    p_operator text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    IF NOT coalesce(p_valid,false) THEN
+      RAISE EXCEPTION 'Shiba % batch produced negative multiplicity',p_operator
+        USING ERRCODE='P0S01';
+    END IF;
+    RETURN true;
+END;
+$$;
+
+-- DISTINCT is a threshold over projected keys. The transition relation is
+-- materialized by the PostgreSQL executor, not in a catalog-backed temporary
+-- table, and feeds set-based state and sink changes in one statement.
 CREATE FUNCTION shiba._apply_distinct_batch(
     stream_view shiba_internal.stream_views,
-    events jsonb
+    p_commit_lsn pg_lsn
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -15,18 +35,11 @@ DECLARE
     result_name text;
     filter_sql text;
     key_arguments text;
-    affected_keys jsonb[];
-    multiplicity_deltas bigint[];
-    minimum_prefixes bigint[];
-    old_multiplicities bigint[];
-    state_is_valid boolean;
-    inserted_keys jsonb[];
-    removed_keys jsonb[];
 BEGIN
     IF stream_view.view_kind<>'distinct' THEN
       RAISE EXCEPTION 'invalid Shiba DISTINCT batch specialization for result %',
         stream_view.result_oid
-        USING ERRCODE='data_corrupted';
+        USING ERRCODE='P0S01';
     END IF;
     SELECT * INTO STRICT distinct_view
     FROM shiba_internal.distinct_views
@@ -54,15 +67,14 @@ BEGIN
     EXECUTE format(
       $statement$
       WITH typed_events AS MATERIALIZED (
-        SELECT raw.ordinality,event.delta::bigint AS delta,input.row
-        FROM jsonb_array_elements($2) WITH ORDINALITY raw(value,ordinality)
-        CROSS JOIN LATERAL jsonb_populate_record(
-          NULL::shiba_internal.delta_event,raw.value
-        ) event
+        SELECT event.sequence AS ordinality,
+               event.delta::bigint AS delta,input.row
+        FROM shiba_internal.change_log event
         CROSS JOIN LATERAL (
           SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
         ) input
-        WHERE event.source_oid=$3
+        WHERE event.commit_lsn=$2
+          AND event.source_oid=$3
           AND coalesce((%2$s),false)
       ),
       keyed_events AS (
@@ -85,82 +97,82 @@ BEGIN
                min(prefix)::bigint AS minimum_prefix
         FROM running
         GROUP BY row_key
+      ),
+      transitions AS MATERIALIZED (
+        SELECT contribution.row_key,contribution.multiplicity_delta,
+               contribution.minimum_prefix,
+               coalesce(state.multiplicity,0)::bigint AS old_multiplicity,
+               (
+                 coalesce(state.multiplicity,0)
+                   + contribution.multiplicity_delta
+               )::bigint AS new_multiplicity
+        FROM contributions contribution
+        LEFT JOIN shiba_internal.projection_state state
+          ON state.result_oid=$1
+         AND state.row_key=contribution.row_key
+      ),
+      validated AS MATERIALIZED (
+        SELECT transition.*
+        FROM transitions transition
+        WHERE shiba._assert_unary_batch_transition(
+          transition.old_multiplicity+transition.minimum_prefix>=0
+            AND transition.new_multiplicity>=0,
+          'DISTINCT'
+        )
+      ),
+      state_upserts AS (
+        INSERT INTO shiba_internal.projection_state
+          (result_oid,row_key,multiplicity)
+        SELECT $1,batch.row_key,batch.new_multiplicity
+        FROM validated batch
+        WHERE batch.multiplicity_delta<>0
+          AND batch.new_multiplicity>0
+        ON CONFLICT(result_oid,row_key) DO UPDATE
+        SET multiplicity=EXCLUDED.multiplicity
+        RETURNING row_key
+      ),
+      state_deletes AS (
+        DELETE FROM shiba_internal.projection_state state
+        USING validated batch
+        WHERE state.result_oid=$1
+          AND state.row_key=batch.row_key
+          AND batch.multiplicity_delta<>0
+          AND batch.new_multiplicity=0
+        RETURNING state.row_key
+      ),
+      sink_deletes AS (
+        DELETE FROM %4$s target
+        USING validated batch
+        WHERE to_jsonb(target)=batch.row_key
+          AND batch.old_multiplicity>0
+          AND batch.new_multiplicity=0
+        RETURNING 1
+      ),
+      mutations AS MATERIALIZED (
+        SELECT
+          (SELECT count(*) FROM state_upserts)
+          +(SELECT count(*) FROM state_deletes)
+          +(SELECT count(*) FROM sink_deletes) AS mutation_count
       )
-      SELECT array_agg(row_key ORDER BY row_key::text),
-             array_agg(multiplicity_delta ORDER BY row_key::text),
-             array_agg(minimum_prefix ORDER BY row_key::text)
-      FROM contributions
+      INSERT INTO %4$s
+      SELECT (jsonb_populate_record(NULL::%4$s,batch.row_key)).*
+      FROM validated batch
+      CROSS JOIN mutations
+      WHERE batch.old_multiplicity=0
+        AND batch.new_multiplicity>0
       $statement$,
-      source_name,filter_sql,key_arguments
+      source_name,filter_sql,key_arguments,result_name
     )
-    USING stream_view.result_oid,events,stream_view.source_oid
-    INTO affected_keys,multiplicity_deltas,minimum_prefixes;
-    IF affected_keys IS NULL THEN
-      RETURN;
-    END IF;
-
-    SELECT array_agg(coalesce(state.multiplicity,0) ORDER BY slot),
-           coalesce(bool_and(
-             coalesce(state.multiplicity,0)+minimum_prefixes[slot]>=0
-           ),true)
-    INTO old_multiplicities,state_is_valid
-    FROM generate_subscripts(affected_keys,1) slot
-    LEFT JOIN shiba_internal.projection_state state
-      ON state.result_oid=stream_view.result_oid
-     AND state.row_key=affected_keys[slot];
-    IF NOT state_is_valid THEN
-      RAISE EXCEPTION 'Shiba DISTINCT batch produced negative multiplicity'
-        USING ERRCODE='data_corrupted';
-    END IF;
-
-    INSERT INTO shiba_internal.projection_state
-      (result_oid,row_key,multiplicity)
-    SELECT stream_view.result_oid,affected_keys[slot],
-           old_multiplicities[slot]+multiplicity_deltas[slot]
-    FROM generate_subscripts(affected_keys,1) slot
-    WHERE multiplicity_deltas[slot]<>0
-      AND old_multiplicities[slot]+multiplicity_deltas[slot]>0
-    ON CONFLICT(result_oid,row_key) DO UPDATE
-    SET multiplicity=EXCLUDED.multiplicity;
-    DELETE FROM shiba_internal.projection_state state
-    USING generate_subscripts(affected_keys,1) slot
-    WHERE state.result_oid=stream_view.result_oid
-      AND state.row_key=affected_keys[slot]
-      AND multiplicity_deltas[slot]<>0
-      AND old_multiplicities[slot]+multiplicity_deltas[slot]=0;
-
-    SELECT array_agg(affected_keys[slot] ORDER BY slot)
-    INTO inserted_keys
-    FROM generate_subscripts(affected_keys,1) slot
-    WHERE old_multiplicities[slot]=0
-      AND multiplicity_deltas[slot]>0;
-    SELECT array_agg(affected_keys[slot] ORDER BY slot)
-    INTO removed_keys
-    FROM generate_subscripts(affected_keys,1) slot
-    WHERE old_multiplicities[slot]>0
-      AND old_multiplicities[slot]+multiplicity_deltas[slot]=0;
-    IF removed_keys IS NOT NULL THEN
-      EXECUTE format(
-        'DELETE FROM %s target WHERE to_jsonb(target)=ANY($1)',
-        result_name
-      ) USING removed_keys;
-    END IF;
-    IF inserted_keys IS NOT NULL THEN
-      EXECUTE format(
-        'INSERT INTO %s
-         SELECT (jsonb_populate_record(NULL::%s,key_value)).*
-         FROM unnest($1::jsonb[]) key_value',
-        result_name,result_name
-      ) USING inserted_keys;
-    END IF;
+    USING stream_view.result_oid,p_commit_lsn,stream_view.source_oid;
 END;
 $$;
 
--- TopN keeps a full multiset. Apply the commit's net row changes together and
--- rebuild the bounded sink once, rather than once for every source delta.
+-- TopN keeps a full multiset. The final state is derived from the statement
+-- snapshot plus this commit's transition relation, so rebuilding the bounded
+-- sink does not require reading state writes made earlier in the statement.
 CREATE FUNCTION shiba._apply_topn_batch(
     stream_view shiba_internal.stream_views,
-    events jsonb
+    p_commit_lsn pg_lsn
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -171,18 +183,13 @@ DECLARE
     source_name text;
     result_name text;
     filter_sql text;
-    affected_rows jsonb[];
-    multiplicity_deltas bigint[];
-    minimum_prefixes bigint[];
-    old_multiplicities bigint[];
-    state_is_valid boolean;
     quoted_outputs text;
     expressions text;
 BEGIN
     IF stream_view.view_kind<>'topn' THEN
       RAISE EXCEPTION 'invalid Shiba TopN batch specialization for result %',
         stream_view.result_oid
-        USING ERRCODE='data_corrupted';
+        USING ERRCODE='P0S01';
     END IF;
     SELECT * INTO STRICT topn_view
     FROM shiba_internal.topn_views
@@ -200,19 +207,23 @@ BEGIN
         AND input_side='left'
         AND phase='pre'
     ),'true') INTO filter_sql;
+    SELECT string_agg(format('%I',output_column),',' ORDER BY ordinal),
+           string_agg(format('input.%I',source_column),',' ORDER BY ordinal)
+    INTO STRICT quoted_outputs,expressions
+    FROM unnest(topn_view.source_columns,topn_view.output_columns)
+      WITH ORDINALITY columns(source_column,output_column,ordinal);
 
     EXECUTE format(
       $statement$
       WITH typed_events AS MATERIALIZED (
-        SELECT raw.ordinality,event.delta::bigint AS delta,input.row
-        FROM jsonb_array_elements($2) WITH ORDINALITY raw(value,ordinality)
-        CROSS JOIN LATERAL jsonb_populate_record(
-          NULL::shiba_internal.delta_event,raw.value
-        ) event
+        SELECT event.sequence AS ordinality,
+               event.delta::bigint AS delta,input.row
+        FROM shiba_internal.change_log event
         CROSS JOIN LATERAL (
           SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
         ) input
-        WHERE event.source_oid=$3
+        WHERE event.commit_lsn=$2
+          AND event.source_oid=$3
           AND coalesce((%2$s),false)
       ),
       canonical_events AS (
@@ -236,84 +247,106 @@ BEGIN
                min(prefix)::bigint AS minimum_prefix
         FROM running
         GROUP BY row_data
+      ),
+      transitions AS MATERIALIZED (
+        SELECT contribution.row_data,contribution.multiplicity_delta,
+               contribution.minimum_prefix,
+               coalesce(state.multiplicity,0)::bigint AS old_multiplicity,
+               (
+                 coalesce(state.multiplicity,0)
+                   + contribution.multiplicity_delta
+               )::bigint AS new_multiplicity
+        FROM contributions contribution
+        LEFT JOIN shiba_internal.topn_rows state
+          ON state.result_oid=$1
+         AND state.row_data=contribution.row_data
+      ),
+      validated AS MATERIALIZED (
+        SELECT transition.*
+        FROM transitions transition
+        WHERE shiba._assert_unary_batch_transition(
+          transition.old_multiplicity+transition.minimum_prefix>=0
+            AND transition.new_multiplicity>=0,
+          'TopN'
+        )
+      ),
+      changed AS MATERIALIZED (
+        SELECT coalesce(bool_or(multiplicity_delta<>0),false) AS value
+        FROM validated
+      ),
+      next_state AS NOT MATERIALIZED (
+        SELECT state.row_data,state.multiplicity
+        FROM shiba_internal.topn_rows state
+        WHERE state.result_oid=$1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM validated batch
+            WHERE batch.row_data=state.row_data
+              AND batch.multiplicity_delta<>0
+          )
+        UNION ALL
+        SELECT batch.row_data,batch.new_multiplicity
+        FROM validated batch
+        WHERE batch.multiplicity_delta<>0
+          AND batch.new_multiplicity>0
+      ),
+      state_upserts AS (
+        INSERT INTO shiba_internal.topn_rows
+          (result_oid,row_data,multiplicity)
+        SELECT $1,batch.row_data,batch.new_multiplicity
+        FROM validated batch
+        WHERE batch.multiplicity_delta<>0
+          AND batch.new_multiplicity>0
+        ON CONFLICT(result_oid,row_data) DO UPDATE
+        SET multiplicity=EXCLUDED.multiplicity
+        RETURNING row_data
+      ),
+      state_deletes AS (
+        DELETE FROM shiba_internal.topn_rows state
+        USING validated batch
+        WHERE state.result_oid=$1
+          AND state.row_data=batch.row_data
+          AND batch.multiplicity_delta<>0
+          AND batch.new_multiplicity=0
+        RETURNING state.row_data
+      ),
+      sink_deletes AS (
+        DELETE FROM %3$s
+        WHERE (SELECT value FROM changed)
+        RETURNING 1
+      ),
+      mutations AS MATERIALIZED (
+        SELECT
+          (SELECT count(*) FROM state_upserts)
+          +(SELECT count(*) FROM state_deletes)
+          +(SELECT count(*) FROM sink_deletes) AS mutation_count
       )
-      SELECT array_agg(row_data ORDER BY row_data::text),
-             array_agg(multiplicity_delta ORDER BY row_data::text),
-             array_agg(minimum_prefix ORDER BY row_data::text)
-      FROM contributions
+      INSERT INTO %3$s (%4$s)
+      SELECT %5$s
+      FROM next_state state
+      CROSS JOIN LATERAL
+        jsonb_populate_record(NULL::%1$s,state.row_data) input
+      CROSS JOIN LATERAL generate_series(1,state.multiplicity) copy(n)
+      CROSS JOIN mutations
+      WHERE (SELECT value FROM changed)
+      ORDER BY input.%6$I %7$s NULLS %8$s,state.row_data::text,copy.n
+      OFFSET %9$s LIMIT %10$s
       $statement$,
-      source_name,filter_sql
-    )
-    USING stream_view.result_oid,events,stream_view.source_oid
-    INTO affected_rows,multiplicity_deltas,minimum_prefixes;
-    IF affected_rows IS NULL THEN
-      RETURN;
-    END IF;
-    SELECT array_agg(coalesce(state.multiplicity,0) ORDER BY slot),
-           coalesce(bool_and(
-             coalesce(state.multiplicity,0)+minimum_prefixes[slot]>=0
-           ),true)
-    INTO old_multiplicities,state_is_valid
-    FROM generate_subscripts(affected_rows,1) slot
-    LEFT JOIN shiba_internal.topn_rows state
-      ON state.result_oid=stream_view.result_oid
-     AND state.row_data=affected_rows[slot];
-    IF NOT state_is_valid THEN
-      RAISE EXCEPTION 'Shiba TopN batch produced negative multiplicity'
-        USING ERRCODE='data_corrupted';
-    END IF;
-
-    INSERT INTO shiba_internal.topn_rows
-      (result_oid,row_data,multiplicity)
-    SELECT stream_view.result_oid,affected_rows[slot],
-           old_multiplicities[slot]+multiplicity_deltas[slot]
-    FROM generate_subscripts(affected_rows,1) slot
-    WHERE multiplicity_deltas[slot]<>0
-      AND old_multiplicities[slot]+multiplicity_deltas[slot]>0
-    ON CONFLICT(result_oid,row_data) DO UPDATE
-    SET multiplicity=EXCLUDED.multiplicity;
-    DELETE FROM shiba_internal.topn_rows state
-    USING generate_subscripts(affected_rows,1) slot
-    WHERE state.result_oid=stream_view.result_oid
-      AND state.row_data=affected_rows[slot]
-      AND multiplicity_deltas[slot]<>0
-      AND old_multiplicities[slot]+multiplicity_deltas[slot]=0;
-
-    IF NOT EXISTS (
-      SELECT 1 FROM unnest(multiplicity_deltas) delta(value)
-      WHERE delta.value<>0
-    ) THEN
-      RETURN;
-    END IF;
-
-    EXECUTE format('DELETE FROM %s',result_name);
-    SELECT string_agg(format('%I',output_column),',' ORDER BY ordinal),
-           string_agg(format('input.%I',source_column),',' ORDER BY ordinal)
-    INTO STRICT quoted_outputs,expressions
-    FROM unnest(topn_view.source_columns,topn_view.output_columns)
-      WITH ORDINALITY columns(source_column,output_column,ordinal);
-    EXECUTE format(
-      'INSERT INTO %s (%s)
-       SELECT %s
-       FROM shiba_internal.topn_rows state
-       CROSS JOIN LATERAL jsonb_populate_record(NULL::%s,state.row_data) input
-       CROSS JOIN LATERAL generate_series(1,state.multiplicity) copy(n)
-       WHERE state.result_oid=$1
-       ORDER BY input.%I %s NULLS %s,state.row_data::text,copy.n
-       OFFSET %s LIMIT %s',
-      result_name,quoted_outputs,expressions,source_name,
+      source_name,filter_sql,result_name,quoted_outputs,expressions,
       topn_view.order_column,upper(topn_view.order_direction),
       CASE topn_view.nulls_first WHEN true THEN 'FIRST' ELSE 'LAST' END,
       topn_view.limit_offset,topn_view.limit_count
-    ) USING stream_view.result_oid;
+    )
+    USING stream_view.result_oid,p_commit_lsn,stream_view.source_oid;
 END;
 $$;
 
--- Window state is grouped by the full canonical row and partition. Apply all
--- multiplicity changes first and rebuild each changed partition exactly once.
+-- Window state is grouped by the full canonical row and partition. All
+-- affected partitions are rebuilt together from the snapshot plus this
+-- commit's validated transition relation.
 CREATE FUNCTION shiba._apply_window_batch(
     stream_view shiba_internal.stream_views,
-    events jsonb
+    p_commit_lsn pg_lsn
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -324,21 +357,13 @@ DECLARE
     source_name text;
     result_name text;
     filter_sql text;
-    affected_partitions jsonb[];
-    affected_rows jsonb[];
-    multiplicity_deltas bigint[];
-    minimum_prefixes bigint[];
-    old_multiplicities bigint[];
-    state_is_valid boolean;
-    rebuild_partitions jsonb[];
-    rebuild_partition jsonb;
     quoted_outputs text;
     expressions text;
 BEGIN
     IF stream_view.view_kind<>'window' THEN
       RAISE EXCEPTION 'invalid Shiba window batch specialization for result %',
         stream_view.result_oid
-        USING ERRCODE='data_corrupted';
+        USING ERRCODE='P0S01';
     END IF;
     SELECT * INTO STRICT window_view
     FROM shiba_internal.window_views
@@ -356,19 +381,26 @@ BEGIN
         AND input_side='left'
         AND phase='pre'
     ),'true') INTO filter_sql;
+    SELECT string_agg(format('%I',column_name),',' ORDER BY ordinal)
+    INTO STRICT quoted_outputs
+    FROM unnest(window_view.output_columns)
+      WITH ORDINALITY output(column_name,ordinal);
+    SELECT string_agg(expression,',' ORDER BY ordinal)
+    INTO STRICT expressions
+    FROM unnest(window_view.target_expressions)
+      WITH ORDINALITY target(expression,ordinal);
 
     EXECUTE format(
       $statement$
       WITH typed_events AS MATERIALIZED (
-        SELECT raw.ordinality,event.delta::bigint AS delta,input.row
-        FROM jsonb_array_elements($2) WITH ORDINALITY raw(value,ordinality)
-        CROSS JOIN LATERAL jsonb_populate_record(
-          NULL::shiba_internal.delta_event,raw.value
-        ) event
+        SELECT event.sequence AS ordinality,
+               event.delta::bigint AS delta,input.row
+        FROM shiba_internal.change_log event
         CROSS JOIN LATERAL (
           SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
         ) input
-        WHERE event.source_oid=$3
+        WHERE event.commit_lsn=$2
+          AND event.source_oid=$3
           AND coalesce((%2$s),false)
       ),
       canonical_events AS (
@@ -396,87 +428,100 @@ BEGIN
                min(prefix)::bigint AS minimum_prefix
         FROM running
         GROUP BY partition_key,row_data
+      ),
+      transitions AS MATERIALIZED (
+        SELECT contribution.partition_key,contribution.row_data,
+               contribution.multiplicity_delta,
+               contribution.minimum_prefix,
+               coalesce(state.multiplicity,0)::bigint AS old_multiplicity,
+               (
+                 coalesce(state.multiplicity,0)
+                   + contribution.multiplicity_delta
+               )::bigint AS new_multiplicity
+        FROM contributions contribution
+        LEFT JOIN shiba_internal.window_rows state
+          ON state.result_oid=$1
+         AND state.partition_key=contribution.partition_key
+         AND state.row_data=contribution.row_data
+      ),
+      validated AS MATERIALIZED (
+        SELECT transition.*
+        FROM transitions transition
+        WHERE shiba._assert_unary_batch_transition(
+          transition.old_multiplicity+transition.minimum_prefix>=0
+            AND transition.new_multiplicity>=0,
+          'window'
+        )
+      ),
+      changed_partitions AS MATERIALIZED (
+        SELECT DISTINCT partition_key
+        FROM validated
+        WHERE multiplicity_delta<>0
+      ),
+      next_state AS MATERIALIZED (
+        SELECT state.partition_key,state.row_data,state.multiplicity
+        FROM shiba_internal.window_rows state
+        JOIN changed_partitions changed
+          ON changed.partition_key=state.partition_key
+        WHERE state.result_oid=$1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM validated batch
+            WHERE batch.partition_key=state.partition_key
+              AND batch.row_data=state.row_data
+              AND batch.multiplicity_delta<>0
+          )
+        UNION ALL
+        SELECT batch.partition_key,batch.row_data,batch.new_multiplicity
+        FROM validated batch
+        WHERE batch.multiplicity_delta<>0
+          AND batch.new_multiplicity>0
+      ),
+      state_upserts AS (
+        INSERT INTO shiba_internal.window_rows
+          (result_oid,partition_key,row_data,multiplicity)
+        SELECT $1,batch.partition_key,batch.row_data,batch.new_multiplicity
+        FROM validated batch
+        WHERE batch.multiplicity_delta<>0
+          AND batch.new_multiplicity>0
+        ON CONFLICT(result_oid,partition_key,row_data) DO UPDATE
+        SET multiplicity=EXCLUDED.multiplicity
+        RETURNING partition_key,row_data
+      ),
+      state_deletes AS (
+        DELETE FROM shiba_internal.window_rows state
+        USING validated batch
+        WHERE state.result_oid=$1
+          AND state.partition_key=batch.partition_key
+          AND state.row_data=batch.row_data
+          AND batch.multiplicity_delta<>0
+          AND batch.new_multiplicity=0
+        RETURNING state.partition_key,state.row_data
+      ),
+      sink_deletes AS (
+        DELETE FROM %4$s result
+        USING changed_partitions changed
+        WHERE coalesce(to_jsonb(result.%5$I),'null'::jsonb)
+              =changed.partition_key
+        RETURNING 1
+      ),
+      mutations AS MATERIALIZED (
+        SELECT
+          (SELECT count(*) FROM state_upserts)
+          +(SELECT count(*) FROM state_deletes)
+          +(SELECT count(*) FROM sink_deletes) AS mutation_count
       )
-      SELECT array_agg(partition_key ORDER BY partition_key::text,row_data::text),
-             array_agg(row_data ORDER BY partition_key::text,row_data::text),
-             array_agg(multiplicity_delta ORDER BY partition_key::text,row_data::text),
-             array_agg(minimum_prefix ORDER BY partition_key::text,row_data::text)
-      FROM contributions
+      INSERT INTO %4$s (%6$s)
+      SELECT %7$s
+      FROM next_state state
+      CROSS JOIN LATERAL
+        jsonb_populate_record(NULL::%1$s,state.row_data) input
+      CROSS JOIN LATERAL generate_series(1,state.multiplicity) copy(n)
+      CROSS JOIN mutations
       $statement$,
-      source_name,filter_sql,window_view.partition_column
+      source_name,filter_sql,window_view.partition_column,result_name,
+      window_view.result_partition_column,quoted_outputs,expressions
     )
-    USING stream_view.result_oid,events,stream_view.source_oid
-    INTO affected_partitions,affected_rows,multiplicity_deltas,minimum_prefixes;
-    IF affected_rows IS NULL THEN
-      RETURN;
-    END IF;
-
-    SELECT array_agg(coalesce(state.multiplicity,0) ORDER BY slot),
-           coalesce(bool_and(
-             coalesce(state.multiplicity,0)+minimum_prefixes[slot]>=0
-           ),true)
-    INTO old_multiplicities,state_is_valid
-    FROM generate_subscripts(affected_rows,1) slot
-    LEFT JOIN shiba_internal.window_rows state
-      ON state.result_oid=stream_view.result_oid
-     AND state.partition_key=affected_partitions[slot]
-     AND state.row_data=affected_rows[slot];
-    IF NOT state_is_valid THEN
-      RAISE EXCEPTION 'Shiba window batch produced negative multiplicity'
-        USING ERRCODE='data_corrupted';
-    END IF;
-
-    INSERT INTO shiba_internal.window_rows
-      (result_oid,partition_key,row_data,multiplicity)
-    SELECT stream_view.result_oid,affected_partitions[slot],
-           affected_rows[slot],
-           old_multiplicities[slot]+multiplicity_deltas[slot]
-    FROM generate_subscripts(affected_rows,1) slot
-    WHERE multiplicity_deltas[slot]<>0
-      AND old_multiplicities[slot]+multiplicity_deltas[slot]>0
-    ON CONFLICT(result_oid,partition_key,row_data) DO UPDATE
-    SET multiplicity=EXCLUDED.multiplicity;
-    DELETE FROM shiba_internal.window_rows state
-    USING generate_subscripts(affected_rows,1) slot
-    WHERE state.result_oid=stream_view.result_oid
-      AND state.partition_key=affected_partitions[slot]
-      AND state.row_data=affected_rows[slot]
-      AND multiplicity_deltas[slot]<>0
-      AND old_multiplicities[slot]+multiplicity_deltas[slot]=0;
-
-    SELECT array_agg(partition_key ORDER BY partition_key::text)
-    INTO rebuild_partitions
-    FROM (
-      SELECT DISTINCT affected_partitions[slot] AS partition_key
-      FROM generate_subscripts(affected_partitions,1) slot
-      WHERE multiplicity_deltas[slot]<>0
-    ) changed;
-    IF rebuild_partitions IS NULL THEN
-      RETURN;
-    END IF;
-    SELECT string_agg(format('%I',column_name),',' ORDER BY ordinal)
-    INTO STRICT quoted_outputs
-    FROM unnest(window_view.output_columns)
-      WITH ORDINALITY output(column_name,ordinal);
-    SELECT string_agg(expression,',' ORDER BY ordinal)
-    INTO STRICT expressions
-    FROM unnest(window_view.target_expressions)
-      WITH ORDINALITY target(expression,ordinal);
-    FOREACH rebuild_partition IN ARRAY rebuild_partitions LOOP
-      EXECUTE format(
-        'DELETE FROM %s
-         WHERE coalesce(to_jsonb(%I),''null''::jsonb)=$1',
-        result_name,window_view.result_partition_column
-      ) USING rebuild_partition;
-      EXECUTE format(
-        'INSERT INTO %s (%s)
-         SELECT %s
-         FROM shiba_internal.window_rows state
-         CROSS JOIN LATERAL jsonb_populate_record(NULL::%s,state.row_data) input
-         CROSS JOIN LATERAL generate_series(1,state.multiplicity) copy(n)
-         WHERE state.result_oid=$1 AND state.partition_key=$2',
-        result_name,quoted_outputs,expressions,source_name
-      ) USING stream_view.result_oid,rebuild_partition;
-    END LOOP;
+    USING stream_view.result_oid,p_commit_lsn,stream_view.source_oid;
 END;
 $$;

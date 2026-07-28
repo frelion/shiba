@@ -17,7 +17,7 @@ BEGIN
     );
     IF declaration IS NULL THEN
         RAISE EXCEPTION 'invalid Shiba CTAS while storing Query analysis'
-            USING ERRCODE = 'data_corrupted';
+            USING ERRCODE='P0S01';
     END IF;
     result_relation := format('%I.%I', 'shiba', declaration[2])::regclass;
     UPDATE shiba_internal.stream_graphs
@@ -25,7 +25,7 @@ BEGIN
     WHERE result_oid = result_relation;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Shiba logical graph is missing for result %', result_relation
-            USING ERRCODE = 'data_corrupted';
+            USING ERRCODE='P0S01';
     END IF;
 END;
 $$;
@@ -37,6 +37,7 @@ AS $$
 DECLARE
     explained jsonb;
     logical jsonb;
+    compiled_physical jsonb;
 BEGIN
     EXECUTE 'EXPLAIN (VERBOSE, FORMAT JSON) ' || definition INTO explained;
     logical := shiba.compile_logical_plan(result_relation)::jsonb;
@@ -87,6 +88,26 @@ BEGIN
     VALUES (result_relation, 'sink', 'Shiba Sink', jsonb_build_object('result_oid', result_relation));
     INSERT INTO shiba_internal.stream_graph_edges (result_oid, upstream_node_id, downstream_node_id)
     VALUES (result_relation, 'n0', 'sink');
+
+    compiled_physical := shiba.compile_physical_plan(result_relation)::jsonb;
+    IF compiled_physical IS NULL
+       OR jsonb_typeof(compiled_physical) IS DISTINCT FROM 'object'
+       OR compiled_physical = '{}'::jsonb
+       OR jsonb_typeof(compiled_physical -> 'version') IS DISTINCT FROM 'number'
+       OR jsonb_typeof(compiled_physical -> 'plan') IS DISTINCT FROM 'object'
+       OR jsonb_typeof(compiled_physical -> 'stages') IS DISTINCT FROM 'array' THEN
+        RAISE EXCEPTION
+            'Shiba physical compiler returned an invalid plan for result %',
+            result_relation
+            USING ERRCODE='P0S01';
+    END IF;
+
+    PERFORM shiba._finalize_physical_plan(
+        result_relation,
+        compiled_physical -> 'plan',
+        compiled_physical -> 'stages',
+        (compiled_physical ->> 'version')::integer
+    );
 END;
 $$;
 
@@ -102,11 +123,409 @@ AS $$
 BEGIN
     INSERT INTO shiba_internal.view_progress (result_oid)
     VALUES (result_relation);
-    INSERT INTO shiba_internal.dag_worker_state (result_oid)
+    INSERT INTO shiba_internal.dag_runtime_state (result_oid)
     VALUES (result_relation);
     PERFORM shiba._compile_stream_graph(result_relation, definition);
 END;
 $$;
+
+-- Create one compiler-selected database-local Stage.  This function accepts a
+-- structured typed schema, never SQL fragments:
+--   [{"name":"commit_lsn","type_oid":3220,"typmod":-1,
+--     "collation_oid":0,"nullable":false}, ...]
+-- Index specs are simple B-tree column lists:
+--   [{"columns":["commit_lsn","join_key"],"unique":false}, ...]
+CREATE FUNCTION shiba_internal._create_unlogged_stage_relation(
+    result_relation oid,
+    physical_plan_id bigint,
+    physical_stage_id integer,
+    column_specs jsonb,
+    stage_index_specs jsonb
+)
+RETURNS TABLE (relation_oid oid, relation_name name)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba_internal
+AS $$
+DECLARE
+    relation_identifier name;
+    column_spec jsonb;
+    column_ordinal bigint;
+    column_identifier text;
+    column_type_oid oid;
+    column_typmod integer;
+    column_collation_oid oid;
+    column_nullable boolean;
+    column_type_sql text;
+    column_collation_sql text;
+    column_definitions text := '';
+    index_spec jsonb;
+    index_ordinal bigint;
+    index_identifier name;
+    index_columns text;
+    index_unique boolean;
+    maximum_identifier_length integer :=
+        current_setting('max_identifier_length')::integer;
+BEGIN
+    IF result_relation IS NULL
+       OR physical_plan_id IS NULL
+       OR physical_plan_id <= 0
+       OR physical_stage_id IS NULL
+       OR physical_stage_id < 0
+       OR jsonb_typeof(column_specs) IS DISTINCT FROM 'array'
+       OR jsonb_array_length(column_specs) = 0
+       OR jsonb_typeof(stage_index_specs) IS DISTINCT FROM 'array' THEN
+        RAISE EXCEPTION 'invalid UNLOGGED Stage specification'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    relation_identifier := format(
+        'stage_r%s_p%s_s%s',
+        result_relation,
+        physical_plan_id,
+        physical_stage_id
+    )::name;
+
+    IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(column_specs) AS proposed(spec)
+        WHERE jsonb_typeof(proposed.spec) IS DISTINCT FROM 'object'
+           OR jsonb_typeof(proposed.spec -> 'name') IS DISTINCT FROM 'string'
+           OR btrim(proposed.spec ->> 'name') = ''
+           OR octet_length(proposed.spec ->> 'name') > maximum_identifier_length
+    ) OR EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(column_specs) AS proposed(spec)
+        GROUP BY proposed.spec ->> 'name'
+        HAVING count(*) > 1
+    ) THEN
+        RAISE EXCEPTION 'invalid or duplicate UNLOGGED Stage column name'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    FOR column_spec, column_ordinal IN
+        SELECT proposed.spec, proposed.ordinality
+        FROM jsonb_array_elements(column_specs)
+            WITH ORDINALITY AS proposed(spec, ordinality)
+        ORDER BY proposed.ordinality
+    LOOP
+        BEGIN
+            column_identifier := column_spec ->> 'name';
+            column_type_oid := (column_spec ->> 'type_oid')::oid;
+            column_typmod := coalesce((column_spec ->> 'typmod')::integer, -1);
+            column_collation_oid :=
+                coalesce((column_spec ->> 'collation_oid')::oid, 0::oid);
+            column_nullable :=
+                coalesce((column_spec ->> 'nullable')::boolean, true);
+        EXCEPTION
+            WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+                RAISE EXCEPTION
+                    'invalid type metadata for UNLOGGED Stage column %',
+                    column_identifier
+                    USING ERRCODE = 'invalid_parameter_value';
+        END;
+
+        SELECT format_type(type_catalog.oid, column_typmod)
+        INTO column_type_sql
+        FROM pg_type AS type_catalog
+        WHERE type_catalog.oid = column_type_oid
+          AND type_catalog.typtype <> 'p';
+        IF column_type_sql IS NULL THEN
+            RAISE EXCEPTION
+                'UNLOGGED Stage column % has invalid or pseudo type OID %',
+                column_identifier,
+                column_type_oid
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+
+        column_collation_sql := '';
+        IF column_collation_oid <> 0 THEN
+            SELECT format(
+                ' COLLATE %I.%I',
+                collation_namespace.nspname,
+                collation_catalog.collname
+            )
+            INTO column_collation_sql
+            FROM pg_collation AS collation_catalog
+            JOIN pg_namespace AS collation_namespace
+              ON collation_namespace.oid = collation_catalog.collnamespace
+            WHERE collation_catalog.oid = column_collation_oid;
+            IF column_collation_sql IS NULL THEN
+                RAISE EXCEPTION
+                    'UNLOGGED Stage column % has unknown collation OID %',
+                    column_identifier,
+                    column_collation_oid
+                    USING ERRCODE = 'invalid_parameter_value';
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_type AS type_catalog
+                WHERE type_catalog.oid = column_type_oid
+                  AND type_catalog.typcollation <> 0
+            ) THEN
+                RAISE EXCEPTION
+                    'UNLOGGED Stage column % type % is not collatable',
+                    column_identifier,
+                    column_type_sql
+                    USING ERRCODE = 'datatype_mismatch';
+            END IF;
+        END IF;
+
+        column_definitions := column_definitions
+            || CASE WHEN column_ordinal > 1 THEN ', ' ELSE '' END
+            || format(
+                '%I %s%s%s',
+                column_identifier,
+                column_type_sql,
+                column_collation_sql,
+                CASE WHEN column_nullable THEN '' ELSE ' NOT NULL' END
+            );
+    END LOOP;
+
+    EXECUTE format(
+        'CREATE UNLOGGED TABLE %I.%I (%s)',
+        'shiba_internal',
+        relation_identifier,
+        column_definitions
+    );
+    EXECUTE format(
+        'REVOKE ALL ON TABLE %I.%I FROM PUBLIC',
+        'shiba_internal',
+        relation_identifier
+    );
+
+    SELECT class_catalog.oid, class_catalog.relname
+    INTO STRICT relation_oid, relation_name
+    FROM pg_class AS class_catalog
+    JOIN pg_namespace AS namespace_catalog
+      ON namespace_catalog.oid = class_catalog.relnamespace
+    WHERE namespace_catalog.nspname = 'shiba_internal'
+      AND class_catalog.relname = relation_identifier
+      AND class_catalog.relkind = 'r'
+      AND class_catalog.relpersistence = 'u';
+
+    FOR index_spec, index_ordinal IN
+        SELECT proposed.spec, proposed.ordinality
+        FROM jsonb_array_elements(stage_index_specs)
+            WITH ORDINALITY AS proposed(spec, ordinality)
+        ORDER BY proposed.ordinality
+    LOOP
+        IF jsonb_typeof(index_spec) IS DISTINCT FROM 'object'
+           OR jsonb_typeof(index_spec -> 'columns') IS DISTINCT FROM 'array'
+           OR jsonb_array_length(index_spec -> 'columns') = 0
+           OR EXISTS (
+               SELECT 1
+               FROM jsonb_array_elements(index_spec -> 'columns') AS key_part(value)
+               WHERE jsonb_typeof(key_part.value) IS DISTINCT FROM 'string'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements(column_specs) AS proposed(spec)
+                      WHERE proposed.spec ->> 'name' = key_part.value #>> '{}'
+                  )
+           )
+           OR EXISTS (
+               SELECT 1
+               FROM jsonb_array_elements_text(index_spec -> 'columns') AS key_part(value)
+               GROUP BY key_part.value
+               HAVING count(*) > 1
+           ) THEN
+            RAISE EXCEPTION 'invalid UNLOGGED Stage index %', index_ordinal
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+
+        BEGIN
+            index_unique := coalesce((index_spec ->> 'unique')::boolean, false);
+        EXCEPTION
+            WHEN invalid_text_representation THEN
+                RAISE EXCEPTION
+                    'invalid unique flag for UNLOGGED Stage index %',
+                    index_ordinal
+                    USING ERRCODE = 'invalid_parameter_value';
+        END;
+
+        SELECT string_agg(format('%I', key_part.value), ', ' ORDER BY key_part.ordinality)
+        INTO index_columns
+        FROM jsonb_array_elements_text(index_spec -> 'columns')
+            WITH ORDINALITY AS key_part(value, ordinality);
+        index_identifier := format(
+            'stage_i%s_%s',
+            relation_oid,
+            index_ordinal
+        )::name;
+        EXECUTE format(
+            'CREATE %s INDEX %I ON %I.%I USING btree (%s)',
+            CASE WHEN index_unique THEN 'UNIQUE' ELSE '' END,
+            index_identifier,
+            'shiba_internal',
+            relation_identifier,
+            index_columns
+        );
+    END LOOP;
+
+    RETURN NEXT;
+END;
+$$;
+
+-- Persist one complete versioned physical plan and materialize its UNLOGGED
+-- stages. Callers invoke this during the surrounding DAG registration
+-- transaction after the logical graph exists.  No apply path calls this API.
+CREATE FUNCTION shiba._finalize_physical_plan(
+    result_relation oid,
+    physical_plan_spec jsonb,
+    stage_specs jsonb,
+    physical_format_version integer DEFAULT 1
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba_internal
+AS $$
+DECLARE
+    new_plan_id bigint;
+    stage_spec jsonb;
+    physical_stage_id integer;
+    physical_stage_name text;
+    physical_storage text;
+    physical_schema_spec jsonb;
+    physical_index_specs jsonb;
+    stage_relation_oid oid;
+    stage_relation_name name;
+BEGIN
+    IF result_relation IS NULL
+       OR physical_format_version IS NULL
+       OR physical_format_version <= 0
+       OR jsonb_typeof(physical_plan_spec) IS DISTINCT FROM 'object'
+       OR jsonb_typeof(stage_specs) IS DISTINCT FROM 'array' THEN
+        RAISE EXCEPTION 'invalid Shiba physical plan specification'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    PERFORM 1
+    FROM shiba_internal.stream_graphs
+    WHERE result_oid = result_relation
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Shiba logical graph is missing for result %', result_relation
+            USING ERRCODE='P0S01';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(stage_specs) AS proposed(spec)
+        WHERE jsonb_typeof(proposed.spec) IS DISTINCT FROM 'object'
+           OR proposed.spec ->> 'stage_id' IS NULL
+           OR jsonb_typeof(proposed.spec -> 'stage_name') IS DISTINCT FROM 'string'
+           OR btrim(proposed.spec ->> 'stage_name') = ''
+           OR proposed.spec ->> 'storage' <> 'unlogged'
+           OR jsonb_typeof(proposed.spec -> 'schema') IS DISTINCT FROM 'array'
+           OR jsonb_typeof(coalesce(proposed.spec -> 'indexes', '[]'::jsonb))
+                IS DISTINCT FROM 'array'
+    ) THEN
+        RAISE EXCEPTION 'invalid Shiba physical Stage specification'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    BEGIN
+        IF EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(stage_specs) AS proposed(spec)
+            WHERE (proposed.spec ->> 'stage_id')::integer < 0
+        ) OR EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(stage_specs) AS proposed(spec)
+            GROUP BY (proposed.spec ->> 'stage_id')::integer
+            HAVING count(*) > 1
+        ) THEN
+            RAISE EXCEPTION 'duplicate or negative Shiba physical stage_id'
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+    EXCEPTION
+        WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+            RAISE EXCEPTION 'invalid Shiba physical stage_id'
+                USING ERRCODE = 'invalid_parameter_value';
+    END;
+
+    IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(stage_specs) AS proposed(spec)
+        GROUP BY proposed.spec ->> 'stage_name'
+        HAVING count(*) > 1
+    ) THEN
+        RAISE EXCEPTION 'duplicate Shiba physical stage_name'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    INSERT INTO shiba_internal.physical_plans (
+        result_oid,
+        version,
+        plan
+    )
+    VALUES (
+        result_relation,
+        physical_format_version,
+        physical_plan_spec
+    )
+    RETURNING plan_id INTO new_plan_id;
+
+    FOR stage_spec IN
+        SELECT proposed.spec
+        FROM jsonb_array_elements(stage_specs) AS proposed(spec)
+        ORDER BY (proposed.spec ->> 'stage_id')::integer
+    LOOP
+        physical_stage_id := (stage_spec ->> 'stage_id')::integer;
+        physical_stage_name := stage_spec ->> 'stage_name';
+        physical_storage := stage_spec ->> 'storage';
+        physical_schema_spec := stage_spec -> 'schema';
+        physical_index_specs := coalesce(stage_spec -> 'indexes', '[]'::jsonb);
+
+        SELECT created.relation_oid, created.relation_name
+        INTO STRICT stage_relation_oid, stage_relation_name
+        FROM shiba_internal._create_unlogged_stage_relation(
+            result_relation,
+            new_plan_id,
+            physical_stage_id,
+            physical_schema_spec,
+            physical_index_specs
+        ) AS created;
+
+        INSERT INTO shiba_internal.physical_stages (
+            result_oid,
+            plan_id,
+            stage_id,
+            stage_name,
+            storage,
+            relation_oid,
+            relation_name,
+            schema_spec,
+            index_spec
+        )
+        VALUES (
+            result_relation,
+            new_plan_id,
+            physical_stage_id,
+            physical_stage_name,
+            physical_storage,
+            stage_relation_oid,
+            stage_relation_name,
+            physical_schema_spec,
+            physical_index_specs
+        );
+        -- A Stage is intentionally empty between commit programs.  Record
+        -- that fact immediately; otherwise PostgreSQL initially assumes an
+        -- unknown cardinality and only corrects the plan after auto-analyze.
+        EXECUTE format(
+            'ANALYZE %I.%I',
+            'shiba_internal',
+            stage_relation_name
+        );
+    END LOOP;
+
+    RETURN new_plan_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION shiba._finalize_physical_plan(oid, jsonb, jsonb, integer)
+FROM PUBLIC;
 
 CREATE FUNCTION shiba._finalize_stream_registration(
     result_relation oid,
@@ -184,7 +603,7 @@ BEGIN
             ELSE '_' || source_roles[source_index]
         END;
         EXECUTE format(
-            'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_worker()',
+            'CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON %s FOR EACH STATEMENT EXECUTE FUNCTION shiba._request_runtime()',
             format('shiba_wakeup_%s%s', result_relation, trigger_suffix),
             source_names[source_index]
         );
@@ -235,6 +654,7 @@ DECLARE
     left_collation_deterministic boolean := true;
     right_collation_deterministic boolean := true;
 BEGIN
+    PERFORM shiba._begin_stream_registration();
     normalized := regexp_replace(regexp_replace(trim(query_text), '\s+', ' ', 'g'), ';$', '');
     d := regexp_match(normalized, '^CREATE TABLE (IF NOT EXISTS )?shiba\.([a-z_][a-z_0-9]*) AS (SELECT .*)$', 'i');
     IF d IS NULL THEN RAISE EXCEPTION 'invalid Shiba JOIN declaration' USING ERRCODE='feature_not_supported'; END IF;
@@ -429,8 +849,8 @@ BEGIN
     END IF;
     PERFORM shiba._prepare_stream_registration(target_oid,d[3]);
     PERFORM shiba._initialize_aggregate_state(target_oid);
-    EXECUTE format('INSERT INTO shiba_internal.join_arrangements SELECT %s,''left'',coalesce(j.row->>%L,''''),j.row,count(*) FROM %s x CROSS JOIN LATERAL (SELECT jsonb_object_agg(key,value) row FROM jsonb_each_text(to_jsonb(x))) j WHERE shiba._row_passes_filter(%s,''left'',j.row) GROUP BY j.row->>%L,j.row',target_oid,left_join_column_name,left_name,target_oid,left_join_column_name);
-    EXECUTE format('INSERT INTO shiba_internal.join_arrangements SELECT %s,''right'',coalesce(j.row->>%L,''''),j.row,count(*) FROM %s x CROSS JOIN LATERAL (SELECT jsonb_object_agg(key,value) row FROM jsonb_each_text(to_jsonb(x))) j WHERE shiba._row_passes_filter(%s,''right'',j.row) GROUP BY j.row->>%L,j.row',target_oid,right_join_column_name,right_name,target_oid,right_join_column_name);
+    EXECUTE format('INSERT INTO shiba_internal.join_arrangements SELECT %s,''left'',coalesce(j.row->%L,''null''::jsonb),j.row,count(*) FROM %s x CROSS JOIN LATERAL (SELECT to_jsonb(x) row) j WHERE shiba._row_passes_filter(%s,''left'',j.row) GROUP BY j.row->%L,j.row',target_oid,left_join_column_name,left_name,target_oid,left_join_column_name);
+    EXECUTE format('INSERT INTO shiba_internal.join_arrangements SELECT %s,''right'',coalesce(j.row->%L,''null''::jsonb),j.row,count(*) FROM %s x CROSS JOIN LATERAL (SELECT to_jsonb(x) row) j WHERE shiba._row_passes_filter(%s,''right'',j.row) GROUP BY j.row->%L,j.row',target_oid,right_join_column_name,right_name,target_oid,right_join_column_name);
     PERFORM shiba._finalize_stream_registration(
       target_oid,target_name,ARRAY[left_oid,right_oid],
       ARRAY[left_name,right_name],ARRAY['left','right']
@@ -448,6 +868,7 @@ DECLARE
     transformed jsonb;
     outer_oid oid;
 BEGIN
+    PERFORM shiba._begin_stream_registration();
     IF analysis -> 'where_predicate' ->> 'error' IS NOT NULL THEN
       RAISE EXCEPTION 'unsupported Shiba subquery: %',
         analysis -> 'where_predicate' ->> 'error'
@@ -521,6 +942,7 @@ DECLARE
     predicate_sql text;
     activation_lsn_value pg_lsn;
 BEGIN
+    PERFORM shiba._begin_stream_registration();
     IF (analysis ->> 'has_sublinks')::boolean
        OR (analysis ->> 'has_aggregates')::boolean
        OR (analysis ->> 'has_distinct')::boolean
@@ -717,6 +1139,7 @@ DECLARE
     predicate_sql text;
     activation_lsn_value pg_lsn;
 BEGIN
+    PERFORM shiba._begin_stream_registration();
     IF (analysis ->> 'has_distinct_on')::boolean
        OR (analysis ->> 'has_window_functions')::boolean
        OR (analysis ->> 'has_sublinks')::boolean
@@ -850,6 +1273,7 @@ DECLARE
     limit_value bigint;
     offset_value bigint;
 BEGIN
+    PERFORM shiba._begin_stream_registration();
     IF (analysis ->> 'has_window_functions')::boolean
        OR (analysis ->> 'has_sublinks')::boolean
        OR (analysis ->> 'has_aggregates')::boolean
@@ -992,6 +1416,7 @@ DECLARE
     sum_is_not_null boolean;
     activation_lsn_value pg_lsn;
 BEGIN
+    PERFORM shiba._begin_stream_registration();
     IF coalesce((analysis ->> 'has_aggregate_filters')::boolean,false)
        OR coalesce((analysis ->> 'has_window_filters')::boolean,false) THEN
         RAISE EXCEPTION 'aggregate and window FILTER clauses are not yet executable by Shiba'

@@ -245,8 +245,8 @@ done
 psql_db shiba_perf -qc "CREATE EXTENSION shiba"
 psql_db shiba_perf -qc "SELECT shiba.activate()"
 wait_for_sql shiba_perf 1 \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba worker'" \
-  "the Shiba WAL router"
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "the Shiba Runtime"
 
 backfill_start_ms="$(now_ms)"
 psql_db shiba_perf -qc "
@@ -261,8 +261,10 @@ metric backfill rows_per_second \
   "$(awk -v rows="${initial_rows}" -v ms="${backfill_ms}" 'BEGIN {printf "%.3f", rows*1000/ms}')" \
   rows_per_second "initial source rows divided by wall time"
 wait_for_sql shiba_perf 1 \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'" \
-  "the Shiba DAG worker"
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "one Runtime after registering the benchmark DAG"
+runtime_pid="$(psql_db shiba_perf -Atqc "
+  SELECT pid FROM pg_stat_activity WHERE backend_type='shiba runtime'")"
 
 psql_db shiba_perf -Atqc "
   EXPLAIN (ANALYZE, BUFFERS, WAL, FORMAT JSON)
@@ -337,7 +339,7 @@ awk -F, '
     p50=values[int((n-1)*0.50)+1]
     p95=values[int((n-1)*0.95)+1]
     p99=values[int((n-1)*0.99)+1]
-    printf "visibility_latency,mean,%.3f,ms,sequential commit-to-worker-apply timestamp\n", sum/n
+    printf "visibility_latency,mean,%.3f,ms,sequential commit-to-Runtime-apply timestamp\n", sum/n
     printf "visibility_latency,p50,%.3f,ms,nearest-rank over raw samples\n", p50
     printf "visibility_latency,p95,%.3f,ms,nearest-rank over raw samples\n", p95
     printf "visibility_latency,p99,%.3f,ms,nearest-rank over raw samples\n", p99
@@ -347,12 +349,12 @@ awk -F, '
 ' "${output_dir}/visibility-latency.csv" >> "${metrics_file}"
 
 psql_db shiba_perf -qc "
-  UPDATE shiba_internal.dag_worker_state
+  UPDATE shiba_internal.dag_runtime_state
   SET active=false
   WHERE result_oid='shiba.bench_stats'::regclass"
-wait_for_sql shiba_perf 0 \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'" \
-  "the DAG worker to stop before large transaction"
+wait_for_sql shiba_perf 1 \
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "the Runtime to remain alive while the benchmark DAG is inactive"
 
 large_tx_start_ms="$(now_ms)"
 psql_db shiba_perf -qc "
@@ -366,9 +368,16 @@ wait_for_sql shiba_perf t \
      SELECT 1 FROM shiba_internal.dag_inbox
      WHERE result_oid='shiba.bench_stats'::regclass
    )" \
-  "the router to durably enqueue the large transaction"
+  "the Runtime to durably enqueue the large transaction"
 large_tx_apply_start_ms="$(now_ms)"
-psql_db shiba_perf -Atqc "SELECT shiba.activate()" >/dev/null
+psql_db shiba_perf -qc "
+  UPDATE shiba_internal.dag_runtime_state
+  SET active=true
+  WHERE result_oid='shiba.bench_stats'::regclass;
+  SELECT shiba.activate()"
+wait_for_sql shiba_perf "${runtime_pid}" \
+  "SELECT pid FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "the same Runtime to drain the large transaction"
 wait_for_result_count "${large_tx_expected_rows}"
 large_tx_apply_end_ms="$(now_ms)"
 metric large_transaction source_commit_wall_time \
@@ -376,7 +385,7 @@ metric large_transaction source_commit_wall_time \
   ms "single transaction source insert"
 metric large_transaction apply_wall_time \
   "$(awk -v start="${large_tx_apply_start_ms}" -v finish="${large_tx_apply_end_ms}" 'BEGIN {printf "%.3f", finish-start}')" \
-  ms "worker activation through applied LSN"
+  ms "DAG reactivation through applied LSN"
 metric large_transaction apply_rows_per_second \
   "$(awk -v rows="${large_tx_rows}" -v start="${large_tx_apply_start_ms}" -v finish="${large_tx_apply_end_ms}" \
     'BEGIN {printf "%.3f", rows*1000/(finish-start)}')" \
@@ -421,6 +430,12 @@ psql_db shiba_perf -Atqc "
     'pending_inbox_rows',(
       SELECT count(*) FROM shiba_internal.dag_inbox
       WHERE result_oid='shiba.bench_stats'::regclass
+    ),
+    'pending_change_log_rows',(
+      SELECT count(*) FROM shiba_internal.change_log
+    ),
+    'pending_routed_transactions',(
+      SELECT count(*) FROM shiba_internal.routed_transactions
     ),
     'progress',(SELECT to_jsonb(progress) FROM shiba.progress('shiba.bench_stats') progress)
   ))" > "${output_dir}/final-state.json"

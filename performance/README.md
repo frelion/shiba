@@ -16,7 +16,10 @@ Run the formal matrix from the repository root:
 
 Its default formal parameters are 20,000 initial rows, 20-row semantic DML
 batches, 40 visibility probes per scenario, 5-second source/result query
-phases, and three randomized repetitions. Results are written to
+phases, one 5,000-row large transaction, and three randomized repetitions.
+The large transaction size can be changed with
+`SHIBA_MATRIX_LARGE_TX_ROWS`, but changing it makes the run incomparable with
+the default formal baseline. Results are written to
 `performance/matrix-results/<UTC run id>/`.
 
 The formal result includes `manifest.json`, `operator-coverage.json`,
@@ -24,6 +27,11 @@ The formal result includes `manifest.json`, `operator-coverage.json`,
 `latency-summary.csv`, action and resource samples, PostgreSQL-wide WAL/I/O
 snapshots, per-scenario plans and pgbench output, exact workload copies,
 checksums, the working-tree patch, and an archive of untracked files.
+`runtime-topology.json` records the singleton `runtime_state` owner PID and a
+zero legacy-worker count. `resources.csv` records both the complete PostgreSQL
+process-tree CPU/RSS and the individual Runtime PID CPU/RSS at 100 ms
+intervals. The `large_transaction` phase therefore exposes
+`rss_peak` and `runtime_rss_peak` independently.
 
 For a deliberately reduced smoke run:
 
@@ -36,11 +44,17 @@ SHIBA_MATRIX_REPETITIONS=1 \
 SHIBA_MATRIX_QUERY_SECONDS=1 \
 SHIBA_MATRIX_QUERY_CLIENTS=2 \
 SHIBA_MATRIX_LATENCY_PROBES=1 \
+SHIBA_MATRIX_LARGE_TX_ROWS=500 \
 ./scripts/performance-matrix.py
 ```
 
 Filtered runs are supported with `SHIBA_MATRIX_SCENARIOS` as a comma-separated
 list, but neither reduced nor filtered runs qualify as a formal baseline.
+
+For ordinary correctness and performance runs, any PostgreSQL `WARNING`,
+`ERROR`, `FATAL`, or `PANIC` invalidates the run. Deterministic failpoint runs
+use a narrower allowlist: only the exact crash record expected from the armed
+failpoint is allowed, and every other warning-or-higher entry still fails.
 
 ## Aggregate-only pilot
 
@@ -91,3 +105,29 @@ PostgreSQL version, configuration, and workload checksums fixed. Run each
 revision at least three times in alternating order and compare medians. Treat
 correctness differences, failed transactions, PostgreSQL errors, or an
 undrained inbox as a failed run rather than a performance result.
+
+Runtime-architecture changes require the complete, unfiltered formal matrix;
+a smoke, filtered scenario list, aggregate-only pilot, or statement that the
+matrix “ran successfully” is not performance acceptance. Compare the candidate
+against the retained pre-refactor baseline using the same host, PostgreSQL
+build and configuration, workload checksums, formal parameters, and repetition
+count. The harness must verify and record exactly one `shiba runtime` PID and no
+legacy `shiba worker`, `shiba dag worker`, `shiba router`, or
+`shiba executor` processes. Fanout measurements pause all participating
+logical DAGs before source DML, then require exactly one `change_log` row per
+source delta and exactly one `dag_inbox` reference per participating
+DAG/source transaction before apply resumes. Preserve both raw result
+directories and report per-scenario and overall median deltas for source-write
+throughput, apply/drain throughput, visibility latency percentiles, query
+throughput, PostgreSQL CPU/RSS, WAL/I/O, correctness, inbox drain completion,
+shared-payload fanout, and large-transaction peak RSS.
+
+Any statistically material regression must be explained and explicitly
+accepted; otherwise it blocks the refactor. A faster aggregate-only pilot
+cannot offset a regression or missing coverage elsewhere in the full operator
+matrix.
+
+The historical reports measure earlier per-result and Router+Executor
+topologies. They are not evidence for the Single Runtime refactor. Until a new
+complete matrix and matched per-scenario baseline comparison are present, the
+Single Runtime performance verdict remains pending.

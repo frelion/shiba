@@ -197,7 +197,7 @@ psql_diff -qc "CREATE EXTENSION shiba"
 psql_diff -qc "SELECT shiba.activate()"
 wait_for_value \
   "1" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba worker'"
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 
 psql_diff -qc "
   CREATE SCHEMA join_diff;
@@ -337,8 +337,8 @@ psql_diff -qc "
     GROUP BY f.gate;
 "
 wait_for_value \
-  "8" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+  "1" \
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 assert_join_results "initial"
 
 join_step=0
@@ -351,7 +351,9 @@ for statement in \
   "DELETE FROM join_diff.dims WHERE row_id IN (1,2)" \
   "INSERT INTO join_diff.dims VALUES (7,1,NULL,4,0)" \
   "UPDATE join_diff.facts SET join_key=NULL WHERE row_id=1" \
-  "UPDATE join_diff.facts SET join_key=1,amount=8,gate=1 WHERE row_id=1"
+  "UPDATE join_diff.facts SET join_key=1,amount=8,gate=1 WHERE row_id=1" \
+  "BEGIN; INSERT INTO join_diff.facts VALUES (100,77,13,0); INSERT INTO join_diff.dims VALUES (100,77,770,1,1); COMMIT" \
+  "BEGIN; DELETE FROM join_diff.facts WHERE row_id=100; DELETE FROM join_diff.dims WHERE row_id=100; COMMIT"
 do
   join_step=$((join_step + 1))
   psql_diff -qc "${statement}"
@@ -428,8 +430,8 @@ psql_diff -qc "
   DROP TABLE shiba.diff_inner;
 "
 wait_for_value \
-  "0" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+  "1" \
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 
 # Phase 2: thresholded semi/anti joins. Right duplicates exercise the 0/1 and
 # 1/2 multiplicity boundaries; NULL on either side exercises PostgreSQL's
@@ -483,8 +485,8 @@ psql_diff -qc "
     GROUP BY o.join_key;
 "
 wait_for_value \
-  "4" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+  "1" \
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 assert_sublink_results "initial"
 
 sublink_step=0
@@ -553,5 +555,5 @@ for sublink_step in {1..24}; do
   assert_sublink_results "random-${sublink_step}"
 done
 
-printf 'join differential tests passed (seed=%s, 66 committed mutations, 408 comparisons)\n' \
+printf 'join differential tests passed (seed=%s, 68 committed mutations, 424 comparisons)\n' \
   "${seed}"

@@ -28,15 +28,12 @@ maintained projection:
 
 ### Performance in user terms
 
-In the current reproducible benchmark environment, a single 5,000-row commit
-for a simple grouped `COUNT`/`SUM` result completed source commit in about
-17 ms, and the result caught up in a median of about 196 ms. The batch apply
-path processed about 25,500 changed rows/second, compared with about 5,850
-rows/second for the previous executor path (4.36x faster for this scenario).
-
-These are benchmark results, not a universal SLA: the fast path currently
-applies to ordinary single-source aggregates. Join, TopN, Window, DISTINCT,
-and high-cardinality workloads have different cost profiles.
+The single-Runtime and shared-change-log design is being rebenchmarked. Older
+per-DAG-worker and Router/Executor measurements do not describe this topology
+and are not presented as a current SLA. Source commit latency, route lag, apply
+lag, long-transaction blocking, and operator throughput are measured
+separately because one large non-preemptible apply can delay all work in the
+database-scoped Runtime.
 
 ## Quick start
 
@@ -54,7 +51,7 @@ cargo pgrx init --pg17 /path/to/pg_config
 cargo pgrx install --pg-config /path/to/pg_config
 ```
 
-Configure the target PostgreSQL server and reconnect clients:
+Configure and restart the target PostgreSQL server:
 
 ```conf
 session_preload_libraries = 'shiba'
@@ -102,17 +99,56 @@ in [docs/MVP.md](docs/MVP.md).
 Analyzed PostgreSQL Query
   -> validated logical plan
   -> CTAS backfill and registration
+  -> persisted versioned PhysicalDagPlan
   -> pgoutput logical replication
-  -> WAL Router
-  -> durable per-result inbox
-  -> DAG executor
+  -> one database-scoped shiba runtime
+       -> bounded WAL routing
+       -> shared durable change_log
+       -> lightweight per-DAG inbox references
+       -> round-robin DagRuntime scheduling
+       -> set-oriented physical Stages
+       -> bounded change-log garbage collection
   -> operator state and result table
 ```
 
-The Rust layer owns PostgreSQL hooks, WAL decoding, plan validation, and
-background workers. SQL functions own catalog state and operator kernels. See
+The Rust layer owns PostgreSQL hooks, WAL decoding, plan validation, and exactly
+one dynamic PostgreSQL background worker named `shiba runtime` per active
+database. Routing, scheduling, DAG application, and garbage collection are
+bounded phases in that one SPI-connected backend. A `DagRuntime` is cached plan
+metadata, not a process or thread, so adding a result DAG does not allocate
+another PostgreSQL worker or CPU resource. SQL functions own catalog state and
+operator kernels. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the detailed execution and
 recovery invariants.
+
+Each decoded row delta is stored once in the shared `change_log`, even when
+several DAGs consume it. `dag_inbox` stores only one lightweight reference per
+DAG and source transaction. Scheduling is round-robin at atomic source-commit
+boundaries; a large commit is not time-sliced and temporarily blocks routing
+and other DAGs. A failed DAG is quarantined with its inbox reference retained
+while healthy DAGs continue on later scheduling turns. Repair and retry are
+explicit.
+
+Registration compiles and persists a versioned `PhysicalDagPlan`. Its Stage
+storage choices are part of the inspectable execution plan: fused expressions
+stay inline, reusable relations inside one statement use `MATERIALIZED` CTEs,
+and a relation that must cross statements may use a pre-created typed
+`UNLOGGED` Stage. The current Join kernel uses statement-materialized input
+deltas and one typed `join_delta` UNLOGGED Stage. Durable routing, inbox,
+progress, result, arrangement, and operator-state tables remain logged and
+authoritative. Stage contents are commit-scoped derived data; after a crash
+they are rebuilt by replaying the retained `dag_inbox` reference and
+`change_log` payload.
+
+Normal apply performs no DDL and creates no temporary table. Inspect the
+persisted plan and its materialized Stage relations with:
+
+```sql
+SELECT shiba.explain_physical('shiba.order_stats');
+```
+
+The Runtime is dynamically registered. After a postmaster restart, the next
+registered-source statement or `SELECT shiba.activate()` restores it.
 
 ## Development and testing
 
@@ -124,7 +160,10 @@ cargo clippy --all-targets -- -D warnings
 
 The full correctness gate covers unit tests, real PostgreSQL 17 end-to-end
 tests, differential checks, join behavior, concurrency, transaction recovery,
-failpoint recovery, and executor architecture. See
+failpoint recovery, physical-Stage lifecycle, and the single-Runtime
+architecture. Performance acceptance uses the complete unfiltered,
+three-repetition matrix and a matched retained baseline; smoke or filtered
+runs are diagnostic only. See
 [docs/TESTING.md](docs/TESTING.md).
 
 ## Releases

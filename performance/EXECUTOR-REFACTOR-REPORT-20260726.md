@@ -1,8 +1,17 @@
 # Shiba Commit-Batch Executor 重构与性能对比报告
 
+> **历史报告，不是 shared-Executor 重构验收证据**
+>
+> 本报告记录的是 2026-07-26 完成的 commit-batch / busy-drain 优化。被测版本
+> 仍采用 legacy per-result executor process；报告中的 run、通过状态和性能
+> 数字都只适用于那次优化，不能用于证明当前“一个 Router +
+> `shiba.executor_count` 个 global Executor”的 shared-Executor 重构已经通过
+> 正确性或性能验收。当前重构必须生成新的 full-matrix 结果和独立报告。
+
 ## 1. 结论
 
-本轮重构已经达到预定目标：去除了 DAG worker “每 25 ms 最多处理一个
+当时的 commit-batch 重构达到了其预定目标：去除了 legacy per-result executor process
+“每 25 ms 最多处理一个
 source commit”的结构性限速，同时保持 source commit 的边界、WAL 顺序、
 UPDATE 的 `-1/+1` 顺序和 progress 原子提交语义。
 
@@ -36,7 +45,7 @@ source DML commit
 → PostgreSQL publication / WAL
 → Router 按 WAL commit 分组
 → 每个相关 DAG 写入 durable dag_inbox
-→ DAG worker 按最小 commit_lsn 取出完整 commit
+→ legacy per-result executor process 按最小 commit_lsn 取出完整 commit
 → Rust 构造跨 source、保持 sequence 顺序的 DeltaBatch
 → 一次 SPI 调用 _apply_dag_delta_batch
 → SQL 按 ordinality 顺序应用该 commit 内的 deltas
@@ -60,21 +69,23 @@ source DML commit
 
 - Router 在有工作时使用零等待连续 drain，但每轮受 16 个 batch 或 50 ms
   预算限制；空闲时仍等待 100 ms。
-- DAG worker 在有 backlog 时连续处理，受 64 个 commit 或 50 ms 预算限制；
+- legacy per-result executor process 在有 backlog 时连续处理，受 64 个
+  commit 或 50 ms 预算限制；
   空闲时等待 25 ms。
 - 每个 commit 单独进入 `BackgroundWorker::transaction`，所以 busy-drain
   没有破坏 commit 级原子性。
-- DAG plan 在 worker 启动时加载一次，而不是每个 commit 重复解析。
+- DAG plan 在该 legacy executor process 启动时加载一次，而不是每个 commit
+  重复解析。
 
-预算是公平性边界：它允许繁忙 worker 高吞吐处理，同时定期返回主循环执行
-heartbeat、active 状态检查和退出响应。
+预算是公平性边界：它允许繁忙的 legacy executor process 高吞吐处理，同时
+定期返回主循环执行 heartbeat、active 状态检查和退出响应。
 
 ### 3.2 Commit batch
 
 - Rust 的 `DeltaRow` 带 source 标识，一个 `DeltaBatch` 可以保存同一 commit
   中交错出现的多 source 事件。
-- worker 一次读取该 DAG 对应 commit 的全部 inbox rows，只进行一次
-  `_apply_dag_delta_batch` SPI 调用。
+- legacy executor process 一次读取该 DAG 对应 commit 的全部 inbox rows，
+  只进行一次 `_apply_dag_delta_batch` SPI 调用。
 - SQL batch wrapper 只获取一次 DAG advisory lock，按 JSON ordinality 顺序
   调用内部 state apply，所有 delta 成功后只写一次 progress。
 - 旧的单 delta 入口保留为兼容层。
@@ -138,7 +149,7 @@ PostgreSQL 两次均使用 `shared_buffers=1GB`、`work_mem=64MB`、`jit=off`、
 ```bash
 ./scripts/test-all.sh
 ./scripts/test-executor-architecture.sh
-./scripts/performance-matrix.py --repetitions 3
+SHIBA_MATRIX_REPETITIONS=3 ./scripts/performance-matrix.py
 ```
 
 正式矩阵会创建隔离的临时 PostgreSQL cluster；每个 scenario 使用新的
@@ -218,8 +229,9 @@ Shiba 端到端容量。旧、新 run 使用完全相同的 workload，所以 12
 | end-to-end wall | 969.60 ms | 869.14 ms | -10.4% |
 | apply rows/s | 5,588 | 5,852 | +4.7% |
 
-大事务原本已经只支付一次 worker 调度成本，因此 executor busy-drain 对它的
-收益有限；显著下降的是 statement-level wakeup 带来的 source commit 成本。
+大事务原本已经只支付一次 legacy executor process 调度成本，因此 executor
+busy-drain 对它的收益有限；显著下降的是 statement-level wakeup 带来的
+source commit 成本。
 剩余约 5.9k rows/s 反映逐 delta JSON/SPI/SQL state apply 的上限。
 
 ### 6.3 代表性 commit-to-apply 延迟

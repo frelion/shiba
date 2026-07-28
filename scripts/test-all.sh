@@ -26,9 +26,9 @@ run_gate "Join and subquery deterministic differential test" \
   "${project_root}/scripts/test-join-differential.sh"
 run_gate "Concurrency, transaction, and recovery test" \
   "${project_root}/scripts/test-concurrency-recovery.sh"
-run_gate "Executor architecture and backlog test" \
+run_gate "Single-Runtime architecture and shared-log test" \
   "${project_root}/scripts/test-executor-architecture.sh"
-run_gate "Deterministic worker failpoint recovery test" \
+run_gate "Deterministic Runtime failpoint recovery test" \
   "${project_root}/scripts/test-failpoint-recovery.sh"
 
 printf '\nAll Shiba correctness gates passed.\n'

@@ -10,7 +10,7 @@ CTAS snapshot/backfill
 → publication/WAL
 → WAL Router
 → durable dag_inbox
-→ DAG worker
+→ legacy per-result executor process
 → operator state
 → protected sink
 → result query
@@ -44,7 +44,8 @@ CTAS snapshot/backfill
    甚至包含更宽的窗口列。
 2. **小事务持续追平仍受 commit 调度限制。** 10 行/事务时，1 client 和
    4 clients 的端到端消费率分别为 **33.86** 和 **34.18 commits/s**，
-   对应 **338.6** 和 **341.8 source rows/s**。这与 DAG worker 每 25 ms
+   对应 **338.6** 和 **341.8 source rows/s**。这与当时 legacy per-result
+   executor process 每 25 ms
    最多消费一个 commit 的结构一致。
 3. **批量事务明显更高效。** 单个 5,000 行事务端到端中位数
    **969.6 ms**，应用速率 **5,588 rows/s**，是 10 行小事务行速率的约
@@ -122,7 +123,8 @@ PostgreSQL 使用 `shared_buffers=1GB`、`work_mem=64MB`、`jit=off`、
 - rollback；
 - INSERT、UPDATE、DELETE；
 - 关键边界动作；
-- 暂停 DAG worker 后 Router enqueue + inbox drain；
+- 暂停当时的 legacy per-result executor process 后 Router enqueue + inbox
+  drain；
 - 40 个独立已提交延迟 probes；
 - 每个动作后的双向 `EXCEPT ALL`；
 - warm pgbench 源查询与 sink 查询；
@@ -255,7 +257,8 @@ buffer-cold（仅 PostgreSQL shared buffers cold）下，同样呈现该趋势�
 | Window skewed | 267.1 | 406.3 | 522.7 | 565.5 |
 
 除 TopN/Window 外，大多数普通 probes 的 p50 为 63–93 ms、p95
-为 113–135 ms。这仍反映 Router 100 ms 与 DAG worker 25 ms 的轮询结构。
+为 113–135 ms。这仍反映 Router 100 ms 与当时 legacy per-result executor
+process 25 ms 的轮询结构。
 
 注意 Null-aware Anti 的 latency probes 是 left-side 插入；它们没有体现昂贵的
 right-side multiplicity 动作。语义动作结果见下一节。
@@ -369,11 +372,11 @@ Shiba）产生约：
 
 ## 13. 优化优先级
 
-### P0：DAG worker busy-drain
+### P0：legacy per-result executor process busy-drain
 
 当前小事务极限约 34 commits/s，直接对应每 25 ms 一次、每轮一个 commit。
-应让 worker 在 inbox 非空时连续处理 commit，仅空闲时等待，并设置行数/时间
-budget 防止单 DAG 饥饿其他工作。
+应让该 legacy executor process 在 inbox 非空时连续处理 commit，仅空闲时
+等待，并设置行数/时间 budget 防止单 DAG 饥饿其他工作。
 
 验收指标：
 

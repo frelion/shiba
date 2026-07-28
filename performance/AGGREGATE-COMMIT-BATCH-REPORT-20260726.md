@@ -101,7 +101,7 @@ UPDATE `-1/+1` 顺序。小 commit 不执行额外的 metadata dispatch query。
 - progress 仍只推进一次；
 - batch 中 `delta` 只允许 `-1/+1`，`row_data` 必须是 JSON object；
 - fast path 在写 state 前验证最终 row count、COUNT state、SUM 非 NULL 计数
-  均合法，撤回不存在的行会以 `data_corrupted` 失败；
+  均合法，撤回不存在的行会以 Shiba 专用 `P0S01` SQLSTATE 失败；
 - group key 使用 JSONB 表示，SQL NULL 继续映射为 JSON `null`，与现有 state
   key 语义一致。
 

@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Deterministically crash the test-only workers at the two durable handoff
-# boundaries that ordinary kill-based recovery tests cannot target exactly.
+# Deterministically crash the test-only single Runtime at the two durable
+# handoff boundaries that ordinary kill-based recovery tests cannot target:
+# apply-before-inbox-ack and route-before-slot-advance.
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pg_config_path="${PG_CONFIG:-/opt/homebrew/opt/postgresql@17/bin/pg_config}"
 pg_bin_dir="$("${pg_config_path}" --bindir)"
-pg_data_dir="$(mktemp -d /tmp/shiba-failpoint-data.XXXXXX)"
-pg_socket_dir="$(mktemp -d /tmp/shiba-failpoint-socket.XXXXXX)"
+pg_data_dir="$(mktemp -d /tmp/shiba-runtime-failpoint-data.XXXXXX)"
+pg_socket_dir="$(mktemp -d /tmp/shiba-runtime-failpoint-socket.XXXXXX)"
 pg_log_file="${pg_data_dir}/postgresql.log"
 pg_port="${SHIBA_FAILPOINT_TEST_PORT:-$((59000 + $$ % 4000))}"
-database_name="shiba_failpoint"
+database_name="shiba_runtime_failpoint"
 
 cleanup() {
   if test "${SHIBA_KEEP_TEST_CLUSTER:-0}" = "1"; then
@@ -32,7 +33,7 @@ psql_gate() {
 }
 
 fail() {
-  printf 'deterministic failpoint gate failed: %s\n' "$1" >&2
+  printf 'deterministic Runtime failpoint gate failed: %s\n' "$1" >&2
   printf 'PostgreSQL log: %s\n' "${pg_log_file}" >&2
   exit 1
 }
@@ -76,57 +77,58 @@ wait_for_log() {
   fail "timed out waiting for ${description}"
 }
 
-restart_dag() {
-  local result_oid="$1"
-  local worker_count
-  local attempt
-  psql_gate -qc "
-    UPDATE shiba_internal.dag_worker_state
-    SET active=true,last_heartbeat=NULL,last_requested_at=NULL
-    WHERE result_oid=${result_oid}::oid;
-    SELECT shiba._ensure_dag_worker(${result_oid}::oid)"
-  for attempt in {1..300}; do
-    worker_count="$(psql_gate -Atqc "
-      SELECT count(*) FROM pg_stat_activity
-      WHERE backend_type='shiba dag worker'")"
-    if test "${worker_count}" = "1"; then
-      return 0
-    fi
-    if test "${worker_count}" -gt 1; then
-      fail "DAG restart created ${worker_count} concurrent executors"
-    fi
-    sleep 0.1
-  done
-  fail "timed out restarting the DAG executor"
+assert_log_count() {
+  local expected="$1"
+  local pattern="$2"
+  local description="$3"
+  local actual
+  actual="$(grep -Fc "${pattern}" "${pg_log_file}" || true)"
+  if test "${actual}" != "${expected}"; then
+    fail "expected ${expected} log record(s) for ${description}, got ${actual}: ${pattern}"
+  fi
 }
 
-restart_router() {
-  local worker_count
-  local attempt
+runtime_pid() {
+  psql_gate -Atqc "
+    SELECT pid FROM pg_stat_activity
+    WHERE backend_type='shiba runtime'"
+}
+
+wait_for_replacement_runtime() {
+  local failed_pid="$1"
+  wait_for_query "1" "
+    SELECT count(*)
+    FROM shiba_internal.runtime_state state
+    JOIN pg_stat_activity activity
+      ON activity.pid=state.owner_pid
+     AND activity.backend_type='shiba runtime'
+    WHERE state.singleton
+      AND state.active
+      AND state.owner_pid<>${failed_pid}" \
+    "PostgreSQL to restart one replacement Runtime"
+  assert_query "1|0|0" "
+    SELECT
+      count(*) FILTER (WHERE backend_type='shiba runtime')
+      || '|' ||
+      count(*) FILTER (WHERE backend_type='shiba router')
+      || '|' ||
+      count(*) FILTER (WHERE backend_type='shiba executor')
+    FROM pg_stat_activity"
+}
+
+set_dag_active() {
+  local result_oid="$1"
+  local active="$2"
   psql_gate -qc "
-    UPDATE shiba_internal.worker_state
-    SET active=true,last_heartbeat=NULL,last_requested_at=NULL
-    WHERE singleton;
-    SELECT shiba._ensure_worker()"
-  for attempt in {1..300}; do
-    worker_count="$(psql_gate -Atqc "
-      SELECT count(*) FROM pg_stat_activity
-      WHERE backend_type='shiba worker'")"
-    if test "${worker_count}" = "1"; then
-      return 0
-    fi
-    if test "${worker_count}" -gt 1; then
-      fail "router restart created ${worker_count} concurrent workers"
-    fi
-    sleep 0.1
-  done
-  fail "timed out restarting the WAL router"
+    UPDATE shiba_internal.dag_runtime_state
+    SET active=${active}
+    WHERE result_oid=${result_oid}::oid"
 }
 
 baseline_diff="
 WITH expected AS (
   SELECT group_id,count(*)::bigint AS row_count,sum(amount)::bigint AS total
-  FROM failpoint_source GROUP BY group_id
+  FROM public.failpoint_source GROUP BY group_id
 ),
 actual AS (
   SELECT group_id,row_count::bigint,total::bigint
@@ -151,7 +153,7 @@ cargo pgrx install --pg-config "${pg_config_path}" --features pg_test
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
-} >> "${pg_data_dir}/postgresql.conf"
+} >>"${pg_data_dir}/postgresql.conf"
 
 "${pg_bin_dir}/pg_ctl" \
   -D "${pg_data_dir}" -l "${pg_log_file}" \
@@ -160,172 +162,205 @@ cargo pgrx install --pg-config "${pg_config_path}" --features pg_test
   -h "${pg_socket_dir}" -p "${pg_port}" "${database_name}"
 
 psql_gate -qc "CREATE EXTENSION shiba"
+psql_gate -qc "SELECT shiba.activate()"
 psql_gate -qc "
-  CREATE TABLE public.shiba_worker_failpoints (
+  CREATE TABLE public.shiba_runtime_failpoints (
     kind text PRIMARY KEY,
-    worker_pid integer,
+    runtime_pid integer,
     result_oid oid,
     commit_lsn pg_lsn,
     pause_ms integer NOT NULL DEFAULT 0 CHECK (pause_ms>=0),
     fired boolean NOT NULL DEFAULT false
-  )"
-psql_gate -Atqc "SELECT shiba.activate()" >/dev/null
-psql_gate -qc "
-  CREATE TABLE failpoint_source (
+  );
+  CREATE TABLE public.failpoint_source (
     event_id integer PRIMARY KEY,
     group_id integer NOT NULL,
     amount integer NOT NULL
   );
-  INSERT INTO failpoint_source VALUES (1,1,10);
+  INSERT INTO public.failpoint_source VALUES (1,1,10);
   CREATE TABLE shiba.failpoint_result AS
   SELECT group_id,count(*) AS row_count,sum(amount) AS total
-  FROM failpoint_source GROUP BY group_id"
+  FROM public.failpoint_source GROUP BY group_id"
 wait_for_query "1" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba worker'" \
-  "the WAL router"
-wait_for_query "1" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'" \
-  "the DAG executor"
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "the single Runtime"
+assert_query "0|0" "
+  SELECT
+    count(*) FILTER (WHERE backend_type='shiba router')
+    || '|' ||
+    count(*) FILTER (WHERE backend_type='shiba executor')
+  FROM pg_stat_activity"
 wait_for_query "0" "${baseline_diff}" "the initial result"
 
-result_oid="$(psql_gate -Atqc "SELECT 'shiba.failpoint_result'::regclass::oid::integer")"
-executor_pid="$(psql_gate -Atqc "
-  SELECT pid FROM pg_stat_activity WHERE backend_type='shiba dag worker'")"
+result_oid="$(psql_gate -Atqc "
+  SELECT 'shiba.failpoint_result'::regclass::oid::integer")"
 
-printf '\n==> Executor apply-before-ack rollback\n'
-# Hold the same advisory lock used by the executor so the exact inbox LSN and
-# worker PID can be armed without racing the commit.
-psql_gate -qc "
-  SELECT pg_advisory_lock(${result_oid}::bigint);
-  SELECT pg_sleep(3)" >/dev/null &
-lock_holder_pid=$!
-wait_for_query "1" "
-  SELECT count(*) FROM pg_locks
-  WHERE locktype='advisory' AND granted AND objid=${result_oid}" \
-  "the executor advisory lock holder"
-
-psql_gate -qc "INSERT INTO failpoint_source VALUES (2,2,20)"
+printf '\n==> Runtime apply-before-ack rollback\n'
+set_dag_active "${result_oid}" false
+psql_gate -qc "INSERT INTO public.failpoint_source VALUES (2,2,20)"
 wait_for_query "1" "
   SELECT count(*) FROM shiba_internal.dag_inbox
   WHERE result_oid=${result_oid}::oid" \
-  "the executor test commit in the durable inbox"
-executor_lsn="$(psql_gate -Atqc "
+  "the apply failpoint commit to reach the durable inbox"
+apply_lsn="$(psql_gate -Atqc "
   SELECT commit_lsn FROM shiba_internal.dag_inbox
   WHERE result_oid=${result_oid}::oid")"
+apply_runtime_pid="$(runtime_pid)"
+progress_before="$(psql_gate -Atqc "
+  SELECT coalesce(applied_lsn::text,'NULL')
+  FROM shiba_internal.view_progress
+  WHERE result_oid=${result_oid}::oid")"
 psql_gate -qc "
-  INSERT INTO public.shiba_worker_failpoints
-    (kind,worker_pid,result_oid,commit_lsn,pause_ms)
+  INSERT INTO public.shiba_runtime_failpoints
+    (kind,runtime_pid,result_oid,commit_lsn,pause_ms)
   VALUES
-    ('executor_before_ack',${executor_pid},${result_oid}::oid,
-     '${executor_lsn}'::pg_lsn,2000)"
-
-wait "${lock_holder_pid}"
-wait_for_log \
-  "test failpoint reached: executor_before_ack result ${result_oid} commit ${executor_lsn}" \
-  "the executor to reach the apply-before-ack boundary"
-# The arrival log is emitted after the old worker has claimed the failpoint
-# and before it sleeps. Prevent a replacement from draining the inbox before
-# rollback assertions are observed.
-psql_gate -qc "
-  UPDATE shiba_internal.dag_worker_state
-  SET active=false
+    ('runtime_apply_before_ack',${apply_runtime_pid},${result_oid}::oid,
+     '${apply_lsn}'::pg_lsn,2000);
+  UPDATE shiba_internal.dag_runtime_state
+  SET active=true
   WHERE result_oid=${result_oid}::oid"
+
 wait_for_log \
-  "executor exited after applying commit ${executor_lsn} and before acknowledgement" \
-  "the executor failpoint"
+  "test failpoint reached: runtime_apply_before_ack result ${result_oid} commit ${apply_lsn}" \
+  "the Runtime to reach the apply-before-ack boundary"
+# Keep the replacement from draining retained input before rollback assertions.
+set_dag_active "${result_oid}" false
+wait_for_log \
+  "runtime exited after applying commit ${apply_lsn} and before acknowledgement" \
+  "the apply-before-ack failpoint"
 wait_for_query "0" "
   SELECT count(*) FROM pg_stat_activity
-  WHERE backend_type='shiba dag worker' AND pid=${executor_pid}" \
-  "the failed executor to exit"
+  WHERE backend_type='shiba runtime' AND pid=${apply_runtime_pid}" \
+  "the failed Runtime to exit"
+wait_for_replacement_runtime "${apply_runtime_pid}"
 
-assert_query "1" "
-  SELECT count(*) FROM shiba_internal.dag_inbox
-  WHERE result_oid=${result_oid}::oid AND commit_lsn='${executor_lsn}'::pg_lsn"
-assert_query "0" "SELECT count(*) FROM shiba.failpoint_result WHERE group_id=2"
-# This UPDATE occurred inside the same transaction as apply_batch, so it too
-# rolls back. The old PID binding prevents the replacement from firing again.
+assert_query "1|1|0|${progress_before}" "
+  SELECT
+    (SELECT count(*) FROM shiba_internal.dag_inbox
+     WHERE result_oid=${result_oid}::oid
+       AND commit_lsn='${apply_lsn}'::pg_lsn)
+    || '|' ||
+    (SELECT count(*) FROM shiba_internal.change_log
+     WHERE commit_lsn='${apply_lsn}'::pg_lsn)
+    || '|' ||
+    (SELECT count(*) FROM shiba.failpoint_result WHERE group_id=2)
+    || '|' ||
+    (SELECT coalesce(applied_lsn::text,'NULL')
+     FROM shiba_internal.view_progress
+     WHERE result_oid=${result_oid}::oid)"
+# The claim happens in the failed apply transaction and must roll back too.
 assert_query "f" "
-  SELECT fired FROM public.shiba_worker_failpoints
-  WHERE kind='executor_before_ack'"
+  SELECT fired FROM public.shiba_runtime_failpoints
+  WHERE kind='runtime_apply_before_ack'"
 
 psql_gate -qc "
-  DELETE FROM public.shiba_worker_failpoints
-  WHERE kind='executor_before_ack'"
-restart_dag "${result_oid}"
-wait_for_query "0" "${baseline_diff}" "the replacement executor to drain the retained inbox"
-assert_query "0" "
-  SELECT count(*) FROM shiba_internal.dag_inbox
+  DELETE FROM public.shiba_runtime_failpoints
+  WHERE kind='runtime_apply_before_ack';
+  UPDATE shiba_internal.dag_runtime_state
+  SET active=true
   WHERE result_oid=${result_oid}::oid"
+wait_for_query "0" "${baseline_diff}" "the replacement Runtime to replay retained input"
+wait_for_query "0" "
+  SELECT count(*) FROM shiba_internal.dag_inbox
+  WHERE result_oid=${result_oid}::oid" \
+  "the replayed inbox reference to be acknowledged"
 
-printf '\n==> Router route-before-slot-advance replay idempotence\n'
-psql_gate -qc "
-  UPDATE shiba_internal.dag_worker_state
-  SET active=false
-  WHERE result_oid=${result_oid}::oid;
-  UPDATE shiba_internal.worker_state SET active=false WHERE singleton"
-wait_for_query "0" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba worker'" \
-  "the WAL router to stop"
-wait_for_query "0" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'" \
-  "the DAG executor to stop"
-
+printf '\n==> Runtime route-before-slot-advance replay idempotence\n'
+set_dag_active "${result_oid}" false
+route_runtime_pid="$(runtime_pid)"
 slot_lsn_before="$(psql_gate -Atqc "
   SELECT confirmed_flush_lsn FROM pg_replication_slots
   WHERE slot_name=shiba_internal.slot_name()::text")"
-routed_before="$(psql_gate -Atqc "SELECT count(*) FROM shiba_internal.routed_transactions")"
 psql_gate -qc "
-  INSERT INTO failpoint_source VALUES (3,3,30);
-  INSERT INTO public.shiba_worker_failpoints(kind,pause_ms)
-  VALUES ('router_before_slot_advance',100)"
-psql_gate -qc "
-  UPDATE shiba_internal.worker_state
-  SET active=true,last_heartbeat=NULL,last_requested_at=NULL
-  WHERE singleton"
-psql_gate -Atqc "SELECT shiba.start_worker()" >/dev/null
+  INSERT INTO public.shiba_runtime_failpoints(kind,runtime_pid,pause_ms)
+  VALUES ('runtime_route_before_slot_advance',${route_runtime_pid},100);
+  INSERT INTO public.failpoint_source VALUES (3,3,30)"
+
 wait_for_log \
-  "router exited after routing and before slot advancement" \
-  "the router failpoint"
+  "runtime exited after routing and before slot advancement" \
+  "the route-before-slot-advance failpoint"
+route_lsn="$(psql_gate -Atqc "
+  SELECT commit_lsn FROM shiba_internal.change_log
+  WHERE source_oid='public.failpoint_source'::regclass
+    AND row_data->>'event_id'='3'")"
 wait_for_query "0" "
   SELECT count(*) FROM pg_stat_activity
-  WHERE backend_type='shiba worker'
-    AND pid=(SELECT worker_pid FROM public.shiba_worker_failpoints
-             WHERE kind='router_before_slot_advance')" \
-  "the failed router to exit"
+  WHERE backend_type='shiba runtime' AND pid=${route_runtime_pid}" \
+  "the routing Runtime to exit"
+wait_for_replacement_runtime "${route_runtime_pid}"
 
-assert_query "t" "
-  SELECT fired AND worker_pid IS NOT NULL
-  FROM public.shiba_worker_failpoints
-  WHERE kind='router_before_slot_advance'"
-assert_query "${slot_lsn_before}" "
-  SELECT confirmed_flush_lsn FROM pg_replication_slots
-  WHERE slot_name=shiba_internal.slot_name()::text"
-assert_query "$((routed_before + 1))" \
-  "SELECT count(*) FROM shiba_internal.routed_transactions"
-assert_query "1" "
-  SELECT count(*) FROM shiba_internal.dag_inbox
-  WHERE result_oid=${result_oid}::oid AND row_data->>'event_id'='3'"
-
-psql_gate -qc "
-  DELETE FROM public.shiba_worker_failpoints
-  WHERE kind='router_before_slot_advance'"
-restart_router
+assert_query "true|${route_runtime_pid}|${route_lsn}" "
+  SELECT fired || '|' || runtime_pid || '|' || commit_lsn
+  FROM public.shiba_runtime_failpoints
+  WHERE kind='runtime_route_before_slot_advance'"
 wait_for_query "t" "
   SELECT confirmed_flush_lsn>'${slot_lsn_before}'::pg_lsn
   FROM pg_replication_slots
   WHERE slot_name=shiba_internal.slot_name()::text" \
-  "the replacement router to advance the slot"
-assert_query "$((routed_before + 1))" \
-  "SELECT count(*) FROM shiba_internal.routed_transactions"
+  "the replacement Runtime to advance the logical slot"
+# GC may concurrently remove older, fully acknowledged transactions. Assert
+# the replayed commit's checkpoint directly instead of relying on a global
+# catalog count that is intentionally not stable.
 assert_query "1" "
-  SELECT count(*) FROM shiba_internal.dag_inbox
-  WHERE result_oid=${result_oid}::oid AND row_data->>'event_id'='3'"
+  SELECT count(*) FROM shiba_internal.routed_transactions
+  WHERE commit_lsn='${route_lsn}'::pg_lsn"
+assert_query "1|1" "
+  SELECT
+    (SELECT count(*) FROM shiba_internal.change_log
+     WHERE commit_lsn='${route_lsn}'::pg_lsn
+       AND source_oid='public.failpoint_source'::regclass
+       AND row_data->>'event_id'='3')
+    || '|' ||
+    (SELECT count(*) FROM shiba_internal.dag_inbox
+     WHERE result_oid=${result_oid}::oid
+       AND commit_lsn='${route_lsn}'::pg_lsn)"
 
-restart_dag "${result_oid}"
-wait_for_query "0" "${baseline_diff}" "the final replayed result"
+psql_gate -qc "
+  DELETE FROM public.shiba_runtime_failpoints
+  WHERE kind='runtime_route_before_slot_advance';
+  UPDATE shiba_internal.dag_runtime_state
+  SET active=true
+  WHERE result_oid=${result_oid}::oid"
+wait_for_query "0" "${baseline_diff}" "the replay-idempotent final result"
 wait_for_query "0" "
   SELECT count(*) FROM shiba_internal.dag_inbox
   WHERE result_oid=${result_oid}::oid" \
   "the final inbox acknowledgement"
 
-printf '\nDeterministic executor and router failpoint recovery gate passed.\n'
+apply_panic="Shiba test failpoint: runtime exited after applying commit ${apply_lsn} and before acknowledgement"
+route_panic="Shiba test failpoint: runtime exited after routing and before slot advancement"
+apply_exit="background worker \"shiba runtime\" (PID ${apply_runtime_pid}) exited with exit code 1"
+route_exit="background worker \"shiba runtime\" (PID ${route_runtime_pid}) exited with exit code 1"
+
+assert_log_count 1 \
+  "Shiba test failpoint reached: runtime_apply_before_ack result ${result_oid} commit ${apply_lsn}" \
+  "the apply boundary arrival with exact result OID and commit LSN"
+assert_log_count 1 "${apply_panic}" "the expected apply panic"
+assert_log_count 1 "${route_panic}" "the expected route panic"
+assert_log_count 1 "${apply_exit}" "the failed apply Runtime PID exit"
+assert_log_count 1 "${route_exit}" "the failed route Runtime PID exit"
+
+runtime_exit_log="$(mktemp /tmp/shiba-runtime-failpoint-exits.XXXXXX)"
+rg 'background worker "shiba runtime"' \
+  "${pg_log_file}" >"${runtime_exit_log}" || true
+if test "$(wc -l <"${runtime_exit_log}" | tr -d ' ')" != "2" ||
+   ! grep -Fq "${apply_exit}" "${runtime_exit_log}" ||
+   ! grep -Fq "${route_exit}" "${runtime_exit_log}"; then
+  sed -n '1,120p' "${runtime_exit_log}" >&2
+  rm -f "${runtime_exit_log}"
+  fail "expected exactly the two deliberately failed Runtime exit records"
+fi
+rm -f "${runtime_exit_log}"
+
+unexpected_log="$(mktemp /tmp/shiba-runtime-failpoint-unexpected.XXXXXX)"
+rg -n 'WARNING|ERROR|FATAL|PANIC' "${pg_log_file}" |
+  grep -Fv -e "${apply_panic}" -e "${route_panic}" \
+  >"${unexpected_log}" || true
+if test -s "${unexpected_log}"; then
+  sed -n '1,120p' "${unexpected_log}" >&2
+  rm -f "${unexpected_log}"
+  fail "PostgreSQL log contains warning-or-higher messages beyond expected Runtime crashes"
+fi
+rm -f "${unexpected_log}"
+
+printf '\nDeterministic single-Runtime failpoint recovery gate passed.\n'

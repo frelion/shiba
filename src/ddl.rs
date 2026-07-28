@@ -44,6 +44,8 @@ unsafe extern "C-unwind" fn shiba_process_utility(
         None
     };
     if let Some(inspection) = &inspection {
+        Spi::run("SELECT shiba._begin_stream_registration()")
+            .expect("Shiba failed to enter database registration lifecycle");
         let lock_analysis = serde_json::json!({
             "sources": inspection
                 .validated
@@ -108,12 +110,25 @@ unsafe fn prepare_stream_drops(pstmt: *mut pg_sys::PlannedStmt) {
         return;
     }
     let utility = (*pstmt).utilityStmt;
+    if (*utility).type_ == pg_sys::NodeTag::T_DropOwnedStmt {
+        let drop_statement = utility.cast::<pg_sys::DropOwnedStmt>();
+        guard_drop_owned_ast(drop_statement);
+        // DROP OWNED removes directly owned objects even under the default
+        // RESTRICT behavior; CASCADE only controls dependent objects.
+        lock_all_dags_before_indirect_drop();
+        return;
+    }
     if (*utility).type_ != pg_sys::NodeTag::T_DropStmt {
         return;
     }
     let drop_statement = utility.cast::<pg_sys::DropStmt>();
     if (*drop_statement).removeType == pg_sys::ObjectType::OBJECT_EXTENSION {
         guard_extension_drop_ast(drop_statement);
+    }
+    if (*drop_statement).behavior == pg_sys::DropBehavior::DROP_CASCADE {
+        lock_all_dags_before_indirect_drop();
+    }
+    if (*drop_statement).removeType == pg_sys::ObjectType::OBJECT_EXTENSION {
         return;
     }
     if (*drop_statement).removeType != pg_sys::ObjectType::OBJECT_TABLE {
@@ -208,6 +223,36 @@ unsafe fn prepare_stream_drops(pstmt: *mut pg_sys::PlannedStmt) {
     }
 }
 
+unsafe fn guard_drop_owned_ast(drop_statement: *mut pg_sys::DropOwnedStmt) {
+    let Some(extension_owner) =
+        Spi::get_one::<pg_sys::Oid>("SELECT extowner FROM pg_extension WHERE extname='shiba'")
+            .expect("Shiba failed to inspect its extension owner before DROP OWNED")
+    else {
+        return;
+    };
+    let role_count = pg_sys::list_length((*drop_statement).roles);
+    for role_index in 0..role_count {
+        let role = pg_sys::list_nth((*drop_statement).roles, role_index).cast::<pg_sys::RoleSpec>();
+        if !role.is_null() && pg_sys::get_rolespec_oid(role, false) == extension_owner {
+            error!(
+                "DROP OWNED by the Shiba extension owner is not supported; drop all Shiba results, call shiba.deactivate(), and use DROP EXTENSION shiba explicitly"
+            );
+        }
+    }
+}
+
+fn lock_all_dags_before_indirect_drop() {
+    if Spi::get_one::<bool>("SELECT to_regclass('shiba_internal.stream_views') IS NOT NULL")
+        .ok()
+        .flatten()
+        != Some(true)
+    {
+        return;
+    }
+    Spi::run("SELECT shiba_internal._lock_all_dags_for_utility()")
+        .expect("Shiba failed to serialize indirect DROP with DAG execution");
+}
+
 unsafe fn guard_extension_drop_ast(drop_statement: *mut pg_sys::DropStmt) {
     let object_count = pg_sys::list_length((*drop_statement).objects);
     for object_index in 0..object_count {
@@ -258,7 +303,8 @@ fn ensure_shiba_slot_inactive() {
     .unwrap_or(false);
     let catalog_exists = Spi::get_one::<bool>(
         "SELECT to_regclass('shiba_internal.stream_views') IS NOT NULL
-           AND to_regclass('shiba_internal.worker_state') IS NOT NULL",
+           AND to_regclass('shiba_internal.runtime_state') IS NOT NULL
+           AND to_regclass('shiba_internal.dag_runtime_state') IS NOT NULL",
     )
     .expect("Shiba failed to inspect its catalog before DROP EXTENSION")
     .unwrap_or(false);
@@ -266,10 +312,10 @@ fn ensure_shiba_slot_inactive() {
         Spi::get_one::<bool>(
             "SELECT NOT EXISTS (SELECT 1 FROM shiba_internal.stream_views)
                AND NOT EXISTS (
-                 SELECT 1 FROM shiba_internal.worker_state WHERE active
+                 SELECT 1 FROM shiba_internal.runtime_state WHERE active
                )
                AND NOT EXISTS (
-                 SELECT 1 FROM shiba_internal.dag_worker_state WHERE active
+                 SELECT 1 FROM shiba_internal.dag_runtime_state WHERE active
                )
                AND NOT EXISTS (
                  SELECT 1 FROM pg_publication WHERE pubname='shiba_publication'

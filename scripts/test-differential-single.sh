@@ -388,8 +388,8 @@ END
 $function$;
 SQL
 
-wait_for_value "13" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'"
+wait_for_value "1" \
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'"
 wait_for_value "0" \
   "SELECT count(*) FROM public.diff_failures() WHERE mismatch_count <> 0"
 

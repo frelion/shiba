@@ -2,91 +2,232 @@
 
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
-use serde_json::{json, Value};
 
-use super::model::{DeltaBatch, DeltaRow, LogicalPlan};
-use super::validate::ExecutionPlan;
+use super::physical::PhysicalDagPlan;
 
-/// Loads and validates the persisted plan once per worker, then applies WAL
-/// batches using the execution descriptor derived from that plan.
+/// Loads and validates persisted plan metadata once per database Runtime.
+///
+/// Operator data remains relational. `DagRuntime` never owns source rows or
+/// operator state and applies an inbox transaction by durable LSN.
 pub struct DagRuntime {
     result_oid: pg_sys::Oid,
-    execution: ExecutionPlan,
-    encoded_descriptor: String,
+    generation: String,
+    physical_plan: PhysicalDagPlan,
+}
+
+pub enum LoadOutcome {
+    Loaded(DagRuntime),
+    Retry,
+    Quarantined,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NextApplyOutcome {
+    Applied,
+    Retry,
+    Quarantined,
+    Inactive,
+    Idle,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ApplyResult {
+    pub outcome: NextApplyOutcome,
+    pub commit_lsn: Option<String>,
 }
 
 impl DagRuntime {
-    pub fn load(result_oid: pg_sys::Oid) -> Result<Self, String> {
+    pub fn load(result_oid: pg_sys::Oid) -> Result<LoadOutcome, String> {
         let argument = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
-        let serialized = Spi::get_one_with_args::<String>(
-            "SELECT logical_plan::text FROM shiba_internal.stream_graphs WHERE result_oid = $1",
-            &argument,
-        )
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("result OID {result_oid} has no logical plan"))?;
-        let plan: LogicalPlan = serde_json::from_str(&serialized)
-            .map_err(|error| format!("invalid logical plan: {error}"))?;
-        let execution = plan.validate_for(result_oid.to_u32())?;
-        let encoded_descriptor = serde_json::to_string(&execution.descriptor)
-            .map_err(|error| format!("execution descriptor is not serializable: {error}"))?;
-        Ok(Self {
+        let loaded = Spi::connect_mut(|client| {
+            let table = client
+                .update(
+                    "SELECT outcome,plan_json,plan_generation,load_error
+                     FROM shiba_internal._load_dag_runtime_safely($1::oid)",
+                    None,
+                    &argument,
+                )
+                .map_err(|error| error.to_string())?;
+            if table.len() != 1 {
+                return Err(format!(
+                    "DAG runtime load returned {} rows, expected 1",
+                    table.len()
+                ));
+            }
+            let row = table.first();
+            Ok((
+                row.get::<String>(1)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "DAG runtime load returned NULL outcome".to_string())?,
+                row.get::<String>(2).map_err(|error| error.to_string())?,
+                row.get::<String>(3).map_err(|error| error.to_string())?,
+                row.get::<String>(4).map_err(|error| error.to_string())?,
+            ))
+        })?;
+        match loaded.0.as_str() {
+            "retry" => return Ok(LoadOutcome::Retry),
+            "quarantined" => return Ok(LoadOutcome::Quarantined),
+            "loaded" => {}
+            unexpected => {
+                return Err(format!(
+                    "DAG runtime load returned unexpected outcome {unexpected:?}"
+                ));
+            }
+        }
+        let serialized = loaded
+            .1
+            .ok_or_else(|| format!("result OID {result_oid} load returned no physical plan"))?;
+        let generation = loaded.2.ok_or_else(|| {
+            format!("result OID {result_oid} load returned no physical-plan generation")
+        })?;
+        let execution: PhysicalDagPlan = serde_json::from_str(&serialized)
+            .map_err(|error| format!("invalid physical plan: {error}"))?;
+        execution.validate_for_result(result_oid.to_u32())?;
+        Ok(LoadOutcome::Loaded(Self {
             result_oid,
-            execution,
-            encoded_descriptor,
-        })
+            generation,
+            physical_plan: execution,
+        }))
     }
 
-    pub fn apply_batch(&self, batch: DeltaBatch) -> Result<(), String> {
-        let encoded =
-            encode_batch_events(&self.execution, self.result_oid, batch.rows)?.to_string();
+    pub fn apply_next_transaction(&self) -> Result<ApplyResult, String> {
         let arguments = unsafe {
             [
                 DatumWithOid::new(self.result_oid, pg_sys::OIDOID),
-                DatumWithOid::new(self.encoded_descriptor.as_str(), pg_sys::TEXTOID),
-                DatumWithOid::new(encoded.as_str(), pg_sys::TEXTOID),
-                DatumWithOid::new(batch.epoch.as_str(), pg_sys::TEXTOID),
+                DatumWithOid::new(self.physical_plan.encoded_descriptor(), pg_sys::TEXTOID),
             ]
         };
-        Spi::run_with_args(
-            "SELECT shiba._apply_dag_delta_batch($1, $2::jsonb, $3::jsonb, $4)",
-            &arguments,
-        )
-        .map_err(|error| error.to_string())
+        Spi::connect_mut(|client| {
+            let table = client
+                .update(
+                    "SELECT outcome,commit_lsn::text
+                     FROM shiba._apply_next_dag_change_log($1::oid,$2::jsonb)",
+                    None,
+                    &arguments,
+                )
+                .map_err(|error| error.to_string())?;
+            if table.len() != 1 {
+                return Err(format!(
+                    "next DAG apply returned {} rows, expected 1",
+                    table.len()
+                ));
+            }
+            let row = table.first();
+            let outcome = row
+                .get::<String>(1)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "next DAG apply returned NULL outcome".to_string())?;
+            let commit_lsn = row.get::<String>(2).map_err(|error| error.to_string())?;
+            let outcome = parse_next_apply_outcome(&outcome)?;
+            if matches!(
+                outcome,
+                NextApplyOutcome::Applied | NextApplyOutcome::Retry | NextApplyOutcome::Quarantined
+            ) != commit_lsn.is_some()
+            {
+                return Err(format!(
+                    "next DAG apply returned inconsistent outcome {outcome:?} and commit LSN"
+                ));
+            }
+            Ok(ApplyResult {
+                outcome,
+                commit_lsn,
+            })
+        })
+    }
+
+    pub fn quarantine(result_oid: pg_sys::Oid, error: &str) -> Result<(), String> {
+        quarantine(result_oid, error)
+    }
+
+    pub fn matches_generation(&self, generation: &str) -> bool {
+        self.generation == generation
+    }
+
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    pub fn release_physical_programs(&self) -> Result<(), String> {
+        release_physical_programs(self.result_oid, &self.generation)
     }
 }
 
-pub(super) fn encode_batch_events(
-    plan: &ExecutionPlan,
-    result_oid: pg_sys::Oid,
-    rows: Vec<DeltaRow>,
-) -> Result<Value, String> {
-    if rows.is_empty() {
-        return Err("DAG delta batch must not be empty".into());
+pub fn release_physical_programs(result_oid: pg_sys::Oid, generation: &str) -> Result<(), String> {
+    let plan_id = generation
+        .parse::<i64>()
+        .map_err(|_| format!("invalid physical-plan generation {generation}"))?;
+    let arguments = unsafe {
+        [
+            DatumWithOid::new(result_oid, pg_sys::OIDOID),
+            DatumWithOid::new(plan_id, pg_sys::INT8OID),
+        ]
+    };
+    Spi::run_with_args(
+        "SELECT shiba_internal._deallocate_join_physical_plans(
+           $1::oid,$2::bigint
+         )",
+        &arguments,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn parse_next_apply_outcome(outcome: &str) -> Result<NextApplyOutcome, String> {
+    match outcome {
+        "applied" => Ok(NextApplyOutcome::Applied),
+        "retry" => Ok(NextApplyOutcome::Retry),
+        "quarantined" => Ok(NextApplyOutcome::Quarantined),
+        "inactive" => Ok(NextApplyOutcome::Inactive),
+        "idle" => Ok(NextApplyOutcome::Idle),
+        unexpected => Err(format!(
+            "next DAG apply returned unexpected outcome {unexpected:?}"
+        )),
     }
-    let mut encoded = Vec::with_capacity(rows.len());
-    for delta in rows {
-        let source_oid_u32 = delta
-            .input
-            .parse::<u32>()
-            .map_err(|_| format!("invalid DAG input OID {}", delta.input))?;
-        if !plan.source_oids.contains(&source_oid_u32) {
-            return Err(format!(
-                "source OID {source_oid_u32} is not an input of result {result_oid}"
-            ));
-        }
-        if !delta.row.is_object() {
-            return Err("source delta row must be a JSON object".into());
-        }
-        let diff = i32::try_from(delta.diff)
-            .map_err(|_| format!("differential weight {} exceeds int32", delta.diff))?;
-        if !matches!(diff, -1 | 1) {
-            return Err(format!("invalid source differential weight {diff}"));
-        }
-        encoded.push(json!({
-            "source_oid": source_oid_u32,
-            "row_data": delta.row,
-            "delta": diff,
-        }));
+}
+
+pub fn quarantine(result_oid: pg_sys::Oid, error: &str) -> Result<(), String> {
+    let arguments = unsafe {
+        [
+            DatumWithOid::new(result_oid, pg_sys::OIDOID),
+            DatumWithOid::new(error, pg_sys::TEXTOID),
+        ]
+    };
+    Spi::run_with_args(
+        "UPDATE shiba_internal.dag_runtime_state
+         SET active = false,
+             last_error = $2,
+             failed_at = clock_timestamp()
+         WHERE result_oid = $1",
+        &arguments,
+    )
+    .map_err(|spi_error| spi_error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_next_apply_outcome, NextApplyOutcome};
+
+    #[test]
+    fn parses_next_apply_outcomes() {
+        assert_eq!(
+            parse_next_apply_outcome("applied"),
+            Ok(NextApplyOutcome::Applied)
+        );
+        assert_eq!(
+            parse_next_apply_outcome("retry"),
+            Ok(NextApplyOutcome::Retry)
+        );
+        assert_eq!(
+            parse_next_apply_outcome("quarantined"),
+            Ok(NextApplyOutcome::Quarantined)
+        );
+        assert_eq!(
+            parse_next_apply_outcome("inactive"),
+            Ok(NextApplyOutcome::Inactive)
+        );
+        assert_eq!(parse_next_apply_outcome("idle"), Ok(NextApplyOutcome::Idle));
+        assert_eq!(
+            parse_next_apply_outcome("unknown"),
+            Err("next DAG apply returned unexpected outcome \"unknown\"".into())
+        );
     }
-    Ok(Value::Array(encoded))
 }

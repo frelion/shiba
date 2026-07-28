@@ -35,10 +35,10 @@ BEGIN
     ELSE
       IF prior_multiplicity=0 THEN
         RAISE EXCEPTION 'Shiba TopN state is missing a retracted row'
-          USING ERRCODE='data_corrupted';
+          USING ERRCODE='P0S01';
       ELSIF prior_multiplicity+delta<0 THEN
         RAISE EXCEPTION 'Shiba TopN multiplicity became negative'
-          USING ERRCODE='data_corrupted';
+          USING ERRCODE='P0S01';
       ELSIF prior_multiplicity+delta=0 THEN
         DELETE FROM shiba_internal.topn_rows
         WHERE result_oid=stream_view.result_oid AND row_data=p_row_data;
@@ -127,10 +127,10 @@ BEGIN
     ELSE
       IF prior_multiplicity=0 THEN
         RAISE EXCEPTION 'Shiba DISTINCT state is missing a retracted row'
-          USING ERRCODE='data_corrupted';
+          USING ERRCODE='P0S01';
       ELSIF prior_multiplicity+delta<0 THEN
         RAISE EXCEPTION 'Shiba DISTINCT multiplicity became negative'
-          USING ERRCODE='data_corrupted';
+          USING ERRCODE='P0S01';
       ELSIF prior_multiplicity+delta=0 THEN
         DELETE FROM shiba_internal.projection_state
         WHERE result_oid=stream_view.result_oid AND row_key=state_row_key;
@@ -191,10 +191,10 @@ BEGIN
         AND window_rows.row_data=p_row_data;
       IF prior_multiplicity IS NULL THEN
         RAISE EXCEPTION 'Shiba window state is missing a retracted row'
-          USING ERRCODE='data_corrupted';
+          USING ERRCODE='P0S01';
       ELSIF prior_multiplicity+delta<0 THEN
         RAISE EXCEPTION 'Shiba window multiplicity became negative'
-          USING ERRCODE='data_corrupted';
+          USING ERRCODE='P0S01';
       ELSIF prior_multiplicity+delta=0 THEN
         DELETE FROM shiba_internal.window_rows
         WHERE result_oid=stream_view.result_oid
@@ -241,7 +241,7 @@ RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     view_row shiba_internal.stream_views%ROWTYPE;
     join_row shiba_internal.inner_join_views%ROWTYPE;
-    key_value text;
+    key_value jsonb;
     prior_multiplicity bigint;
     same_total bigint := 0;
     opposite_total bigint := 0;
@@ -255,20 +255,26 @@ DECLARE
     new_match_total bigint;
     new_right_total bigint;
     new_right_null_total bigint;
-    left_key text;
+    left_key jsonb;
     old_visible boolean;
     new_visible boolean;
 BEGIN
     SELECT * INTO STRICT view_row FROM shiba_internal.stream_views WHERE result_oid = result_relation;
     SELECT * INTO STRICT join_row FROM shiba_internal.inner_join_views WHERE result_oid = result_relation;
-    key_value := input_row ->> CASE p_input_side WHEN 'left' THEN join_row.left_join_column ELSE join_row.right_join_column END;
+    key_value := coalesce(
+      input_row -> CASE p_input_side
+        WHEN 'left' THEN join_row.left_join_column
+        ELSE join_row.right_join_column
+      END,
+      'null'::jsonb
+    );
     preserves_input := join_row.join_type = 'full'
       OR (join_row.join_type = 'left' AND p_input_side = 'left')
       OR (join_row.join_type = 'right' AND p_input_side = 'right');
     preserves_opposite := join_row.join_type = 'full'
       OR (join_row.join_type = 'left' AND opposite = 'left')
       OR (join_row.join_type = 'right' AND opposite = 'right');
-    IF key_value IS NOT NULL THEN
+    IF key_value<>'null'::jsonb THEN
         SELECT coalesce(sum(multiplicity),0) INTO same_total
         FROM shiba_internal.join_arrangements
         WHERE result_oid=result_relation AND input_side=p_input_side AND join_key=key_value;
@@ -280,27 +286,27 @@ BEGIN
         SELECT multiplicity INTO prior_multiplicity
         FROM shiba_internal.join_arrangements
         WHERE result_oid = result_relation AND input_side = p_input_side
-          AND join_key = COALESCE(key_value, '') AND row_data = input_row;
+          AND join_key=key_value AND row_data=input_row;
         -- A slot may replay a commit after a worker crash boundary.  Do not
         -- accept an absent row: inbox acknowledgement and state changes are
         -- atomic, so this indicates an encoding or state-integrity bug.
         IF prior_multiplicity IS NULL THEN
             RAISE EXCEPTION 'Shiba JOIN state is missing a retracted row'
-                USING ERRCODE='data_corrupted';
+                USING ERRCODE='P0S01';
         END IF;
     END IF;
 
     IF join_row.join_type='null_anti' THEN
       SELECT coalesce(sum(multiplicity),0),
              coalesce(sum(multiplicity) FILTER (
-               WHERE row_data ->> join_row.right_join_column IS NULL
+               WHERE join_key='null'::jsonb
              ),0)
       INTO right_total,right_null_total
       FROM shiba_internal.join_arrangements
       WHERE result_oid=result_relation AND input_side='right';
       IF p_input_side='left' THEN
         old_visible := right_total=0
-          OR (key_value IS NOT NULL AND right_null_total=0 AND opposite_total=0);
+          OR (key_value<>'null'::jsonb AND right_null_total=0 AND opposite_total=0);
         IF old_visible THEN
           PERFORM shiba._apply_inner_join_aggregate(
             view_row,join_row,input_row,'{}'::jsonb,p_delta,defer_sink
@@ -309,14 +315,17 @@ BEGIN
       ELSE
         new_right_total := right_total+p_delta;
         new_right_null_total := right_null_total
-          + CASE WHEN key_value IS NULL THEN p_delta ELSE 0 END;
+          + CASE WHEN key_value='null'::jsonb THEN p_delta ELSE 0 END;
         FOR match_row IN
           SELECT row_data,multiplicity
           FROM shiba_internal.join_arrangements
           WHERE result_oid=result_relation AND input_side='left'
         LOOP
-          left_key := match_row.row_data ->> join_row.left_join_column;
-          IF left_key IS NULL THEN
+          left_key := coalesce(
+            match_row.row_data->join_row.left_join_column,
+            'null'::jsonb
+          );
+          IF left_key='null'::jsonb THEN
             old_match_total := 0;
           ELSE
             SELECT coalesce(sum(multiplicity),0) INTO old_match_total
@@ -325,11 +334,11 @@ BEGIN
               AND join_key=left_key;
           END IF;
           new_match_total := old_match_total
-            + CASE WHEN key_value IS NOT NULL AND left_key=key_value THEN p_delta ELSE 0 END;
+            + CASE WHEN key_value<>'null'::jsonb AND left_key=key_value THEN p_delta ELSE 0 END;
           old_visible := right_total=0
-            OR (left_key IS NOT NULL AND right_null_total=0 AND old_match_total=0);
+            OR (left_key<>'null'::jsonb AND right_null_total=0 AND old_match_total=0);
           new_visible := new_right_total=0
-            OR (left_key IS NOT NULL AND new_right_null_total=0 AND new_match_total=0);
+            OR (left_key<>'null'::jsonb AND new_right_null_total=0 AND new_match_total=0);
           IF old_visible IS DISTINCT FROM new_visible THEN
             PERFORM shiba._apply_inner_join_aggregate(
               view_row,join_row,match_row.row_data,'{}'::jsonb,
@@ -341,13 +350,13 @@ BEGIN
       END IF;
     ELSIF join_row.join_type IN ('semi','anti') THEN
       IF p_input_side='left' THEN
-        IF (join_row.join_type='semi' AND key_value IS NOT NULL AND opposite_total>0)
-           OR (join_row.join_type='anti' AND (key_value IS NULL OR opposite_total=0)) THEN
+        IF (join_row.join_type='semi' AND key_value<>'null'::jsonb AND opposite_total>0)
+           OR (join_row.join_type='anti' AND (key_value='null'::jsonb OR opposite_total=0)) THEN
           PERFORM shiba._apply_inner_join_aggregate(
             view_row,join_row,input_row,'{}'::jsonb,p_delta,defer_sink
           );
         END IF;
-      ELSIF key_value IS NOT NULL
+      ELSIF key_value<>'null'::jsonb
         AND ((p_delta>0 AND same_total=0)
           OR (p_delta<0 AND same_total+p_delta=0)) THEN
         FOR match_row IN
@@ -372,7 +381,7 @@ BEGIN
     ELSE
       -- SQL equality never matches NULL.  We still retain the row so an
       -- UPDATE from NULL to a value has correct future arrangement state.
-      IF key_value IS NOT NULL THEN
+      IF key_value<>'null'::jsonb THEN
         FOR match_row IN
             SELECT row_data, multiplicity
             FROM shiba_internal.join_arrangements AS arrangement
@@ -394,7 +403,7 @@ BEGIN
 
     -- A preserved row with no equality match contributes one NULL-extended
     -- joined row per source multiplicity.
-      IF preserves_input AND (key_value IS NULL OR opposite_total = 0) THEN
+      IF preserves_input AND (key_value='null'::jsonb OR opposite_total=0) THEN
         IF p_input_side = 'left' THEN
             PERFORM shiba._apply_inner_join_aggregate(
                 view_row,join_row,input_row,'{}'::jsonb,p_delta,defer_sink
@@ -408,7 +417,7 @@ BEGIN
 
     -- The first row on one side replaces all preserved NULL-extended rows on
     -- the opposite side. Removing the last row restores them.
-      IF key_value IS NOT NULL AND preserves_opposite
+      IF key_value<>'null'::jsonb AND preserves_opposite
        AND ((p_delta > 0 AND same_total = 0)
          OR (p_delta < 0 AND same_total + p_delta = 0)) THEN
         FOR match_row IN
@@ -435,23 +444,23 @@ BEGIN
 
     IF p_delta > 0 THEN
         INSERT INTO shiba_internal.join_arrangements (result_oid, input_side, join_key, row_data, multiplicity)
-        VALUES (result_relation, p_input_side, COALESCE(key_value, ''), input_row, p_delta)
+        VALUES (result_relation,p_input_side,key_value,input_row,p_delta)
         ON CONFLICT (result_oid, input_side, join_key, row_data) DO UPDATE
         SET multiplicity = shiba_internal.join_arrangements.multiplicity + EXCLUDED.multiplicity;
     ELSE
         IF prior_multiplicity + p_delta < 0 THEN
             RAISE EXCEPTION 'Shiba JOIN state corruption: deleted row is absent from its arrangement'
-                USING ERRCODE = 'data_corrupted';
+                USING ERRCODE='P0S01';
         END IF;
         IF prior_multiplicity + p_delta = 0 THEN
             DELETE FROM shiba_internal.join_arrangements
             WHERE result_oid = result_relation AND input_side = p_input_side
-              AND join_key = COALESCE(key_value, '') AND row_data = input_row;
+              AND join_key=key_value AND row_data=input_row;
         ELSE
             UPDATE shiba_internal.join_arrangements
             SET multiplicity = prior_multiplicity + p_delta
             WHERE result_oid = result_relation AND input_side = p_input_side
-              AND join_key = COALESCE(key_value, '') AND row_data = input_row;
+              AND join_key=key_value AND row_data=input_row;
         END IF;
     END IF;
 
@@ -489,11 +498,8 @@ BEGIN
     PERFORM shiba._apply_aggregate_state(
       view_row.result_oid,state_group_key,delta,state_sum_value,state_count_input
     );
-    IF defer_sink THEN
-      INSERT INTO pg_temp.shiba_join_batch_groups(result_oid,group_key)
-      VALUES(view_row.result_oid,state_group_key)
-      ON CONFLICT(result_oid,group_key) DO NOTHING;
-    ELSE
-      PERFORM shiba._sync_aggregate_sink(view_row,state_group_key);
-    END IF;
+    -- Compatibility calls remain immediately visible.  Commit-level JOIN
+    -- execution uses _apply_join_commit_temp_free and never enters this
+    -- callback path, so defer_sink no longer requires backend-local scratch.
+    PERFORM shiba._sync_aggregate_sink(view_row,state_group_key);
 END; $$;

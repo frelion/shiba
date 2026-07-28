@@ -68,6 +68,8 @@ REPETITIONS = env_int("SHIBA_MATRIX_REPETITIONS", 3)
 QUERY_SECONDS = env_int("SHIBA_MATRIX_QUERY_SECONDS", 5)
 QUERY_CLIENTS = env_int("SHIBA_MATRIX_QUERY_CLIENTS", 4)
 LATENCY_PROBES = env_int("SHIBA_MATRIX_LATENCY_PROBES", 40)
+LARGE_TRANSACTION_ROWS = env_int("SHIBA_MATRIX_LARGE_TX_ROWS", 5_000)
+RESOURCE_SAMPLE_MS = env_int("SHIBA_MATRIX_RESOURCE_SAMPLE_MS", 100)
 SEED = env_int("SHIBA_MATRIX_SEED", 20260725)
 KEEP_CLUSTER = os.environ.get("SHIBA_KEEP_MATRIX_CLUSTER", "0") == "1"
 SKIP_BUILD = os.environ.get("SHIBA_MATRIX_SKIP_BUILD", "0") == "1"
@@ -89,6 +91,7 @@ ACTION_SAMPLES: list[dict[str, Any]] = []
 SCENARIO_SUMMARIES: list[dict[str, Any]] = []
 RESOURCE_ROWS: list[dict[str, Any]] = []
 POSTMASTER_PID: int | None = None
+RUNTIME_OBSERVATIONS: list[dict[str, Any]] = []
 
 
 def run(
@@ -152,6 +155,83 @@ def scalar(sql: str, *, database: str = DATABASE) -> str:
     if not lines:
         raise BenchmarkError(f"query returned no scalar value: {sql}")
     return lines[-1]
+
+
+LEGACY_SHIBA_BACKEND_TYPES = (
+    "shiba worker",
+    "shiba dag worker",
+    "shiba router",
+    "shiba executor",
+)
+
+
+def runtime_topology() -> list[dict[str, int]]:
+    output = psql(
+        """
+SELECT json_build_object(
+  'owner_pid',state.owner_pid
+)::text
+FROM shiba_internal.runtime_state state
+JOIN pg_stat_activity activity
+  ON activity.pid=state.owner_pid
+ AND activity.backend_type='shiba runtime'
+WHERE state.singleton AND state.active
+  AND activity.datname=current_database()
+""",
+        tuples=True,
+    )
+    return [json.loads(line) for line in output.splitlines() if line.strip()]
+
+
+def legacy_shiba_backend_count() -> int:
+    backend_types = ",".join(
+        "'" + backend_type.replace("'", "''") + "'"
+        for backend_type in LEGACY_SHIBA_BACKEND_TYPES
+    )
+    return int(
+        scalar(
+            "SELECT count(*) FROM pg_stat_activity "
+            f"WHERE datname=current_database() AND backend_type IN ({backend_types})"
+        )
+    )
+
+
+def runtime_topology_ready() -> bool:
+    topology = runtime_topology()
+    return (
+        len(topology) == 1
+        and scalar(
+            "SELECT count(*) FROM pg_stat_activity "
+            "WHERE datname=current_database() AND backend_type='shiba runtime'"
+        )
+        == "1"
+        and legacy_shiba_backend_count() == 0
+    )
+
+
+def record_runtime_topology() -> None:
+    if not runtime_topology_ready():
+        raise BenchmarkError("Single Runtime topology invariant is not satisfied")
+    topology = runtime_topology()
+    legacy_count = legacy_shiba_backend_count()
+    observation = {
+        "database": DATABASE,
+        "observed_utc": datetime.now(timezone.utc).isoformat(),
+        "actual_count": len(topology),
+        "legacy_worker_count": legacy_count,
+        "runtimes": topology,
+    }
+    RUNTIME_OBSERVATIONS.append(observation)
+    (OUTPUT_DIR / "runtime-topology.json").write_text(
+        json.dumps(RUNTIME_OBSERVATIONS, indent=2) + "\n"
+    )
+    environment_path = OUTPUT_DIR / "environment.json"
+    environment = json.loads(environment_path.read_text())
+    environment["actual_runtime_count"] = len(topology)
+    environment["legacy_worker_count"] = legacy_count
+    environment["runtime_pids"] = [row["owner_pid"] for row in topology]
+    environment["runtime_observations"] = RUNTIME_OBSERVATIONS
+    environment_path.write_text(json.dumps(environment, indent=2) + "\n")
 
 
 def metric(
@@ -232,9 +312,9 @@ def io_delta(after: dict[str, float], before: dict[str, float]) -> dict[str, flo
     return {key: after[key] - before.get(key, 0.0) for key in after}
 
 
-def process_snapshot() -> tuple[float, int]:
+def process_snapshot(runtime_pid: int | None = None) -> tuple[float, int, float, int]:
     if POSTMASTER_PID is None:
-        return (0.0, 0)
+        return (0.0, 0, 0.0, 0)
     completed = run(
         ["ps", "-axo", "pid=,ppid=,%cpu=,rss="], check=False, capture=True
     )
@@ -258,7 +338,10 @@ def process_snapshot() -> tuple[float, int]:
                 changed = True
     cpu = sum(records.get(pid, (0, 0.0, 0))[1] for pid in descendants)
     rss = sum(records.get(pid, (0, 0.0, 0))[2] for pid in descendants)
-    return cpu, rss
+    runtime_record = records.get(runtime_pid) if runtime_pid is not None else None
+    runtime_cpu = runtime_record[1] if runtime_record else 0.0
+    runtime_rss = runtime_record[2] if runtime_record else 0
+    return cpu, rss, runtime_cpu, runtime_rss
 
 
 class ResourceSampler:
@@ -268,28 +351,41 @@ class ResourceSampler:
         self.phase = phase
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.runtime_pid: int | None = None
 
     def __enter__(self):
+        if not runtime_topology_ready():
+            raise BenchmarkError(
+                f"{self.scenario}/{self.phase}: expected exactly one Runtime "
+                "and no legacy Shiba workers"
+            )
+        self.runtime_pid = runtime_topology()[0]["owner_pid"]
+
         def sample() -> None:
             while not self.stop_event.is_set():
-                cpu, rss = process_snapshot()
+                cpu, rss, runtime_cpu, runtime_rss = process_snapshot(
+                    self.runtime_pid
+                )
                 RESOURCE_ROWS.append(
                     {
                         "epoch_ms": time.time_ns() / 1_000_000,
                         "repetition": self.repetition,
                         "scenario": self.scenario,
                         "phase": self.phase,
+                        "runtime_pid": self.runtime_pid,
                         "cpu_percent": cpu,
                         "rss_kib": rss,
+                        "runtime_cpu_percent": runtime_cpu,
+                        "runtime_rss_kib": runtime_rss,
                     }
                 )
-                self.stop_event.wait(0.1)
+                self.stop_event.wait(RESOURCE_SAMPLE_MS / 1000)
 
         self.thread = threading.Thread(target=sample, daemon=True)
         self.thread.start()
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, exc_type, *_):
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=2)
@@ -327,6 +423,47 @@ class ResourceSampler:
                 "KiB",
                 "sum across PostgreSQL process tree",
             )
+            metric(
+                self.repetition,
+                self.scenario,
+                self.phase,
+                "runtime_cpu_mean",
+                statistics.fmean(
+                    float(row["runtime_cpu_percent"]) for row in rows
+                ),
+                "percent",
+                "single Runtime; 100% is one core",
+            )
+            metric(
+                self.repetition,
+                self.scenario,
+                self.phase,
+                "runtime_cpu_peak",
+                max(float(row["runtime_cpu_percent"]) for row in rows),
+                "percent",
+                "single Runtime",
+            )
+            metric(
+                self.repetition,
+                self.scenario,
+                self.phase,
+                "runtime_rss_peak",
+                max(int(row["runtime_rss_kib"]) for row in rows),
+                "KiB",
+                "single Runtime",
+            )
+        if exc_type is None:
+            if not runtime_topology_ready():
+                raise BenchmarkError(
+                    f"{self.scenario}/{self.phase}: Runtime topology changed "
+                    "during resource sampling"
+                )
+            current_pid = runtime_topology()[0]["owner_pid"]
+            if current_pid != self.runtime_pid:
+                raise BenchmarkError(
+                    f"{self.scenario}/{self.phase}: Runtime PID changed from "
+                    f"{self.runtime_pid} to {current_pid}"
+                )
 
 
 def restart_cluster() -> None:
@@ -363,12 +500,10 @@ def create_database() -> None:
     psql("CREATE EXTENSION shiba")
     psql("SELECT shiba.activate()")
     wait_until(
-        "WAL Router",
-        lambda: scalar(
-            "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba worker'"
-        )
-        == "1",
+        "single Shiba Runtime",
+        runtime_topology_ready,
     )
+    record_runtime_topology()
 
 
 def destroy_database() -> None:
@@ -380,21 +515,17 @@ def destroy_database() -> None:
             raise BenchmarkError(
                 f"cannot destroy scenario database with {result_count} active results"
             )
-        psql("UPDATE shiba_internal.worker_state SET active=false WHERE singleton")
-        wait_until(
-            "WAL Router to stop before slot removal",
-            lambda: scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba worker'"
-            )
-            == "0",
-        )
         psql("SELECT shiba.deactivate()")
         wait_until(
-            "all Shiba workers to stop",
+            "all Shiba processes to stop",
             lambda: scalar(
                 """
 SELECT count(*) FROM pg_stat_activity
-WHERE backend_type IN ('shiba worker','shiba dag worker')
+WHERE datname=current_database()
+  AND backend_type IN (
+    'shiba runtime','shiba worker','shiba dag worker',
+    'shiba router','shiba executor'
+  )
 """
             )
             == "0",
@@ -632,6 +763,24 @@ def relation_bytes(qualified_name: str) -> int:
     )
 
 
+def physical_stage_stats(result_oids_sql: str) -> dict[str, int]:
+    value = scalar(
+        f"""
+SELECT json_build_object(
+  'relation_bytes',coalesce(sum(pg_total_relation_size(stage.relation_oid)),0),
+  'live_tuples',coalesce(sum(statistics.n_live_tup),0),
+  'dead_tuples',coalesce(sum(statistics.n_dead_tup),0),
+  'autovacuum_count',coalesce(sum(statistics.autovacuum_count),0)
+)::text
+FROM shiba_internal.physical_stages stage
+LEFT JOIN pg_stat_user_tables statistics
+  ON statistics.relid=stage.relation_oid
+WHERE stage.result_oid IN ({result_oids_sql})
+"""
+    )
+    return {name: int(number) for name, number in json.loads(value).items()}
+
+
 def graph_operators() -> list[str]:
     value = scalar(
         """
@@ -819,19 +968,18 @@ def record_action(
     baseline_sql = format_action(sql_override or action.sql, "baseline")
     shiba_sql = format_action(sql_override or action.sql, "source")
 
+    runtime_pids: set[int] | None = None
     if backlog:
+        runtime_pids = {row["owner_pid"] for row in runtime_topology()}
         psql(
             """
-UPDATE shiba_internal.dag_worker_state
+UPDATE shiba_internal.dag_runtime_state
 SET active=false WHERE result_oid='shiba.perf_result'::regclass
 """
         )
         wait_until(
-            "DAG worker to stop",
-            lambda: scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'"
-            )
-            == "0",
+            "the Runtime to remain alive while the DAG is inactive",
+            runtime_topology_ready,
         )
 
     before_progress = progress()
@@ -856,7 +1004,20 @@ SET active=false WHERE result_oid='shiba.perf_result'::regclass
         routed_value = wait_for_routed(before_routed_lsn)
         if backlog:
             wait_for_inbox_present(str(routed_value["commit_lsn"]))
-            psql("SELECT shiba.activate()")
+            psql(
+                """
+UPDATE shiba_internal.dag_runtime_state
+SET active=true WHERE result_oid='shiba.perf_result'::regclass;
+SELECT shiba.activate()
+"""
+            )
+            wait_until(
+                "the same Runtime to drain the reactivated DAG",
+                lambda: {
+                    row["owner_pid"] for row in runtime_topology()
+                }
+                == runtime_pids,
+            )
         ack_epoch = wait_for_inbox_ack(str(routed_value["commit_lsn"]))
         return commit_epoch, routed_value, ack_epoch
 
@@ -1064,13 +1225,7 @@ def run_scenario(repetition: int, scenario: Scenario, run_dir: Path) -> set[str]
         for key, value in io_delta(after_io, before_io).items():
             metric(repetition, scenario.name, "backfill", f"io_{key}", value, "")
 
-        wait_until(
-            "DAG worker",
-            lambda: scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'"
-            )
-            == "1",
-        )
+        wait_until("single Runtime", runtime_topology_ready)
         operators = graph_operators()
         operator_set = set(operators)
         missing = set(scenario.required_operators) - operator_set
@@ -1105,6 +1260,16 @@ def run_scenario(repetition: int, scenario: Scenario, run_dir: Path) -> set[str]
         record_explain_metrics(
             repetition, scenario.name, "result_buffer_cold", result_cold
         )
+
+        # The Runtime is a dynamic BGW. A full postmaster restart intentionally
+        # requires explicit activation (or the next registered-source statement)
+        # before asynchronous work resumes.
+        psql("SELECT shiba.activate()")
+        wait_until(
+            "single Runtime after buffer-cold restarts",
+            runtime_topology_ready,
+        )
+        record_runtime_topology()
 
         # Warm each relation before timed concurrent reads; alternate order by run.
         psql(defining_query)
@@ -1232,6 +1397,17 @@ def run_scenario(repetition: int, scenario: Scenario, run_dir: Path) -> set[str]
             ("database_bytes", int(scalar("SELECT pg_database_size(current_database())"))),
         ):
             metric(repetition, scenario.name, "space", name, value, "bytes")
+        for name, value in physical_stage_stats(
+            "'shiba.perf_result'::regclass"
+        ).items():
+            metric(
+                repetition,
+                scenario.name,
+                "physical_stage",
+                name,
+                value,
+                "bytes" if name == "relation_bytes" else "count",
+            )
         final_difference = correctness_difference(defining_query)
         final_inbox = int(
             scalar(
@@ -1261,11 +1437,8 @@ WHERE result_oid='shiba.perf_result'::regclass
 
         psql("DROP TABLE shiba.perf_result")
         wait_until(
-            "DAG worker exit",
-            lambda: scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'"
-            )
-            == "0",
+            "Runtime to remain after dropping the DAG",
+            runtime_topology_ready,
         )
         return operator_set
     finally:
@@ -1306,12 +1479,35 @@ def run_multidag(repetition: int, run_dir: Path) -> None:
         for result_name, query in definitions.items():
             psql(f"CREATE TABLE shiba.{result_name} AS {query}")
         wait_until(
-            "four DAG workers",
-            lambda: scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'"
-            )
-            == "4",
+            "single Runtime for four DAGs",
+            runtime_topology_ready,
         )
+        fanout_oids = """
+  'shiba.fanout_aggregate'::regclass,
+  'shiba.fanout_filter'::regclass,
+  'shiba.fanout_distinct'::regclass,
+  'shiba.fanout_topn'::regclass
+"""
+        psql(
+            f"""
+UPDATE shiba_internal.dag_runtime_state
+SET active=false
+WHERE result_oid IN ({fanout_oids})
+"""
+        )
+        wait_until(
+            "all fanout DAGs to be paused",
+            lambda: int(
+                scalar(
+                    f"""
+SELECT count(*) FROM shiba_internal.dag_runtime_state
+WHERE result_oid IN ({fanout_oids}) AND active
+"""
+                )
+            )
+            == 0,
+        )
+        record_runtime_topology()
         before_routed = max_routed_lsn()
         before_wal = lsn()
         before_io = io_snapshot()
@@ -1327,6 +1523,64 @@ FROM generate_series(1,{MUTATIONS * 10}) value
             )
             commit_ms = commit_epoch_ms(xid)
             routed = wait_for_routed(before_routed)
+            payload_rows = int(
+                scalar(
+                    "SELECT count(*) FROM shiba_internal.change_log "
+                    f"WHERE commit_lsn='{routed['commit_lsn']}'::pg_lsn"
+                )
+            )
+            inbox_references = int(
+                scalar(
+                    "SELECT count(*) FROM shiba_internal.dag_inbox "
+                    f"WHERE result_oid IN ({fanout_oids}) "
+                    f"AND commit_lsn='{routed['commit_lsn']}'::pg_lsn"
+                )
+            )
+            metric(
+                repetition,
+                name,
+                "fanout_storage",
+                "change_log_payload_rows",
+                payload_rows,
+                "rows",
+            )
+            metric(
+                repetition,
+                name,
+                "fanout_storage",
+                "dag_inbox_reference_rows",
+                inbox_references,
+                "rows",
+            )
+            metric(
+                repetition,
+                name,
+                "fanout_storage",
+                "payload_rows_per_source_delta",
+                payload_rows / (MUTATIONS * 10),
+                "ratio",
+            )
+            metric(
+                repetition,
+                name,
+                "fanout_storage",
+                "inbox_references_per_dag_transaction",
+                inbox_references / len(definitions),
+                "ratio",
+            )
+            if payload_rows != MUTATIONS * 10 or inbox_references != len(definitions):
+                raise BenchmarkError(
+                    "shared payload invariant failed: "
+                    f"payload={payload_rows}, inbox={inbox_references}"
+                )
+            psql(
+                f"""
+UPDATE shiba_internal.dag_runtime_state
+SET active=true
+WHERE result_oid IN ({fanout_oids});
+SELECT shiba.activate()
+"""
+            )
             wait_until(
                 "all fanout DAGs to apply",
                 lambda: int(
@@ -1334,13 +1588,10 @@ FROM generate_series(1,{MUTATIONS * 10}) value
                         """
 SELECT count(*) FROM shiba_internal.dag_inbox
 WHERE result_oid IN (
-  'shiba.fanout_aggregate'::regclass,
-  'shiba.fanout_filter'::regclass,
-  'shiba.fanout_distinct'::regclass,
-  'shiba.fanout_topn'::regclass
+%s
 ) AND commit_lsn='%s'::pg_lsn
 """
-                        % routed["commit_lsn"]
+                        % (fanout_oids, routed["commit_lsn"])
                     )
                 )
                 == 0,
@@ -1437,16 +1688,22 @@ SELECT count(*) FROM d
             sum(relation_bytes(f"shiba.{result}") for result in definitions),
             "bytes",
         )
+        for metric_name, value in physical_stage_stats(fanout_oids).items():
+            metric(
+                repetition,
+                name,
+                "physical_stage",
+                metric_name,
+                value,
+                "bytes" if metric_name == "relation_bytes" else "count",
+            )
         if inbox:
             raise BenchmarkError(f"multi-DAG inbox not empty: {inbox}")
         for result_name in reversed(list(definitions)):
             psql(f"DROP TABLE shiba.{result_name}")
         wait_until(
-            "fanout workers to exit",
-            lambda: scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'"
-            )
-            == "0",
+            "Runtime to remain after dropping fanout DAGs",
+            runtime_topology_ready,
         )
     finally:
         try:
@@ -1495,12 +1752,34 @@ def run_multisource_multidag(repetition: int, run_dir: Path) -> None:
         for result_name, query in definitions.items():
             psql(f"CREATE TABLE shiba.{result_name} AS {query}")
         wait_until(
-            "three multi-source DAG workers",
-            lambda: scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'"
-            )
-            == "3",
+            "single Runtime for three multi-source DAGs",
+            runtime_topology_ready,
         )
+        multisource_oids = """
+  'shiba.source_fact_stats'::regclass,
+  'shiba.source_dim_stats'::regclass,
+  'shiba.source_join_stats'::regclass
+"""
+        psql(
+            f"""
+UPDATE shiba_internal.dag_runtime_state
+SET active=false
+WHERE result_oid IN ({multisource_oids})
+"""
+        )
+        wait_until(
+            "all multi-source fanout DAGs to be paused",
+            lambda: int(
+                scalar(
+                    f"""
+SELECT count(*) FROM shiba_internal.dag_runtime_state
+WHERE result_oid IN ({multisource_oids}) AND active
+"""
+                )
+            )
+            == 0,
+        )
+        record_runtime_topology()
         before_routed = max_routed_lsn()
         before_wal = lsn()
         before_io = io_snapshot()
@@ -1518,6 +1797,64 @@ FROM generate_series(1,{MUTATIONS * 5}) value
             )
             commit_ms = commit_epoch_ms(xid)
             routed = wait_for_routed(before_routed)
+            payload_rows = int(
+                scalar(
+                    "SELECT count(*) FROM shiba_internal.change_log "
+                    f"WHERE commit_lsn='{routed['commit_lsn']}'::pg_lsn"
+                )
+            )
+            inbox_references = int(
+                scalar(
+                    "SELECT count(*) FROM shiba_internal.dag_inbox "
+                    f"WHERE result_oid IN ({multisource_oids}) "
+                    f"AND commit_lsn='{routed['commit_lsn']}'::pg_lsn"
+                )
+            )
+            metric(
+                repetition,
+                name,
+                "fanout_storage",
+                "change_log_payload_rows",
+                payload_rows,
+                "rows",
+            )
+            metric(
+                repetition,
+                name,
+                "fanout_storage",
+                "dag_inbox_reference_rows",
+                inbox_references,
+                "rows",
+            )
+            metric(
+                repetition,
+                name,
+                "fanout_storage",
+                "payload_rows_per_source_delta",
+                payload_rows / (MUTATIONS * 10),
+                "ratio",
+            )
+            metric(
+                repetition,
+                name,
+                "fanout_storage",
+                "inbox_references_per_dag_transaction",
+                inbox_references / len(definitions),
+                "ratio",
+            )
+            if payload_rows != MUTATIONS * 10 or inbox_references != len(definitions):
+                raise BenchmarkError(
+                    "multi-source shared payload invariant failed: "
+                    f"payload={payload_rows}, inbox={inbox_references}"
+                )
+            psql(
+                f"""
+UPDATE shiba_internal.dag_runtime_state
+SET active=true
+WHERE result_oid IN ({multisource_oids});
+SELECT shiba.activate()
+"""
+            )
             wait_until(
                 "multi-source fanout inbox drain",
                 lambda: int(
@@ -1525,9 +1862,7 @@ FROM generate_series(1,{MUTATIONS * 5}) value
                         f"""
 SELECT count(*) FROM shiba_internal.dag_inbox
 WHERE result_oid IN (
-  'shiba.source_fact_stats'::regclass,
-  'shiba.source_dim_stats'::regclass,
-  'shiba.source_join_stats'::regclass
+{multisource_oids}
 ) AND commit_lsn='{routed["commit_lsn"]}'::pg_lsn
 """
                 )
@@ -1620,16 +1955,22 @@ SELECT count(*) FROM d
             sum(relation_bytes(f"shiba.{result}") for result in definitions),
             "bytes",
         )
+        for metric_name, value in physical_stage_stats(multisource_oids).items():
+            metric(
+                repetition,
+                name,
+                "physical_stage",
+                metric_name,
+                value,
+                "bytes" if metric_name == "relation_bytes" else "count",
+            )
         if inbox:
             raise BenchmarkError(f"multi-source multi-DAG inbox not empty: {inbox}")
         for result_name in reversed(list(definitions)):
             psql(f"DROP TABLE shiba.{result_name}")
         wait_until(
-            "multi-source workers to exit",
-            lambda: scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'"
-            )
-            == "0",
+            "Runtime to remain after dropping multi-source DAGs",
+            runtime_topology_ready,
         )
     finally:
         try:
@@ -1674,11 +2015,8 @@ FROM source.ingress GROUP BY group_id;
 """
         )
         wait_until(
-            "ingress DAG worker",
-            lambda: scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'"
-            )
-            == "1",
+            "single Runtime for ingress DAG",
+            runtime_topology_ready,
         )
         scripts: dict[str, Path] = {}
         for schema in ("baseline", "source"):
@@ -1799,32 +2137,106 @@ WITH expected AS (
             if difference:
                 raise BenchmarkError(f"ingress control {profile} differs by {difference}")
 
-        # A single large transaction isolates per-row apply from per-commit pacing.
-        before_routed = max_routed_lsn()
-        started = time.perf_counter_ns()
-        xid, source_wall = run_transaction(
-            f"""
-INSERT INTO source.ingress
-SELECT nextval('source.ingress_id'),value % {GROUPS},1 + value % 1000
-FROM generate_series(1,5000) value
+        # Pause the logical DAG so routing storage and relation-driven apply are
+        # observable while the one physical Runtime remains alive. The sampler
+        # records both the complete PostgreSQL process tree and the Runtime PID.
+        psql(
+            """
+UPDATE shiba_internal.dag_runtime_state
+SET active=false
+WHERE result_oid='shiba.ingress_stats'::regclass
 """
         )
-        commit_ms = commit_epoch_ms(xid)
-        routed = wait_for_routed(before_routed)
-        expected_source_rows = int(scalar("SELECT count(*) FROM source.ingress"))
-        ack_ms = wait_until(
-            "large transaction result row-count convergence",
-            lambda: (
-                time.time_ns() / 1_000_000
-                if int(
-                    scalar(
-                        "SELECT coalesce(sum(row_count),0) FROM shiba.ingress_stats"
-                    )
-                )
-                == expected_source_rows
-                else None
-            ),
+        wait_until(
+            "the ingress DAG to be paused",
+            lambda: scalar(
+                """
+SELECT active::text FROM shiba_internal.dag_runtime_state
+WHERE result_oid='shiba.ingress_stats'::regclass
+"""
+            )
+            == "false",
         )
+        record_runtime_topology()
+        before_routed = max_routed_lsn()
+        started = time.perf_counter_ns()
+        with ResourceSampler(repetition, name, "large_transaction"):
+            xid, source_wall = run_transaction(
+                f"""
+INSERT INTO source.ingress
+SELECT nextval('source.ingress_id'),value % {GROUPS},1 + value % 1000
+FROM generate_series(1,{LARGE_TRANSACTION_ROWS}) value
+"""
+            )
+            commit_ms = commit_epoch_ms(xid)
+            routed = wait_for_routed(before_routed)
+            payload_rows = int(
+                scalar(
+                    "SELECT count(*) FROM shiba_internal.change_log "
+                    f"WHERE commit_lsn='{routed['commit_lsn']}'::pg_lsn"
+                )
+            )
+            inbox_references = int(
+                scalar(
+                    """
+SELECT count(*) FROM shiba_internal.dag_inbox
+WHERE result_oid='shiba.ingress_stats'::regclass
+"""
+                    f"AND commit_lsn='{routed['commit_lsn']}'::pg_lsn"
+                )
+            )
+            metric(
+                repetition,
+                name,
+                "large_transaction",
+                "change_log_payload_rows",
+                payload_rows,
+                "rows",
+            )
+            metric(
+                repetition,
+                name,
+                "large_transaction",
+                "dag_inbox_reference_rows",
+                inbox_references,
+                "rows",
+            )
+            if (
+                payload_rows != LARGE_TRANSACTION_ROWS
+                or inbox_references != 1
+            ):
+                raise BenchmarkError(
+                    "large transaction storage invariant failed: "
+                    f"payload={payload_rows}, inbox={inbox_references}"
+                )
+            psql(
+                """
+UPDATE shiba_internal.dag_runtime_state
+SET active=true
+WHERE result_oid='shiba.ingress_stats'::regclass;
+SELECT shiba.activate()
+"""
+            )
+            expected_source_rows = int(
+                scalar("SELECT count(*) FROM source.ingress")
+            )
+            ack_ms = wait_until(
+                "large transaction result row-count convergence",
+                lambda: (
+                    time.time_ns() / 1_000_000
+                    if int(
+                        scalar(
+                            "SELECT coalesce(sum(row_count),0) "
+                            "FROM shiba.ingress_stats"
+                        )
+                    )
+                    == expected_source_rows
+                    else None
+                ),
+            )
+            wait_for_inbox_ack(
+                str(routed["commit_lsn"]), "shiba.ingress_stats"
+            )
         elapsed = (time.perf_counter_ns() - started) / 1_000_000
         metric(repetition, name, "large_transaction", "source_commit_wall", source_wall, "ms")
         metric(repetition, name, "large_transaction", "end_to_end_wall", elapsed, "ms")
@@ -1841,7 +2253,7 @@ FROM generate_series(1,5000) value
             name,
             "large_transaction",
             "rows_per_second",
-            5000 * 1000 / max(ack_ms - commit_ms, 0.001),
+            LARGE_TRANSACTION_ROWS * 1000 / max(ack_ms - commit_ms, 0.001),
             "rows_per_second",
         )
         difference = int(
@@ -1872,11 +2284,8 @@ WITH expected AS (
             raise BenchmarkError(f"large ingress transaction differs by {difference}")
         psql("DROP TABLE shiba.ingress_stats")
         wait_until(
-            "ingress worker exit",
-            lambda: scalar(
-                "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'"
-            )
-            == "0",
+            "Runtime to remain after dropping ingress DAG",
+            runtime_topology_ready,
         )
     finally:
         try:
@@ -1969,6 +2378,28 @@ def aggregate_latency_samples() -> list[dict[str, Any]]:
     return output
 
 
+def aggregate_latency_by_run() -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int], list[float]] = {}
+    for row in ACTION_SAMPLES:
+        if row.get("sample_kind") == "latency_probe":
+            key = (str(row["scenario"]), int(row["repetition"]))
+            grouped.setdefault(key, []).append(float(row["commit_to_apply_ms"]))
+    output: list[dict[str, Any]] = []
+    for (scenario, repetition), values in sorted(grouped.items()):
+        output.append(
+            {
+                "scenario": scenario,
+                "repetition": repetition,
+                "samples": len(values),
+                "p50_ms": percentile(values, 0.50),
+                "p95_ms": percentile(values, 0.95),
+                "p99_ms": percentile(values, 0.99),
+                "max_ms": max(values),
+            }
+        )
+    return output
+
+
 def snapshot_workspace() -> None:
     workload_dir = OUTPUT_DIR / "workload"
     workload_dir.mkdir(parents=True, exist_ok=True)
@@ -2030,6 +2461,8 @@ def write_environment(scenarios: list[Scenario]) -> None:
             "query_seconds": QUERY_SECONDS,
             "query_clients": QUERY_CLIENTS,
             "latency_probes": LATENCY_PROBES,
+            "large_transaction_rows": LARGE_TRANSACTION_ROWS,
+            "resource_sample_ms": RESOURCE_SAMPLE_MS,
             "seed": SEED,
             "scenario_filter": sorted(SCENARIO_FILTER),
         },
@@ -2128,8 +2561,24 @@ def stop_cluster() -> None:
 def check_log() -> list[str]:
     if not PG_LOG.exists():
         return []
-    pattern = re.compile(r"\b(ERROR|FATAL|PANIC)\b")
-    return [line for line in PG_LOG.read_text(errors="replace").splitlines() if pattern.search(line)]
+    pattern = re.compile(r"\b(WARNING|ERROR|FATAL|PANIC)\b")
+    lines = PG_LOG.read_text(errors="replace").splitlines()
+    errors: list[str] = []
+    for index, line in enumerate(lines):
+        if not pattern.search(line):
+            continue
+        expected_runtime_shutdown = (
+            'FATAL:  terminating background worker "shiba runtime" '
+            "due to administrator command"
+        ) in line and any(
+            "received fast shutdown request" in prior
+            # Logical-decoding DETAIL/LOG records can be emitted between the
+            # postmaster request and the Runtime's expected FATAL.
+            for prior in lines[max(0, index - 20) : index]
+        )
+        if not expected_runtime_shutdown:
+            errors.append(line)
+    return errors
 
 
 def global_postgres_stats() -> dict[str, Any]:
@@ -2224,6 +2673,9 @@ def main() -> int:
         write_csv(
             OUTPUT_DIR / "latency-summary.csv", aggregate_latency_samples()
         )
+        write_csv(
+            OUTPUT_DIR / "latency-by-run.csv", aggregate_latency_by_run()
+        )
         write_csv(OUTPUT_DIR / "action-samples.csv", ACTION_SAMPLES)
         write_csv(OUTPUT_DIR / "scenario-summaries.csv", SCENARIO_SUMMARIES)
         write_csv(OUTPUT_DIR / "resources.csv", RESOURCE_ROWS)
@@ -2256,6 +2708,19 @@ def main() -> int:
                 if row["metric"] == "failed_transactions"
             ),
             "log_error_count": len(errors),
+            "actual_runtime_counts": sorted(
+                {row["actual_count"] for row in RUNTIME_OBSERVATIONS}
+            ),
+            "legacy_worker_counts": sorted(
+                {row["legacy_worker_count"] for row in RUNTIME_OBSERVATIONS}
+            ),
+            "runtime_pids": sorted(
+                {
+                    runtime["owner_pid"]
+                    for row in RUNTIME_OBSERVATIONS
+                    for runtime in row["runtimes"]
+                }
+            ),
         }
         (OUTPUT_DIR / "manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n"

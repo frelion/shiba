@@ -11,14 +11,12 @@ SECURITY DEFINER
 SET search_path = pg_catalog, shiba, shiba_internal
 AS $$
 BEGIN
-    INSERT INTO shiba_internal.dag_inbox (result_oid, commit_lsn, sequence, source_oid, delta, row_data)
-    SELECT stream_view.result_oid, commit_lsn::pg_lsn, event_sequence, source_relation, delta, row_data
-    FROM shiba_internal.stream_views AS stream_view
-    LEFT JOIN shiba_internal.inner_join_views AS join_view
-      ON join_view.result_oid = stream_view.result_oid
-    WHERE stream_view.activation_lsn < commit_lsn::pg_lsn
-      AND (stream_view.source_oid = source_relation OR join_view.right_source_oid = source_relation)
-    ON CONFLICT DO NOTHING;
+    PERFORM shiba._route_change_log_delta(
+      source_relation,row_data,delta,commit_lsn,event_sequence
+    );
+    PERFORM shiba._enqueue_change_log_source(
+      source_relation,commit_lsn::pg_lsn
+    );
 END;
 $$;
 
@@ -131,17 +129,17 @@ BEGIN
     SELECT * INTO STRICT stream_view FROM shiba_internal.stream_views WHERE result_oid = result_relation;
     IF stream_view.source_oid<>left_source_oid THEN
       RAISE EXCEPTION 'logical plan left input disagrees with metadata for result %',result_relation
-        USING ERRCODE='data_corrupted';
+        USING ERRCODE='P0S01';
     END IF;
     row_data := shiba._canonicalize_row(source_relation,row_data);
     IF execution_pipeline='window' THEN
         IF stream_view.view_kind<>'window' THEN
           RAISE EXCEPTION 'logical plan pipeline disagrees with window metadata for result %',result_relation
-            USING ERRCODE='data_corrupted';
+            USING ERRCODE='P0S01';
         END IF;
         IF source_relation<>stream_view.source_oid THEN
           RAISE EXCEPTION 'Shiba window DAG inbox source does not belong to result %',result_relation
-            USING ERRCODE='data_corrupted';
+            USING ERRCODE='P0S01';
         END IF;
         IF shiba._row_passes_filter(result_relation,'left',row_data) THEN
           PERFORM shiba._apply_window_delta(
@@ -153,11 +151,11 @@ BEGIN
     IF execution_pipeline='distinct' THEN
         IF stream_view.view_kind<>'distinct' THEN
           RAISE EXCEPTION 'logical plan pipeline disagrees with DISTINCT metadata for result %',result_relation
-            USING ERRCODE='data_corrupted';
+            USING ERRCODE='P0S01';
         END IF;
         IF source_relation<>stream_view.source_oid THEN
           RAISE EXCEPTION 'Shiba DISTINCT DAG inbox source does not belong to result %',result_relation
-            USING ERRCODE='data_corrupted';
+            USING ERRCODE='P0S01';
         END IF;
         IF shiba._row_passes_filter(result_relation,'left',row_data) THEN
           PERFORM shiba._apply_distinct_delta(
@@ -169,11 +167,11 @@ BEGIN
     IF execution_pipeline='topn' THEN
         IF stream_view.view_kind<>'topn' THEN
           RAISE EXCEPTION 'logical plan pipeline disagrees with TopN metadata for result %',result_relation
-            USING ERRCODE='data_corrupted';
+            USING ERRCODE='P0S01';
         END IF;
         IF source_relation<>stream_view.source_oid THEN
           RAISE EXCEPTION 'Shiba TopN DAG inbox source does not belong to result %',result_relation
-            USING ERRCODE='data_corrupted';
+            USING ERRCODE='P0S01';
         END IF;
         IF shiba._row_passes_filter(result_relation,'left',row_data) THEN
           PERFORM shiba._apply_topn_delta(
@@ -185,14 +183,14 @@ BEGIN
     IF execution_pipeline='join' THEN
         IF stream_view.view_kind<>'aggregate' THEN
           RAISE EXCEPTION 'logical plan pipeline disagrees with join metadata for result %',result_relation
-            USING ERRCODE='data_corrupted';
+            USING ERRCODE='P0S01';
         END IF;
         SELECT * INTO STRICT join_view
         FROM shiba_internal.inner_join_views WHERE result_oid = result_relation;
         IF join_view.right_source_oid<>right_source_oid
            OR join_view.join_type<>execution_join_type THEN
           RAISE EXCEPTION 'logical plan join descriptor disagrees with metadata for result %',result_relation
-            USING ERRCODE='data_corrupted';
+            USING ERRCODE='P0S01';
         END IF;
         IF source_relation = left_source_oid THEN
             input_side := 'left';
@@ -200,7 +198,7 @@ BEGIN
             input_side := 'right';
         ELSE
             RAISE EXCEPTION 'Shiba DAG inbox source does not belong to result %', result_relation
-                USING ERRCODE = 'data_corrupted';
+                USING ERRCODE='P0S01';
         END IF;
         IF NOT shiba._row_passes_filter(result_relation, input_side, row_data) THEN
             RETURN;
@@ -215,11 +213,11 @@ BEGIN
              WHERE result_oid=result_relation
            ) THEN
           RAISE EXCEPTION 'logical plan pipeline disagrees with aggregate metadata for result %',result_relation
-            USING ERRCODE='data_corrupted';
+            USING ERRCODE='P0S01';
         END IF;
         IF source_relation <> stream_view.source_oid THEN
             RAISE EXCEPTION 'Shiba DAG inbox source does not belong to result %', result_relation
-                USING ERRCODE = 'data_corrupted';
+                USING ERRCODE='P0S01';
         END IF;
         IF NOT shiba._row_passes_filter(result_relation, 'left', row_data) THEN
             RETURN;
@@ -227,7 +225,7 @@ BEGIN
         PERFORM shiba._apply_logged_delta(stream_view, row_data, delta);
     ELSE
         RAISE EXCEPTION 'unsupported logical execution pipeline %',execution_pipeline
-          USING ERRCODE='data_corrupted';
+          USING ERRCODE='P0S01';
     END IF;
 END;
 $$;
@@ -237,48 +235,109 @@ CREATE FUNCTION shiba._advance_dag_progress(
     commit_lsn text
 )
 RETURNS void
-LANGUAGE sql
+LANGUAGE plpgsql
 AS $$
-    INSERT INTO shiba_internal.view_progress (result_oid, applied_lsn, updated_at)
+DECLARE
+    changed_rows bigint;
+BEGIN
+    INSERT INTO shiba_internal.view_progress AS progress
+        (result_oid, applied_lsn, updated_at)
     VALUES (result_relation, commit_lsn::pg_lsn, clock_timestamp())
     ON CONFLICT (result_oid) DO UPDATE
     SET applied_lsn = EXCLUDED.applied_lsn,
         updated_at = EXCLUDED.updated_at
-$$;
+    WHERE progress.applied_lsn IS NULL
+       OR progress.applied_lsn < EXCLUDED.applied_lsn;
 
--- Compatibility entry point for a single delta. New workers use the batch
--- entry point below so a source commit crosses SPI and advances progress once.
-CREATE FUNCTION shiba._apply_dag_delta(
-    result_relation oid,
-    source_relation oid,
-    row_data jsonb,
-    delta integer,
-    commit_lsn text
-)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, shiba, shiba_internal
-AS $$
-BEGIN
-    PERFORM pg_advisory_xact_lock(result_relation::bigint);
-    PERFORM shiba._apply_dag_delta_state(
-      result_relation,shiba._logical_execution_descriptor(result_relation),
-      source_relation,row_data,delta,commit_lsn
-    );
-    PERFORM shiba._advance_dag_progress(result_relation,commit_lsn);
+    GET DIAGNOSTICS changed_rows = ROW_COUNT;
+    IF changed_rows = 0 THEN
+      RAISE EXCEPTION
+        'Shiba DAG % progress must advance monotonically beyond %, requested %',
+        result_relation,
+        (
+          SELECT progress.applied_lsn
+          FROM shiba_internal.view_progress AS progress
+          WHERE progress.result_oid=result_relation
+        ),
+        commit_lsn::pg_lsn
+        USING ERRCODE='P0S01';
+    END IF;
 END;
 $$;
 
--- Commit-level physical dispatch. JOIN and small Aggregate commits retain WAL
--- order; DISTINCT, TopN and Window consume their complete source commit so
--- projected collisions and affected partitions are coalesced before state is
--- changed.
-CREATE FUNCTION shiba._apply_dag_delta_batch(
+-- Acquire the one canonical DAG apply lock sequence.  The advisory lock
+-- serializes execution with DROP/lifecycle work, the runtime-state row
+-- revalidates that the DAG is runnable, and only then may the oldest inbox row
+-- be claimed.  All locks are transaction-scoped or row locks and therefore
+-- remain held by callers after this function returns.
+CREATE FUNCTION shiba._claim_dag_commit(
+    result_relation oid,
+    requested_commit_lsn pg_lsn DEFAULT NULL
+)
+RETURNS TABLE (
+    claim_status text,
+    claimed_commit_lsn pg_lsn
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba_internal
+AS $$
+DECLARE
+    earliest_commit_lsn pg_lsn;
+    runtime_is_active boolean;
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+      shiba_internal.dag_lock_key(result_relation)
+    );
+    SELECT runtime.active INTO runtime_is_active
+    FROM shiba_internal.dag_runtime_state AS runtime
+    WHERE runtime.result_oid=result_relation
+    FOR UPDATE;
+    IF NOT FOUND OR NOT runtime_is_active THEN
+      claim_status := 'inactive';
+      claimed_commit_lsn := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+
+    SELECT inbox.commit_lsn INTO earliest_commit_lsn
+    FROM shiba_internal.dag_inbox AS inbox
+    WHERE inbox.result_oid=result_relation
+    ORDER BY inbox.commit_lsn
+    LIMIT 1
+    FOR UPDATE;
+    IF NOT FOUND THEN
+      IF requested_commit_lsn IS NOT NULL THEN
+        RAISE EXCEPTION 'Shiba DAG % has no inbox work for commit %',
+          result_relation,requested_commit_lsn
+          USING ERRCODE='P0S01';
+      END IF;
+      claim_status := 'idle';
+      claimed_commit_lsn := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+    IF requested_commit_lsn IS NOT NULL
+       AND earliest_commit_lsn<>requested_commit_lsn THEN
+      RAISE EXCEPTION
+        'Shiba DAG % must apply earliest inbox commit %, requested %',
+        result_relation,earliest_commit_lsn,requested_commit_lsn
+        USING ERRCODE='P0S01';
+    END IF;
+
+    claim_status := 'claimed';
+    claimed_commit_lsn := earliest_commit_lsn;
+    RETURN NEXT;
+END;
+$$;
+
+-- Execute one already-claimed commit.  The caller must have used
+-- _claim_dag_commit in this transaction; this function deliberately performs
+-- no additional scheduler locks or inbox scans.
+CREATE FUNCTION shiba._apply_claimed_dag_commit(
     result_relation oid,
     execution_descriptor jsonb,
-    events jsonb,
-    commit_lsn text
+    commit_lsn pg_lsn
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -286,13 +345,10 @@ SECURITY DEFINER
 SET search_path = pg_catalog, shiba, shiba_internal
 AS $$
 DECLARE
-    event record;
-    event_count bigint := 0;
-    aggregate_only_insertions boolean := true;
     stream_view shiba_internal.stream_views%ROWTYPE;
     execution_pipeline text := execution_descriptor->>'pipeline';
     left_source_oid oid := (execution_descriptor->>'left_source_oid')::oid;
-    use_aggregate_batch boolean := false;
+    source_commit_lsn pg_lsn := commit_lsn;
     use_unary_batch boolean :=
       execution_pipeline IN ('window','distinct','topn');
 BEGIN
@@ -309,116 +365,264 @@ BEGIN
       RAISE EXCEPTION 'invalid Shiba logical execution descriptor'
         USING ERRCODE='invalid_parameter_value';
     END IF;
-    IF jsonb_typeof(events) IS DISTINCT FROM 'array' THEN
-      RAISE EXCEPTION 'Shiba DAG delta batch must be a JSON array'
-        USING ERRCODE='invalid_parameter_value';
-    END IF;
 
-    PERFORM pg_advisory_xact_lock(result_relation::bigint);
-    -- Unary stateful operators avoid repeated sink/partition rebuilds even for
-    -- small UPDATE commits. Aggregate keeps its measured crossover threshold.
-    IF use_unary_batch OR jsonb_array_length(events)>=64 THEN
-      SELECT * INTO STRICT stream_view
-      FROM shiba_internal.stream_views
-      WHERE result_oid=result_relation;
-    END IF;
+    SELECT * INTO STRICT stream_view
+    FROM shiba_internal.stream_views AS metadata
+    WHERE metadata.result_oid=result_relation;
+    PERFORM set_config(
+      'TimeZone',stream_view.execution_settings->>'TimeZone',true
+    );
+    PERFORM set_config(
+      'DateStyle',stream_view.execution_settings->>'DateStyle',true
+    );
+    PERFORM set_config(
+      'IntervalStyle',stream_view.execution_settings->>'IntervalStyle',true
+    );
+    PERFORM set_config(
+      'extra_float_digits',
+      stream_view.execution_settings->>'extra_float_digits',
+      true
+    );
+    PERFORM set_config(
+      'bytea_output',stream_view.execution_settings->>'bytea_output',true
+    );
     IF use_unary_batch AND stream_view.source_oid<>left_source_oid THEN
       RAISE EXCEPTION
         'logical plan unary input disagrees with metadata for result %',
         result_relation
-        USING ERRCODE='data_corrupted';
+        USING ERRCODE='P0S01';
     END IF;
-    IF jsonb_array_length(events)>=64 THEN
-      use_aggregate_batch :=
-        execution_pipeline='aggregate'
-        AND stream_view.view_kind='aggregate'
-        AND stream_view.source_oid=left_source_oid
-        AND NOT EXISTS (
-          SELECT 1 FROM shiba_internal.inner_join_views
-          WHERE result_oid=result_relation
-        );
+    IF stream_view.source_oid<>left_source_oid THEN
+      RAISE EXCEPTION
+        'logical plan left input disagrees with metadata for result %',
+        result_relation
+        USING ERRCODE='P0S01';
     END IF;
-    IF execution_pipeline='join' AND jsonb_array_length(events)>1 THEN
-      PERFORM shiba._begin_join_batch(result_relation);
-    END IF;
-    FOR event IN
-      SELECT value,ordinality
-      FROM jsonb_array_elements(events) WITH ORDINALITY input(value,ordinality)
-      ORDER BY ordinality
-    LOOP
-      IF jsonb_typeof(event.value) IS DISTINCT FROM 'object'
-         OR jsonb_typeof(event.value->'row_data') IS DISTINCT FROM 'object'
-         OR (event.value->>'delta') IS NULL
-         OR (event.value->>'source_oid') IS NULL THEN
-        RAISE EXCEPTION 'invalid Shiba DAG event at batch position %',event.ordinality
-          USING ERRCODE='invalid_parameter_value';
-      END IF;
-      IF (event.value->>'delta')::integer NOT IN (-1,1) THEN
-        RAISE EXCEPTION 'invalid Shiba DAG differential weight at batch position %',event.ordinality
-          USING ERRCODE='invalid_parameter_value';
-      END IF;
-      IF use_aggregate_batch
-         AND NOT stream_view.count_distinct
-         AND (event.value->>'delta')::integer<>1 THEN
-        aggregate_only_insertions := false;
-      END IF;
-      IF use_aggregate_batch OR use_unary_batch THEN
-        IF (event.value->>'source_oid')::oid<>stream_view.source_oid THEN
-          RAISE EXCEPTION 'Shiba DAG inbox source does not belong to result %',result_relation
-            USING ERRCODE='data_corrupted';
-        END IF;
-      ELSE
-        PERFORM shiba._apply_dag_delta_state(
-          result_relation,
-          execution_descriptor,
-          (event.value->>'source_oid')::oid,
-          event.value->'row_data',
-          (event.value->>'delta')::integer,
-          commit_lsn,
-          execution_pipeline='join' AND jsonb_array_length(events)>1
-        );
-      END IF;
-      event_count := event_count+1;
-    END LOOP;
 
-    IF event_count=0 THEN
-      RAISE EXCEPTION 'Shiba DAG delta batch must not be empty'
-        USING ERRCODE='invalid_parameter_value';
+    IF execution_pipeline='aggregate' THEN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM shiba_internal.change_log AS logged_event
+        WHERE logged_event.commit_lsn=source_commit_lsn
+          AND logged_event.source_oid=left_source_oid
+      ) THEN
+        RAISE EXCEPTION
+          'Shiba DAG % inbox commit % has no applicable change-log events',
+          result_relation,source_commit_lsn
+          USING ERRCODE='P0S01';
+      END IF;
     END IF;
-    IF use_aggregate_batch THEN
-      PERFORM shiba._apply_single_source_aggregate_batch(
-        stream_view,events,aggregate_only_insertions
+
+    IF execution_pipeline='join' THEN
+      PERFORM shiba._apply_join_commit_temp_free(
+        result_relation,execution_descriptor,source_commit_lsn
+      );
+    ELSIF execution_pipeline='aggregate' THEN
+      PERFORM shiba._apply_single_source_aggregate_temp_free(
+        stream_view,source_commit_lsn,false
       );
     ELSIF execution_pipeline='distinct' THEN
-      PERFORM shiba._apply_distinct_batch(stream_view,events);
+      PERFORM shiba._apply_distinct_batch(stream_view,source_commit_lsn);
     ELSIF execution_pipeline='topn' THEN
-      PERFORM shiba._apply_topn_batch(stream_view,events);
+      PERFORM shiba._apply_topn_batch(stream_view,source_commit_lsn);
     ELSIF execution_pipeline='window' THEN
-      PERFORM shiba._apply_window_batch(stream_view,events);
+      PERFORM shiba._apply_window_batch(stream_view,source_commit_lsn);
     END IF;
-    IF execution_pipeline='join' AND jsonb_array_length(events)>1 THEN
-      PERFORM shiba._finish_join_batch(result_relation);
-    END IF;
-    PERFORM shiba._advance_dag_progress(result_relation,commit_lsn);
+
+    PERFORM shiba._advance_dag_progress(result_relation,commit_lsn::text);
 END;
 $$;
 
--- Compatibility entry point. The executor worker never uses this overload:
--- its route comes from the already validated in-memory LogicalPlan.
-CREATE FUNCTION shiba._apply_dag_delta_batch(
+-- Compatibility entry point for callers that already selected a commit. It
+-- now takes the canonical advisory -> runtime-state -> inbox lock sequence,
+-- then executes the claimed payload without acknowledging it.
+CREATE FUNCTION shiba._apply_dag_commit(
     result_relation oid,
-    events jsonb,
-    commit_lsn text
+    execution_descriptor jsonb,
+    commit_lsn pg_lsn
 )
 RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba, shiba_internal
+AS $$
+DECLARE
+    claim_status_value text;
+    claimed_lsn pg_lsn;
+BEGIN
+    SELECT claim.claim_status,claim.claimed_commit_lsn
+    INTO STRICT claim_status_value,claimed_lsn
+    FROM shiba._claim_dag_commit(result_relation,commit_lsn) AS claim;
+    IF claim_status_value<>'claimed' THEN
+      RAISE EXCEPTION 'Shiba DAG % is not active',result_relation
+        USING ERRCODE='object_not_in_prerequisite_state';
+    END IF;
+    PERFORM shiba._apply_claimed_dag_commit(
+      result_relation,execution_descriptor,claimed_lsn
+    );
+END;
+$$;
+
+-- Apply an already-claimed commit inside an intentional PL/pgSQL
+-- subtransaction:
+-- an operator/SPI error rolls back every state/result/progress mutation from
+-- this source commit. Explicitly transient concurrency failures leave the DAG
+-- active for a later transaction retry; deterministic failures quarantine it.
+-- The normal entry point requests acknowledgement here so its affected-row
+-- count is part of the same error/isolation protocol.
+CREATE FUNCTION shiba._apply_claimed_dag_safely(
+    result_relation oid,
+    execution_descriptor jsonb,
+    p_commit_lsn pg_lsn,
+    acknowledge boolean
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba, shiba_internal
+AS $$
+DECLARE
+    error_state text;
+    error_message text;
+    error_detail text;
+    error_hint text;
+    acknowledged_rows bigint;
+BEGIN
+    BEGIN
+        PERFORM shiba._apply_claimed_dag_commit(
+          result_relation,execution_descriptor,p_commit_lsn
+        );
+        IF acknowledge THEN
+          DELETE FROM shiba_internal.dag_inbox AS inbox
+          WHERE inbox.result_oid=result_relation
+            AND inbox.commit_lsn=p_commit_lsn;
+          GET DIAGNOSTICS acknowledged_rows = ROW_COUNT;
+          IF acknowledged_rows<>1 THEN
+            RAISE EXCEPTION
+              'Shiba DAG % acknowledgement for commit % affected % rows, expected 1',
+              result_relation::regclass,p_commit_lsn,acknowledged_rows
+              USING ERRCODE='P0S01';
+          END IF;
+        END IF;
+        RETURN 'applied';
+    EXCEPTION
+      WHEN serialization_failure OR deadlock_detected OR lock_not_available THEN
+        -- The exception block is a subtransaction, so all apply mutations have
+        -- already rolled back. Keep the DAG and inbox eligible for retry in a
+        -- fresh outer transaction. Do not include query_canceled here:
+        -- cancellation and administrative termination must propagate.
+        RETURN 'retry';
+      WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS
+          error_state = RETURNED_SQLSTATE,
+          error_message = MESSAGE_TEXT,
+          error_detail = PG_EXCEPTION_DETAIL,
+          error_hint = PG_EXCEPTION_HINT;
+
+        -- Resource exhaustion, operator intervention, and system failures are
+        -- Runtime/backend failures rather than deterministic DAG failures.
+        -- Propagate them so PostgreSQL can abort/restart the singleton Runtime.
+        -- PL/pgSQL's OTHERS does not catch query_canceled, so 57014 already
+        -- propagates without reaching this branch.
+        IF left(error_state,2) IN ('40','53','54','57','58','XX') THEN
+          RAISE;
+        END IF;
+
+        UPDATE shiba_internal.dag_runtime_state
+        SET active = false,
+            last_error = concat_ws(
+              E'\n',
+              format('[%s] %s', error_state, error_message),
+              nullif(error_detail, ''),
+              nullif(error_hint, '')
+            ),
+            failed_at = clock_timestamp()
+        WHERE result_oid = result_relation;
+        RETURN 'quarantined';
+    END;
+END;
+$$;
+
+-- Normal Runtime integration entry point. It owns claim, apply and exact
+-- one-row acknowledgement, and reports both the outcome and the claimed LSN so
+-- the caller can retain deterministic failpoint/logging behavior.
+CREATE FUNCTION shiba._apply_next_dag_change_log(
+    result_relation oid,
+    execution_descriptor jsonb
+)
+RETURNS TABLE (
+    outcome text,
+    commit_lsn pg_lsn
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba, shiba_internal
+AS $$
+DECLARE
+    claim_status_value text;
+    claimed_lsn pg_lsn;
+    apply_outcome text;
+BEGIN
+    SELECT claim.claim_status,claim.claimed_commit_lsn
+    INTO STRICT claim_status_value,claimed_lsn
+    FROM shiba._claim_dag_commit(result_relation,NULL) AS claim;
+    IF claim_status_value<>'claimed' THEN
+      RETURN QUERY SELECT claim_status_value,NULL::pg_lsn;
+      RETURN;
+    END IF;
+
+    apply_outcome := shiba._apply_claimed_dag_safely(
+      result_relation,execution_descriptor,claimed_lsn,true
+    );
+    RETURN QUERY SELECT apply_outcome,claimed_lsn;
+END;
+$$;
+
+-- Compatibility entry point for the current Rust caller and direct SQL tests.
+-- It uses the canonical lock sequence but intentionally leaves acknowledgement
+-- to the caller. Runtime integration should move to _apply_next_dag_change_log
+-- and remove its Rust-side inbox pre-lock and DELETE.
+CREATE FUNCTION shiba._safe_apply_dag_change_log(
+    result_relation oid,
+    execution_descriptor jsonb,
+    commit_lsn pg_lsn
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba, shiba_internal
+AS $$
+DECLARE
+    claim_status_value text;
+    claimed_lsn pg_lsn;
+BEGIN
+    SELECT claim.claim_status,claim.claimed_commit_lsn
+    INTO STRICT claim_status_value,claimed_lsn
+    FROM shiba._claim_dag_commit(result_relation,commit_lsn) AS claim;
+    IF claim_status_value<>'claimed' THEN
+      RAISE EXCEPTION 'Shiba DAG % is not active',result_relation
+        USING ERRCODE='object_not_in_prerequisite_state';
+    END IF;
+    RETURN shiba._apply_claimed_dag_safely(
+      result_relation,execution_descriptor,claimed_lsn,false
+    );
+END;
+$$;
+
+-- Catalog-plan compatibility entry point for SQL callers. The Runtime should
+-- pass its already validated descriptor to the three-argument overload above.
+CREATE FUNCTION shiba._safe_apply_dag_change_log(
+    result_relation oid,
+    commit_lsn pg_lsn
+)
+RETURNS text
 LANGUAGE sql
 SECURITY DEFINER
 SET search_path = pg_catalog, shiba, shiba_internal
 AS $$
-    SELECT shiba._apply_dag_delta_batch(
+    SELECT shiba._safe_apply_dag_change_log(
       result_relation,
       shiba._logical_execution_descriptor(result_relation),
-      events,
       commit_lsn
     )
 $$;

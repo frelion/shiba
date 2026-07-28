@@ -21,7 +21,7 @@ SELECT * FROM shiba.order_stats;
 The `shiba` schema is reserved for Shiba-managed result tables. Source tables must be outside that schema, and ordinary `CREATE TABLE shiba.name (...)` declarations are rejected. PostgreSQL materialized views in every schema retain their native `REFRESH MATERIALIZED VIEW` semantics.
 
 Shiba result tables are owned by the extension owner and ordinary roles receive
-only `SELECT`. The worker changes them through a restricted `SECURITY DEFINER`
+only `SELECT`. The Runtime changes them through a restricted `SECURITY DEFINER`
 apply entrypoint; a session GUC is not an authorization mechanism. As in core
 PostgreSQL, the extension owner and superusers remain trusted administrators.
 
@@ -71,7 +71,10 @@ GROUP BY product_id
 HAVING count(*) >= 2;
 ```
 
-Each committed source row change is decoded from PostgreSQL WAL as `+1` or `-1`. The asynchronous worker later updates only its affected group: `COUNT(*)` receives `+1` or `-1`, and `SUM(amount)` receives `+amount` or `-amount`.
+Each committed source row change is decoded from PostgreSQL WAL as `+1` or
+`-1`. The asynchronous Runtime later schedules the result's logical
+`DagRuntime` and updates only its affected group: `COUNT(*)` receives `+1` or
+`-1`, and `SUM(amount)` receives `+amount` or `-amount`.
 Predicates are evaluated through PostgreSQL's own column type and comparison
 operator, not as JSON text. An update that crosses a predicate boundary is
 therefore naturally maintained as an old-row retraction followed by a new-row
@@ -90,11 +93,12 @@ JOIN items i ON s.item_id = i.id
 GROUP BY i.category_id;
 ```
 
-Shiba keeps a multiplicity-preserving arrangement for each join input. A WAL
-delta probes the opposite arrangement and emits joined `+/-` deltas. Outer
-joins additionally retract and restore NULL-extended rows at the zero/one
-match boundary. Semi and anti joins emit only when right-side multiplicity
-crosses that boundary.
+Shiba keeps a logged, multiplicity-preserving arrangement for each join input.
+For one source commit, a set-oriented physical program fixes the
+transaction-entry arrangements, derives final arrangements for affected keys,
+and emits the exact signed bag difference `new Join output - old Join output`.
+Outer, semi, anti, and null-aware anti visibility follows old/new match
+cardinality rather than a per-event callback.
 
 Window and TopN operators retain their complete input multiset in Shiba-owned
 state. A window delta rebuilds only its affected old/new partition; TopN
@@ -109,14 +113,79 @@ aggregate/window `FILTER`, `FETCH ... WITH TIES`, self-joins, filtered
 cascading Shiba results. Unsupported declarations fail during registration;
 there is no full-refresh or source-scan fallback.
 
+Source row identity currently supports PostgreSQL built-ins with normalized
+representations: boolean and integer/float/numeric types; date, time,
+timestamp, and interval types; UUID, `pg_lsn`, and OID; character, bytea,
+bit-string, network, and JSON types when the column is non-TOASTable. Domains,
+arrays, enums, `money`, and user-defined base types are rejected. This closed
+set prevents locale- or extension-GUC-dependent type output from changing a
+state key between the registration session and the Runtime session.
+
 ## Consistency model
 
-Only committed WAL transactions appear on the logical slot, so rolled-back writes are never decoded. A dynamic Shiba worker consumes bounded batches in short transactions; result changes are therefore eventually consistent. Each committed transaction is durably deduplicated by its commit LSN, and each result records an activation LSN immediately after its locked CTAS backfill. This prevents both crash replay double-counting and replaying pre-backfill WAL into a newly-created result. `shiba_internal.view_progress.applied_lsn` exposes the per-result commit-LSN watermark.
+Only committed WAL transactions appear on the logical slot, so rolled-back
+writes are never decoded. Each active database has exactly one real PostgreSQL
+background worker named `shiba runtime`. Routing, round-robin DAG scheduling,
+application, and garbage collection are bounded phases in this one
+SPI-connected backend. A logical `DagRuntime` is cached plan metadata, not a
+worker or thread. Result changes are therefore eventually consistent, and the
+number of result DAGs does not change PostgreSQL process count.
+
+The Runtime consumes one atomic source commit for one DAG at a time. It rotates
+ready DAGs at commit boundaries and does not run SPI concurrently on Rust
+threads. A source commit is non-preemptible: a large apply temporarily delays
+routing, every other DAG, and garbage collection.
+
+Each committed transaction is durably deduplicated by its commit LSN, and each
+result records an activation LSN immediately after its locked CTAS backfill.
+Every decoded delta is stored once in the shared durable `change_log`.
+`dag_inbox` stores at most one lightweight `(result_oid, commit_lsn)` reference
+per affected DAG, so payload is not duplicated by fanout. Operator SQL reads
+the ordered shared payload directly. Operator state, result rows, progress, and
+acknowledgement of one DAG reference remain one atomic Runtime transaction.
+This prevents both crash replay double-counting and replaying pre-backfill WAL
+into a newly-created result.
+`shiba_internal.view_progress.applied_lsn` exposes the per-result commit-LSN
+watermark.
+
+Registration persists a versioned `PhysicalDagPlan`. A physical Stage is a
+relation-reuse decision inside the one Runtime, not another worker. Inline
+relations stay fused, relations reused inside one statement use
+`MATERIALIZED` CTEs, and the current Join program uses one pre-created typed
+UNLOGGED `join_delta` Stage when its exact output must cross SQL statements.
+Join input delta remains statement-materialized.
+
+All recovery authority remains logged: `change_log`, `dag_inbox`, progress,
+arrangements, operator state, and result rows. The UNLOGGED Stage is
+commit-scoped derived data. Normal apply creates no temporary table and
+performs no DDL. If PostgreSQL crashes before apply commits, the logged inbox
+and change-log input remain and the replacement Runtime rebuilds the Stage
+during complete-transaction replay.
+
+The Runtime is configured for PostgreSQL to restart it after an abnormal exit
+while the postmaster stays up. Because it is dynamically registered, a
+postmaster restart does not itself re-register it: the next statement on a
+registered source table, or an explicit `SELECT shiba.activate()`, restores the
+single Runtime.
+
+If loading or applying one DAG fails, the current commit is rolled back, its
+durable inbox reference and its shared payload are retained, and that DAG is
+marked failed (quarantined) while other DAGs continue on subsequent scheduler
+turns. `shiba.activate()` does not automatically reactivate a failed DAG.
+Recovery requires fixing the underlying cause and explicitly clearing/retrying
+that DAG. Shared payload is garbage-collected only after no DAG references its
+source transaction.
 
 Applications can inspect a result's public progress surface without reading internal tables:
 
 ```sql
 SELECT * FROM shiba.progress('shiba.order_stats');
+```
+
+The physical execution plan and Stage metadata are also inspectable:
+
+```sql
+SELECT shiba.explain_physical('shiba.order_stats');
 ```
 
 `TRUNCATE` is deliberately rejected for Shiba source tables in this MVP. Before

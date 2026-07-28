@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # A focused correctness gate for changes to Shiba's routing, transaction,
-# worker-lifecycle, and recovery paths.  Every assertion runs against an
+# process lifecycle and recovery paths. Every assertion runs against an
 # isolated PostgreSQL cluster and every potentially blocking SQL statement has
 # a server-side timeout, so a lock-order regression fails instead of hanging.
 
@@ -111,8 +111,8 @@ cargo pgrx install --pg-config "${pg_config_path}"
 psql_gate -qc "CREATE EXTENSION shiba"
 psql_gate -Atqc "SELECT shiba.activate()" >/dev/null
 wait_for_query "1" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba worker'" \
-  "the WAL router"
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "the Shiba Runtime"
 
 psql_gate -qc "
   CREATE TABLE concurrency_source (
@@ -127,12 +127,12 @@ psql_gate -qc "
   FROM concurrency_source
   GROUP BY group_id"
 wait_for_query "1" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'" \
-  "the result DAG worker"
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "one Runtime with one DAG"
 wait_for_baseline "initial backfill"
 
 # Four independent sessions commit many overlapping transactions.  Each
-# transaction mixes INSERT/UPDATE/DELETE so router ordering and old/new tuple
+# transaction mixes INSERT/UPDATE/DELETE so Runtime routing and old/new tuple
 # handling are exercised under concurrent wakeups.
 writer_pids=()
 for writer in 1 2 3 4; do
@@ -196,16 +196,18 @@ assert_query "${source_fingerprint_before_rollback}" "
 assert_query "0" "SELECT count(*) FROM concurrency_source WHERE event_id>900000"
 wait_for_baseline "the rolled-back bulk transaction"
 
-# Quiesce only the DAG executor while the router keeps consuming WAL.  Its
-# durable inbox must retain the complete transaction until activate() starts a
-# replacement executor.
+# Quiesce only the logical DAG while the database Runtime stays alive.
+# Its durable inbox must retain the transaction reference until the DAG is
+# reactivated.
 psql_gate -qc "
-  UPDATE shiba_internal.dag_worker_state
+  UPDATE shiba_internal.dag_runtime_state
   SET active=false
   WHERE result_oid='shiba.concurrency_result'::regclass"
-wait_for_query "0" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'" \
-  "the DAG worker to stop"
+wait_for_query "1" \
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "the Runtime to remain alive while the DAG is inactive"
+runtime_pid="$(psql_gate -Atqc "
+  SELECT pid FROM pg_stat_activity WHERE backend_type='shiba runtime'")"
 psql_gate -qc "
   INSERT INTO concurrency_source
   SELECT 950000+value,value % 19,value*4
@@ -214,24 +216,30 @@ wait_for_query "t" "
   SELECT EXISTS (
     SELECT 1 FROM shiba_internal.dag_inbox
     WHERE result_oid='shiba.concurrency_result'::regclass
-  )" "the stopped DAG worker's durable inbox"
-psql_gate -Atqc "SELECT shiba.activate()" >/dev/null
+  )" "the inactive DAG runtime's durable inbox"
+psql_gate -qc "
+  UPDATE shiba_internal.dag_runtime_state
+  SET active=true
+  WHERE result_oid='shiba.concurrency_result'::regclass;
+  SELECT shiba.activate()"
 wait_for_query "1" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'" \
-  "the replacement DAG worker"
-wait_for_baseline "durable-inbox recovery after DAG worker restart"
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "the unique Runtime after DAG reactivation"
+assert_query "${runtime_pid}" "
+  SELECT pid FROM pg_stat_activity WHERE backend_type='shiba runtime'"
+wait_for_baseline "durable-inbox recovery after DAG reactivation"
 wait_for_query "0" "
   SELECT count(*) FROM shiba_internal.dag_inbox
   WHERE result_oid='shiba.concurrency_result'::regclass" \
-  "the replacement DAG worker to acknowledge its inbox"
+  "the reactivated DAG runtime to acknowledge its inbox"
 
-# Stop the router cleanly, commit WAL while it is absent, and prove that the
+# Stop the Runtime cleanly, commit WAL while it is absent, and prove that the
 # persistent slot has not advanced.  Restart PostgreSQL before reactivation;
-# the replacement workers must drain precisely that retained WAL.
-psql_gate -qc "UPDATE shiba_internal.worker_state SET active=false WHERE singleton"
+# the replacement Runtime must route and drain precisely that retained WAL.
+psql_gate -qc "UPDATE shiba_internal.runtime_state SET active=false WHERE singleton"
 wait_for_query "0" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba worker'" \
-  "the WAL router to stop"
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "the Runtime to stop"
 slot_name_before_restart="$(psql_gate -Atqc "SELECT shiba_internal.slot_name()")"
 slot_lsn_before_restart="$(psql_gate -Atqc "
   SELECT confirmed_flush_lsn
@@ -269,18 +277,15 @@ assert_query "1" "
   WHERE slot_name=shiba_internal.slot_name()::text"
 psql_gate -Atqc "SELECT shiba.activate()" >/dev/null
 wait_for_query "1" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba worker'" \
-  "the replacement WAL router"
-wait_for_query "1" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'" \
-  "the replacement DAG worker"
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "the replacement Runtime"
 wait_for_baseline "persistent-slot recovery after PostgreSQL restart"
 assert_query "t" "
   SELECT confirmed_flush_lsn > '${slot_lsn_before_restart}'::pg_lsn
   FROM pg_replication_slots
   WHERE slot_name=shiba_internal.slot_name()::text"
 
-# A post-recovery transaction detects a replacement worker that merely drained
+# A post-recovery transaction detects a replacement Runtime that merely drained
 # old WAL and then stalled.
 psql_gate -qc "
   INSERT INTO concurrency_source
@@ -288,7 +293,7 @@ psql_gate -qc "
 wait_for_baseline "post-recovery writes"
 assert_query "t" "
   SELECT last_heartbeat >= pg_postmaster_start_time()
-  FROM shiba_internal.worker_state WHERE singleton"
+  FROM shiba_internal.runtime_state WHERE singleton"
 
 # Force an actual lock overlap: one writer holds its source lock while a second
 # writer keeps committing and DROP quiesces the result DAG.  SQL timeouts make
@@ -302,9 +307,9 @@ psql_gate -qc "
   CREATE TABLE shiba.drop_race_result AS
   SELECT group_id,count(*) AS row_count,sum(amount) AS total_amount
   FROM drop_race_source GROUP BY group_id"
-wait_for_query "2" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'" \
-  "the DROP-race DAG worker"
+wait_for_query "1" \
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "one Runtime with two DAGs"
 
 psql_gate -qc "
   BEGIN;
@@ -331,8 +336,8 @@ wait "${holding_writer_pid}"
 wait "${streaming_writer_pid}"
 wait "${drop_pid}"
 wait_for_query "1" \
-  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba dag worker'" \
-  "the dropped DAG worker to exit"
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "the Runtime to remain after dropping one DAG"
 assert_query "t" "SELECT to_regclass('shiba.drop_race_result') IS NULL"
 assert_query "0" "
   SELECT count(*) FROM shiba_internal.stream_views
@@ -343,5 +348,103 @@ wait_for_query "0" \
    WHERE pubname='shiba_publication' AND tablename='drop_race_source'" \
   "DROP-race publication cleanup"
 wait_for_baseline "the surviving result after concurrent DROP"
+
+# The database lifecycle lock serializes a complete registration with
+# deactivate().  When registration wins, deactivate must observe the committed
+# DAG and refuse to tear the database lifecycle down.
+psql_gate -qc "
+  CREATE TABLE lifecycle_registration_source (
+    event_id integer NOT NULL,
+    group_id integer NOT NULL,
+    amount integer NOT NULL
+  );
+  INSERT INTO lifecycle_registration_source VALUES (1,1,10),(2,2,20)"
+psql_gate -qc "
+  BEGIN;
+  CREATE TABLE shiba.lifecycle_registration_result AS
+  SELECT group_id,count(*) AS row_count,sum(amount) AS total_amount
+  FROM lifecycle_registration_source GROUP BY group_id;
+  SELECT pg_sleep(1);
+  COMMIT" >/dev/null &
+registration_winner_pid=$!
+sleep 0.2
+if psql_gate -qc "SELECT shiba.deactivate()" >/dev/null 2>&1; then
+  fail "deactivate succeeded after a concurrent registration committed first"
+fi
+wait "${registration_winner_pid}"
+assert_query "1" "
+  SELECT count(*) FROM shiba_internal.stream_views
+  WHERE result_oid='shiba.lifecycle_registration_result'::regclass"
+assert_query "t" "
+  SELECT active FROM shiba_internal.runtime_state WHERE singleton"
+psql_gate -qc "DROP TABLE shiba.lifecycle_registration_result"
+psql_gate -qc "DROP TABLE shiba.concurrency_result"
+wait_for_query "0" \
+  "SELECT count(*) FROM shiba_internal.stream_views" \
+  "all DAG registrations to be removed before deactivation"
+
+# When deactivate wins, it gracefully stops the live Runtime, takes the Runtime
+# identity lock, waits for slot active_pid to clear, and holds the lifecycle
+# lock through commit.  A registration that started meanwhile must wake only
+# after commit and fail without leaving a table or catalog row behind.
+psql_gate -qc "
+  BEGIN;
+  SELECT shiba.deactivate();
+  SELECT pg_sleep(1);
+  COMMIT" >/dev/null &
+deactivation_winner_pid=$!
+wait_for_query "0" \
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "synchronous deactivation to stop the Runtime"
+if psql_gate -qc "
+  CREATE TABLE shiba.registration_after_deactivate AS
+  SELECT group_id,count(*) AS row_count,sum(amount) AS total_amount
+  FROM lifecycle_registration_source GROUP BY group_id" >/dev/null 2>&1; then
+  fail "registration committed into a concurrently deactivated database"
+fi
+wait "${deactivation_winner_pid}"
+assert_query "f" "
+  SELECT active FROM shiba_internal.runtime_state WHERE singleton"
+assert_query "0" "
+  SELECT count(*) FROM pg_replication_slots
+  WHERE slot_name=shiba_internal.slot_name()::text"
+assert_query "0" "
+  SELECT count(*) FROM pg_publication WHERE pubname='shiba_publication'"
+assert_query "t" "
+  SELECT to_regclass('shiba.registration_after_deactivate') IS NULL"
+assert_query "0" "SELECT count(*) FROM shiba_internal.stream_views"
+
+# activate() remains idempotent after a full deactivation: it recreates the
+# publication and slot and launches exactly one dynamic Runtime.
+psql_gate -Atqc "SELECT shiba.activate()" >/dev/null
+wait_for_query "1" \
+  "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \
+  "the Runtime after reactivation"
+assert_query "1" "
+  SELECT count(*) FROM pg_replication_slots
+  WHERE slot_name=shiba_internal.slot_name()::text"
+assert_query "1" "
+  SELECT count(*) FROM pg_publication WHERE pubname='shiba_publication'"
+
+# Initial snapshots honor the caller while logical decoding sees the complete
+# relation.  Until policy semantics are compiled into a DAG, reject both
+# enabled and forced row-level-security sources instead of allowing divergent
+# snapshot/incremental visibility.
+psql_gate -qc "
+  CREATE TABLE lifecycle_rls_source (
+    event_id integer NOT NULL,
+    group_id integer NOT NULL,
+    amount integer NOT NULL
+  );
+  ALTER TABLE lifecycle_rls_source ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE lifecycle_rls_source FORCE ROW LEVEL SECURITY"
+if psql_gate -qc "
+  CREATE TABLE shiba.rls_result AS
+  SELECT group_id,count(*) AS row_count,sum(amount) AS total_amount
+  FROM lifecycle_rls_source GROUP BY group_id" >/dev/null 2>&1; then
+  fail "registration accepted a row-level-security source"
+fi
+assert_query "t" "SELECT to_regclass('shiba.rls_result') IS NULL"
+assert_query "0" "SELECT count(*) FROM shiba_internal.stream_views"
 
 printf 'Shiba concurrency, transaction, and persistent-slot recovery gate passed.\n'

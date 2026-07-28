@@ -4,106 +4,33 @@
 //! persisted model -> compiler -> validator -> PostgreSQL runtime bridge.
 
 mod compile;
+#[allow(dead_code)]
 mod model;
+mod persist;
+mod physical;
 mod runtime;
 mod validate;
 
 #[allow(unused_imports)]
 pub use compile::compile_logical_plan;
 #[allow(unused_imports)]
-pub use model::{DeltaBatch, DeltaRow, LogicalEdge, LogicalNode, LogicalPlan, OperatorKind};
-pub use runtime::DagRuntime;
+pub use model::{LogicalEdge, LogicalNode, LogicalPlan, OperatorKind};
+#[allow(unused_imports)]
+pub use persist::compile_physical_plan;
+pub use runtime::{release_physical_programs, DagRuntime, LoadOutcome, NextApplyOutcome};
 
 #[cfg(test)]
 use compile::{build_logical_plan, LogicalPlanBuilder};
 #[cfg(test)]
 use model::LOGICAL_PLAN_VERSION;
 #[cfg(test)]
-use runtime::encode_batch_events;
+use validate::{ExecutionJoinType, ExecutionPipeline};
 #[cfg(test)]
-use validate::{ExecutionDescriptor, ExecutionJoinType, ExecutionPipeline, ExecutionPlan};
-#[cfg(test)]
-use {pgrx::pg_sys, serde_json::json, serde_json::Value};
+use {serde_json::json, serde_json::Value};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_execution(source_oids: &[u32]) -> ExecutionPlan {
-        ExecutionPlan {
-            descriptor: ExecutionDescriptor {
-                pipeline: ExecutionPipeline::Aggregate,
-                left_source_oid: source_oids[0],
-                right_source_oid: source_oids.get(1).copied(),
-                join_type: None,
-            },
-            source_oids: source_oids.iter().copied().collect(),
-        }
-    }
-
-    #[test]
-    fn batch_encoding_preserves_cross_source_wal_order() {
-        let plan = test_execution(&[41, 42]);
-        let events = encode_batch_events(
-            &plan,
-            pg_sys::Oid::from(99),
-            vec![
-                DeltaRow {
-                    input: "41".into(),
-                    row: json!({"id": 7, "value": "old"}),
-                    diff: -1,
-                },
-                DeltaRow {
-                    input: "42".into(),
-                    row: json!({"id": 7, "value": "dimension"}),
-                    diff: 1,
-                },
-                DeltaRow {
-                    input: "41".into(),
-                    row: json!({"id": 7, "value": "new"}),
-                    diff: 1,
-                },
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(events[0]["source_oid"], 41);
-        assert_eq!(events[0]["delta"], -1);
-        assert_eq!(events[1]["source_oid"], 42);
-        assert_eq!(events[2]["row_data"]["value"], "new");
-    }
-
-    #[test]
-    fn batch_encoding_rejects_empty_unplanned_and_non_object_inputs() {
-        let plan = test_execution(&[41]);
-        let result_oid = pg_sys::Oid::from(99);
-
-        assert!(encode_batch_events(&plan, result_oid, vec![])
-            .unwrap_err()
-            .contains("must not be empty"));
-        assert!(encode_batch_events(
-            &plan,
-            result_oid,
-            vec![DeltaRow {
-                input: "42".into(),
-                row: json!({"id": 1}),
-                diff: 1,
-            }]
-        )
-        .unwrap_err()
-        .contains("not an input"));
-        assert!(encode_batch_events(
-            &plan,
-            result_oid,
-            vec![DeltaRow {
-                input: "41".into(),
-                row: json!([1, 2]),
-                diff: 1,
-            }]
-        )
-        .unwrap_err()
-        .contains("JSON object"));
-    }
 
     #[test]
     fn logical_plan_round_trips_every_operator_kind() {

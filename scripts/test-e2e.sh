@@ -55,11 +55,13 @@ cargo pgrx install --pg-config "${pg_config_path}"
 
 psql_e2e -qc "CREATE EXTENSION shiba"
 psql_e2e -qc "SELECT shiba.activate()"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 psql_e2e -qc "CREATE TABLE orders (product_id integer NOT NULL, amount integer NOT NULL)"
 psql_e2e -qc "INSERT INTO orders VALUES (1, 10), (1, 20), (2, 5)"
 psql_e2e -qc "CREATE TABLE shiba.order_stats AS SELECT product_id, count(*) AS order_count, sum(amount) AS total_amount FROM orders GROUP BY product_id"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+# One DAG is scheduled by the single database-wide Runtime.
+wait_for_value "1" "SELECT count(*) FROM shiba_internal.dag_runtime_state WHERE active"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid = 'shiba.order_stats'::regclass")" = "scan,aggregate,project,sink"
 test "$(psql_e2e -Atqc "SELECT count(*) || ':' || count(*) FILTER (WHERE stateful) FROM shiba_internal.operator_instances WHERE result_oid = 'shiba.order_stats'::regclass")" = "4:1"
 test "$(psql_e2e -Atqc "SELECT row_count || ':' || sum_value FROM shiba_internal.aggregate_state WHERE result_oid = 'shiba.order_stats'::regclass AND group_key = '1'::jsonb")" = "2:30"
@@ -69,6 +71,7 @@ test "$(psql_e2e -Atqc "SELECT (analyzed_query->'targets'->0->>'expression') || 
 # string "-1" must select the ordered-prefix path, never the insertion-only
 # fast path. Sixty-four events force batch specialization.
 if psql_e2e -qc "
+  BEGIN;
   WITH event_rows AS (
     SELECT 1 AS sequence,
            jsonb_build_object('product_id',999,'amount',1) AS row_data,
@@ -84,24 +87,27 @@ if psql_e2e -qc "
            jsonb_build_object('product_id',1000+n,'amount',1),to_jsonb(-1)
     FROM generate_series(1,31) n
   ),
-  payload AS (
-    SELECT jsonb_agg(
-             jsonb_build_object(
-               'source_oid','orders'::regclass::oid,
-               'row_data',row_data,
-               'delta',delta
-             )
-             ORDER BY sequence
-           ) AS events
-    FROM event_rows
+  insert_header AS (
+    INSERT INTO shiba_internal.routed_transactions(commit_lsn)
+    VALUES ('0/100001') RETURNING commit_lsn
+  ),
+  insert_events AS (
+    INSERT INTO shiba_internal.change_log(
+      commit_lsn,sequence,source_oid,delta,row_data
+    )
+    SELECT insert_header.commit_lsn,event_rows.sequence,
+           'orders'::regclass,(event_rows.delta #>> '{}')::integer,
+           event_rows.row_data
+    FROM event_rows CROSS JOIN insert_header
   )
-  SELECT shiba._apply_dag_delta_batch(
+  INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
+  VALUES ('shiba.order_stats'::regclass,'0/100001');
+  SELECT shiba._apply_dag_commit(
     'shiba.order_stats'::regclass,
     shiba._logical_execution_descriptor('shiba.order_stats'::regclass),
-    events,
-    '0/1'
-  )
-  FROM payload
+    '0/100001'
+  );
+  COMMIT
 " >/dev/null 2>&1; then
   printf 'aggregate batch accepted a string retraction before insertion\n' >&2
   exit 1
@@ -128,7 +134,7 @@ fi
 # HAVING is a visibility operator over durable aggregate state. Hidden groups
 # retain their accumulator and can cross the boundary in either direction.
 psql_e2e -qc "CREATE TABLE shiba.popular_orders AS SELECT product_id, count(*) AS order_count, sum(amount) AS total_amount FROM orders GROUP BY product_id HAVING count(*) >= 3"
-wait_for_value "2" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid = 'shiba.popular_orders'::regclass")" = "scan,aggregate,having,project,sink"
 test "$(psql_e2e -Atqc "SELECT count(*) FROM shiba.popular_orders")" = "0"
 test "$(psql_e2e -Atqc "SELECT row_count FROM shiba_internal.aggregate_state WHERE result_oid = 'shiba.popular_orders'::regclass AND group_key = '1'::jsonb")" = "2"
@@ -139,7 +145,7 @@ wait_for_value "0" "SELECT count(*) FROM shiba.popular_orders WHERE product_id =
 wait_for_value "1" "SELECT count(*) FROM shiba_internal.aggregate_state WHERE result_oid = 'shiba.popular_orders'::regclass AND group_key = '8'::jsonb AND row_count = 2 AND sum_value = 5"
 psql_e2e -qc "DELETE FROM orders WHERE product_id = 8"
 psql_e2e -qc "DROP TABLE shiba.popular_orders"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 
 # COUNT(DISTINCT column) owns a per-group multiplicity arrangement. Duplicate
 # values and NULLs must not change the public count, while SUM still receives
@@ -165,7 +171,7 @@ psql_e2e -qc "DELETE FROM distinct_orders"
 wait_for_value "0" "SELECT count(*) FROM shiba.distinct_customers"
 wait_for_value "0" "SELECT count(*) FROM shiba_internal.distinct_state WHERE result_oid='shiba.distinct_customers'::regclass"
 psql_e2e -qc "DROP TABLE shiba.distinct_customers"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 
 # HAVING COUNT(DISTINCT ...) reads the same durable distinct arrangement as
 # the projected aggregate. Groups remain accumulated while hidden and can
@@ -184,7 +190,7 @@ if psql_e2e -qc "CREATE TABLE shiba.mismatched_distinct_having AS SELECT product
   exit 1
 fi
 psql_e2e -qc "DROP TABLE shiba.multi_customer_orders"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 
 # PostgreSQL SubLink nodes are decorrelated to thresholded arrangements:
 # EXISTS/IN are semi joins and NOT EXISTS is an anti join.
@@ -195,9 +201,37 @@ psql_e2e -qc "INSERT INTO allowed_products VALUES (10,1),(11,1)"
 psql_e2e -qc "CREATE TABLE shiba.allowed_order_stats AS SELECT o.product_id, count(*) AS order_count, sum(o.amount) AS total_amount FROM sub_orders o WHERE EXISTS (SELECT 1 FROM allowed_products a WHERE a.product_id=o.product_id) GROUP BY o.product_id"
 wait_for_value "1" "SELECT count(*) FROM shiba.allowed_order_stats WHERE product_id=1 AND order_count=2 AND total_amount=12"
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid='shiba.allowed_order_stats'::regclass")" = "scan,scan,semi_join,aggregate,project,sink"
-# The executor reuses one backend for many commits. Exercise two explicit
-# begin/finish cycles on one connection and verify that the temp batch context
-# is reused without retaining active state or affected groups.
+# Registration persists the versioned physical plan and creates only the
+# cross-statement Join output Stage. Join input deltas remain statement-local
+# MATERIALIZED CTEs and therefore must not allocate unused relations.
+test "$(psql_e2e -Atqc "SELECT count(*) FROM shiba_internal.physical_plans WHERE result_oid='shiba.allowed_order_stats'::regclass")" = "1"
+test "$(psql_e2e -Atqc "SELECT count(*) || ':' || min(stage_name) || ':' || min(storage) FROM shiba_internal.physical_stages WHERE result_oid='shiba.allowed_order_stats'::regclass")" = "1:join_delta:unlogged"
+test "$(psql_e2e -Atqc "SELECT count(*) FROM shiba_internal.physical_stages stage JOIN pg_class relation ON relation.oid=stage.relation_oid JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE stage.result_oid='shiba.allowed_order_stats'::regclass AND relation.relpersistence='u' AND namespace.nspname='shiba_internal'")" = "1"
+test "$(psql_e2e -Atqc "SELECT jsonb_array_length(shiba.explain_physical('shiba.allowed_order_stats'::regclass)->'stages')")" = "1"
+allowed_stage_oid="$(psql_e2e -Atqc "SELECT relation_oid FROM shiba_internal.physical_stages WHERE result_oid='shiba.allowed_order_stats'::regclass AND stage_name='join_delta'")"
+allowed_stage_relation="$(psql_e2e -Atqc "SELECT format('%I.%I',namespace.nspname,relation.relname) FROM shiba_internal.physical_stages stage JOIN pg_class relation ON relation.oid=stage.relation_oid JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE stage.result_oid='shiba.allowed_order_stats'::regclass AND stage.stage_name='join_delta'")"
+test "$(psql_e2e -Atqc "
+  BEGIN;
+  ALTER TABLE ${allowed_stage_relation} ADD COLUMN invalid_shape integer;
+  SELECT outcome
+  FROM shiba_internal._load_dag_runtime_safely(
+    'shiba.allowed_order_stats'::regclass
+  );
+  ROLLBACK
+")" = "quarantined"
+test "$(psql_e2e -Atqc "SELECT count(*) FROM pg_attribute WHERE attrelid=${allowed_stage_oid}::oid AND attname='invalid_shape' AND NOT attisdropped")" = "0"
+test "$(psql_e2e -Atqc "SELECT active FROM shiba_internal.dag_runtime_state WHERE result_oid='shiba.allowed_order_stats'::regclass")" = "t"
+# A long-lived Runtime explicitly releases both prepared Join statements when
+# a cached DAG generation disappears. Exercise the session-local helper
+# directly because pg_prepared_statements cannot observe another backend.
+test "$(psql_e2e -Atqc "
+  PREPARE shiba_join_stage_r42_p7 AS SELECT 1;
+  PREPARE shiba_join_consume_r42_p7 AS SELECT 1;
+  SELECT shiba_internal._deallocate_join_physical_plans(42::oid,7)
+")" = "2"
+# The compatibility begin/finish entry points are intentionally stateless.
+# Exercise two cycles and verify that they do not create a catalog-backed
+# scratch relation in the caller session.
 psql_e2e -qc "
   BEGIN;
   SELECT shiba._begin_join_batch('shiba.allowed_order_stats'::regclass);
@@ -208,8 +242,13 @@ psql_e2e -qc "
   SELECT shiba._finish_join_batch('shiba.allowed_order_stats'::regclass);
   DO \$block\$
   BEGIN
-    IF EXISTS (SELECT 1 FROM pg_temp.shiba_join_batch_groups) THEN
-      RAISE EXCEPTION 'join batch temp state leaked across commits';
+    IF EXISTS (
+      SELECT 1
+      FROM pg_class relation
+      WHERE relation.relpersistence='t'
+        AND relation.relname='shiba_join_batch_groups'
+    ) THEN
+      RAISE EXCEPTION 'join execution created a temp scratch relation';
     END IF;
   END
   \$block\$;
@@ -224,30 +263,41 @@ psql_e2e -qc "
     reference_state jsonb;
     batch_state jsonb;
     states_differ boolean := false;
-    batch_events jsonb := jsonb_build_array(
-      jsonb_build_object(
-        'source_oid','allowed_products'::regclass::oid,
-        'row_data',jsonb_build_object('permit_id',901,'product_id',2),
-        'delta',1
-      ),
-      jsonb_build_object(
-        'source_oid','allowed_products'::regclass::oid,
-        'row_data',jsonb_build_object('permit_id',902,'product_id',2),
-        'delta',1
-      )
-    );
   BEGIN
     BEGIN
-      PERFORM shiba._apply_dag_delta(
+      INSERT INTO shiba_internal.routed_transactions(commit_lsn)
+      VALUES ('0/200001'),('0/200002');
+      INSERT INTO shiba_internal.change_log
+        (commit_lsn,sequence,source_oid,delta,row_data)
+      VALUES
+        ('0/200001',1,'allowed_products'::regclass,1,
+         jsonb_build_object('permit_id',901,'product_id',2)),
+        ('0/200002',1,'allowed_products'::regclass,1,
+         jsonb_build_object('permit_id',902,'product_id',2));
+      INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
+      VALUES
+        ('shiba.allowed_order_stats'::regclass,'0/200001'),
+        ('shiba.allowed_order_stats'::regclass,'0/200002');
+      PERFORM shiba._apply_dag_commit(
         'shiba.allowed_order_stats'::regclass,
-        'allowed_products'::regclass,
-        jsonb_build_object('permit_id',901,'product_id',2),1,'0/2'
+        shiba._logical_execution_descriptor(
+          'shiba.allowed_order_stats'::regclass
+        ),
+        '0/200001'
       );
-      PERFORM shiba._apply_dag_delta(
+      DELETE FROM shiba_internal.dag_inbox
+      WHERE result_oid='shiba.allowed_order_stats'::regclass
+        AND commit_lsn='0/200001';
+      PERFORM shiba._apply_dag_commit(
         'shiba.allowed_order_stats'::regclass,
-        'allowed_products'::regclass,
-        jsonb_build_object('permit_id',902,'product_id',2),1,'0/2'
+        shiba._logical_execution_descriptor(
+          'shiba.allowed_order_stats'::regclass
+        ),
+        '0/200002'
       );
+      DELETE FROM shiba_internal.dag_inbox
+      WHERE result_oid='shiba.allowed_order_stats'::regclass
+        AND commit_lsn='0/200002';
       SELECT jsonb_build_object(
         'sink',(SELECT jsonb_agg(to_jsonb(s) ORDER BY product_id::text)
                 FROM shiba.allowed_order_stats s),
@@ -265,9 +315,27 @@ psql_e2e -qc "
     END;
 
     BEGIN
-      PERFORM shiba._apply_dag_delta_batch(
-        'shiba.allowed_order_stats'::regclass,batch_events,'0/2'
+      INSERT INTO shiba_internal.routed_transactions(commit_lsn)
+      VALUES ('0/200003');
+      INSERT INTO shiba_internal.change_log
+        (commit_lsn,sequence,source_oid,delta,row_data)
+      VALUES
+        ('0/200003',1,'allowed_products'::regclass,1,
+         jsonb_build_object('permit_id',901,'product_id',2)),
+        ('0/200003',2,'allowed_products'::regclass,1,
+         jsonb_build_object('permit_id',902,'product_id',2));
+      INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
+      VALUES ('shiba.allowed_order_stats'::regclass,'0/200003');
+      PERFORM shiba._apply_dag_commit(
+        'shiba.allowed_order_stats'::regclass,
+        shiba._logical_execution_descriptor(
+          'shiba.allowed_order_stats'::regclass
+        ),
+        '0/200003'
       );
+      DELETE FROM shiba_internal.dag_inbox
+      WHERE result_oid='shiba.allowed_order_stats'::regclass
+        AND commit_lsn='0/200003';
       SELECT jsonb_build_object(
         'sink',(SELECT jsonb_agg(to_jsonb(s) ORDER BY product_id::text)
                 FROM shiba.allowed_order_stats s),
@@ -290,14 +358,25 @@ psql_e2e -qc "
   END
   \$oracle\$;
 "
+test "$(psql_e2e -Atqc "SELECT count(*) FROM ${allowed_stage_relation}")" = "0"
 psql_e2e -qc "DELETE FROM allowed_products WHERE permit_id=10"
-wait_for_value "1" "SELECT count(*) FROM shiba.allowed_order_stats WHERE product_id=1 AND order_count=2 AND total_amount=12"
+wait_for_value "0" "SELECT count(*) FROM shiba_internal.join_arrangements WHERE result_oid='shiba.allowed_order_stats'::regclass AND input_side='right' AND row_data->>'permit_id'='10'"
+allowed_stage_relfilenode="$(psql_e2e -Atqc "SELECT relfilenode FROM pg_class WHERE oid=${allowed_stage_oid}::oid")"
 psql_e2e -qc "DELETE FROM allowed_products WHERE permit_id=11"
 wait_for_value "0" "SELECT count(*) FROM shiba.allowed_order_stats"
 psql_e2e -qc "INSERT INTO allowed_products VALUES (12,2)"
 wait_for_value "1" "SELECT count(*) FROM shiba.allowed_order_stats WHERE product_id=2 AND order_count=1 AND total_amount=3"
 psql_e2e -qc "INSERT INTO sub_orders VALUES (5,2,8)"
 wait_for_value "1" "SELECT count(*) FROM shiba.allowed_order_stats WHERE product_id=2 AND order_count=2 AND total_amount=11"
+test "$(psql_e2e -Atqc "SELECT count(*) FROM ${allowed_stage_relation}")" = "0"
+# A cached DagRuntime is keyed by physical plan_id. Repeated commits must not
+# reload the same generation and therefore must not re-TRUNCATE the Stage.
+test "$(psql_e2e -Atqc "SELECT relfilenode FROM pg_class WHERE oid=${allowed_stage_oid}::oid")" = "${allowed_stage_relfilenode}"
+# DELETE RETURNING leaves reusable dead space. Verify threshold compaction
+# truncates only the already-empty Stage; production uses a 64 MiB threshold.
+test "$(psql_e2e -Atqc "SELECT shiba_internal._compact_physical_stages('shiba.allowed_order_stats'::regclass,1)")" = "1"
+test "$(psql_e2e -Atqc "SELECT count(*) FROM ${allowed_stage_relation}")" = "0"
+test "$(psql_e2e -Atqc "SELECT relfilenode FROM pg_class WHERE oid=${allowed_stage_oid}::oid")" != "${allowed_stage_relfilenode}"
 
 psql_e2e -qc "CREATE TABLE shiba.blocked_order_stats AS SELECT o.product_id, count(*) AS order_count, sum(o.amount) AS total_amount FROM sub_orders o WHERE NOT EXISTS (SELECT 1 FROM allowed_products a WHERE a.product_id=o.product_id) GROUP BY o.product_id"
 wait_for_value "1" "SELECT count(*) FROM shiba.blocked_order_stats WHERE product_id=1 AND order_count=2 AND total_amount=12"
@@ -325,11 +404,28 @@ if psql_e2e -qc "CREATE TABLE shiba.filtered_in_stats AS SELECT o.product_id,cou
   printf 'an IN subquery predicate that is not in the DAG unexpectedly succeeded\n' >&2
   exit 1
 fi
+
+# SQL NULL and the text empty string are distinct JOIN keys. Empty strings
+# match each other; NULL never does.
+psql_e2e -qc "CREATE TABLE empty_key_facts (row_id integer NOT NULL, join_key name, amount integer NOT NULL)"
+psql_e2e -qc "CREATE TABLE empty_key_dims (row_id integer NOT NULL, join_key name, group_id integer NOT NULL)"
+psql_e2e -qc "INSERT INTO empty_key_facts VALUES (1,'',5),(2,NULL,7)"
+psql_e2e -qc "INSERT INTO empty_key_dims VALUES (1,'',9),(2,NULL,10)"
+psql_e2e -qc "CREATE TABLE shiba.empty_key_stats AS SELECT d.group_id,count(*) AS row_count,sum(f.amount) AS total_amount FROM empty_key_facts f JOIN empty_key_dims d ON f.join_key=d.join_key GROUP BY d.group_id"
+wait_for_value "1" "SELECT count(*) FROM shiba.empty_key_stats WHERE group_id=9 AND row_count=1 AND total_amount=5"
+wait_for_value "0" "SELECT count(*) FROM shiba.empty_key_stats WHERE group_id=10"
+psql_e2e -qc "INSERT INTO empty_key_facts VALUES (3,'',11)"
+wait_for_value "1" "SELECT count(*) FROM shiba.empty_key_stats WHERE group_id=9 AND row_count=2 AND total_amount=16"
+psql_e2e -qc "DELETE FROM empty_key_dims WHERE row_id=1"
+wait_for_value "0" "SELECT count(*) FROM shiba.empty_key_stats"
+psql_e2e -qc "DROP TABLE shiba.empty_key_stats"
+
 psql_e2e -qc "DROP TABLE shiba.not_in_order_stats"
 psql_e2e -qc "DROP TABLE shiba.in_order_stats"
 psql_e2e -qc "DROP TABLE shiba.blocked_order_stats"
 psql_e2e -qc "DROP TABLE shiba.allowed_order_stats"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+test "$(psql_e2e -Atqc "SELECT count(*) FROM pg_class WHERE oid=${allowed_stage_oid}::oid")" = "0"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 
 # Window state is an ordered multiset per partition. A delta rebuilds only its
 # old/new partition from durable Shiba state, including peer-aware ranks and
@@ -339,14 +435,26 @@ psql_e2e -qc "INSERT INTO window_events VALUES (1,1,10),(2,1,20),(3,1,20)"
 psql_e2e -qc "CREATE TABLE shiba.event_windows AS SELECT event_id,category_id,score,row_number() OVER w AS position,rank() OVER w AS ranking,dense_rank() OVER w AS dense_ranking,count(*) OVER w AS running_count,sum(score) OVER w AS running_sum,avg(score) OVER w AS running_avg,min(score) OVER w AS running_min,max(score) OVER w AS running_max FROM window_events WINDOW w AS (PARTITION BY category_id ORDER BY score)"
 wait_for_value "1" "SELECT count(*) FROM shiba.event_windows WHERE event_id=1 AND position=1 AND ranking=1 AND dense_ranking=1 AND running_count=1 AND running_sum=10 AND running_avg=10 AND running_min=10 AND running_max=10"
 wait_for_value "2" "SELECT count(*) FROM shiba.event_windows WHERE score=20 AND ranking=2 AND dense_ranking=2 AND running_count=3 AND running_sum=50"
-if psql_e2e -qc "SELECT shiba._apply_dag_delta_batch(
-  'shiba.event_windows'::regclass,
-  jsonb_build_array(
-    jsonb_build_object('source_oid','window_events'::regclass::oid,'row_data',jsonb_build_object('event_id',999,'category_id',9,'score',999),'delta',-1),
-    jsonb_build_object('source_oid','window_events'::regclass::oid,'row_data',jsonb_build_object('event_id',999,'category_id',9,'score',999),'delta',1)
-  ),
-  '0/1'
-)" >/dev/null 2>&1; then
+if psql_e2e -qc "
+  BEGIN;
+  INSERT INTO shiba_internal.routed_transactions(commit_lsn)
+  VALUES ('0/100002');
+  INSERT INTO shiba_internal.change_log
+    (commit_lsn,sequence,source_oid,delta,row_data)
+  VALUES
+    ('0/100002',1,'window_events'::regclass,-1,
+     jsonb_build_object('event_id',999,'category_id',9,'score',999)),
+    ('0/100002',2,'window_events'::regclass,1,
+     jsonb_build_object('event_id',999,'category_id',9,'score',999));
+  INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
+  VALUES ('shiba.event_windows'::regclass,'0/100002');
+  SELECT shiba._apply_dag_commit(
+    'shiba.event_windows'::regclass,
+    shiba._logical_execution_descriptor('shiba.event_windows'::regclass),
+    '0/100002'
+  );
+  COMMIT
+" >/dev/null 2>&1; then
   printf 'window batch accepted a retraction-before-insertion from zero state\n' >&2
   exit 1
 fi
@@ -361,7 +469,7 @@ wait_for_value "1" "SELECT count(*) FROM shiba.event_windows WHERE event_id=4 AN
 psql_e2e -qc "DELETE FROM window_events WHERE event_id=4"
 wait_for_value "2" "SELECT count(*) FROM shiba.event_windows WHERE category_id=1 AND score=20 AND ranking=1 AND dense_ranking=1 AND running_count=2 AND running_sum=40"
 psql_e2e -qc "DROP TABLE shiba.event_windows"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 
 psql_e2e -qc "CREATE TABLE frame_events (event_id integer NOT NULL, category_id integer NOT NULL, score integer NOT NULL)"
 psql_e2e -qc "INSERT INTO frame_events VALUES (1,1,10),(2,1,20),(3,1,30)"
@@ -388,14 +496,26 @@ psql_e2e -qc "CREATE TABLE distinct_rows (row_id integer NOT NULL, category_id i
 psql_e2e -qc "INSERT INTO distinct_rows VALUES (1,1,10),(2,1,10),(3,1,20),(4,NULL,30)"
 psql_e2e -qc "CREATE TABLE shiba.unique_labels AS SELECT DISTINCT category_id,label FROM distinct_rows"
 wait_for_value "3" "SELECT count(*) FROM shiba.unique_labels"
-if psql_e2e -qc "SELECT shiba._apply_dag_delta_batch(
-  'shiba.unique_labels'::regclass,
-  jsonb_build_array(
-    jsonb_build_object('source_oid','distinct_rows'::regclass::oid,'row_data',jsonb_build_object('row_id',999,'category_id',9,'label',999),'delta',-1),
-    jsonb_build_object('source_oid','distinct_rows'::regclass::oid,'row_data',jsonb_build_object('row_id',999,'category_id',9,'label',999),'delta',1)
-  ),
-  '0/1'
-)" >/dev/null 2>&1; then
+if psql_e2e -qc "
+  BEGIN;
+  INSERT INTO shiba_internal.routed_transactions(commit_lsn)
+  VALUES ('0/100003');
+  INSERT INTO shiba_internal.change_log
+    (commit_lsn,sequence,source_oid,delta,row_data)
+  VALUES
+    ('0/100003',1,'distinct_rows'::regclass,-1,
+     jsonb_build_object('row_id',999,'category_id',9,'label',999)),
+    ('0/100003',2,'distinct_rows'::regclass,1,
+     jsonb_build_object('row_id',999,'category_id',9,'label',999));
+  INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
+  VALUES ('shiba.unique_labels'::regclass,'0/100003');
+  SELECT shiba._apply_dag_commit(
+    'shiba.unique_labels'::regclass,
+    shiba._logical_execution_descriptor('shiba.unique_labels'::regclass),
+    '0/100003'
+  );
+  COMMIT
+" >/dev/null 2>&1; then
   printf 'DISTINCT batch accepted a retraction-before-insertion from zero state\n' >&2
   exit 1
 fi
@@ -421,7 +541,7 @@ psql_e2e -qc "UPDATE distinct_rows SET label=99 WHERE row_id=6"
 wait_for_value "4" "SELECT count(*) FROM shiba.unique_labels"
 wait_for_value "1" "SELECT multiplicity FROM shiba_internal.projection_state WHERE result_oid='shiba.unique_labels'::regclass AND row_key=jsonb_build_object('category_id',2,'label',99)"
 psql_e2e -qc "DROP TABLE shiba.unique_labels"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 
 # Global TopN keeps the full ordered multiset in operator state and rewrites
 # only the bounded sink after each committed delta.
@@ -429,14 +549,26 @@ psql_e2e -qc "CREATE TABLE scored_rows (row_id integer NOT NULL, score integer)"
 psql_e2e -qc "INSERT INTO scored_rows VALUES (1,10),(2,20),(3,15),(4,NULL)"
 psql_e2e -qc "CREATE TABLE shiba.top_scores AS SELECT row_id,score FROM scored_rows ORDER BY score DESC NULLS LAST LIMIT 3"
 wait_for_value "2,3,1" "SELECT string_agg(row_id::text,',' ORDER BY score DESC NULLS LAST) FROM shiba.top_scores"
-if psql_e2e -qc "SELECT shiba._apply_dag_delta_batch(
-  'shiba.top_scores'::regclass,
-  jsonb_build_array(
-    jsonb_build_object('source_oid','scored_rows'::regclass::oid,'row_data',jsonb_build_object('row_id',999,'score',999),'delta',-1),
-    jsonb_build_object('source_oid','scored_rows'::regclass::oid,'row_data',jsonb_build_object('row_id',999,'score',999),'delta',1)
-  ),
-  '0/1'
-)" >/dev/null 2>&1; then
+if psql_e2e -qc "
+  BEGIN;
+  INSERT INTO shiba_internal.routed_transactions(commit_lsn)
+  VALUES ('0/100004');
+  INSERT INTO shiba_internal.change_log
+    (commit_lsn,sequence,source_oid,delta,row_data)
+  VALUES
+    ('0/100004',1,'scored_rows'::regclass,-1,
+     jsonb_build_object('row_id',999,'score',999)),
+    ('0/100004',2,'scored_rows'::regclass,1,
+     jsonb_build_object('row_id',999,'score',999));
+  INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
+  VALUES ('shiba.top_scores'::regclass,'0/100004');
+  SELECT shiba._apply_dag_commit(
+    'shiba.top_scores'::regclass,
+    shiba._logical_execution_descriptor('shiba.top_scores'::regclass),
+    '0/100004'
+  );
+  COMMIT
+" >/dev/null 2>&1; then
   printf 'TopN batch accepted a retraction-before-insertion from zero state\n' >&2
   exit 1
 fi
@@ -456,7 +588,7 @@ wait_for_value "3,4,1" "SELECT string_agg(row_id::text,',' ORDER BY score DESC N
 wait_for_value "4,1" "SELECT string_agg(row_id::text,',' ORDER BY score DESC NULLS LAST) FROM shiba.offset_scores"
 psql_e2e -qc "DROP TABLE shiba.offset_scores"
 psql_e2e -qc "DROP TABLE shiba.top_scores"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 if psql_e2e -qc "CREATE TABLE shiba.top_scores_with_ties AS SELECT row_id,score FROM scored_rows ORDER BY score DESC FETCH FIRST 2 ROWS WITH TIES" >/dev/null 2>&1; then
   printf 'FETCH WITH TIES unexpectedly succeeded\n' >&2
   exit 1
@@ -472,12 +604,25 @@ wait_for_value "2" "SELECT row_id FROM shiba.boolean_topn"
 wait_for_value "1" "SELECT count(*) FROM shiba_internal.topn_rows WHERE result_oid='shiba.boolean_topn'::regclass"
 psql_e2e -qc "DROP TABLE shiba.boolean_topn"
 
+# Row identity also preserves the registration session's type-output GUCs.
+# Runtime applies in a different backend but must encode timestamptz state with
+# the captured TimeZone so DELETE/UPDATE can find the backfilled row.
+psql_e2e -qc "CREATE TABLE timezone_topn_rows (row_id integer NOT NULL, occurred_at timestamptz NOT NULL)"
+psql_e2e -qc "INSERT INTO timezone_topn_rows VALUES (1,'2025-01-01 00:00:00+00'),(2,'2025-01-02 00:00:00+00')"
+psql_e2e -qc "SET TIME ZONE 'America/New_York'; CREATE TABLE shiba.timezone_topn AS SELECT row_id,occurred_at FROM timezone_topn_rows ORDER BY occurred_at LIMIT 2"
+test "$(psql_e2e -Atqc "SELECT execution_settings->>'TimeZone' FROM shiba_internal.stream_views WHERE result_oid='shiba.timezone_topn'::regclass")" = "America/New_York"
+psql_e2e -qc "DELETE FROM timezone_topn_rows WHERE row_id=1"
+wait_for_value "2" "SELECT row_id FROM shiba.timezone_topn"
+wait_for_value "1" "SELECT count(*) FROM shiba_internal.topn_rows WHERE result_oid='shiba.timezone_topn'::regclass"
+test "$(psql_e2e -Atqc "SELECT active FROM shiba_internal.dag_runtime_state WHERE result_oid='shiba.timezone_topn'::regclass")" = "t"
+psql_e2e -qc "DROP TABLE shiba.timezone_topn"
+
 if psql_e2e -qc "CREATE TABLE shiba.not_a_stream (id integer)" >/dev/null 2>&1; then
   printf 'ordinary table creation in the shiba schema unexpectedly succeeded\n' >&2
   exit 1
 fi
 
-# Source writers do not need privileges on Shiba's internal worker functions.
+# Source writers do not need privileges on Shiba's internal process controls.
 # The statement-level wakeup trigger executes with the extension owner's
 # privileges while row data continues to flow exclusively through WAL.
 psql_e2e -qc "CREATE ROLE shiba_writer"
@@ -488,8 +633,8 @@ psql_e2e -qc "SET SESSION AUTHORIZATION shiba_writer; UPDATE orders SET amount=6
 wait_for_value "1" "SELECT count(*) FROM shiba.order_stats WHERE product_id=77 AND order_count=1 AND total_amount=6"
 psql_e2e -qc "SET SESSION AUTHORIZATION shiba_writer; DELETE FROM orders WHERE product_id=77"
 wait_for_value "0" "SELECT count(*) FROM shiba.order_stats WHERE product_id=77"
-if psql_e2e -qc "SET SESSION AUTHORIZATION shiba_writer; SELECT shiba._ensure_worker()" >/dev/null 2>&1; then
-  printf 'source writer unexpectedly executed an internal Shiba worker function\n' >&2
+if psql_e2e -qc "SET SESSION AUTHORIZATION shiba_writer; SELECT shiba._ensure_runtime()" >/dev/null 2>&1; then
+  printf 'source writer unexpectedly executed an internal Shiba Runtime function\n' >&2
   exit 1
 fi
 
@@ -508,10 +653,10 @@ if psql_e2e -qc "TRUNCATE orders" >/dev/null 2>&1; then
   exit 1
 fi
 
-# A view created while the worker is deliberately paused must not replay WAL
+# A view created while the Runtime is deliberately paused must not replay WAL
 # which its CTAS snapshot already contains.
-psql_e2e -qc "UPDATE shiba_internal.worker_state SET active = false WHERE singleton"
-wait_for_value "0" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba worker'"
+psql_e2e -qc "UPDATE shiba_internal.runtime_state SET active = false WHERE singleton"
+wait_for_value "0" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 psql_e2e -qc "INSERT INTO orders VALUES (9, 90)"
 psql_e2e -qc "CREATE TABLE shiba.paused_order_stats AS SELECT product_id, count(*) AS order_count, sum(amount) AS total_amount FROM orders GROUP BY product_id"
 psql_e2e -qc "SELECT shiba.activate()"
@@ -554,6 +699,14 @@ SELECT relkind FROM pg_class WHERE oid = 'public.native_snapshot'::regclass;
 SQL
 )"
 test "${result}" = $'0.1.0\nr\n1:3:37,2:1:5,9:1:90\n3\n1:2:27,2:1:9,9:1:90\n1:2:27,2:1:9,9:1:90\n0\n1\n1\nAggregate,Seq Scan,Shiba Sink\n2\n1\nt\nt\nt\nt\nm'
+
+psql_e2e -qc "CREATE TABLE unsupported_money_source (row_id integer NOT NULL,amount money NOT NULL)"
+if psql_e2e -qc "CREATE TABLE shiba.unsupported_money AS SELECT row_id,amount FROM unsupported_money_source ORDER BY row_id LIMIT 1" >/dev/null 2>&1; then
+  printf 'registering a locale-sensitive money identity unexpectedly succeeded\n' >&2
+  exit 1
+fi
+test "$(psql_e2e -Atqc "SELECT to_regclass('shiba.unsupported_money') IS NULL")" = "t"
+psql_e2e -qc "DROP TABLE unsupported_money_source"
 
 if psql_e2e -qc "ALTER TABLE orders ADD COLUMN ignored integer" >/dev/null 2>&1; then
   printf 'altering a Shiba source unexpectedly succeeded\n' >&2
@@ -598,7 +751,9 @@ psql_e2e -qc "CREATE TABLE sales (line_id integer NOT NULL, item_id integer NOT 
 psql_e2e -qc "INSERT INTO items VALUES (1, 7), (2, 8)"
 psql_e2e -qc "INSERT INTO sales VALUES (1, 1, 10), (2, 2, 20)"
 psql_e2e -qc "CREATE TABLE shiba.category_sales AS SELECT i.category_id, count(*) AS sale_count, sum(s.amount) AS total_amount FROM sales s JOIN items i ON s.item_id = i.id GROUP BY i.category_id"
-wait_for_value "2" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+# Two simultaneously active DAGs must not grow the Runtime process count.
+wait_for_value "2" "SELECT count(*) FROM shiba_internal.dag_runtime_state WHERE active"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid = 'shiba.category_sales'::regclass")" = "scan,scan,inner_join,aggregate,project,sink"
 test "$(psql_e2e -Atqc "SELECT count(*) || ':' || count(*) FILTER (WHERE stateful) FROM shiba_internal.operator_instances WHERE result_oid = 'shiba.category_sales'::regclass")" = "6:2"
 test "$(psql_e2e -Atqc "SELECT row_count || ':' || sum_value FROM shiba_internal.aggregate_state WHERE result_oid = 'shiba.category_sales'::regclass AND group_key = '7'::jsonb")" = "1:10"
@@ -685,7 +840,9 @@ psql_e2e -qc "CREATE TABLE outer_sales (item_id integer NOT NULL, amount integer
 psql_e2e -qc "INSERT INTO outer_items VALUES (1, 7)"
 psql_e2e -qc "INSERT INTO outer_sales VALUES (1, 10), (99, 5)"
 psql_e2e -qc "CREATE TABLE shiba.left_outer_sales AS SELECT i.category_id, count(*) AS sale_count, sum(s.amount) AS total_amount FROM outer_sales s LEFT JOIN outer_items i ON s.item_id = i.id GROUP BY i.category_id"
-wait_for_value "3" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+# Three simultaneously active DAGs still share the same Runtime.
+wait_for_value "3" "SELECT count(*) FROM shiba_internal.dag_runtime_state WHERE active"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid = 'shiba.left_outer_sales'::regclass")" = "scan,scan,left_join,aggregate,project,sink"
 test "$(psql_e2e -Atqc "SELECT sale_count || ':' || total_amount FROM shiba.left_outer_sales WHERE category_id IS NULL")" = "1:5"
 psql_e2e -qc "INSERT INTO outer_items VALUES (99, 8)"
@@ -733,6 +890,23 @@ psql_e2e -qc "INSERT INTO full_sales VALUES (2, 20)"
 wait_for_value "1" "SELECT count(*) FROM shiba.full_outer_sales WHERE category_id = 8 AND sale_count = 1 AND total_amount = 20"
 psql_e2e -qc "DROP TABLE shiba.full_outer_sales"
 
+# Exercise the large-Stage planner path and then a small commit on the same
+# prepared program. The first commit crosses the 1,024-row ANALYZE threshold;
+# the second verifies that resetting the emptied Stage statistics preserves
+# the ordinary small-batch path.
+psql_e2e -qc "CREATE TABLE large_stage_facts (dim_id integer NOT NULL,amount integer NOT NULL)"
+psql_e2e -qc "CREATE TABLE large_stage_dims (id integer NOT NULL,group_id integer NOT NULL)"
+psql_e2e -qc "INSERT INTO large_stage_dims VALUES (1,7)"
+psql_e2e -qc "CREATE TABLE shiba.large_stage_stats AS SELECT d.group_id,count(*) AS matched_count,sum(f.amount) AS total_amount FROM large_stage_facts f JOIN large_stage_dims d ON f.dim_id=d.id GROUP BY d.group_id"
+psql_e2e -qc "INSERT INTO large_stage_facts SELECT 1,1 FROM generate_series(1,1100)"
+wait_for_value "1" "SELECT count(*) FROM shiba.large_stage_stats WHERE group_id=7 AND matched_count=1100 AND total_amount=1100"
+psql_e2e -qc "INSERT INTO large_stage_facts VALUES (1,2)"
+wait_for_value "1" "SELECT count(*) FROM shiba.large_stage_stats WHERE group_id=7 AND matched_count=1101 AND total_amount=1102"
+test "$(psql_e2e -Atqc "SELECT count(*) FROM shiba_internal.physical_stages stage WHERE stage.result_oid='shiba.large_stage_stats'::regclass AND stage.storage='unlogged' AND (SELECT count(*) FROM pg_class relation WHERE relation.oid=stage.relation_oid AND relation.relpersistence='u')=1")" = "1"
+large_stage_relation="$(psql_e2e -Atqc "SELECT format('%I.%I',namespace.nspname,relation.relname) FROM shiba_internal.physical_stages stage JOIN pg_class relation ON relation.oid=stage.relation_oid JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE stage.result_oid='shiba.large_stage_stats'::regclass")"
+test "$(psql_e2e -Atqc "SELECT count(*) FROM ${large_stage_relation}")" = "0"
+psql_e2e -qc "DROP TABLE shiba.large_stage_stats"
+
 psql_e2e -qc "DROP TABLE shiba.category_sales"
 wait_for_value "0" "SELECT count(*) FROM pg_publication_tables WHERE pubname = 'shiba_publication' AND tablename IN ('sales', 'items')"
 
@@ -741,7 +915,7 @@ wait_for_value "0" "SELECT count(*) FROM pg_publication_tables WHERE pubname = '
 # while the result DAG is being quiesced and removed.
 psql_e2e -qc "CREATE TABLE drop_race_source (group_id integer NOT NULL, amount integer NOT NULL)"
 psql_e2e -qc "CREATE TABLE shiba.drop_race AS SELECT group_id,count(*) AS row_count,sum(amount) AS total_amount FROM drop_race_source GROUP BY group_id"
-wait_for_value "2" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 (
   for attempt in {1..40}; do
     psql_e2e -qc "INSERT INTO drop_race_source VALUES (1,${attempt})"
@@ -751,12 +925,12 @@ drop_race_writer_pid=$!
 sleep 0.05
 psql_e2e -qc "DROP TABLE shiba.drop_race"
 wait "${drop_race_writer_pid}"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 test "$(psql_e2e -Atqc "SELECT to_regclass('shiba.drop_race') IS NULL")" = "t"
 
 psql_e2e -qc "CREATE TABLE shiba.unqualified_drop AS SELECT group_id,count(*) AS row_count,sum(amount) AS total_amount FROM drop_race_source GROUP BY group_id"
 psql_e2e -qc "SET search_path=shiba,public; DROP TABLE unqualified_drop"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 
 # Batch DROP takes every result advisory lock first, then every source lock in
 # one global OID order. The crossed source ownership below exercised a
@@ -773,13 +947,13 @@ psql_e2e -qc "DROP TABLE shiba.batch_by,shiba.batch_bx" &
 batch_drop_b_pid=$!
 wait "${batch_drop_a_pid}"
 wait "${batch_drop_b_pid}"
-wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba dag worker'"
+wait_for_value "1" "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'shiba runtime'"
 
 "${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -m immediate stop >/dev/null
 "${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -l "${pg_log_file}" -o "-k ${pg_socket_dir} -p ${pg_port}" -w start >/dev/null
 psql_e2e -qc "INSERT INTO orders VALUES (5, 25)"
 wait_for_value "1" "SELECT count(*) FROM shiba.order_stats WHERE product_id = 5 AND order_count = 1 AND total_amount = 25"
-wait_for_value "1" "SELECT count(*) FROM shiba_internal.worker_state WHERE last_heartbeat >= pg_postmaster_start_time()"
+wait_for_value "1" "SELECT count(*) FROM shiba_internal.runtime_state WHERE last_heartbeat >= pg_postmaster_start_time()"
 psql_e2e -qc "DROP TABLE shiba.order_stats"
 wait_for_value "0" "SELECT count(*) FROM shiba_internal.stream_views"
 wait_for_value "0" "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'shiba_wakeup_%' AND NOT tgisinternal"
@@ -789,8 +963,12 @@ if psql_e2e -qc "DROP EXTENSION/**/shiba" >/dev/null 2>&1; then
   printf 'dropping Shiba with an active logical slot unexpectedly succeeded\n' >&2
   exit 1
 fi
-psql_e2e -qc "UPDATE shiba_internal.worker_state SET active=false WHERE singleton"
-wait_for_value "0" "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba worker'"
+if psql_e2e -qc "DROP OWNED BY CURRENT_USER" >/dev/null 2>&1; then
+  printf 'DROP OWNED bypassed Shiba extension-owner lifecycle protection\n' >&2
+  exit 1
+fi
+psql_e2e -qc "UPDATE shiba_internal.runtime_state SET active=false WHERE singleton"
+wait_for_value "0" "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'"
 psql_e2e -qc "SELECT pg_drop_replication_slot(shiba_internal.slot_name())"
 if psql_e2e -qc "DROP EXTENSION shiba" >/dev/null 2>&1; then
   printf 'dropping Shiba without a completed deactivation unexpectedly succeeded\n' >&2
