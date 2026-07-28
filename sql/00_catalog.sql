@@ -42,6 +42,21 @@ CREATE TABLE shiba_internal.stream_views (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+-- Only indexes created through shiba.create_index are removable through the
+-- user API.  PostgreSQL does not support foreign keys into pg_class/pg_authid,
+-- so the lifecycle event trigger removes rows when an index is dropped and
+-- every API operation revalidates the stored object identity by OID.
+CREATE TABLE shiba_internal.managed_indexes (
+    index_oid oid PRIMARY KEY,
+    result_oid oid NOT NULL
+      REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
+    index_name name NOT NULL,
+    index_columns name[] NOT NULL,
+    creator_oid oid NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (result_oid, index_name)
+);
+
 CREATE TABLE shiba_internal.stream_filters (
     result_oid oid NOT NULL REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
     input_side text NOT NULL CHECK (input_side IN ('left', 'right')),

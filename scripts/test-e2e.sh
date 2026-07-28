@@ -38,6 +38,22 @@ wait_for_value() {
   return 1
 }
 
+expect_failure_as_contains() {
+  local role="$1"
+  local expected_message="$2"
+  local query="$3"
+  local output
+  if output="$(psql_e2e -U "${role}" -qc "${query}" 2>&1)"; then
+    printf 'query unexpectedly succeeded as %s: %s\n' "${role}" "${query}" >&2
+    exit 1
+  fi
+  if [[ "${output}" != *"${expected_message}"* ]]; then
+    printf 'expected error containing [%s] as %s, got:\n%s\n' \
+      "${expected_message}" "${role}" "${output}" >&2
+    exit 1
+  fi
+}
+
 cd "${project_root}"
 cargo pgrx install --pg-config "${pg_config_path}"
 
@@ -67,6 +83,61 @@ test "$(psql_e2e -Atqc "SELECT count(*) || ':' || count(*) FILTER (WHERE statefu
 test "$(psql_e2e -Atqc "SELECT row_count || ':' || sum_value FROM shiba_internal.aggregate_state WHERE result_oid = 'shiba.order_stats'::regclass AND group_key = '1'::jsonb")" = "2:30"
 test "$(psql_e2e -Atqc "SELECT (analyzed_query->>'has_aggregates') || ':' || jsonb_array_length(analyzed_query->'sources') || ':' || jsonb_array_length(analyzed_query->'targets') FROM shiba_internal.stream_graphs WHERE result_oid = 'shiba.order_stats'::regclass")" = "true:1:3"
 test "$(psql_e2e -Atqc "SELECT (analyzed_query->'targets'->0->>'expression') || ':' || (analyzed_query->'targets'->1->>'aggregate') || ':' || (analyzed_query->'targets'->2->>'aggregate') || ':' || (analyzed_query->'targets'->2->>'input_column') FROM shiba_internal.stream_graphs WHERE result_oid = 'shiba.order_stats'::regclass")" = "column:count:sum:2"
+
+# Result consumers can manage ordinary non-unique indexes through the
+# controlled SECURITY DEFINER API even though the result table remains owned
+# by the extension owner. The generated group-key uniqueness constraint is not
+# droppable through that API, and ordinary result roles cannot add DDL
+# constraints directly.
+psql_e2e -qc "CREATE ROLE shiba_index_user LOGIN"
+psql_e2e -qc "GRANT USAGE ON SCHEMA shiba TO shiba_index_user"
+psql_e2e -qc "GRANT SELECT ON shiba.order_stats TO shiba_index_user"
+psql_e2e -qc "GRANT EXECUTE ON FUNCTION shiba.create_index(regclass,text,text[]), shiba.drop_index(regclass) TO shiba_index_user"
+psql_e2e -U shiba_index_user -qc "SELECT shiba.create_index('shiba.order_stats'::regclass, 'order_stats_total_amount_idx', ARRAY['total_amount'])"
+test "$(psql_e2e -Atqc "SELECT count(*) FROM pg_class index_class JOIN pg_index index_catalog ON index_catalog.indexrelid=index_class.oid WHERE index_catalog.indrelid='shiba.order_stats'::regclass AND index_class.relname='order_stats_total_amount_idx' AND NOT index_catalog.indisunique")" = "1"
+expect_failure_as_contains \
+  shiba_index_user \
+  'must be owner of table order_stats' \
+  "ALTER TABLE shiba.order_stats ADD CONSTRAINT order_stats_forbidden CHECK (total_amount >= 0)"
+expect_failure_as_contains \
+  shiba_index_user \
+  'is not a Shiba-managed user index' \
+  "SELECT shiba.drop_index(indexrelid::regclass) FROM pg_index WHERE indrelid='shiba.order_stats'::regclass AND indisunique"
+expect_failure_as_contains \
+  shiba_index_user \
+  'cannot run inside a transaction block' \
+  "BEGIN; SELECT shiba.create_index('shiba.order_stats'::regclass, 'order_stats_forbidden_transaction_idx', ARRAY['product_id']); COMMIT"
+
+# Index DDL is a separate privilege from reading result data, and managed
+# indexes retain creator ownership even though PostgreSQL records the extension
+# owner as the physical index owner.
+psql_e2e -qc "CREATE ROLE shiba_index_peer LOGIN"
+psql_e2e -qc "GRANT USAGE ON SCHEMA shiba TO shiba_index_peer"
+psql_e2e -qc "GRANT SELECT ON shiba.order_stats TO shiba_index_peer"
+expect_failure_as_contains \
+  shiba_index_peer \
+  'permission denied for function drop_index' \
+  "SELECT shiba.drop_index('shiba.order_stats_total_amount_idx'::regclass)"
+psql_e2e -qc "GRANT EXECUTE ON FUNCTION shiba.drop_index(regclass) TO shiba_index_peer"
+expect_failure_as_contains \
+  shiba_index_peer \
+  'did not create Shiba managed index' \
+  "SELECT shiba.drop_index('shiba.order_stats_total_amount_idx'::regclass)"
+
+# Variable-width keys are rejected even when the current values are short,
+# because a future wider value could make PostgreSQL index maintenance fail.
+# SUM(bigint) produces an unbounded numeric result while retaining fixed-width
+# source columns supported by the MVP.
+psql_e2e -qc "CREATE TABLE index_numeric_source (group_id integer NOT NULL, amount bigint NOT NULL)"
+psql_e2e -qc "INSERT INTO index_numeric_source VALUES (1,10)"
+psql_e2e -qc "CREATE TABLE shiba.index_numeric_result AS SELECT group_id,count(*) AS row_count,sum(amount) AS total_amount FROM index_numeric_source GROUP BY group_id"
+psql_e2e -qc "GRANT SELECT ON shiba.index_numeric_result TO shiba_index_user"
+expect_failure_as_contains \
+  shiba_index_user \
+  'require at most 1024 bytes of fixed-width built-in B-tree columns' \
+  "SELECT shiba.create_index('shiba.index_numeric_result'::regclass, 'index_numeric_result_total_idx', ARRAY['total_amount'])"
+psql_e2e -qc "DROP TABLE shiba.index_numeric_result"
+psql_e2e -qc "DROP TABLE index_numeric_source"
 # The internal JSON ABI accepts integer text as well as JSON numbers. A
 # string "-1" must select the ordered-prefix path, never the insertion-only
 # fast path. Sixty-four events force batch specialization.
@@ -633,6 +704,16 @@ psql_e2e -qc "SET SESSION AUTHORIZATION shiba_writer; UPDATE orders SET amount=6
 wait_for_value "1" "SELECT count(*) FROM shiba.order_stats WHERE product_id=77 AND order_count=1 AND total_amount=6"
 psql_e2e -qc "SET SESSION AUTHORIZATION shiba_writer; DELETE FROM orders WHERE product_id=77"
 wait_for_value "0" "SELECT count(*) FROM shiba.order_stats WHERE product_id=77"
+psql_e2e -U shiba_index_user -qc "SELECT shiba.drop_index('shiba.order_stats_total_amount_idx'::regclass)"
+test "$(psql_e2e -Atqc "SELECT count(*) FROM pg_class WHERE oid = to_regclass('shiba.order_stats_total_amount_idx')")" = "0"
+psql_e2e -qc "REVOKE ALL ON shiba.order_stats FROM shiba_index_user"
+psql_e2e -qc "REVOKE ALL ON SCHEMA shiba FROM shiba_index_user"
+psql_e2e -qc "REVOKE ALL ON FUNCTION shiba.create_index(regclass,text,text[]), shiba.drop_index(regclass) FROM shiba_index_user"
+psql_e2e -qc "DROP ROLE shiba_index_user"
+psql_e2e -qc "REVOKE ALL ON shiba.order_stats FROM shiba_index_peer"
+psql_e2e -qc "REVOKE ALL ON SCHEMA shiba FROM shiba_index_peer"
+psql_e2e -qc "REVOKE ALL ON FUNCTION shiba.drop_index(regclass) FROM shiba_index_peer"
+psql_e2e -qc "DROP ROLE shiba_index_peer"
 if psql_e2e -qc "SET SESSION AUTHORIZATION shiba_writer; SELECT shiba._ensure_runtime()" >/dev/null 2>&1; then
   printf 'source writer unexpectedly executed an internal Shiba Runtime function\n' >&2
   exit 1

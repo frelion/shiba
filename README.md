@@ -84,6 +84,35 @@ GROUP BY product_id;
 
 `shiba` is reserved for Shiba-managed result tables. Native PostgreSQL
 materialized views keep their normal `REFRESH MATERIALIZED VIEW` behavior.
+Result tables are owned by the extension owner. Index management is a separate
+privilege from reading result data: explicitly authorized consumers can add and
+remove their own workload-specific non-unique B-tree indexes through the
+controlled `shiba.create_index` and `shiba.drop_index` functions. Constraint
+DDL and unique indexes are not exposed for Shiba results.
+
+```sql
+GRANT USAGE ON SCHEMA shiba TO report_reader;
+GRANT SELECT ON shiba.order_stats TO report_reader;
+GRANT EXECUTE ON FUNCTION
+    shiba.create_index(regclass, text, text[]),
+    shiba.drop_index(regclass)
+TO report_reader;
+
+SELECT shiba.create_index(
+    'shiba.order_stats'::regclass,
+    'order_stats_product_id_idx',
+    ARRAY['product_id']
+);
+
+SELECT shiba.drop_index('shiba.order_stats_product_id_idx'::regclass);
+```
+
+Call both functions as standalone autocommit statements, not inside `BEGIN`.
+Each result supports at most eight managed indexes with at most eight columns
+per index. To guarantee that later Runtime writes cannot exceed PostgreSQL's
+B-tree index-tuple limit, managed keys are restricted to fixed-width built-in
+types with a conservative combined width of at most 1024 bytes. Variable-width
+types such as `text`, `bytea`, `numeric`, arrays, and JSON are rejected.
 
 ## Supported query families
 

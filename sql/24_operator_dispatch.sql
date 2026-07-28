@@ -286,9 +286,17 @@ DECLARE
     earliest_commit_lsn pg_lsn;
     runtime_is_active boolean;
 BEGIN
-    PERFORM pg_advisory_xact_lock(
+    -- User-managed index DDL owns this lock while PostgreSQL builds or drops
+    -- an index.  Never let the singleton Runtime block behind that work:
+    -- report a retry so the scheduler can continue with other ready DAGs.
+    IF NOT pg_try_advisory_xact_lock(
       shiba_internal.dag_lock_key(result_relation)
-    );
+    ) THEN
+      claim_status := 'retry';
+      claimed_commit_lsn := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
     SELECT runtime.active INTO runtime_is_active
     FROM shiba_internal.dag_runtime_state AS runtime
     WHERE runtime.result_oid=result_relation

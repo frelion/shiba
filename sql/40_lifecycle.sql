@@ -186,6 +186,28 @@ CREATE EVENT TRIGGER shiba_cleanup_dropped_stream_table
     ON sql_drop
     EXECUTE FUNCTION shiba._cleanup_dropped_stream_table();
 
+CREATE FUNCTION shiba._cleanup_dropped_managed_index()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    dropped record;
+BEGIN
+    FOR dropped IN
+        SELECT *
+        FROM pg_event_trigger_dropped_objects()
+        WHERE object_type = 'index'
+    LOOP
+        DELETE FROM shiba_internal.managed_indexes
+        WHERE index_oid = dropped.objid;
+    END LOOP;
+END;
+$$;
+
+CREATE EVENT TRIGGER shiba_cleanup_dropped_managed_index
+    ON sql_drop
+    EXECUTE FUNCTION shiba._cleanup_dropped_managed_index();
+
 CREATE FUNCTION shiba._guard_source_table_alter()
 RETURNS event_trigger
 LANGUAGE plpgsql
@@ -397,6 +419,347 @@ BEGIN
     ) THEN
         PERFORM pg_drop_replication_slot(shiba_internal.slot_name());
     END IF;
+END;
+$$;
+
+-- Result relations are owned by the extension owner so that the Runtime can
+-- update them through the protected DML path.  A separately authorized index
+-- manager can add a bounded set of workload-specific access paths without
+-- becoming the table owner.  Keep this API deliberately narrower than CREATE
+-- INDEX: only fixed-width built-in types with a default B-tree operator class
+-- are accepted, and the conservative total key-width bound guarantees that a
+-- future value cannot exceed PostgreSQL's B-tree index-tuple size limit.
+CREATE FUNCTION shiba.create_index(
+    result_table regclass,
+    index_name text,
+    index_columns text[]
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba_internal
+AS $$
+DECLARE
+    result_schema name;
+    result_relation_name text;
+    column_sql text;
+    invoker_oid oid;
+    supported_column_count integer;
+    fixed_key_bytes integer;
+    created_index_oid oid;
+    maximum_identifier_length integer :=
+        current_setting('max_identifier_length')::integer;
+BEGIN
+    -- Privileged DDL relation locks live until transaction end.  Requiring an
+    -- autocommit top-level call prevents a caller from retaining them in an
+    -- idle explicit transaction after this function returns.
+    PERFORM shiba.require_index_ddl_top_level();
+    invoker_oid := shiba.index_ddl_invoker();
+
+    IF result_table IS NULL
+       OR index_name IS NULL
+       OR btrim(index_name) = ''
+       OR octet_length(index_name) > maximum_identifier_length
+       OR index_columns IS NULL
+       OR cardinality(index_columns) = 0
+       OR cardinality(index_columns) > 8
+       OR array_ndims(index_columns) IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'invalid Shiba result index specification'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM shiba_internal.stream_views
+        WHERE result_oid = result_table::oid
+    ) THEN
+        RAISE EXCEPTION 'relation % is not a Shiba result table', result_table
+            USING ERRCODE = 'wrong_object_type';
+    END IF;
+
+    IF NOT has_table_privilege(invoker_oid, result_table, 'SELECT') THEN
+        RAISE EXCEPTION
+            'role % must have SELECT on Shiba result table % to create an index',
+            pg_get_userbyid(invoker_oid),
+            result_table
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM unnest(index_columns) AS requested(column_name)
+        WHERE requested.column_name IS NULL
+           OR btrim(requested.column_name) = ''
+    ) OR EXISTS (
+        SELECT 1
+        FROM unnest(index_columns) AS requested(column_name)
+        GROUP BY requested.column_name
+        HAVING count(*) > 1
+    ) THEN
+        RAISE EXCEPTION 'Shiba result index columns must be non-empty and distinct'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(
+        shiba_internal.dag_lock_key(result_table::oid)
+    );
+
+    -- Recheck identity and authorization after taking the same DAG lock used
+    -- by apply and result DROP.  Revoking SELECT while this call waits takes
+    -- effect before privileged DDL begins.
+    PERFORM 1
+    FROM shiba_internal.stream_views
+    WHERE result_oid = result_table::oid
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'relation % is not a Shiba result table', result_table
+            USING ERRCODE = 'wrong_object_type';
+    END IF;
+
+    IF NOT has_table_privilege(invoker_oid, result_table, 'SELECT') THEN
+        RAISE EXCEPTION
+            'role % must have SELECT on Shiba result table % to create an index',
+            pg_get_userbyid(invoker_oid),
+            result_table
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+
+    IF (
+        SELECT count(*)
+        FROM shiba_internal.managed_indexes
+        WHERE result_oid = result_table::oid
+    ) >= 8 THEN
+        RAISE EXCEPTION
+            'Shiba result table % already has the maximum of 8 managed indexes',
+            result_table
+            USING ERRCODE = 'configuration_limit_exceeded';
+    END IF;
+
+    SELECT namespace.nspname,
+           format('%I.%I', namespace.nspname, relation.relname)
+    INTO STRICT result_schema, result_relation_name
+    FROM pg_class AS relation
+    JOIN pg_namespace AS namespace
+      ON namespace.oid = relation.relnamespace
+    WHERE relation.oid = result_table::oid
+      AND relation.relkind = 'r'
+      AND namespace.nspname = 'shiba';
+
+    IF EXISTS (
+        SELECT 1
+        FROM unnest(index_columns) AS requested(column_name)
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM pg_attribute AS attribute
+            WHERE attribute.attrelid = result_table::oid
+              AND attribute.attname = requested.column_name
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+        )
+    ) THEN
+        RAISE EXCEPTION
+            'one or more Shiba result index columns do not exist on %',
+            result_table
+            USING ERRCODE = 'undefined_column';
+    END IF;
+
+    SELECT count(*),
+           coalesce(sum(type_catalog.typlen), 0)::integer
+    INTO STRICT supported_column_count, fixed_key_bytes
+    FROM unnest(index_columns) AS requested(column_name)
+    JOIN pg_attribute AS attribute
+      ON attribute.attrelid = result_table::oid
+     AND attribute.attname = requested.column_name
+     AND attribute.attnum > 0
+     AND NOT attribute.attisdropped
+    JOIN pg_type AS type_catalog
+      ON type_catalog.oid = attribute.atttypid
+    JOIN pg_namespace AS type_namespace
+      ON type_namespace.oid = type_catalog.typnamespace
+    WHERE type_namespace.nspname = 'pg_catalog'
+      AND type_catalog.typlen > 0
+      AND EXISTS (
+          SELECT 1
+          FROM pg_opclass AS operator_class
+          JOIN pg_am AS access_method
+            ON access_method.oid = operator_class.opcmethod
+          WHERE access_method.amname = 'btree'
+            AND operator_class.opcdefault
+            AND operator_class.opcintype = attribute.atttypid
+      );
+
+    IF supported_column_count <> cardinality(index_columns)
+       OR fixed_key_bytes > 1024 THEN
+        RAISE EXCEPTION
+            'Shiba managed indexes require at most 1024 bytes of fixed-width built-in B-tree columns'
+            USING ERRCODE = 'feature_not_supported',
+                  HINT = 'Index only fixed-width pg_catalog types; variable-width text, bytea, numeric, arrays, JSON, and user-defined types are not accepted.';
+    END IF;
+
+    SELECT string_agg(
+               format('%I', requested.column_name),
+               ', ' ORDER BY requested.ordinality
+           )
+    INTO STRICT column_sql
+    FROM unnest(index_columns) WITH ORDINALITY
+        AS requested(column_name, ordinality);
+
+    -- PostgreSQL places an index in its parent table's namespace.  The index
+    -- name is therefore intentionally not schema-qualified here.
+    EXECUTE format(
+        'CREATE INDEX %I ON %s USING btree (%s)',
+        index_name,
+        result_relation_name,
+        column_sql
+    );
+
+    SELECT index_class.oid
+    INTO STRICT created_index_oid
+    FROM pg_class AS index_class
+    JOIN pg_namespace AS index_namespace
+      ON index_namespace.oid = index_class.relnamespace
+    JOIN pg_index AS index_catalog
+      ON index_catalog.indexrelid = index_class.oid
+    WHERE index_namespace.nspname = result_schema
+      AND index_class.relname = index_name
+      AND index_class.relkind = 'i'
+      AND index_catalog.indrelid = result_table::oid
+      AND NOT index_catalog.indisunique;
+
+    INSERT INTO shiba_internal.managed_indexes (
+        index_oid,
+        result_oid,
+        index_name,
+        index_columns,
+        creator_oid
+    )
+    VALUES (
+        created_index_oid,
+        result_table::oid,
+        index_name::name,
+        index_columns::name[],
+        invoker_oid
+    );
+END;
+$$;
+
+-- Drop only indexes previously created through the managed API, and only for
+-- their creator (or the extension owner).  Lock the index by OID before
+-- re-reading its live identity so a concurrent trusted DDL cannot substitute a
+-- different same-name object between validation and DROP INDEX.
+CREATE FUNCTION shiba.drop_index(index_relation regclass)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba_internal
+AS $$
+DECLARE
+    parent_relation oid;
+    index_schema name;
+    index_name name;
+    is_unique boolean;
+    is_primary boolean;
+    is_exclusion boolean;
+    creator_oid oid;
+    invoker_oid oid;
+    extension_owner_oid oid;
+BEGIN
+    PERFORM shiba.require_index_ddl_top_level();
+    invoker_oid := shiba.index_ddl_invoker();
+
+    IF index_relation IS NULL THEN
+        RAISE EXCEPTION 'index relation cannot be NULL'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    SELECT managed.result_oid
+    INTO parent_relation
+    FROM shiba_internal.managed_indexes AS managed
+    WHERE managed.index_oid = index_relation::oid;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'index % is not a Shiba-managed user index', index_relation
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(
+        shiba_internal.dag_lock_key(parent_relation)
+    );
+    PERFORM shiba.lock_index_ddl_target(index_relation::oid);
+
+    SELECT index_catalog.indrelid,
+           index_namespace.nspname,
+           index_class.relname,
+           index_catalog.indisunique,
+           index_catalog.indisprimary,
+           index_catalog.indisexclusion,
+           managed.creator_oid
+    INTO
+        parent_relation,
+        index_schema,
+        index_name,
+        is_unique,
+        is_primary,
+        is_exclusion,
+        creator_oid
+    FROM shiba_internal.managed_indexes AS managed
+    JOIN pg_class AS index_class
+      ON index_class.oid = managed.index_oid
+     AND index_class.relname = managed.index_name
+    JOIN pg_namespace AS index_namespace
+      ON index_namespace.oid = index_class.relnamespace
+    JOIN pg_index AS index_catalog
+      ON index_catalog.indexrelid = index_class.oid
+     AND index_catalog.indrelid = managed.result_oid
+    JOIN shiba_internal.stream_views AS stream_view
+      ON stream_view.result_oid = managed.result_oid
+    WHERE managed.index_oid = index_relation::oid
+      AND index_class.relkind = 'i'
+    FOR UPDATE OF managed;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'managed index % changed identity before it could be dropped', index_relation
+            USING ERRCODE = 'wrong_object_type';
+    END IF;
+
+    IF NOT has_table_privilege(invoker_oid, parent_relation, 'SELECT') THEN
+        RAISE EXCEPTION
+            'role % must have SELECT on the Shiba result table to drop index %',
+            pg_get_userbyid(invoker_oid),
+            index_relation
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+
+    SELECT extowner
+    INTO STRICT extension_owner_oid
+    FROM pg_extension
+    WHERE extname = 'shiba';
+    IF invoker_oid <> creator_oid
+       AND invoker_oid <> extension_owner_oid THEN
+        RAISE EXCEPTION
+            'role % did not create Shiba managed index %',
+            pg_get_userbyid(invoker_oid),
+            index_relation
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+
+    IF is_unique
+       OR is_primary
+       OR is_exclusion
+       OR EXISTS (
+           SELECT 1
+           FROM pg_constraint AS constraint_catalog
+           WHERE constraint_catalog.conindid = index_relation::oid
+       ) THEN
+        RAISE EXCEPTION
+            'cannot drop constraint-backed or unique Shiba result index %',
+            index_relation
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+
+    EXECUTE format(
+        'DROP INDEX %I.%I',
+        index_schema,
+        index_name
+    );
 END;
 $$;
 

@@ -2,6 +2,7 @@ use pgrx::prelude::*;
 
 mod ddl;
 mod filter;
+mod index_management;
 mod logical;
 mod pgoutput;
 pub mod query_analysis;
@@ -73,7 +74,12 @@ pgrx::extension_sql_file!(
 pgrx::extension_sql_file!(
     "../sql/40_lifecycle.sql",
     name = "shiba_lifecycle",
-    requires = ["shiba_registration"],
+    requires = [
+        "shiba_registration",
+        index_management::index_ddl_invoker,
+        index_management::lock_index_ddl_target,
+        index_management::require_index_ddl_top_level
+    ],
     finalize,
 );
 

@@ -256,9 +256,13 @@ DECLARE
     error_hint text;
 BEGIN
     BEGIN
-        PERFORM pg_advisory_xact_lock(
+        IF NOT pg_try_advisory_xact_lock(
           shiba_internal.dag_lock_key(result_relation)
-        );
+        ) THEN
+          RETURN QUERY
+            SELECT 'retry',NULL::text,NULL::text,NULL::text;
+          RETURN;
+        END IF;
         SELECT plan::text,plan_id::text
         INTO STRICT loaded_plan,loaded_generation
         FROM shiba_internal.physical_plans

@@ -21,8 +21,23 @@ SELECT * FROM shiba.order_stats;
 The `shiba` schema is reserved for Shiba-managed result tables. Source tables must be outside that schema, and ordinary `CREATE TABLE shiba.name (...)` declarations are rejected. PostgreSQL materialized views in every schema retain their native `REFRESH MATERIALIZED VIEW` semantics.
 
 Shiba result tables are owned by the extension owner and ordinary roles receive
-only `SELECT`. The Runtime changes them through a restricted `SECURITY DEFINER`
-apply entrypoint; a session GUC is not an authorization mechanism. As in core
+`SELECT` on the result data. The Runtime changes them through a restricted
+`SECURITY DEFINER` apply entrypoint; a session GUC is not an authorization
+mechanism. Index management is separately authorized by explicitly granting
+`EXECUTE` on `shiba.create_index(regclass,text,text[])` and
+`shiba.drop_index(regclass)`. Authorized consumers must also have schema
+`USAGE` and table `SELECT`; they may drop only indexes they created through the
+managed API. Calls must be standalone autocommit statements so privileged DDL
+locks cannot survive in a caller-controlled transaction.
+
+Managed indexes are non-unique B-trees over at most eight fixed-width built-in
+columns, with a conservative maximum combined key width of 1024 bytes and at
+most eight managed indexes per result. Variable-width and user-defined types
+are rejected: an ordinary B-tree over a currently short `text` value could
+otherwise reject a later wider Runtime value. Constraint DDL and unique indexes
+are not exposed because user-defined enforcement rules could likewise reject a
+later Shiba update. While index DDL owns a result's DAG lock, the singleton
+Runtime skips that DAG and continues scheduling other ready DAGs. As in core
 PostgreSQL, the extension owner and superusers remain trusted administrators.
 
 Shiba uses PostgreSQL's `CREATE TABLE ... AS SELECT` grammar only for unquoted `shiba.<name>` declarations. `shiba.activate()` is a one-time database setup command that creates the required logical slot; PostgreSQL does not permit that operation during `CREATE EXTENSION`. A session-preloaded utility hook locks the source table during initial backfill, then adds it to the `pgoutput` publication before the declaration commits. This gives the initial snapshot a clean handoff to the WAL stream.

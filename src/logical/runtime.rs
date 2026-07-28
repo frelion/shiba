@@ -119,11 +119,14 @@ impl DagRuntime {
                 .ok_or_else(|| "next DAG apply returned NULL outcome".to_string())?;
             let commit_lsn = row.get::<String>(2).map_err(|error| error.to_string())?;
             let outcome = parse_next_apply_outcome(&outcome)?;
-            if matches!(
-                outcome,
-                NextApplyOutcome::Applied | NextApplyOutcome::Retry | NextApplyOutcome::Quarantined
-            ) != commit_lsn.is_some()
-            {
+            let lsn_is_consistent = match outcome {
+                NextApplyOutcome::Applied | NextApplyOutcome::Quarantined => commit_lsn.is_some(),
+                // A retry after claiming work identifies the commit; a retry
+                // caused by a busy DAG advisory lock intentionally does not.
+                NextApplyOutcome::Retry => true,
+                NextApplyOutcome::Inactive | NextApplyOutcome::Idle => commit_lsn.is_none(),
+            };
+            if !lsn_is_consistent {
                 return Err(format!(
                     "next DAG apply returned inconsistent outcome {outcome:?} and commit LSN"
                 ));

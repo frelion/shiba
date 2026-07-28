@@ -131,6 +131,100 @@ wait_for_query "1" \
   "one Runtime with one DAG"
 wait_for_baseline "initial backfill"
 
+# Index DDL owns one DAG lock, but the singleton Runtime must try-lock and keep
+# scheduling other DAGs instead of blocking globally. Exercise both a held DAG
+# lock and a real DROP INDEX waiting behind a long index reader.
+psql_gate -qc "
+  CREATE TABLE index_peer_source (
+    event_id integer NOT NULL,
+    group_id integer NOT NULL,
+    amount integer NOT NULL
+  );
+  INSERT INTO index_peer_source VALUES (1,1,10);
+  CREATE TABLE shiba.index_peer_result AS
+  SELECT group_id,count(*) AS row_count,sum(amount) AS total_amount
+  FROM index_peer_source
+  GROUP BY group_id"
+wait_for_query "1" \
+  "SELECT count(*) FROM shiba.index_peer_result
+   WHERE group_id=1 AND row_count=1 AND total_amount=10" \
+  "the peer DAG initial backfill"
+
+psql_gate -qc "
+  BEGIN;
+  SELECT pg_advisory_xact_lock(
+    shiba_internal.dag_lock_key('shiba.concurrency_result'::regclass)
+  );
+  SELECT pg_sleep(3);
+  COMMIT" >/dev/null &
+held_dag_lock_pid=$!
+sleep 0.2
+psql_gate -qc "
+  INSERT INTO concurrency_source VALUES (700001,99,11);
+  INSERT INTO index_peer_source VALUES (2,2,20)"
+peer_updated=0
+for attempt in {1..15}; do
+  if test "$(psql_gate -Atqc "
+      SELECT count(*) FROM shiba.index_peer_result
+      WHERE group_id=2 AND row_count=1 AND total_amount=20")" = "1"; then
+    peer_updated=1
+    break
+  fi
+  sleep 0.1
+done
+test "${peer_updated}" = "1" ||
+  fail "the singleton Runtime blocked behind another DAG's advisory lock"
+kill -0 "${held_dag_lock_pid}" 2>/dev/null ||
+  fail "the held DAG lock ended before Runtime fairness was demonstrated"
+assert_query "0" "
+  SELECT count(*) FROM shiba.concurrency_result WHERE group_id=99"
+wait "${held_dag_lock_pid}"
+wait_for_query "1" \
+  "SELECT count(*) FROM shiba.concurrency_result
+   WHERE group_id=99 AND row_count=1 AND total_amount=11" \
+  "the formerly locked DAG to catch up"
+
+psql_gate -qc "
+  SELECT shiba.create_index(
+    'shiba.concurrency_result'::regclass,
+    'concurrency_result_total_amount_idx',
+    ARRAY['total_amount']
+  )"
+psql_gate -qc "
+  BEGIN;
+  SET LOCAL enable_seqscan=off;
+  SELECT count(*) FROM shiba.concurrency_result WHERE total_amount=11;
+  SELECT pg_sleep(3);
+  COMMIT" >/dev/null &
+index_reader_pid=$!
+sleep 0.2
+psql_gate -qc "
+  SELECT shiba.drop_index(
+    'shiba.concurrency_result_total_amount_idx'::regclass
+  )" >/dev/null &
+index_drop_pid=$!
+sleep 0.2
+psql_gate -qc "INSERT INTO index_peer_source VALUES (3,3,30)"
+peer_updated=0
+for attempt in {1..15}; do
+  if test "$(psql_gate -Atqc "
+      SELECT count(*) FROM shiba.index_peer_result
+      WHERE group_id=3 AND row_count=1 AND total_amount=30")" = "1"; then
+    peer_updated=1
+    break
+  fi
+  sleep 0.1
+done
+test "${peer_updated}" = "1" ||
+  fail "Runtime blocked globally while DROP INDEX waited for a reader"
+kill -0 "${index_drop_pid}" 2>/dev/null ||
+  fail "DROP INDEX did not remain blocked behind the long index reader"
+wait "${index_reader_pid}"
+wait "${index_drop_pid}"
+assert_query "t" "
+  SELECT to_regclass('shiba.concurrency_result_total_amount_idx') IS NULL"
+wait_for_baseline "index-DDL scheduling tests"
+
 # Four independent sessions commit many overlapping transactions.  Each
 # transaction mixes INSERT/UPDATE/DELETE so Runtime routing and old/new tuple
 # handling are exercised under concurrent wakeups.
@@ -379,6 +473,8 @@ assert_query "t" "
   SELECT active FROM shiba_internal.runtime_state WHERE singleton"
 psql_gate -qc "DROP TABLE shiba.lifecycle_registration_result"
 psql_gate -qc "DROP TABLE shiba.concurrency_result"
+psql_gate -qc "DROP TABLE shiba.index_peer_result"
+psql_gate -qc "DROP TABLE index_peer_source"
 wait_for_query "0" \
   "SELECT count(*) FROM shiba_internal.stream_views" \
   "all DAG registrations to be removed before deactivation"
