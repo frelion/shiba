@@ -505,7 +505,7 @@ BEGIN
       INTO upper_sequence
       FROM (
         SELECT event.sequence
-        FROM shiba_internal.all_change_log event
+        FROM shiba_internal.effective_change_log event
         WHERE event.commit_lsn=p_commit_lsn
           AND event.source_oid=stream_view.source_oid
           AND event.sequence>lower_sequence
@@ -530,7 +530,7 @@ BEGIN
                    event.delta
                      * coalesce(((input.row).%4$I)::numeric,0)
                  )::numeric AS sum_delta
-          FROM shiba_internal.all_change_log event
+          FROM shiba_internal.effective_change_log event
           CROSS JOIN LATERAL (
             SELECT jsonb_populate_record(
               NULL::%1$s,event.row_data

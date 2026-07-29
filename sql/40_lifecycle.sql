@@ -324,6 +324,7 @@ DECLARE
     slot_active_pid integer;
     candidate_pid integer;
     candidate_backend_type text;
+    candidate_application_name text;
     candidate_datid oid;
     escalated boolean := false;
 BEGIN
@@ -344,12 +345,13 @@ BEGIN
         FROM pg_replication_slots
         WHERE slot_name = shiba_internal.slot_name()::text;
 
-        -- Prefer the slot's live owner over catalog state, which can lag a
-        -- process exit.  Outside routing, owner_pid identifies the Runtime.
-        candidate_pid := coalesce(slot_active_pid, owner_pid_value);
+        -- In v2 the slot's active_pid is PostgreSQL's walsender, not Shiba's
+        -- Runtime.  Signal only the Runtime identity owner; closing its libpq
+        -- connection makes the paired walsender exit.
+        candidate_pid := owner_pid_value;
         IF candidate_pid IS NOT NULL THEN
-            SELECT backend_type, datid
-            INTO candidate_backend_type, candidate_datid
+            SELECT backend_type, application_name, datid
+            INTO candidate_backend_type, candidate_application_name, candidate_datid
             FROM pg_stat_activity
             WHERE pid = candidate_pid;
 
@@ -401,13 +403,14 @@ BEGIN
         WHERE slot_name = shiba_internal.slot_name()::text;
         EXIT WHEN slot_active_pid IS NULL;
 
-        SELECT backend_type, datid
-        INTO candidate_backend_type, candidate_datid
+        SELECT backend_type, application_name, datid
+        INTO candidate_backend_type, candidate_application_name, candidate_datid
         FROM pg_stat_activity
         WHERE pid = slot_active_pid;
         IF FOUND
            AND (
-               candidate_backend_type IS DISTINCT FROM 'shiba runtime'
+               candidate_backend_type IS DISTINCT FROM 'walsender'
+               OR candidate_application_name IS DISTINCT FROM 'shiba'
                OR candidate_datid IS DISTINCT FROM (
                    SELECT oid FROM pg_database WHERE datname = current_database()
                )
@@ -454,8 +457,11 @@ BEGIN
         pending_since = NULL
     WHERE singleton;
     UPDATE shiba_internal.dag_runtime_state SET active = false;
-    DELETE FROM shiba_internal.routed_transactions;
+    DELETE FROM shiba_internal.ingress_transactions;
     DROP PUBLICATION IF EXISTS shiba_publication;
+    PERFORM shiba_internal.retire_ingress_generation(
+        shiba_internal.slot_name()
+    );
     IF EXISTS (
         SELECT 1 FROM pg_replication_slots WHERE slot_name = shiba_internal.slot_name()::text
     ) THEN

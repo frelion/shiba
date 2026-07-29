@@ -106,7 +106,7 @@ BEGIN
         $fold_statement$
         WITH raw_chunk AS MATERIALIZED (
           SELECT event.sequence AS ordinality,event.delta,event.row_data
-          FROM shiba_internal.all_change_log event
+          FROM shiba_internal.effective_change_log event
           WHERE event.commit_lsn=$2
             AND event.source_oid=$3
             AND event.sequence>$4
@@ -352,7 +352,7 @@ BEGIN
         )
         +(
           SELECT count(*)
-          FROM shiba_internal.all_change_log event
+          FROM shiba_internal.effective_change_log event
           CROSS JOIN LATERAL (
             SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
           ) input
@@ -381,7 +381,7 @@ BEGIN
       WITH typed_events AS MATERIALIZED (
         SELECT event.sequence AS ordinality,
                event.delta::bigint AS delta,input.row
-        FROM shiba_internal.all_change_log event
+        FROM shiba_internal.effective_change_log event
         CROSS JOIN LATERAL (
           SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
         ) input
@@ -595,7 +595,7 @@ BEGIN
                coalesce(
                  to_jsonb((input.row).%3$I),'null'::jsonb
                ) AS partition_key
-        FROM shiba_internal.all_change_log event
+        FROM shiba_internal.effective_change_log event
         CROSS JOIN LATERAL (
           SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
         ) input
@@ -635,7 +635,7 @@ BEGIN
       WITH typed_events AS MATERIALIZED (
         SELECT event.sequence AS ordinality,
                event.delta::bigint AS delta,input.row
-        FROM shiba_internal.all_change_log event
+        FROM shiba_internal.effective_change_log event
         CROSS JOIN LATERAL (
           SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
         ) input

@@ -89,178 +89,8 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION shiba._begin_route_transaction(commit_lsn pg_lsn)
-RETURNS boolean
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, shiba_internal
-AS $$
-BEGIN
-    INSERT INTO shiba_internal.routed_transactions (commit_lsn)
-    VALUES (commit_lsn)
-    ON CONFLICT DO NOTHING;
-    RETURN FOUND;
-END;
-$$;
-
--- Persist one decoded delta in the shared payload.  Production routing appends
--- every row first, then canonicalizes and fans out the complete commit once.
--- The caller must first claim commit_lsn with _begin_route_transaction in this
--- same transaction.
-CREATE FUNCTION shiba._route_change_log_delta(
-    source_relation oid,
-    row_data jsonb,
-    delta integer,
-    commit_lsn text,
-    event_sequence integer
-)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, shiba_internal
-AS $$
-BEGIN
-    INSERT INTO shiba_internal.change_log (
-        commit_lsn,
-        sequence,
-        source_oid,
-        delta,
-        row_data
-    )
-    VALUES (
-        commit_lsn::pg_lsn,
-        event_sequence,
-        source_relation,
-        delta,
-        row_data
-    );
-END;
-$$;
-
--- Compatibility helper for direct SQL callers that route one event at a time.
--- The Runtime does not call this per row; it fans out once in
--- _canonicalize_change_log_commit after the complete transaction is present.
-CREATE FUNCTION shiba._enqueue_change_log_source(
-    source_relation oid,
-    routed_lsn pg_lsn
-)
-RETURNS void
-LANGUAGE sql
-SECURITY DEFINER
-SET search_path = pg_catalog, shiba_internal
-AS $$
-    INSERT INTO shiba_internal.dag_inbox (result_oid, commit_lsn)
-    SELECT DISTINCT stream_view.result_oid, routed_lsn
-    FROM shiba_internal.stream_views AS stream_view
-    JOIN shiba_internal.view_progress AS progress
-      ON progress.result_oid = stream_view.result_oid
-    LEFT JOIN shiba_internal.inner_join_views AS join_view
-      ON join_view.result_oid = stream_view.result_oid
-    WHERE stream_view.activation_lsn < routed_lsn
-      AND (
-        progress.applied_lsn IS NULL
-        OR progress.applied_lsn < routed_lsn
-      )
-      AND (
-        stream_view.source_oid = source_relation
-        OR join_view.right_source_oid = source_relation
-      )
-    ON CONFLICT DO NOTHING;
-$$;
-
--- pgoutput transports tuple values as text. Normalize the shared payload once
--- per source relation after the complete commit has been routed, rather than
--- making every downstream DAG and operator decode every row again.
-CREATE FUNCTION shiba._canonicalize_change_log_commit(p_commit_lsn pg_lsn)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, shiba_internal
-AS $$
-DECLARE
-    source_record record;
-    source_name text;
-BEGIN
-    FOR source_record IN
-      SELECT DISTINCT source_oid
-      FROM shiba_internal.change_log
-      WHERE commit_lsn=p_commit_lsn
-    LOOP
-      SELECT format('%I.%I',namespace.nspname,relation.relname)
-      INTO STRICT source_name
-      FROM pg_class relation
-      JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
-      WHERE relation.oid=source_record.source_oid;
-
-      EXECUTE format(
-        'UPDATE shiba_internal.change_log event
-         SET row_data=to_jsonb(
-           jsonb_populate_record(NULL::%s,event.row_data)
-         )
-         WHERE event.commit_lsn=$1
-           AND event.source_oid=$2',
-        source_name
-      ) USING p_commit_lsn,source_record.source_oid;
-    END LOOP;
-
-    UPDATE shiba_internal.routed_transactions routed
-    SET event_count=payload.event_count,
-        payload_bytes=payload.payload_bytes
-    FROM (
-      SELECT count(*)::bigint AS event_count,
-             coalesce(sum(pg_column_size(event.row_data)),0)::bigint
-               AS payload_bytes
-      FROM shiba_internal.change_log event
-      WHERE event.commit_lsn=p_commit_lsn
-    ) payload
-    WHERE routed.commit_lsn=p_commit_lsn;
-
-    -- One transaction-level fan-out replaces a catalog lookup and conflicting
-    -- inbox insert for every source row in a large commit.
-    INSERT INTO shiba_internal.dag_inbox (result_oid,commit_lsn)
-    SELECT DISTINCT stream_view.result_oid,p_commit_lsn
-    FROM (
-      SELECT DISTINCT source_oid
-      FROM shiba_internal.change_log
-      WHERE commit_lsn=p_commit_lsn
-    ) changed_source
-    JOIN shiba_internal.stream_views stream_view
-      ON stream_view.source_oid=changed_source.source_oid
-    JOIN shiba_internal.view_progress progress
-      ON progress.result_oid=stream_view.result_oid
-    LEFT JOIN shiba_internal.inner_join_views join_view
-      ON join_view.result_oid=stream_view.result_oid
-    WHERE stream_view.activation_lsn<p_commit_lsn
-      AND (
-        progress.applied_lsn IS NULL
-        OR progress.applied_lsn<p_commit_lsn
-      )
-    UNION
-    SELECT DISTINCT stream_view.result_oid,p_commit_lsn
-    FROM (
-      SELECT DISTINCT source_oid
-      FROM shiba_internal.change_log
-      WHERE commit_lsn=p_commit_lsn
-    ) changed_source
-    JOIN shiba_internal.inner_join_views join_view
-      ON join_view.right_source_oid=changed_source.source_oid
-    JOIN shiba_internal.stream_views stream_view
-      ON stream_view.result_oid=join_view.result_oid
-    JOIN shiba_internal.view_progress progress
-      ON progress.result_oid=stream_view.result_oid
-    WHERE stream_view.activation_lsn<p_commit_lsn
-      AND (
-        progress.applied_lsn IS NULL
-        OR progress.applied_lsn<p_commit_lsn
-      )
-    ON CONFLICT DO NOTHING;
-END;
-$$;
-
--- Delete only complete routed transactions for which no DAG reference remains.
--- Keep a short, time-bounded grace period so monitoring can observe completed
--- routing and a just-restarted Runtime can cheaply recognize replayed WAL.
--- Deleting the transaction header cascades to its shared change-log payload.
+-- Delete only confirmed, fully routed ingress transactions for which no DAG
+-- reference remains. Deleting the transaction cascades to its one payload.
 CREATE FUNCTION shiba._gc_change_log(max_transactions integer)
 RETURNS bigint
 LANGUAGE plpgsql
@@ -276,23 +106,37 @@ BEGIN
     END IF;
 
     WITH garbage AS (
-        SELECT routed.commit_lsn
-        FROM shiba_internal.routed_transactions AS routed
-        WHERE routed.routed_at < clock_timestamp() - interval '1 second'
+        SELECT txn.ingress_txn_id
+        FROM shiba_internal.ingress_transactions AS txn
+        JOIN shiba_internal.ingress_replay_state AS replay
+          ON replay.slot_generation = txn.slot_generation
+        WHERE txn.status IN ('committed', 'aborted')
+          AND txn.finalized_at < clock_timestamp()
+              - pg_catalog.current_setting('shiba.ingress_retention')::interval
+          AND replay.replay_safe_lsn >= txn.end_lsn
+          AND (
+              txn.status = 'aborted'
+              OR EXISTS (
+                  SELECT 1
+                    FROM shiba_internal.routing_tasks AS task
+                   WHERE task.ingress_txn_id = txn.ingress_txn_id
+                     AND task.status = 'complete'
+              )
+          )
           AND NOT EXISTS (
             SELECT 1
             FROM shiba_internal.dag_inbox AS inbox
-            WHERE inbox.commit_lsn = routed.commit_lsn
-        )
-        ORDER BY routed.commit_lsn
+            WHERE inbox.ingress_txn_id = txn.ingress_txn_id
+          )
+        ORDER BY txn.commit_lsn
         LIMIT max_transactions
         FOR UPDATE SKIP LOCKED
     ),
     deleted AS (
-        DELETE FROM shiba_internal.routed_transactions AS routed
+        DELETE FROM shiba_internal.ingress_transactions AS txn
         USING garbage
-        WHERE routed.commit_lsn = garbage.commit_lsn
-        RETURNING routed.commit_lsn
+        WHERE txn.ingress_txn_id = garbage.ingress_txn_id
+        RETURNING txn.ingress_txn_id
     )
     SELECT count(*) INTO deleted_count FROM deleted;
 
@@ -301,7 +145,7 @@ END;
 $$;
 
 CREATE FUNCTION shiba._ensure_logical_slot()
-RETURNS void
+RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, shiba_internal
@@ -311,7 +155,9 @@ BEGIN
         SELECT 1 FROM pg_replication_slots WHERE slot_name = shiba_internal.slot_name()::text
     ) THEN
         PERFORM pg_create_logical_replication_slot(shiba_internal.slot_name(), 'pgoutput');
+        RETURN true;
     END IF;
+    RETURN false;
 END;
 $$;
 
@@ -321,11 +167,25 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, shiba_internal, public
 AS $$
+DECLARE
+    slot_created boolean;
 BEGIN
     PERFORM shiba._lock_database_lifecycle();
+    IF nullif(
+        pg_catalog.current_setting('shiba.replication_conninfo', true),
+        ''
+    ) IS NULL THEN
+        RAISE EXCEPTION
+            'shiba.replication_conninfo must be configured before activation'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
     -- Logical slot creation must precede transactional catalog writes in this
     -- transaction.  Publication creation is safe after the slot exists.
-    PERFORM shiba._ensure_logical_slot();
+    slot_created := shiba._ensure_logical_slot();
+    PERFORM shiba_internal.ensure_ingress_generation(
+        shiba_internal.slot_name(),
+        slot_created
+    );
     IF NOT EXISTS (
         SELECT 1 FROM pg_publication WHERE pubname = 'shiba_publication'
     ) THEN
@@ -356,8 +216,9 @@ BEGIN
     -- These queue relations are born empty.  Seed zero-row statistics before
     -- the first source commit so PostgreSQL does not plan the first handful
     -- of Runtime transactions with its default unknown-table cardinality.
-    ANALYZE shiba_internal.routed_transactions;
+    ANALYZE shiba_internal.ingress_transactions;
     ANALYZE shiba_internal.change_log;
+    ANALYZE shiba_internal.routing_tasks;
     ANALYZE shiba_internal.dag_inbox;
     PERFORM shiba._ensure_runtime();
     RETURN true;

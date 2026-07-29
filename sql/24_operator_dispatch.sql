@@ -1,25 +1,3 @@
-CREATE FUNCTION shiba._route_wal_delta(
-    source_relation oid,
-    row_data jsonb,
-    delta integer,
-    commit_lsn text,
-    event_sequence integer
-)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, shiba, shiba_internal
-AS $$
-BEGIN
-    PERFORM shiba._route_change_log_delta(
-      source_relation,row_data,delta,commit_lsn,event_sequence
-    );
-    PERFORM shiba._enqueue_change_log_source(
-      source_relation,commit_lsn::pg_lsn
-    );
-END;
-$$;
-
 CREATE FUNCTION shiba._canonicalize_row(source_relation oid, row_data jsonb)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -276,6 +254,7 @@ CREATE FUNCTION shiba._claim_dag_commit(
 )
 RETURNS TABLE (
     claim_status text,
+    claimed_ingress_txn_id bigint,
     claimed_commit_lsn pg_lsn
 )
 LANGUAGE plpgsql
@@ -283,6 +262,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog, shiba_internal
 AS $$
 DECLARE
+    earliest_ingress_txn_id bigint;
     earliest_commit_lsn pg_lsn;
     runtime_is_active boolean;
 BEGIN
@@ -293,6 +273,7 @@ BEGIN
       shiba_internal.dag_lock_key(result_relation)
     ) THEN
       claim_status := 'retry';
+      claimed_ingress_txn_id := NULL;
       claimed_commit_lsn := NULL;
       RETURN NEXT;
       RETURN;
@@ -303,12 +284,14 @@ BEGIN
     FOR UPDATE;
     IF NOT FOUND OR NOT runtime_is_active THEN
       claim_status := 'inactive';
+      claimed_ingress_txn_id := NULL;
       claimed_commit_lsn := NULL;
       RETURN NEXT;
       RETURN;
     END IF;
 
-    SELECT inbox.commit_lsn INTO earliest_commit_lsn
+    SELECT inbox.ingress_txn_id,inbox.commit_lsn
+    INTO earliest_ingress_txn_id,earliest_commit_lsn
     FROM shiba_internal.dag_inbox AS inbox
     WHERE inbox.result_oid=result_relation
     ORDER BY inbox.commit_lsn
@@ -321,6 +304,7 @@ BEGIN
           USING ERRCODE='P0S01';
       END IF;
       claim_status := 'idle';
+      claimed_ingress_txn_id := NULL;
       claimed_commit_lsn := NULL;
       RETURN NEXT;
       RETURN;
@@ -334,6 +318,7 @@ BEGIN
     END IF;
 
     claim_status := 'claimed';
+    claimed_ingress_txn_id := earliest_ingress_txn_id;
     claimed_commit_lsn := earliest_commit_lsn;
     RETURN NEXT;
 END;
@@ -345,6 +330,7 @@ $$;
 CREATE FUNCTION shiba._apply_claimed_dag_commit(
     result_relation oid,
     execution_descriptor jsonb,
+    ingress_transaction_id bigint,
     commit_lsn pg_lsn
 )
 RETURNS void
@@ -417,10 +403,12 @@ BEGIN
         USING ERRCODE='P0S01';
     END IF;
 
-    SELECT routed.event_count,routed.payload_bytes
+    SELECT txn.event_count,txn.payload_bytes
     INTO STRICT commit_event_count,commit_payload_bytes
-    FROM shiba_internal.routed_transactions routed
-    WHERE routed.commit_lsn=source_commit_lsn;
+    FROM shiba_internal.ingress_transactions txn
+    WHERE txn.ingress_txn_id=ingress_transaction_id
+      AND txn.commit_lsn=source_commit_lsn
+      AND txn.status='committed';
     IF commit_event_count>max_commit_rows
        OR commit_payload_bytes>max_commit_bytes THEN
       RAISE EXCEPTION
@@ -429,20 +417,6 @@ BEGIN
         max_commit_rows,max_commit_bytes
         USING ERRCODE='53400',
               HINT='Increase shiba.max_commit_rows/max_commit_bytes or split the source transaction.';
-    END IF;
-
-    IF execution_pipeline='aggregate' THEN
-      IF NOT EXISTS (
-        SELECT 1
-        FROM shiba_internal.all_change_log AS logged_event
-        WHERE logged_event.commit_lsn=source_commit_lsn
-          AND logged_event.source_oid=left_source_oid
-      ) THEN
-        RAISE EXCEPTION
-          'Shiba DAG % inbox commit % has no applicable change-log events',
-          result_relation,source_commit_lsn
-          USING ERRCODE='P0S01';
-      END IF;
     END IF;
 
     IF execution_pipeline='join' THEN
@@ -480,17 +454,20 @@ SET search_path = pg_catalog, shiba, shiba_internal
 AS $$
 DECLARE
     claim_status_value text;
+    claimed_ingress_txn_id bigint;
     claimed_lsn pg_lsn;
 BEGIN
-    SELECT claim.claim_status,claim.claimed_commit_lsn
-    INTO STRICT claim_status_value,claimed_lsn
+    SELECT claim.claim_status,
+           claim.claimed_ingress_txn_id,
+           claim.claimed_commit_lsn
+    INTO STRICT claim_status_value,claimed_ingress_txn_id,claimed_lsn
     FROM shiba._claim_dag_commit(result_relation,commit_lsn) AS claim;
     IF claim_status_value<>'claimed' THEN
       RAISE EXCEPTION 'Shiba DAG % is not active',result_relation
         USING ERRCODE='object_not_in_prerequisite_state';
     END IF;
     PERFORM shiba._apply_claimed_dag_commit(
-      result_relation,execution_descriptor,claimed_lsn
+      result_relation,execution_descriptor,claimed_ingress_txn_id,claimed_lsn
     );
 END;
 $$;
@@ -505,6 +482,7 @@ $$;
 CREATE FUNCTION shiba._apply_claimed_dag_safely(
     result_relation oid,
     execution_descriptor jsonb,
+    p_ingress_txn_id bigint,
     p_commit_lsn pg_lsn,
     acknowledge boolean
 )
@@ -522,12 +500,12 @@ DECLARE
 BEGIN
     BEGIN
         PERFORM shiba._apply_claimed_dag_commit(
-          result_relation,execution_descriptor,p_commit_lsn
+          result_relation,execution_descriptor,p_ingress_txn_id,p_commit_lsn
         );
         IF acknowledge THEN
           DELETE FROM shiba_internal.dag_inbox AS inbox
           WHERE inbox.result_oid=result_relation
-            AND inbox.commit_lsn=p_commit_lsn;
+            AND inbox.ingress_txn_id=p_ingress_txn_id;
           GET DIAGNOSTICS acknowledged_rows = ROW_COUNT;
           IF acknowledged_rows<>1 THEN
             RAISE EXCEPTION
@@ -610,11 +588,14 @@ SET search_path = pg_catalog, shiba, shiba_internal
 AS $$
 DECLARE
     claim_status_value text;
+    claimed_ingress_txn_id bigint;
     claimed_lsn pg_lsn;
     apply_outcome text;
 BEGIN
-    SELECT claim.claim_status,claim.claimed_commit_lsn
-    INTO STRICT claim_status_value,claimed_lsn
+    SELECT claim.claim_status,
+           claim.claimed_ingress_txn_id,
+           claim.claimed_commit_lsn
+    INTO STRICT claim_status_value,claimed_ingress_txn_id,claimed_lsn
     FROM shiba._claim_dag_commit(result_relation,NULL) AS claim;
     IF claim_status_value<>'claimed' THEN
       RETURN QUERY SELECT claim_status_value,NULL::pg_lsn;
@@ -622,7 +603,11 @@ BEGIN
     END IF;
 
     apply_outcome := shiba._apply_claimed_dag_safely(
-      result_relation,execution_descriptor,claimed_lsn,true
+      result_relation,
+      execution_descriptor,
+      claimed_ingress_txn_id,
+      claimed_lsn,
+      true
     );
     RETURN QUERY SELECT apply_outcome,claimed_lsn;
 END;
@@ -644,17 +629,24 @@ SET search_path = pg_catalog, shiba, shiba_internal
 AS $$
 DECLARE
     claim_status_value text;
+    claimed_ingress_txn_id bigint;
     claimed_lsn pg_lsn;
 BEGIN
-    SELECT claim.claim_status,claim.claimed_commit_lsn
-    INTO STRICT claim_status_value,claimed_lsn
+    SELECT claim.claim_status,
+           claim.claimed_ingress_txn_id,
+           claim.claimed_commit_lsn
+    INTO STRICT claim_status_value,claimed_ingress_txn_id,claimed_lsn
     FROM shiba._claim_dag_commit(result_relation,commit_lsn) AS claim;
     IF claim_status_value<>'claimed' THEN
       RAISE EXCEPTION 'Shiba DAG % is not active',result_relation
         USING ERRCODE='object_not_in_prerequisite_state';
     END IF;
     RETURN shiba._apply_claimed_dag_safely(
-      result_relation,execution_descriptor,claimed_lsn,false
+      result_relation,
+      execution_descriptor,
+      claimed_ingress_txn_id,
+      claimed_lsn,
+      false
     );
 END;
 $$;

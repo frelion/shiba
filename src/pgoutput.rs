@@ -82,6 +82,7 @@ pub enum ParseContext {
     Streaming,
 }
 
+#[cfg(test)]
 pub fn parse(input: &[u8]) -> Result<Message, &'static str> {
     parse_with_context(input, ParseContext::NonStreaming)
 }

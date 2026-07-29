@@ -234,18 +234,22 @@ impl ReplicationTransport {
         let dbname = c"dbname";
         let replication = c"replication";
         let application_name = c"application_name";
+        let connect_timeout = c"connect_timeout";
         let database = c"database";
         let shiba = c"shiba";
+        let five_seconds = c"5";
         let keywords = [
             dbname.as_ptr(),
             replication.as_ptr(),
             application_name.as_ptr(),
+            connect_timeout.as_ptr(),
             ptr::null(),
         ];
         let values = [
             conninfo.as_ptr(),
             database.as_ptr(),
             shiba.as_ptr(),
+            five_seconds.as_ptr(),
             ptr::null(),
         ];
 

@@ -1,4 +1,4 @@
-//! Bounded pgoutput-v2 ingress state machine.
+//! Bounded pgoutput-ingress state machine.
 //!
 //! Replication I/O happens only outside SPI transactions.  This module turns
 //! complete CopyData frames into one bounded, single-source-transaction batch;
@@ -73,7 +73,7 @@ impl fmt::Display for IngressError {
             Self::Protocol(error) => write!(formatter, "invalid pgoutput message: {error}"),
             Self::State(error) => write!(formatter, "invalid pgoutput stream state: {error}"),
             Self::CounterOverflow(counter) => {
-                write!(formatter, "v2 ingress {counter} counter overflow")
+                write!(formatter, "ingress {counter} counter overflow")
             }
         }
     }
@@ -186,6 +186,7 @@ impl PendingBatch {
 pub(crate) struct ReplicationIngress {
     transport: ReplicationTransport,
     relations: HashMap<u32, Vec<String>>,
+    max_cached_relations: usize,
     open_streams: HashMap<u32, u64>,
     active_segment: Option<ActiveSegment>,
     last_change_lsn: HashMap<u32, (u64, u64)>,
@@ -197,10 +198,13 @@ impl ReplicationIngress {
     pub(crate) fn new(
         transport: ReplicationTransport,
         open_streams: impl IntoIterator<Item = (u32, u64)>,
+        max_cached_relations: usize,
     ) -> Self {
+        assert!(max_cached_relations > 0);
         Self {
             transport,
             relations: HashMap::new(),
+            max_cached_relations,
             open_streams: open_streams.into_iter().collect(),
             active_segment: None,
             last_change_lsn: HashMap::new(),
@@ -337,6 +341,14 @@ impl ReplicationIngress {
                 let segment = self.require_active_segment("Relation")?;
                 self.validate_message_xid(segment, source_xid, "Relation")?;
                 self.ensure_pending(segment)?;
+                if !self.relations.contains_key(&relid)
+                    && self.relations.len() >= self.max_cached_relations
+                {
+                    return Err(IngressError::State(format!(
+                        "relation descriptor cache reached shiba.max_cached_relations ({})",
+                        self.max_cached_relations
+                    )));
+                }
                 self.relations.insert(relid, columns);
             }
             Message::Type { source_xid, .. } => {
@@ -396,7 +408,7 @@ impl ReplicationIngress {
             }
             Message::Truncate { .. } => {
                 return Err(IngressError::State(
-                    "TRUNCATE is outside the v2 DAG delta contract; remove it from the publication"
+                    "TRUNCATE is outside the DAG delta contract; remove it from the publication"
                         .into(),
                 ));
             }

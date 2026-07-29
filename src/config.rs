@@ -39,6 +39,14 @@ const DEFAULT_INGRESS_BATCH_BYTES: i32 = 16 * 1024 * 1024;
 const MIN_INGRESS_BATCH_BYTES: i32 = 1;
 const MAX_INGRESS_BATCH_BYTES: i32 = i32::MAX;
 
+const DEFAULT_MAX_CACHED_RELATIONS: i32 = 4_096;
+const MIN_MAX_CACHED_RELATIONS: i32 = 1;
+const MAX_MAX_CACHED_RELATIONS: i32 = 65_536;
+
+const DEFAULT_INGRESS_RETENTION_MS: i32 = 1_000;
+const MIN_INGRESS_RETENTION_MS: i32 = 0;
+const MAX_INGRESS_RETENTION_MS: i32 = i32::MAX;
+
 static RUNTIME_WORK_MEM_KB: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_RUNTIME_WORK_MEM_KB);
 static RUNTIME_TEMP_FILE_LIMIT_KB: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_RUNTIME_TEMP_FILE_LIMIT_KB);
@@ -49,6 +57,8 @@ static MAX_COMMIT_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_COM
 static MAX_COMMIT_BYTES: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_COMMIT_BYTES);
 static INGRESS_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_BATCH_ROWS);
 static INGRESS_BATCH_BYTES: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_BATCH_BYTES);
+static MAX_CACHED_RELATIONS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_CACHED_RELATIONS);
+static INGRESS_RETENTION_MS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_RETENTION_MS);
 static REPLICATION_CONNINFO: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 pub fn init() {
@@ -124,7 +134,7 @@ pub fn init() {
     );
     GucRegistry::define_int_guc(
         c"shiba.ingress_batch_rows",
-        c"Target maximum row images in one v2 ingress transaction.",
+        c"Target maximum row images in one ingress transaction.",
         c"One individual replication message or tuple remains indivisible.",
         &INGRESS_BATCH_ROWS,
         MIN_INGRESS_BATCH_ROWS,
@@ -134,13 +144,33 @@ pub fn init() {
     );
     GucRegistry::define_int_guc(
         c"shiba.ingress_batch_bytes",
-        c"Target maximum pgoutput payload bytes in one v2 ingress transaction.",
+        c"Target maximum pgoutput payload bytes in one ingress transaction.",
         c"One individual replication message or tuple may exceed this target.",
         &INGRESS_BATCH_BYTES,
         MIN_INGRESS_BATCH_BYTES,
         MAX_INGRESS_BATCH_BYTES,
         GucContext::Sighup,
         GucFlags::UNIT_BYTE,
+    );
+    GucRegistry::define_int_guc(
+        c"shiba.max_cached_relations",
+        c"Maximum pgoutput relation descriptors retained by one Shiba Runtime.",
+        c"The Runtime fails closed at this limit because evicting descriptors can misdecode tuples.",
+        &MAX_CACHED_RELATIONS,
+        MIN_MAX_CACHED_RELATIONS,
+        MAX_MAX_CACHED_RELATIONS,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"shiba.ingress_retention",
+        c"Minimum retention after ingress transaction finalization.",
+        c"Replay-safe transactions remain inspectable for this duration before bounded GC.",
+        &INGRESS_RETENTION_MS,
+        MIN_INGRESS_RETENTION_MS,
+        MAX_INGRESS_RETENTION_MS,
+        GucContext::Sighup,
+        GucFlags::UNIT_MS,
     );
     GucRegistry::define_string_guc(
         c"shiba.replication_conninfo",
@@ -173,6 +203,11 @@ pub fn ingress_batch_rows() -> usize {
 pub fn ingress_batch_bytes() -> usize {
     usize::try_from(INGRESS_BATCH_BYTES.get())
         .expect("shiba.ingress_batch_bytes passed PostgreSQL range validation")
+}
+
+pub fn max_cached_relations() -> usize {
+    usize::try_from(MAX_CACHED_RELATIONS.get())
+        .expect("shiba.max_cached_relations passed PostgreSQL range validation")
 }
 
 pub fn replication_conninfo() -> Option<CString> {
@@ -213,5 +248,9 @@ mod tests {
         );
         assert!((MIN_INGRESS_BATCH_BYTES..=MAX_INGRESS_BATCH_BYTES)
             .contains(&DEFAULT_INGRESS_BATCH_BYTES));
+        assert!((MIN_MAX_CACHED_RELATIONS..=MAX_MAX_CACHED_RELATIONS)
+            .contains(&DEFAULT_MAX_CACHED_RELATIONS));
+        assert!((MIN_INGRESS_RETENTION_MS..=MAX_INGRESS_RETENTION_MS)
+            .contains(&DEFAULT_INGRESS_RETENTION_MS));
     }
 }

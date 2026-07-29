@@ -295,46 +295,6 @@ CREATE TABLE shiba_internal.view_progress (
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
--- Logical slots can replay committed transactions after a crash.  The Router
--- records its routing decision with the shared payload and DAG references in
--- one transaction.  This row is the transaction header used by bounded GC.
-CREATE TABLE shiba_internal.routed_transactions (
-    commit_lsn pg_lsn PRIMARY KEY,
-    event_count bigint NOT NULL DEFAULT 0 CHECK (event_count >= 0),
-    payload_bytes bigint NOT NULL DEFAULT 0 CHECK (payload_bytes >= 0),
-    routed_at timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-
--- Every decoded row delta is stored once, independent of the number of DAGs
--- that consume it. Routing normalizes pgoutput text fields to typed JSONB once
--- after the complete commit is present. Operator state and results remain
--- LOGGED.
-CREATE TABLE shiba_internal.change_log (
-    commit_lsn pg_lsn NOT NULL,
-    sequence integer NOT NULL CHECK (sequence > 0),
-    source_oid oid NOT NULL,
-    delta integer NOT NULL CHECK (delta IN (-1, 1)),
-    row_data jsonb NOT NULL,
-    PRIMARY KEY (commit_lsn, sequence),
-    FOREIGN KEY (commit_lsn)
-        REFERENCES shiba_internal.routed_transactions(commit_lsn)
-        ON DELETE CASCADE
-);
-
--- A DAG inbox row is transaction-level work, not another payload copy.
--- RESTRICT makes deleting a routed transaction (and therefore its change-log
--- payload) impossible while any DAG still needs that source transaction.
-CREATE TABLE shiba_internal.dag_inbox (
-    result_oid oid NOT NULL
-        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    commit_lsn pg_lsn NOT NULL
-        REFERENCES shiba_internal.routed_transactions(commit_lsn) ON DELETE RESTRICT,
-    PRIMARY KEY (result_oid, commit_lsn)
-);
-
-CREATE INDEX shiba_dag_inbox_commit_idx
-    ON shiba_internal.dag_inbox (commit_lsn);
-
 -- DAGs are logical runtimes scheduled cooperatively by the Runtime.  This
 -- table intentionally contains no PostgreSQL-process lease or heartbeat.
 CREATE TABLE shiba_internal.dag_runtime_state (
@@ -363,11 +323,8 @@ CREATE TABLE shiba_internal.runtime_state (
     CHECK (owner_pid IS NULL OR pending_launch_xid IS NULL)
 );
 
--- V2 durable ingress is additive.  The v1 routed_transactions/change_log/
--- dag_inbox relations above remain unchanged until all v1 readers have been
--- migrated.
---
--- Every relation below is LOGGED (the PostgreSQL default).  Replication
+-- Durable ingress is the only routing and operator input model.
+-- Every relation below is LOGGED (the PostgreSQL default). Replication
 -- buffers and parser state are disposable; these rows are the crash-recovery
 -- authority.
 
@@ -377,11 +334,13 @@ CREATE TABLE shiba_internal.runtime_state (
 -- table transaction committed.  confirmed_lsn and replay_safe_lsn advance
 -- independently: confirmation intent is not proof that the slot position has
 -- reached durable storage.
-CREATE TABLE shiba_internal.v2_ingress_replay_state (
+CREATE TABLE shiba_internal.ingress_replay_state (
     slot_generation bigint PRIMARY KEY CHECK (slot_generation > 0),
     slot_name name NOT NULL CHECK (length(slot_name::text) > 0),
     database_oid oid NOT NULL CHECK (database_oid <> 0::oid),
     plugin name NOT NULL DEFAULT 'pgoutput' CHECK (plugin = 'pgoutput'::name),
+    system_identifier text NOT NULL CHECK (length(system_identifier) > 0),
+    slot_baseline_lsn pg_lsn NOT NULL,
     state text NOT NULL DEFAULT 'active'
         CHECK (state IN ('active', 'retired', 'invalid')),
     persisted_lsn pg_lsn,
@@ -399,16 +358,16 @@ CREATE TABLE shiba_internal.v2_ingress_replay_state (
 );
 
 -- At most one generation for a database/slot pair may accept new ingress.
-CREATE UNIQUE INDEX shiba_v2_ingress_active_slot_idx
-    ON shiba_internal.v2_ingress_replay_state (database_oid, slot_name)
+CREATE UNIQUE INDEX shiba_ingress_active_slot_idx
+    ON shiba_internal.ingress_replay_state (database_oid, slot_name)
     WHERE state = 'active';
 
 -- Ordinary transactions use Begin.final_lsn as identity. Streamed transactions
 -- use the first observed segment LSN because their commit LSN is not known yet.
-CREATE TABLE shiba_internal.v2_ingress_transactions (
+CREATE TABLE shiba_internal.ingress_transactions (
     ingress_txn_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     slot_generation bigint NOT NULL
-        REFERENCES shiba_internal.v2_ingress_replay_state(slot_generation)
+        REFERENCES shiba_internal.ingress_replay_state(slot_generation)
         ON DELETE RESTRICT,
     source_xid bigint NOT NULL
         CHECK (source_xid BETWEEN 0 AND 4294967295),
@@ -453,20 +412,20 @@ CREATE TABLE shiba_internal.v2_ingress_transactions (
 
 -- Commit records have stable WAL positions.  This also prevents two source
 -- transactions from being admitted as the same source epoch.
-CREATE UNIQUE INDEX shiba_v2_ingress_commit_lsn_idx
-    ON shiba_internal.v2_ingress_transactions (commit_lsn)
+CREATE UNIQUE INDEX shiba_ingress_commit_lsn_idx
+    ON shiba_internal.ingress_transactions (commit_lsn)
     WHERE status = 'committed';
 
-CREATE INDEX shiba_v2_ingress_open_txn_idx
-    ON shiba_internal.v2_ingress_transactions
+CREATE INDEX shiba_ingress_open_txn_idx
+    ON shiba_internal.ingress_transactions
        (slot_generation, source_xid, streamed, identity_lsn)
     WHERE status = 'open';
 
 -- A batch is the durability and feedback unit, not the event identity.  A
 -- 32-byte digest is supplied by the protocol parser (SHA-256 in v2).
-CREATE TABLE shiba_internal.v2_ingress_decode_batches (
+CREATE TABLE shiba_internal.ingress_decode_batches (
     slot_generation bigint NOT NULL
-        REFERENCES shiba_internal.v2_ingress_replay_state(slot_generation)
+        REFERENCES shiba_internal.ingress_replay_state(slot_generation)
         ON DELETE RESTRICT,
     decode_end_lsn pg_lsn NOT NULL,
     message_digest bytea NOT NULL
@@ -481,9 +440,9 @@ CREATE TABLE shiba_internal.v2_ingress_decode_batches (
 -- allocated only for a new stable event identity; replay keeps the original
 -- value.  JSONB is the v2 SQL ABI until physical operators consume typed Stage
 -- rows directly.
-CREATE TABLE shiba_internal.v2_change_log (
+CREATE TABLE shiba_internal.change_log (
     ingress_txn_id bigint NOT NULL
-        REFERENCES shiba_internal.v2_ingress_transactions(ingress_txn_id)
+        REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
         ON DELETE CASCADE,
     change_lsn pg_lsn NOT NULL,
     change_ordinal bigint NOT NULL CHECK (change_ordinal >= 0),
@@ -492,8 +451,11 @@ CREATE TABLE shiba_internal.v2_change_log (
         CHECK (source_subxid BETWEEN 0 AND 4294967295),
     input_seq bigint NOT NULL CHECK (input_seq > 0),
     source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
-    weight bigint NOT NULL CHECK (weight <> 0),
+    weight bigint NOT NULL CHECK (weight IN (-1, 1)),
+    -- Immutable wire-text image used for replay conflict detection.
     typed_payload jsonb NOT NULL,
+    -- Bounded-batch normalization fills the operator-facing typed image.
+    canonical_payload jsonb,
     payload_bytes bigint NOT NULL CHECK (payload_bytes >= 0),
     persisted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (
@@ -508,9 +470,9 @@ CREATE TABLE shiba_internal.v2_change_log (
 -- The first durable event establishes a streamed subtransaction's immutable
 -- lower bound.  Later StreamAbort handling can therefore append one compact
 -- interval without scanning or rewriting any payload rows.
-CREATE TABLE shiba_internal.v2_ingress_subxacts (
+CREATE TABLE shiba_internal.ingress_subxacts (
     ingress_txn_id bigint NOT NULL
-        REFERENCES shiba_internal.v2_ingress_transactions(ingress_txn_id)
+        REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
         ON DELETE CASCADE,
     source_subxid bigint NOT NULL
         CHECK (source_subxid BETWEEN 0 AND 4294967295),
@@ -520,7 +482,7 @@ CREATE TABLE shiba_internal.v2_ingress_subxacts (
     UNIQUE (ingress_txn_id, first_input_seq),
     UNIQUE (ingress_txn_id, source_subxid, first_input_seq),
     FOREIGN KEY (ingress_txn_id, first_input_seq)
-        REFERENCES shiba_internal.v2_change_log
+        REFERENCES shiba_internal.change_log
                    (ingress_txn_id, input_seq)
         ON DELETE CASCADE
 );
@@ -529,7 +491,7 @@ CREATE TABLE shiba_internal.v2_ingress_subxacts (
 -- through_input_seq), so events appended after StreamAbort remain visible.
 -- One source subtransaction and one control WAL identity can each describe at
 -- most one interval inside an ingress transaction.
-CREATE TABLE shiba_internal.v2_ingress_rollbacks (
+CREATE TABLE shiba_internal.ingress_rollbacks (
     ingress_txn_id bigint NOT NULL,
     from_input_seq bigint NOT NULL CHECK (from_input_seq > 0),
     through_input_seq bigint NOT NULL,
@@ -541,58 +503,60 @@ CREATE TABLE shiba_internal.v2_ingress_rollbacks (
     UNIQUE (ingress_txn_id, aborted_subxid),
     CHECK (from_input_seq < through_input_seq),
     FOREIGN KEY (ingress_txn_id, aborted_subxid, from_input_seq)
-        REFERENCES shiba_internal.v2_ingress_subxacts
+        REFERENCES shiba_internal.ingress_subxacts
                    (ingress_txn_id, source_subxid, first_input_seq)
         ON DELETE CASCADE
 );
 
--- Supports the event-driven anti-join used by v2_effective_change_log.
-CREATE INDEX shiba_v2_ingress_rollbacks_interval_idx
-    ON shiba_internal.v2_ingress_rollbacks
+-- Supports the event-driven anti-join used by effective_change_log.
+CREATE INDEX shiba_ingress_rollbacks_interval_idx
+    ON shiba_internal.ingress_rollbacks
        (ingress_txn_id, from_input_seq, through_input_seq);
 
 -- The reusable consumer surface: only committed top-level transactions are
 -- visible, and append-only rollback intervals mask aborted subtransaction
 -- payload without mutating it.
-CREATE VIEW shiba_internal.v2_effective_change_log AS
+CREATE VIEW shiba_internal.effective_change_log AS
 SELECT event.ingress_txn_id,
+       txn.commit_lsn,
+       event.input_seq AS sequence,
        event.change_lsn,
        event.change_ordinal,
        event.image_ordinal,
        event.source_subxid,
-       event.input_seq,
        event.source_oid,
-       event.weight,
-       event.typed_payload,
+       event.weight::integer AS delta,
+       event.canonical_payload AS row_data,
        event.payload_bytes,
        event.persisted_at
-  FROM shiba_internal.v2_change_log AS event
-  JOIN shiba_internal.v2_ingress_transactions AS txn
+  FROM shiba_internal.change_log AS event
+  JOIN shiba_internal.ingress_transactions AS txn
     ON txn.ingress_txn_id = event.ingress_txn_id
    AND txn.status = 'committed'
- WHERE NOT EXISTS (
+ WHERE event.canonical_payload IS NOT NULL
+   AND NOT EXISTS (
        SELECT 1
-         FROM shiba_internal.v2_ingress_rollbacks AS rollback
+         FROM shiba_internal.ingress_rollbacks AS rollback
         WHERE rollback.ingress_txn_id = event.ingress_txn_id
           AND rollback.from_input_seq <= event.input_seq
           AND event.input_seq < rollback.through_input_seq
  );
 
 -- Routing examines this bounded-per-source set rather than rescanning payload.
-CREATE TABLE shiba_internal.v2_ingress_sources (
+CREATE TABLE shiba_internal.ingress_sources (
     ingress_txn_id bigint NOT NULL
-        REFERENCES shiba_internal.v2_ingress_transactions(ingress_txn_id)
+        REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
         ON DELETE CASCADE,
     source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
     PRIMARY KEY (ingress_txn_id, source_oid)
 );
 
-CREATE INDEX shiba_v2_ingress_sources_source_idx
-    ON shiba_internal.v2_ingress_sources (source_oid, ingress_txn_id);
+CREATE INDEX shiba_ingress_sources_source_idx
+    ON shiba_internal.ingress_sources (source_oid, ingress_txn_id);
 
 -- Commit creates one task only.  subscriber_cursor is the last result OID
 -- routed by keyset pagination; zero means that no subscriber has been visited.
-CREATE TABLE shiba_internal.v2_routing_tasks (
+CREATE TABLE shiba_internal.routing_tasks (
     ingress_txn_id bigint PRIMARY KEY,
     commit_lsn pg_lsn NOT NULL,
     subscriber_cursor oid NOT NULL DEFAULT 0::oid,
@@ -604,15 +568,33 @@ CREATE TABLE shiba_internal.v2_routing_tasks (
     completed_at timestamptz,
     last_error text,
     FOREIGN KEY (ingress_txn_id, commit_lsn)
-        REFERENCES shiba_internal.v2_ingress_transactions
+        REFERENCES shiba_internal.ingress_transactions
                    (ingress_txn_id, commit_lsn)
         ON DELETE CASCADE,
     CHECK ((status = 'complete') = (completed_at IS NOT NULL)),
     CHECK ((status = 'failed') = (last_error IS NOT NULL))
 );
 
-CREATE INDEX shiba_v2_routing_tasks_ready_idx
-    ON shiba_internal.v2_routing_tasks (commit_lsn, ingress_txn_id)
+CREATE INDEX shiba_routing_tasks_ready_idx
+    ON shiba_internal.routing_tasks (commit_lsn, ingress_txn_id)
     WHERE status IN ('pending', 'routing');
+
+-- A DAG inbox row references the ingress transaction directly. Payload is
+-- never copied per DAG, and RESTRICT prevents GC while any DAG still needs it.
+CREATE TABLE shiba_internal.dag_inbox (
+    result_oid oid NOT NULL
+        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
+    ingress_txn_id bigint NOT NULL,
+    commit_lsn pg_lsn NOT NULL,
+    PRIMARY KEY (result_oid, ingress_txn_id),
+    UNIQUE (result_oid, commit_lsn),
+    FOREIGN KEY (ingress_txn_id, commit_lsn)
+        REFERENCES shiba_internal.ingress_transactions
+                   (ingress_txn_id, commit_lsn)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX shiba_dag_inbox_commit_idx
+    ON shiba_internal.dag_inbox (commit_lsn);
 
 INSERT INTO shiba_internal.runtime_state (singleton) VALUES (true);
