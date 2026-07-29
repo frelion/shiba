@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_streaming_tags_and_flags() {
-        for tag in [b's', b'e', b'a'] {
+        for tag in *b"sea" {
             assert_eq!(
                 parse(&[tag]),
                 Err("unsupported or truncated pgoutput message")
