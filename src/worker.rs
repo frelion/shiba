@@ -72,7 +72,7 @@ pub unsafe fn install_runtime_wakeup_callback() {
     pg_sys::RegisterXactCallback(Some(runtime_wakeup_xact_callback), std::ptr::null_mut());
 }
 
-#[pg_guard]
+#[cfg_attr(not(test), pg_guard)]
 unsafe extern "C-unwind" fn runtime_wakeup_xact_callback(
     event: pg_sys::XactEvent::Type,
     _arg: *mut std::ffi::c_void,
