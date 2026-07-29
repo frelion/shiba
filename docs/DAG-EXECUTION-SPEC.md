@@ -104,7 +104,9 @@ exist.
 
 ```text
 PostgreSQL postmaster
-  -> shiba runtime (one BGW per active database)
+  -> logical walsender (one PostgreSQL-owned backend per active database)
+       -> pgoutput protocol v2 over a replication connection
+  -> shiba runtime (one Shiba BGW per active database)
        -> bounded ingress step
        -> DAG scheduler
             -> DAG A / runnable task
@@ -117,6 +119,8 @@ PostgreSQL postmaster
 The Runtime:
 
 - MUST use one SPI-connected backend;
+- MUST own one replication-protocol client connection whose server side is a
+  PostgreSQL walsender;
 - MUST execute only one Shiba work quantum at a time;
 - MUST set `max_parallel_workers_per_gather = 0` for v2 so a Shiba SQL program
   cannot silently create PostgreSQL parallel-query workers;
@@ -126,9 +130,10 @@ The Runtime:
   a configured bounded LRU;
 - MUST treat every backend-local cache as disposable after restart.
 
-This topology bounds Shiba-owned execution concurrency to one. It does not
-reserve a CPU core: the operating system schedules the Runtime like any other
-PostgreSQL backend.
+This topology bounds Shiba-owned execution concurrency to one. The walsender
+is PostgreSQL-owned transport and decoding infrastructure; it never executes a
+Shiba DAG or writes Shiba tables. Neither backend reserves a CPU core: the
+operating system schedules them like other PostgreSQL backends.
 
 The Runtime is dynamically registered. A backend crash while the postmaster
 stays up uses the configured BGW restart path. Dynamic registration itself does
@@ -263,11 +268,19 @@ segments. It MUST NOT require a transaction-sized Rust collection, a
 transaction-sized JSON value, or one Shiba database transaction containing the
 complete source payload.
 
-The target is one long-lived logical decoding context inside the Runtime BGW,
-using `pgoutput`, protocol version 2, and `streaming = on`. The context lives
-outside ordinary SPI work-quantum transactions and is resumed across scheduler
-turns. Streamed transaction blocks are provisional until a `Stream Commit` is
-received.
+The target is one long-lived logical decoding context in a PostgreSQL
+walsender, using `pgoutput`, protocol version 2, and `streaming = on`. The
+Runtime BGW is the replication client. It receives complete wire messages,
+persists them with ordinary short SPI transactions, and multiplexes ingestion
+with DAG scheduling. Streamed transaction blocks are provisional until a
+`Stream Commit` is received.
+
+The replication connection and the Runtime's SPI connection are distinct
+PostgreSQL backend sessions. The Runtime MUST NOT hold an SPI transaction open
+while waiting for network or replication input. Connection setup and
+authentication MUST be explicit deployment configuration; credentials MUST
+use PostgreSQL-supported passfile, certificate, or peer mechanisms rather than
+being persisted in Shiba catalog rows.
 
 The production ingress MUST NOT repeatedly call the SQL
 `pg_logical_slot_*_changes` SRFs:
@@ -285,12 +298,11 @@ The production ingress MUST NOT repeatedly call the SQL
 The SQL interface MAY be used by a feasibility test, but it is not the target
 data path.
 
-Logical decoding output callbacks MUST NOT write Shiba tables or perform any
-operation that assigns an XID. They copy complete messages into a bounded
-memory buffer backed, when necessary, by a disposable PostgreSQL temporary
-file. On `Stream Stop`, normal transaction Commit, Stream Commit, or Stream
-Abort, the decoder stops and hands the completed decode block to the ingress
-transaction described below.
+The walsender's logical-decoding output callbacks never write Shiba tables.
+The Runtime copies only complete replication messages into a bounded ingress
+batch. A batch ends at a configured byte/row budget or at `Stream Stop`,
+normal Commit, Stream Commit, or Stream Abort. One individual tuple or
+protocol message is the indivisible memory unit.
 
 ### 7.2 Durable ingress model
 
@@ -301,7 +313,7 @@ ingress_transactions(
   ingress_txn_id,
   slot_generation,
   xid,
-  first_stream_lsn,
+  identity_lsn,
   status,                 -- open | committed | aborted
   commit_lsn,
   end_lsn,
@@ -387,17 +399,17 @@ conflicting payload for the same WAL event identity is corruption.
 
 ### 7.3 Decode-block transaction
 
-For one complete decode block the Runtime MUST:
+For one complete replication batch the Runtime MUST:
 
-1. stop logical decoding at a Stream Stop, Commit, Stream Commit, or Stream
-   Abort boundary;
-2. parse the buffered messages incrementally;
+1. read only complete replication messages and stop at a batch budget or a
+   Stream Stop, Commit, Stream Commit, or Stream Abort boundary;
+2. parse the messages incrementally;
 3. lock or create the ingress transaction header;
 4. insert the decode-batch descriptor and its payload idempotently;
 5. advance `next_input_seq` and statistics;
 6. commit the LOGGED payload;
-7. only after that commit, call
-   `LogicalConfirmReceivedLocation(decode_end_lsn)`;
+7. only after that commit, send a replication Standby Status Update whose
+   flush/apply LSN does not exceed `decode_end_lsn`;
 8. yield to DAG scheduling and GC before decoding another block when their
    budgets require a turn.
 
@@ -437,12 +449,12 @@ an open or aborted ingress transaction.
 PostgreSQL's logical-decoding C API is internal rather than a stable extension
 ABI. Before v2 ingress implementation is accepted, a focused spike MUST prove:
 
-1. a decoding context can remain valid across alternating decode turns and
-   pgrx `BackgroundWorker::transaction` SPI turns;
-2. ResourceOwner, snapshot, syscache, and publication state are clean across
-   those turns;
-3. protocol-v2 Stream blocks can be stopped, persisted, confirmed, and resumed
-   without rebuilding the prior WAL prefix;
+1. a same-backend persistent decoding context is either proven safe across
+   ordinary SPI transactions or rejected before any unsafe XID assignment;
+2. the replication-protocol fallback can maintain one walsender decoding
+   context while the Runtime independently executes short SPI transactions;
+3. protocol-v2 Stream blocks can be received, persisted, confirmed, and
+   resumed without rebuilding the prior WAL prefix;
 4. output callbacks can use a bounded buffer or disposable spill file without
    table writes or XID assignment;
 5. persisted event identity is stable under crash replay, multi-insert records,
@@ -463,11 +475,13 @@ decode-block or RSS ceiling. The resource contract therefore includes the
 largest indivisible tuple/WAL record, and the spike MUST measure actual block
 size.
 
-If the persistent-context spike fails, the most credible fallback is the
-logical replication protocol. That preserves one Shiba Runtime BGW but adds a
-PostgreSQL walsender/replication connection. If “one process in the entire
-system” is absolute, PostgreSQL 17 offers no stable public interface that also
-provides bounded, recoverable, preemptible, linear-time decoding. The
+The same-backend persistent-context spike failed on PostgreSQL 17:
+`PROC_IN_LOGICAL_DECODING` excludes that backend's XID from ordinary snapshot
+construction until the slot is released. Therefore the logical replication
+protocol fallback is normative for v2. It preserves one Shiba Runtime BGW but
+adds a PostgreSQL walsender/replication connection. If “one process in the
+entire system” is absolute, PostgreSQL 17 offers no supported interface that
+also provides bounded, recoverable, preemptible, linear-time decoding. The
 implementation MUST surface that conflict rather than retaining protocol
 version 1 and claiming bounded ingress.
 

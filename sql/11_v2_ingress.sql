@@ -117,7 +117,8 @@ $$;
 CREATE FUNCTION shiba_internal.v2_claim_ingress_txn(
     p_slot_generation bigint,
     p_source_xid bigint,
-    p_first_stream_lsn pg_lsn
+    p_streamed boolean,
+    p_identity_lsn pg_lsn
 )
 RETURNS TABLE (
     ingress_txn_id bigint,
@@ -137,7 +138,8 @@ DECLARE
 BEGIN
     IF p_slot_generation IS NULL
        OR p_source_xid IS NULL
-       OR p_first_stream_lsn IS NULL THEN
+       OR p_streamed IS NULL
+       OR p_identity_lsn IS NULL THEN
         RAISE EXCEPTION USING
             ERRCODE = '22004',
             MESSAGE = 'v2 ingress transaction identity must not contain NULL';
@@ -166,14 +168,16 @@ BEGIN
     INSERT INTO shiba_internal.v2_ingress_transactions (
         slot_generation,
         source_xid,
-        first_stream_lsn
+        streamed,
+        identity_lsn
     )
     VALUES (
         p_slot_generation,
         p_source_xid,
-        p_first_stream_lsn
+        p_streamed,
+        p_identity_lsn
     )
-    ON CONFLICT (slot_generation, source_xid, first_stream_lsn)
+    ON CONFLICT (slot_generation, source_xid, streamed, identity_lsn)
         DO NOTHING
     RETURNING v2_ingress_transactions.ingress_txn_id
          INTO v_ingress_txn_id;
@@ -187,7 +191,8 @@ BEGIN
           FROM shiba_internal.v2_ingress_transactions AS txn
          WHERE txn.slot_generation = p_slot_generation
            AND txn.source_xid = p_source_xid
-           AND txn.first_stream_lsn = p_first_stream_lsn
+           AND txn.streamed = p_streamed
+           AND txn.identity_lsn = p_identity_lsn
          FOR UPDATE;
     END IF;
 
@@ -224,7 +229,8 @@ AS $$
 DECLARE
     v_slot_generation bigint;
     v_status text;
-    v_first_stream_lsn pg_lsn;
+    v_streamed boolean;
+    v_identity_lsn pg_lsn;
     v_next_input_seq bigint;
     v_existing_source_subxid bigint;
     v_existing_source_oid oid;
@@ -278,10 +284,12 @@ BEGIN
     -- Lock-order level 2.  This serializes input_seq allocation for one source
     -- transaction and makes replay retain the first allocation.
     SELECT txn.status,
-           txn.first_stream_lsn,
+           txn.streamed,
+           txn.identity_lsn,
            txn.next_input_seq
       INTO STRICT v_status,
-                  v_first_stream_lsn,
+                  v_streamed,
+                  v_identity_lsn,
                   v_next_input_seq
       FROM shiba_internal.v2_ingress_transactions AS txn
      WHERE txn.ingress_txn_id = p_ingress_txn_id
@@ -297,13 +305,13 @@ BEGIN
             );
     END IF;
 
-    IF p_change_lsn < v_first_stream_lsn THEN
+    IF v_streamed AND p_change_lsn < v_identity_lsn THEN
         RAISE EXCEPTION USING
             ERRCODE = '22023',
             MESSAGE = format(
-                'event LSN %s precedes transaction first-stream LSN %s',
+                'event LSN %s precedes transaction identity LSN %s',
                 p_change_lsn,
-                v_first_stream_lsn
+                v_identity_lsn
             );
     END IF;
 
@@ -540,7 +548,8 @@ DECLARE
     v_slot_generation bigint;
     v_source_xid bigint;
     v_status text;
-    v_first_stream_lsn pg_lsn;
+    v_streamed boolean;
+    v_identity_lsn pg_lsn;
     v_next_input_seq bigint;
     v_existing_subxid bigint;
     v_existing_control_lsn pg_lsn;
@@ -591,11 +600,13 @@ BEGIN
 
     SELECT txn.source_xid,
            txn.status,
-           txn.first_stream_lsn,
+           txn.streamed,
+           txn.identity_lsn,
            txn.next_input_seq
       INTO STRICT v_source_xid,
                   v_status,
-                  v_first_stream_lsn,
+                  v_streamed,
+                  v_identity_lsn,
                   v_next_input_seq
       FROM shiba_internal.v2_ingress_transactions AS txn
      WHERE txn.ingress_txn_id = p_ingress_txn_id
@@ -611,6 +622,15 @@ BEGIN
             );
     END IF;
 
+    IF NOT v_streamed THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = format(
+                'cannot roll back a subtransaction of ordinary ingress transaction %s',
+                p_ingress_txn_id
+            );
+    END IF;
+
     IF v_source_xid IS DISTINCT FROM p_top_xid THEN
         RAISE EXCEPTION USING
             ERRCODE = 'XX001',
@@ -622,13 +642,13 @@ BEGIN
             );
     END IF;
 
-    IF p_control_lsn < v_first_stream_lsn THEN
+    IF p_control_lsn < v_identity_lsn THEN
         RAISE EXCEPTION USING
             ERRCODE = '22023',
             MESSAGE = format(
-                'rollback control LSN %s precedes transaction first-stream LSN %s',
+                'rollback control LSN %s precedes transaction identity LSN %s',
                 p_control_lsn,
-                v_first_stream_lsn
+                v_identity_lsn
             );
     END IF;
 
@@ -834,7 +854,8 @@ AS $$
 DECLARE
     v_slot_generation bigint;
     v_status text;
-    v_first_stream_lsn pg_lsn;
+    v_streamed boolean;
+    v_identity_lsn pg_lsn;
     v_existing_commit_lsn pg_lsn;
     v_existing_end_lsn pg_lsn;
 BEGIN
@@ -858,13 +879,15 @@ BEGIN
      FOR UPDATE;
 
     SELECT txn.status,
-           txn.first_stream_lsn,
+           txn.streamed,
+           txn.identity_lsn,
            txn.commit_lsn,
            txn.end_lsn,
            txn.event_count,
            txn.payload_bytes
       INTO STRICT v_status,
-                  v_first_stream_lsn,
+                  v_streamed,
+                  v_identity_lsn,
                   v_existing_commit_lsn,
                   v_existing_end_lsn,
                   event_count,
@@ -873,14 +896,16 @@ BEGIN
      WHERE txn.ingress_txn_id = p_ingress_txn_id
      FOR UPDATE;
 
-    IF p_commit_lsn < v_first_stream_lsn OR p_end_lsn < p_commit_lsn THEN
+    IF (v_streamed AND p_commit_lsn < v_identity_lsn)
+       OR (NOT v_streamed AND p_commit_lsn <> v_identity_lsn)
+       OR p_end_lsn < p_commit_lsn THEN
         RAISE EXCEPTION USING
             ERRCODE = '22023',
             MESSAGE = format(
                 'invalid commit/end LSNs %s/%s for transaction beginning at %s',
                 p_commit_lsn,
                 p_end_lsn,
-                v_first_stream_lsn
+                v_identity_lsn
             );
     END IF;
 
@@ -961,7 +986,8 @@ AS $$
 DECLARE
     v_slot_generation bigint;
     v_status text;
-    v_first_stream_lsn pg_lsn;
+    v_streamed boolean;
+    v_identity_lsn pg_lsn;
     v_existing_end_lsn pg_lsn;
 BEGIN
     IF p_ingress_txn_id IS NULL OR p_end_lsn IS NULL THEN
@@ -982,12 +1008,14 @@ BEGIN
      FOR UPDATE;
 
     SELECT txn.status,
-           txn.first_stream_lsn,
+           txn.streamed,
+           txn.identity_lsn,
            txn.end_lsn,
            txn.event_count,
            txn.payload_bytes
       INTO STRICT v_status,
-                  v_first_stream_lsn,
+                  v_streamed,
+                  v_identity_lsn,
                   v_existing_end_lsn,
                   event_count,
                   payload_bytes
@@ -995,13 +1023,22 @@ BEGIN
      WHERE txn.ingress_txn_id = p_ingress_txn_id
      FOR UPDATE;
 
-    IF p_end_lsn < v_first_stream_lsn THEN
+    IF NOT v_streamed THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = format(
+                'ordinary ingress transaction %s cannot receive StreamAbort',
+                p_ingress_txn_id
+            );
+    END IF;
+
+    IF p_end_lsn < v_identity_lsn THEN
         RAISE EXCEPTION USING
             ERRCODE = '22023',
             MESSAGE = format(
-                'abort LSN %s precedes transaction first-stream LSN %s',
+                'abort LSN %s precedes transaction identity LSN %s',
                 p_end_lsn,
-                v_first_stream_lsn
+                v_identity_lsn
             );
     END IF;
 
@@ -1151,7 +1188,7 @@ REVOKE ALL ON FUNCTION
     shiba_internal.v2_ensure_ingress_generation(name)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
-    shiba_internal.v2_claim_ingress_txn(bigint, bigint, pg_lsn)
+    shiba_internal.v2_claim_ingress_txn(bigint, bigint, boolean, pg_lsn)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
     shiba_internal.v2_insert_ingress_event(

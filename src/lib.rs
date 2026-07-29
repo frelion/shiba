@@ -4,6 +4,7 @@ mod config;
 mod ddl;
 mod filter;
 mod index_management;
+mod ingress;
 mod logical;
 mod pgoutput;
 pub mod query_analysis;
@@ -26,9 +27,15 @@ pgrx::extension_sql_file!(
 );
 
 pgrx::extension_sql_file!(
+    "../sql/11_v2_ingress.sql",
+    name = "shiba_v2_ingress",
+    requires = ["shiba_runtime"],
+);
+
+pgrx::extension_sql_file!(
     "../sql/20_operator_filters.sql",
     name = "shiba_operator_filters",
-    requires = ["shiba_runtime"],
+    requires = ["shiba_v2_ingress"],
 );
 
 pgrx::extension_sql_file!(

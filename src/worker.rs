@@ -4,7 +4,7 @@
 //! garbage collection are bounded phases of one SPI-connected PostgreSQL
 //! backend. A DAG runtime is plan metadata, never a process or thread.
 
-use crate::{config, logical, pgoutput};
+use crate::{config, ingress, logical, pgoutput, replication};
 use pgrx::bgworkers::*;
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
@@ -146,6 +146,7 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
         return;
     }
     BackgroundWorker::transaction(configure_runtime_session);
+    let mut v2_ingress = initialize_v2_ingress();
 
     log!("Shiba Runtime started for database {database_name}");
     let runtimes = Mutex::new(DeterministicLru::<pg_sys::Oid, logical::DagRuntime>::new(
@@ -166,9 +167,15 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
         }
         reload_config_if_requested();
 
-        let routed = match route_bounded_burst() {
-            RuntimePhase::Inactive => break 'runtime,
-            RuntimePhase::Worked(count) => count,
+        let routed = match v2_ingress.as_mut() {
+            Some(v2_ingress) => match route_v2_ingress_once(v2_ingress) {
+                RuntimePhase::Inactive => break 'runtime,
+                RuntimePhase::Worked(count) => count,
+            },
+            None => match route_bounded_burst() {
+                RuntimePhase::Inactive => break 'runtime,
+                RuntimePhase::Worked(count) => count,
+            },
         };
 
         let Some(ready_dags) = BackgroundWorker::transaction(|| {
@@ -229,6 +236,351 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
 enum RuntimePhase {
     Inactive,
     Worked(usize),
+}
+
+struct V2IngressRuntime {
+    generation: i64,
+    ingress: ingress::ReplicationIngress,
+    persisted_lsn: u64,
+    pending_feedback: Option<u64>,
+    queued_feedback: Option<u64>,
+}
+
+struct V2IngressBootstrap {
+    generation: i64,
+    slot_name: String,
+    start_lsn: u64,
+    open_streams: Vec<(u32, u64)>,
+}
+
+fn initialize_v2_ingress() -> Option<V2IngressRuntime> {
+    let conninfo = config::replication_conninfo()?;
+    let conninfo = conninfo
+        .to_str()
+        .expect("shiba.replication_conninfo is not valid UTF-8");
+    let bootstrap = BackgroundWorker::transaction(bootstrap_v2_ingress);
+    let mut transport =
+        replication::ReplicationTransport::connect(conninfo).unwrap_or_else(|error| {
+            panic!("Shiba could not connect its v2 replication client: {error}")
+        });
+    transport
+        .start_replication(replication::StartReplicationOptions {
+            slot: &bootstrap.slot_name,
+            start_lsn: bootstrap.start_lsn,
+            publication_names: &["shiba_publication"],
+        })
+        .unwrap_or_else(|error| panic!("Shiba could not start v2 logical replication: {error}"));
+    Some(V2IngressRuntime {
+        generation: bootstrap.generation,
+        ingress: ingress::ReplicationIngress::new(transport, bootstrap.open_streams),
+        persisted_lsn: bootstrap.start_lsn,
+        pending_feedback: None,
+        queued_feedback: None,
+    })
+}
+
+fn bootstrap_v2_ingress() -> V2IngressBootstrap {
+    let slot_name = Spi::get_one::<String>("SELECT shiba_internal.slot_name()::text")
+        .expect("Shiba could not read its logical slot name")
+        .expect("Shiba logical slot name is NULL");
+    let slot_argument = unsafe { [DatumWithOid::new(slot_name.as_str(), pg_sys::TEXTOID)] };
+    let generation = Spi::get_one_with_args::<i64>(
+        "SELECT slot_generation
+         FROM shiba_internal.v2_ensure_ingress_generation($1::name)",
+        &slot_argument,
+    )
+    .expect("Shiba could not initialize its v2 ingress generation")
+    .expect("v2 ingress generation initialization returned no row");
+    let generation_argument = unsafe { [DatumWithOid::new(generation, pg_sys::INT8OID)] };
+    let persisted_lsn = Spi::get_one_with_args::<String>(
+        "SELECT coalesce(persisted_lsn, '0/0'::pg_lsn)::text
+         FROM shiba_internal.v2_feedback_upper_bound($1)",
+        &generation_argument,
+    )
+    .expect("Shiba could not read its v2 durable ingress position")
+    .expect("v2 ingress generation has no feedback state");
+    let open_streams = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT source_xid, identity_lsn::text
+                 FROM shiba_internal.v2_ingress_transactions
+                 WHERE slot_generation = $1
+                   AND status = 'open'
+                   AND streamed
+                 ORDER BY source_xid, identity_lsn",
+                None,
+                &generation_argument,
+            )
+            .expect("Shiba could not restore open v2 ingress transactions")
+            .map(|row| {
+                let xid = row
+                    .get::<i64>(1)
+                    .expect("invalid v2 source xid")
+                    .expect("NULL v2 source xid");
+                let xid = u32::try_from(xid).expect("v2 source xid exceeds uint32");
+                let first_lsn = row
+                    .get::<String>(2)
+                    .expect("invalid v2 first stream LSN")
+                    .expect("NULL v2 first stream LSN");
+                (
+                    xid,
+                    parse_lsn(&first_lsn).expect("invalid durable v2 first stream LSN"),
+                )
+            })
+            .collect()
+    });
+    V2IngressBootstrap {
+        generation,
+        slot_name,
+        start_lsn: parse_lsn(&persisted_lsn).expect("invalid durable v2 ingress LSN"),
+        open_streams,
+    }
+}
+
+fn route_v2_ingress_once(runtime: &mut V2IngressRuntime) -> RuntimePhase {
+    if !BackgroundWorker::transaction(runtime_is_active) {
+        return RuntimePhase::Inactive;
+    }
+
+    flush_v2_feedback(runtime);
+    let budget = ingress::IngressBudget {
+        max_events: config::ingress_batch_rows(),
+        max_wire_bytes: config::ingress_batch_bytes(),
+    };
+    match runtime
+        .ingress
+        .poll_batch(budget)
+        .unwrap_or_else(|error| panic!("Shiba v2 ingress failed: {error}"))
+    {
+        ingress::IngressPoll::Batch(batch) => {
+            let persisted_lsn = BackgroundWorker::transaction(|| {
+                persist_v2_ingress_batch(runtime.generation, &batch)
+            });
+            #[cfg(any(test, feature = "pg_test"))]
+            if let Some(pause) = BackgroundWorker::transaction(|| {
+                let decode_lsn = format_lsn(batch.decode_end_lsn);
+                test_failpoints::claim(
+                    "runtime_v2_ingress_before_feedback",
+                    None,
+                    Some(&decode_lsn),
+                )
+            }) {
+                std::thread::sleep(pause);
+                panic!(
+                    "Shiba test failpoint: Runtime exited after v2 ingress commit and before replication feedback"
+                );
+            }
+            runtime.persisted_lsn = runtime.persisted_lsn.max(persisted_lsn);
+            runtime.pending_feedback = Some(runtime.persisted_lsn);
+            flush_v2_feedback(runtime);
+            RuntimePhase::Worked(1)
+        }
+        ingress::IngressPoll::Pending { reply_requested } => {
+            if reply_requested {
+                runtime.pending_feedback = Some(runtime.persisted_lsn);
+                flush_v2_feedback(runtime);
+            }
+            RuntimePhase::Worked(0)
+        }
+        ingress::IngressPoll::End => {
+            panic!("Shiba v2 replication connection ended unexpectedly")
+        }
+    }
+}
+
+fn flush_v2_feedback(runtime: &mut V2IngressRuntime) {
+    if let Some(queued_lsn) = runtime.queued_feedback {
+        match runtime
+            .ingress
+            .transport_mut()
+            .flush()
+            .unwrap_or_else(|error| {
+                panic!("Shiba could not flush v2 replication feedback: {error}")
+            }) {
+            replication::WriteStatus::Flushed => {
+                record_v2_feedback(runtime.generation, queued_lsn);
+                runtime.queued_feedback = None;
+            }
+            replication::WriteStatus::PendingFlush => return,
+            replication::WriteStatus::WouldBlock => {
+                panic!("libpq flush returned an impossible WouldBlock status")
+            }
+        }
+    }
+
+    let Some(feedback_lsn) = runtime.pending_feedback.take() else {
+        return;
+    };
+    match runtime
+        .ingress
+        .transport_mut()
+        // Durable ingress is the receiver's write/flush point.  It is not the
+        // DAG apply point; reporting it as apply could incorrectly satisfy a
+        // synchronous_commit=remote_apply source transaction.
+        .send_standby_status(feedback_lsn, feedback_lsn, 0, false)
+        .unwrap_or_else(|error| panic!("Shiba could not send v2 replication feedback: {error}"))
+    {
+        replication::WriteStatus::Flushed => {
+            record_v2_feedback(runtime.generation, feedback_lsn);
+        }
+        replication::WriteStatus::PendingFlush => {
+            runtime.queued_feedback = Some(feedback_lsn);
+        }
+        replication::WriteStatus::WouldBlock => {
+            runtime.pending_feedback = Some(feedback_lsn);
+        }
+    }
+}
+
+fn record_v2_feedback(generation: i64, feedback_lsn: u64) {
+    let feedback_lsn = format_lsn(feedback_lsn);
+    BackgroundWorker::transaction(|| {
+        let arguments = unsafe {
+            [
+                DatumWithOid::new(generation, pg_sys::INT8OID),
+                DatumWithOid::new(feedback_lsn.as_str(), pg_sys::TEXTOID),
+            ]
+        };
+        Spi::run_with_args(
+            "SELECT shiba_internal.v2_record_ingress_feedback($1, $2::pg_lsn)",
+            &arguments,
+        )
+        .expect("Shiba could not record v2 replication feedback");
+    });
+}
+
+fn persist_v2_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> u64 {
+    let identity_lsn = format_lsn(batch.identity_lsn);
+    let claim_arguments = unsafe {
+        [
+            DatumWithOid::new(generation, pg_sys::INT8OID),
+            DatumWithOid::new(i64::from(batch.source_xid), pg_sys::INT8OID),
+            DatumWithOid::new(batch.streamed, pg_sys::BOOLOID),
+            DatumWithOid::new(identity_lsn.as_str(), pg_sys::TEXTOID),
+        ]
+    };
+    let ingress_txn_id = Spi::get_one_with_args::<i64>(
+        "SELECT ingress_txn_id
+         FROM shiba_internal.v2_claim_ingress_txn($1, $2, $3, $4::pg_lsn)",
+        &claim_arguments,
+    )
+    .expect("Shiba could not claim a v2 ingress transaction")
+    .expect("v2 ingress transaction claim returned no row");
+
+    let events = Value::Array(
+        batch
+            .events
+            .iter()
+            .map(|event| {
+                serde_json::json!({
+                    "change_lsn": format_lsn(event.change_lsn),
+                    "change_ordinal": event.change_ordinal,
+                    "image_ordinal": event.image_ordinal,
+                    "source_subxid": event.source_subxid,
+                    "source_oid": event.source_oid,
+                    "weight": event.weight,
+                    "typed_payload": event.payload,
+                })
+            })
+            .collect(),
+    )
+    .to_string();
+    let event_arguments = unsafe {
+        [
+            DatumWithOid::new(ingress_txn_id, pg_sys::INT8OID),
+            DatumWithOid::new(events.as_str(), pg_sys::TEXTOID),
+        ]
+    };
+    Spi::run_with_args(
+        "SELECT shiba_internal.v2_insert_ingress_events($1, $2::jsonb)",
+        &event_arguments,
+    )
+    .expect("Shiba could not persist a bounded v2 ingress event batch");
+
+    let decode_end_lsn = format_lsn(batch.decode_end_lsn);
+    let digest = batch.digest.to_vec();
+    let batch_arguments = unsafe {
+        [
+            DatumWithOid::new(generation, pg_sys::INT8OID),
+            DatumWithOid::new(decode_end_lsn.as_str(), pg_sys::TEXTOID),
+            DatumWithOid::new(digest, pg_sys::BYTEAOID),
+            DatumWithOid::new(
+                i64::try_from(batch.events.len()).expect("v2 event batch exceeds bigint"),
+                pg_sys::INT8OID,
+            ),
+            DatumWithOid::new(
+                i64::try_from(batch.wire_bytes).expect("v2 wire-byte count exceeds bigint"),
+                pg_sys::INT8OID,
+            ),
+        ]
+    };
+    Spi::run_with_args(
+        "SELECT shiba_internal.v2_record_ingress_batch($1, $2::pg_lsn, $3, $4, $5)",
+        &batch_arguments,
+    )
+    .expect("Shiba could not checkpoint a bounded v2 ingress batch");
+
+    match &batch.finalization {
+        Some(ingress::IngressFinalization::Commit {
+            commit_lsn,
+            end_lsn,
+        }) => {
+            let commit_lsn = format_lsn(*commit_lsn);
+            let end_lsn = format_lsn(*end_lsn);
+            let arguments = unsafe {
+                [
+                    DatumWithOid::new(ingress_txn_id, pg_sys::INT8OID),
+                    DatumWithOid::new(commit_lsn.as_str(), pg_sys::TEXTOID),
+                    DatumWithOid::new(end_lsn.as_str(), pg_sys::TEXTOID),
+                ]
+            };
+            Spi::run_with_args(
+                "SELECT shiba_internal.v2_commit_ingress_txn(
+                     $1, $2::pg_lsn, $3::pg_lsn
+                 )",
+                &arguments,
+            )
+            .expect("Shiba could not finalize a committed v2 ingress transaction");
+        }
+        Some(ingress::IngressFinalization::Abort { end_lsn }) => {
+            let end_lsn = format_lsn(*end_lsn);
+            let arguments = unsafe {
+                [
+                    DatumWithOid::new(ingress_txn_id, pg_sys::INT8OID),
+                    DatumWithOid::new(end_lsn.as_str(), pg_sys::TEXTOID),
+                ]
+            };
+            Spi::run_with_args(
+                "SELECT shiba_internal.v2_abort_ingress_txn($1, $2::pg_lsn)",
+                &arguments,
+            )
+            .expect("Shiba could not finalize an aborted v2 ingress transaction");
+        }
+        Some(ingress::IngressFinalization::SubtransactionAbort {
+            subxid,
+            control_lsn,
+        }) => {
+            let control_lsn = format_lsn(*control_lsn);
+            let arguments = unsafe {
+                [
+                    DatumWithOid::new(ingress_txn_id, pg_sys::INT8OID),
+                    DatumWithOid::new(i64::from(batch.source_xid), pg_sys::INT8OID),
+                    DatumWithOid::new(i64::from(*subxid), pg_sys::INT8OID),
+                    DatumWithOid::new(control_lsn.as_str(), pg_sys::TEXTOID),
+                ]
+            };
+            Spi::run_with_args(
+                "SELECT shiba_internal.v2_rollback_ingress_subxact(
+                     $1, $2, $3, $4::pg_lsn
+                 )",
+                &arguments,
+            )
+            .expect("Shiba could not persist a v2 streamed subtransaction rollback");
+        }
+        None => {}
+    }
+
+    batch.decode_end_lsn
 }
 
 fn route_bounded_burst() -> RuntimePhase {
@@ -947,20 +1299,37 @@ fn peek_and_route_wal_transactions(max_transactions: usize) -> Option<RoutedBurs
                     is_new,
                 });
             }
-            pgoutput::Message::Relation { relid, columns } => {
+            pgoutput::Message::Relation {
+                source_xid: None,
+                relid,
+                columns,
+            } => {
                 relations.insert(relid, columns);
             }
-            pgoutput::Message::Insert { relid, row } => {
+            pgoutput::Message::Insert {
+                source_xid: None,
+                relid,
+                row,
+            } => {
                 let row = tuple_to_json(relid, row, &relations).expect("invalid inserted tuple");
                 route_delta(&mut route, relid, 1, row);
             }
-            pgoutput::Message::Update { relid, old, new } => {
+            pgoutput::Message::Update {
+                source_xid: None,
+                relid,
+                old,
+                new,
+            } => {
                 let old = tuple_to_json(relid, old, &relations).expect("invalid old tuple");
                 route_delta(&mut route, relid, -1, old);
                 let new = tuple_to_json(relid, new, &relations).expect("invalid new tuple");
                 route_delta(&mut route, relid, 1, new);
             }
-            pgoutput::Message::Delete { relid, old } => {
+            pgoutput::Message::Delete {
+                source_xid: None,
+                relid,
+                old,
+            } => {
                 let row = tuple_to_json(relid, old, &relations).expect("invalid deleted tuple");
                 route_delta(&mut route, relid, -1, row);
             }
@@ -989,6 +1358,32 @@ fn peek_and_route_wal_transactions(max_transactions: usize) -> Option<RoutedBurs
                 if transaction_count >= max_transactions {
                     break;
                 }
+            }
+            pgoutput::Message::StreamStart { .. }
+            | pgoutput::Message::StreamStop
+            | pgoutput::Message::StreamCommit { .. }
+            | pgoutput::Message::StreamAbort { .. }
+            | pgoutput::Message::Relation {
+                source_xid: Some(_),
+                ..
+            }
+            | pgoutput::Message::Type { .. }
+            | pgoutput::Message::Origin { .. }
+            | pgoutput::Message::LogicalMessage { .. }
+            | pgoutput::Message::Insert {
+                source_xid: Some(_),
+                ..
+            }
+            | pgoutput::Message::Update {
+                source_xid: Some(_),
+                ..
+            }
+            | pgoutput::Message::Delete {
+                source_xid: Some(_),
+                ..
+            }
+            | pgoutput::Message::Truncate { .. } => {
+                panic!("Shiba protocol-v1 router received a protocol-v2 stream message")
             }
         }
     }
@@ -1187,6 +1582,13 @@ fn format_lsn(lsn: u64) -> String {
     format!("{:X}/{:X}", lsn >> 32, lsn & 0xffff_ffff)
 }
 
+fn parse_lsn(lsn: &str) -> Result<u64, &'static str> {
+    let (high, low) = lsn.split_once('/').ok_or("LSN is missing slash")?;
+    let high = u32::from_str_radix(high, 16).map_err(|_| "invalid high LSN word")?;
+    let low = u32::from_str_radix(low, 16).map_err(|_| "invalid low LSN word")?;
+    Ok((u64::from(high) << 32) | u64::from(low))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1250,6 +1652,11 @@ mod tests {
         assert_eq!(format_lsn(u32::MAX as u64), "0/FFFFFFFF");
         assert_eq!(format_lsn(1_u64 << 32), "1/0");
         assert_eq!(format_lsn(u64::MAX), "FFFFFFFF/FFFFFFFF");
+        for lsn in [0, 1, u32::MAX as u64, 1_u64 << 32, u64::MAX] {
+            assert_eq!(parse_lsn(&format_lsn(lsn)), Ok(lsn));
+        }
+        assert!(parse_lsn("not-an-lsn").is_err());
+        assert!(parse_lsn("100000000/0").is_err());
     }
 
     #[test]

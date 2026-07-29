@@ -1,6 +1,7 @@
 //! PostgreSQL GUCs for bounding Runtime process resource use.
 
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
+use std::ffi::CString;
 
 const DEFAULT_RUNTIME_WORK_MEM_KB: i32 = 16 * 1024;
 const MIN_RUNTIME_WORK_MEM_KB: i32 = 64;
@@ -30,6 +31,14 @@ const DEFAULT_MAX_COMMIT_BYTES: i32 = 1_073_741_824;
 const MIN_MAX_COMMIT_BYTES: i32 = 1;
 const MAX_MAX_COMMIT_BYTES: i32 = i32::MAX;
 
+const DEFAULT_INGRESS_BATCH_ROWS: i32 = 2_048;
+const MIN_INGRESS_BATCH_ROWS: i32 = 1;
+const MAX_INGRESS_BATCH_ROWS: i32 = 1_000_000;
+
+const DEFAULT_INGRESS_BATCH_BYTES: i32 = 16 * 1024 * 1024;
+const MIN_INGRESS_BATCH_BYTES: i32 = 1;
+const MAX_INGRESS_BATCH_BYTES: i32 = i32::MAX;
+
 static RUNTIME_WORK_MEM_KB: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_RUNTIME_WORK_MEM_KB);
 static RUNTIME_TEMP_FILE_LIMIT_KB: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_RUNTIME_TEMP_FILE_LIMIT_KB);
@@ -38,6 +47,9 @@ static STAGE_CHUNK_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_STAGE_
 static MAX_STAGE_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_STAGE_ROWS);
 static MAX_COMMIT_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_COMMIT_ROWS);
 static MAX_COMMIT_BYTES: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_COMMIT_BYTES);
+static INGRESS_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_BATCH_ROWS);
+static INGRESS_BATCH_BYTES: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_BATCH_BYTES);
+static REPLICATION_CONNINFO: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 pub fn init() {
     GucRegistry::define_int_guc(
@@ -110,6 +122,34 @@ pub fn init() {
         GucContext::Sighup,
         GucFlags::default(),
     );
+    GucRegistry::define_int_guc(
+        c"shiba.ingress_batch_rows",
+        c"Target maximum row images in one v2 ingress transaction.",
+        c"One individual replication message or tuple remains indivisible.",
+        &INGRESS_BATCH_ROWS,
+        MIN_INGRESS_BATCH_ROWS,
+        MAX_INGRESS_BATCH_ROWS,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"shiba.ingress_batch_bytes",
+        c"Target maximum pgoutput payload bytes in one v2 ingress transaction.",
+        c"One individual replication message or tuple may exceed this target.",
+        &INGRESS_BATCH_BYTES,
+        MIN_INGRESS_BATCH_BYTES,
+        MAX_INGRESS_BATCH_BYTES,
+        GucContext::Sighup,
+        GucFlags::UNIT_BYTE,
+    );
+    GucRegistry::define_string_guc(
+        c"shiba.replication_conninfo",
+        c"libpq connection parameters for the v2 logical replication connection.",
+        c"Use passfile, certificate, or peer authentication; do not place an inline password here.",
+        &REPLICATION_CONNINFO,
+        GucContext::Sighup,
+        GucFlags::SUPERUSER_ONLY,
+    );
 }
 
 pub fn runtime_work_mem_kb() -> i32 {
@@ -123,6 +163,20 @@ pub fn runtime_temp_file_limit_kb() -> i32 {
 pub fn max_cached_dags() -> usize {
     usize::try_from(MAX_CACHED_DAGS.get())
         .expect("shiba.max_cached_dags passed PostgreSQL range validation")
+}
+
+pub fn ingress_batch_rows() -> usize {
+    usize::try_from(INGRESS_BATCH_ROWS.get())
+        .expect("shiba.ingress_batch_rows passed PostgreSQL range validation")
+}
+
+pub fn ingress_batch_bytes() -> usize {
+    usize::try_from(INGRESS_BATCH_BYTES.get())
+        .expect("shiba.ingress_batch_bytes passed PostgreSQL range validation")
+}
+
+pub fn replication_conninfo() -> Option<CString> {
+    REPLICATION_CONNINFO.get()
 }
 
 pub fn format_kilobytes(value: i32) -> String {
@@ -154,5 +208,10 @@ mod tests {
         assert!((MIN_MAX_STAGE_ROWS..=MAX_MAX_STAGE_ROWS).contains(&DEFAULT_MAX_STAGE_ROWS));
         assert!((MIN_MAX_COMMIT_ROWS..=MAX_MAX_COMMIT_ROWS).contains(&DEFAULT_MAX_COMMIT_ROWS));
         assert!((MIN_MAX_COMMIT_BYTES..=MAX_MAX_COMMIT_BYTES).contains(&DEFAULT_MAX_COMMIT_BYTES));
+        assert!(
+            (MIN_INGRESS_BATCH_ROWS..=MAX_INGRESS_BATCH_ROWS).contains(&DEFAULT_INGRESS_BATCH_ROWS)
+        );
+        assert!((MIN_INGRESS_BATCH_BYTES..=MAX_INGRESS_BATCH_BYTES)
+            .contains(&DEFAULT_INGRESS_BATCH_BYTES));
     }
 }

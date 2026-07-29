@@ -329,7 +329,19 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_publication WHERE pubname = 'shiba_publication'
     ) THEN
-        CREATE PUBLICATION shiba_publication;
+        -- V2 has bounded row-delta kernels but no bounded TRUNCATE kernel.
+        -- Exclude TRUNCATE at the publication boundary instead of accepting
+        -- a message the Runtime cannot apply correctly.
+        CREATE PUBLICATION shiba_publication
+          WITH (publish = 'insert, update, delete');
+    ELSIF EXISTS (
+        SELECT 1
+        FROM pg_publication
+        WHERE pubname = 'shiba_publication'
+          AND pubtruncate
+    ) THEN
+        ALTER PUBLICATION shiba_publication
+          SET (publish = 'insert, update, delete');
     END IF;
     UPDATE shiba_internal.runtime_state
     SET active = true,

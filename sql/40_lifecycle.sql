@@ -819,7 +819,8 @@ BEGIN
         RAISE EXCEPTION 'publication shiba_publication already exists; choose a clean database or remove the conflicting publication'
             USING ERRCODE = 'duplicate_object';
     END IF;
-    CREATE PUBLICATION shiba_publication;
+    CREATE PUBLICATION shiba_publication
+      WITH (publish = 'insert, update, delete');
 END;
 $$;
 

@@ -403,9 +403,8 @@ CREATE UNIQUE INDEX shiba_v2_ingress_active_slot_idx
     ON shiba_internal.v2_ingress_replay_state (database_oid, slot_name)
     WHERE state = 'active';
 
--- Open transactions cannot be keyed by commit LSN because it is unknown until
--- Stream Commit.  first_stream_lsn separates wrapped/reused 32-bit XIDs within
--- one slot generation.
+-- Ordinary transactions use Begin.final_lsn as identity. Streamed transactions
+-- use the first observed segment LSN because their commit LSN is not known yet.
 CREATE TABLE shiba_internal.v2_ingress_transactions (
     ingress_txn_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     slot_generation bigint NOT NULL
@@ -413,7 +412,8 @@ CREATE TABLE shiba_internal.v2_ingress_transactions (
         ON DELETE RESTRICT,
     source_xid bigint NOT NULL
         CHECK (source_xid BETWEEN 0 AND 4294967295),
-    first_stream_lsn pg_lsn NOT NULL,
+    streamed boolean NOT NULL,
+    identity_lsn pg_lsn NOT NULL,
     status text NOT NULL DEFAULT 'open'
         CHECK (status IN ('open', 'committed', 'aborted')),
     commit_lsn pg_lsn,
@@ -423,7 +423,7 @@ CREATE TABLE shiba_internal.v2_ingress_transactions (
     payload_bytes bigint NOT NULL DEFAULT 0 CHECK (payload_bytes >= 0),
     opened_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     finalized_at timestamptz,
-    UNIQUE (slot_generation, source_xid, first_stream_lsn),
+    UNIQUE (slot_generation, source_xid, streamed, identity_lsn),
     UNIQUE (ingress_txn_id, commit_lsn),
     CHECK (next_input_seq = event_count + 1),
     CHECK (
@@ -436,14 +436,18 @@ CREATE TABLE shiba_internal.v2_ingress_transactions (
           AND commit_lsn IS NOT NULL
           AND end_lsn IS NOT NULL
           AND finalized_at IS NOT NULL
-          AND first_stream_lsn <= commit_lsn
+          AND (
+              (streamed AND identity_lsn <= commit_lsn)
+              OR (NOT streamed AND identity_lsn = commit_lsn)
+          )
           AND commit_lsn <= end_lsn)
         OR
         (status = 'aborted'
+          AND streamed
           AND commit_lsn IS NULL
           AND end_lsn IS NOT NULL
           AND finalized_at IS NOT NULL
-          AND first_stream_lsn <= end_lsn)
+          AND identity_lsn <= end_lsn)
     )
 );
 
@@ -455,7 +459,7 @@ CREATE UNIQUE INDEX shiba_v2_ingress_commit_lsn_idx
 
 CREATE INDEX shiba_v2_ingress_open_txn_idx
     ON shiba_internal.v2_ingress_transactions
-       (slot_generation, source_xid, first_stream_lsn)
+       (slot_generation, source_xid, streamed, identity_lsn)
     WHERE status = 'open';
 
 -- A batch is the durability and feedback unit, not the event identity.  A
