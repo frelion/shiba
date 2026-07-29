@@ -115,8 +115,8 @@ unsafe fn wake_backend_latch(owner_pid: i32) {
 #[cfg(test)]
 unsafe fn wake_backend_latch(_owner_pid: i32) {}
 
-#[pg_guard]
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), pg_guard)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGINT);
     // Use PostgreSQL's normal backend SIGTERM handler. The pgrx deferred

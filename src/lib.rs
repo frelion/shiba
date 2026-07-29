@@ -13,16 +13,24 @@
 
 use pgrx::prelude::*;
 
+// A plain Rust unit-test binary is not loaded by PostgreSQL. Keep the
+// extension-only runtime graph unexported there so Linux can discard its
+// unresolved PostgreSQL server symbols at link time.
+#[cfg_attr(test, allow(dead_code))]
 mod config;
 mod ddl;
 mod index_management;
+#[cfg_attr(test, allow(dead_code))]
 mod ingress;
+#[cfg_attr(test, allow(dead_code))]
 mod logical;
 mod pgoutput;
 mod postgres;
 mod query_analysis;
 mod query_tree;
+#[cfg_attr(test, allow(dead_code))]
 mod replication;
+#[cfg_attr(test, allow(dead_code))]
 mod worker;
 
 ::pgrx::pg_module_magic!();
