@@ -173,7 +173,7 @@ BEGIN
            count(*) FILTER (WHERE event.source_oid=left_source_oid),
            count(*) FILTER (WHERE event.source_oid=right_source_oid)
     INTO applicable_events,left_event_count,right_event_count
-    FROM shiba_internal.change_log event
+    FROM shiba_internal.all_change_log event
     WHERE event.commit_lsn=p_commit_lsn
       AND event.source_oid IN (left_source_oid,right_source_oid);
     IF applicable_events=0 THEN
@@ -346,7 +346,7 @@ BEGIN
                ) AS join_key,
                event.row_data,
                sum(event.delta)::bigint AS weight
-        FROM shiba_internal.change_log event
+        FROM shiba_internal.all_change_log event
         CROSS JOIN LATERAL (
           SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
         ) input
@@ -364,7 +364,7 @@ BEGIN
                ) AS join_key,
                event.row_data,
                sum(event.delta)::bigint AS weight
-        FROM shiba_internal.change_log event
+        FROM shiba_internal.all_change_log event
         CROSS JOIN LATERAL (
           SELECT jsonb_populate_record(NULL::%4$s,event.row_data) AS row
         ) input
@@ -629,7 +629,7 @@ BEGIN
                ) AS join_key,
                event.row_data,
                event.delta::bigint AS multiplicity_delta
-        FROM shiba_internal.change_log event
+        FROM shiba_internal.all_change_log event
         CROSS JOIN LATERAL (
           SELECT jsonb_populate_record(
             NULL::%1$s,event.row_data
@@ -648,7 +648,7 @@ BEGIN
                ) AS join_key,
                event.row_data,
                event.delta::bigint AS multiplicity_delta
-        FROM shiba_internal.change_log event
+        FROM shiba_internal.all_change_log event
         CROSS JOIN LATERAL (
           SELECT jsonb_populate_record(
             NULL::%4$s,event.row_data

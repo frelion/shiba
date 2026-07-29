@@ -434,7 +434,7 @@ BEGIN
     IF execution_pipeline='aggregate' THEN
       IF NOT EXISTS (
         SELECT 1
-        FROM shiba_internal.change_log AS logged_event
+        FROM shiba_internal.all_change_log AS logged_event
         WHERE logged_event.commit_lsn=source_commit_lsn
           AND logged_event.source_oid=left_source_oid
       ) THEN
