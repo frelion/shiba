@@ -1654,7 +1654,6 @@ fn step_rebuild(
     let AggregatePhase::DrainRebuild {
         group_queue_id,
         aggregate_ordinal,
-        after: _,
         ..
     } = stored.value.phase
     else {

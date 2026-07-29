@@ -4,99 +4,75 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+reject_matches() {
+  local pattern="$1"
+  local message="$2"
+  shift 2
+
+  local matches
+  local status
+  set +e
+  matches="$(git grep --untracked -n -E -e "$pattern" -- "$@" 2>&1)"
+  status=$?
+  set -e
+
+  if test "$status" -eq 0; then
+    printf '%s\n%s\n' "$matches" "$message" >&2
+    exit 1
+  fi
+  if test "$status" -ne 1; then
+    printf '%s\n' "$matches" >&2
+    exit "$status"
+  fi
+}
+
 old_symbols='ExecutionPipeline|ExecutionDescriptor|QueryAnalysis|ValidatedQuery|LogicalPlan|LogicalNode|LogicalEdge|PhysicalDagPlan|physical_plan|physical_stage_id|explain_physical|DagRuntime|max_cached_dags|DagStep|NextApplyOutcome|compile_physical_plan|index_ddl_invoker|query_text|target_query_text|_register_(stream|inner_join|subquery|window|distinct|topn)_stream_table|_begin_stream_registration|_prepare_stream_drop|_apply_next_dag_change_log|_apply_claimed_dag_batch|_step_operator|_provision_[a-z_]+|checkpoint_operator|peek_effect_stream|aggregate_catalog_capability|trusted_slot_type_sql|trusted_btree_comparison|shiba_internal\.(stream_views|inner_join_views|stream_graphs|stream_graph_nodes|stream_graph_edges|stream_filters|stream_having|stream_join_filters|join_arrangements|aggregate_state|distinct_state|window_views|window_rows|distinct_views|projection_state|topn_views|topn_rows|physical_plans|physical_stages|operator_instances|dag_runtime_state|ingress_decode_batches|view_progress|dag_inbox|routing_tasks)\b|shiba_physical_stages|quarantined|resource_blocked'
 
-if matches="$(
-  rg -n "$old_symbols" \
-    src sql scripts docs README.md CONTRIBUTING.md \
-    -g '!scripts/test-clean-cut.sh'
-)"; then
-  printf '%s\n' "$matches" >&2
-  printf '%s\n' \
-    "old execution architecture is still present in code, tests, or docs" >&2
-  exit 1
-fi
-
-if matches="$(rg -n 'own\.row_value|existing\.row_value' src/kernel/join.rs)"; then
-  printf '%s\n' "$matches" >&2
-  printf '%s\n' \
-    "Join own-row identity must use its indexed binary row_key" >&2
-  exit 1
-fi
-
-if matches="$(rg -n 'record_send\(input_row\.row_value\)' src/kernel/join.rs)"; then
-  printf '%s\n' "$matches" >&2
-  printf '%s\n' \
-    "Join input identity must canonicalize through canonical_row_key_sql" >&2
-  exit 1
-fi
-
-if matches="$(rg -n 'aggregate_seen|Aggregate DISTINCT.*seen state' src/kernel)"; then
-  printf '%s\n' "$matches" >&2
-  printf '%s\n' \
-    "Aggregate DISTINCT must use its ordered durable tuple cursor, not an unbounded seen relation" >&2
-  exit 1
-fi
-
-if matches="$(rg -n 'IS NOT DISTINCT FROM' src/kernel/distinct.rs)"; then
-  printf '%s\n' "$matches" >&2
-  printf '%s\n' \
-    "Distinct SQL keys must use their resolved exact B-tree equality" >&2
-  exit 1
-fi
-
-if matches="$(
-  rg -n 'pg_catalog\.record_send' src/kernel -g '!storage.rs'
-)"; then
-  printf '%s\n' "$matches" >&2
-  printf '%s\n' \
-    "kernel row identity must use the shared canonical_row_key_sql helper" >&2
-  exit 1
-fi
-
-if matches="$(
-  rg -n 'jsonb_populate_record|to_jsonb' src/kernel/storage.rs
-)"; then
-  printf '%s\n' "$matches" >&2
-  printf '%s\n' \
-    "canonical row identity must use one named-composite text roundtrip" >&2
-  exit 1
-fi
-
-if matches="$(rg -n 'pg_catalog\.to_jsonb' sql/11_ingress.sql)"; then
-  printf '%s\n' "$matches" >&2
-  printf '%s\n' \
-    "ingress must retain original per-column pgoutput text JSON" >&2
-  exit 1
-fi
-
-if matches="$(
-  rg -n 'jsonb_populate_record|to_jsonb|pg_column_size' \
-    sql/12_effect_stream.sql
-)"; then
-  printf '%s\n' "$matches" >&2
-  printf '%s\n' \
-    "effect row bytes must measure the complete binary record" >&2
-  exit 1
-fi
-
-if matches="$(
-  rg -n \
-    'fn (topn_index_order|window_index_order|resolve_order|resolve_window_order|resolve_binary_operator|resolve_window_binary_operator)\b' \
-    src/kernel
-)"; then
-  printf '%s\n' "$matches" >&2
-  printf '%s\n' \
-    "ordered kernels must use the shared B-tree capability resolver" >&2
-  exit 1
-fi
-
-if matches="$(rg -n '#\[cfg\(any\(\)\)\]|\bobsolete\b' src/kernel)"; then
-  printf '%s\n' "$matches" >&2
-  printf '%s\n' \
-    "disabled or obsolete kernel paths must be deleted, not retained" >&2
-  exit 1
-fi
+reject_matches \
+  "$old_symbols" \
+  "old execution architecture is still present in code, tests, or docs" \
+  src sql scripts docs README.md CONTRIBUTING.md \
+  ':(exclude)scripts/test-clean-cut.sh'
+reject_matches \
+  'own\.row_value|existing\.row_value' \
+  "Join own-row identity must use its indexed binary row_key" \
+  src/kernel/join.rs
+reject_matches \
+  'record_send\(input_row\.row_value\)' \
+  "Join input identity must canonicalize through canonical_row_key_sql" \
+  src/kernel/join.rs
+reject_matches \
+  'aggregate_seen|Aggregate DISTINCT.*seen state' \
+  "Aggregate DISTINCT must use its ordered durable tuple cursor, not an unbounded seen relation" \
+  src/kernel
+reject_matches \
+  'IS NOT DISTINCT FROM' \
+  "Distinct SQL keys must use their resolved exact B-tree equality" \
+  src/kernel/distinct.rs
+reject_matches \
+  'pg_catalog\.record_send' \
+  "kernel row identity must use the shared canonical_row_key_sql helper" \
+  src/kernel ':(exclude)src/kernel/storage.rs'
+reject_matches \
+  'jsonb_populate_record|to_jsonb' \
+  "canonical row identity must use one named-composite text roundtrip" \
+  src/kernel/storage.rs
+reject_matches \
+  'pg_catalog\.to_jsonb' \
+  "ingress must retain original per-column pgoutput text JSON" \
+  sql/11_ingress.sql
+reject_matches \
+  'jsonb_populate_record|to_jsonb|pg_column_size' \
+  "effect row bytes must measure the complete binary record" \
+  sql/12_effect_stream.sql
+reject_matches \
+  'fn (topn_index_order|window_index_order|resolve_order|resolve_window_order|resolve_binary_operator|resolve_window_binary_operator)\b' \
+  "ordered kernels must use the shared B-tree capability resolver" \
+  src/kernel
+reject_matches \
+  '#\[cfg\(any\(\)\)\]|\bobsolete\b' \
+  "disabled or obsolete kernel paths must be deleted, not retained" \
+  src/kernel
 
 for removed_file in \
   src/query_analysis.rs \
