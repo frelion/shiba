@@ -8,6 +8,7 @@ mod logical;
 mod pgoutput;
 pub mod query_analysis;
 mod query_tree;
+pub mod replication;
 mod worker;
 
 ::pgrx::pg_module_magic!();

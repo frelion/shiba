@@ -2,6 +2,7 @@
 name = "shiba"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 license = "PostgreSQL"
 description = "Single-node incremental materialized views for PostgreSQL"
 repository = "https://github.com/frelion/shiba"
