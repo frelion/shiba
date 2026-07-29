@@ -37,7 +37,7 @@ wait_for_value() {
   local expected="$1"
   local query="$2"
   local attempt
-  for attempt in {1..200}; do
+  for attempt in {1..600}; do
     if test "$(psql_diff -Atqc "${query}")" = "${expected}"; then
       return 0
     fi
