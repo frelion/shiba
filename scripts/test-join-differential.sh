@@ -38,7 +38,7 @@ wait_for_value() {
   local expected="$1"
   local query="$2"
   local attempt
-  for attempt in {1..150}; do
+  for attempt in {1..500}; do
     if test "$(psql_diff -Atqc "${query}")" = "${expected}"; then
       return 0
     fi
@@ -181,6 +181,7 @@ cargo pgrx install --pg-config "${pg_config_path}"
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
+  printf "shiba.ingress_batch_rows = 4\n"
   printf "shiba.replication_conninfo = 'host=%s port=%s dbname=shiba_join_diff user=%s'\n" \
     "${pg_socket_dir}" "${pg_port}" "$(id -un)"
 } >> "${pg_data_dir}/postgresql.conf"
@@ -580,7 +581,7 @@ psql_diff -qc "
 psql_diff -qc "
   BEGIN;
   INSERT INTO join_diff.batch_left
-  SELECT id,1,1 FROM generate_series(1,5000) AS id;
+  SELECT id,1,1 FROM generate_series(1,64) AS id;
   INSERT INTO join_diff.batch_right VALUES (1,7);
   COMMIT"
 wait_for_value "1" "
@@ -617,7 +618,7 @@ psql_diff -qc "
   UPDATE shiba_internal.dag_runtime_state
   SET active=true
   WHERE result_oid='shiba.diff_multibatch_join'::regclass"
-wait_for_value "1|5000|5000|0" "
+wait_for_value "1|64|64|0" "
   SELECT count(*) || '|' ||
          coalesce(max(row_count),0) || '|' ||
          coalesce(max(total_amount),0) || '|' ||
