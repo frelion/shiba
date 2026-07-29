@@ -1,0 +1,66 @@
+name: Performance smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PG_CONFIG: /usr/lib/postgresql/17/bin/pg_config
+
+jobs:
+  smoke:
+    name: PostgreSQL 17 smoke artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install PostgreSQL 17
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo \"$VERSION_CODENAME\")-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-17 postgresql-client-17 postgresql-server-dev-17
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust and pgrx artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: ~/.pgrx
+
+      - name: Install and initialize cargo-pgrx
+        run: |
+          cargo install cargo-pgrx --version 0.19.1 --locked
+          cargo pgrx init --pg17 "$PG_CONFIG"
+
+      - name: Allow extension installation
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" \
+            "$("$PG_CONFIG" --sharedir)/extension" \
+            "$("$PG_CONFIG" --pkglibdir)"
+
+      - name: Run performance smoke matrix
+        run: |
+          ./scripts/performance-matrix.py run \
+            --manifest benchmarks/matrix.json \
+            --profile smoke \
+            --output artifacts/performance-smoke.json \
+            --csv artifacts/performance-smoke.csv
+
+      - name: Upload performance artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-smoke
+          path: artifacts/
+          if-no-files-found: error

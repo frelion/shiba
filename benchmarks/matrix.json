@@ -1,0 +1,8 @@
+{
+  "cases": [
+    {
+      "name": "postgresql17",
+      "command": "./scripts/performance-benchmark.sh"
+    }
+  ]
+}
