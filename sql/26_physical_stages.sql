@@ -393,6 +393,67 @@ BEGIN
 END;
 $$;
 
+-- Shared operator-private fold Stages are also emptied before the DAG commit.
+-- Reclaim their heap/index files only after coarse growth, using one global
+-- lifecycle lock because the relations are shared across result OIDs.
+CREATE FUNCTION shiba_internal._compact_shared_fold_stages(
+    threshold_bytes bigint DEFAULT 67108864
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba_internal
+AS $$
+DECLARE
+    stage_name text;
+    stage_oid regclass;
+    stage_empty boolean;
+    compacted integer := 0;
+BEGIN
+    IF threshold_bytes IS NULL OR threshold_bytes<=0 THEN
+      RAISE EXCEPTION 'invalid shared Stage compaction request'
+        USING ERRCODE='invalid_parameter_value';
+    END IF;
+    -- Compaction is best-effort maintenance.  Never let it delay Runtime
+    -- shutdown, DAG apply, or another database lifecycle operation.
+    IF NOT pg_try_advisory_xact_lock(
+      shiba_internal.identity_lock_namespace(),1
+    ) THEN
+      RETURN 0;
+    END IF;
+    FOREACH stage_name IN ARRAY ARRAY[
+      'shiba_internal.aggregate_group_fold_stage',
+      'shiba_internal.aggregate_distinct_fold_stage',
+      'shiba_internal.distinct_fold_stage'
+    ]
+    LOOP
+      stage_oid := to_regclass(stage_name);
+      IF stage_oid IS NULL THEN
+        RAISE EXCEPTION 'Shiba shared Stage % is missing',stage_name
+          USING ERRCODE='P0S01';
+      END IF;
+      IF pg_total_relation_size(stage_oid)>=threshold_bytes THEN
+        BEGIN
+          EXECUTE format(
+            'LOCK TABLE %s IN ACCESS EXCLUSIVE MODE NOWAIT',stage_oid
+          );
+          EXECUTE format(
+            'SELECT NOT EXISTS (SELECT 1 FROM %s LIMIT 1)',stage_oid
+          ) INTO STRICT stage_empty;
+          IF stage_empty THEN
+            EXECUTE format('TRUNCATE TABLE %s',stage_oid);
+            compacted := compacted+1;
+          END IF;
+        EXCEPTION
+          WHEN lock_not_available THEN
+            CONTINUE;
+        END;
+      END IF;
+    END LOOP;
+    RETURN compacted;
+END;
+$$;
+
 CREATE FUNCTION shiba.explain_physical(result_table regclass)
 RETURNS jsonb
 LANGUAGE sql
@@ -428,4 +489,6 @@ REVOKE ALL ON FUNCTION shiba._physical_stage_name(oid,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION shiba_internal._validate_physical_stages(oid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION shiba._truncate_physical_stages(oid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION shiba_internal._compact_physical_stages(oid,bigint)
+FROM PUBLIC;
+REVOKE ALL ON FUNCTION shiba_internal._compact_shared_fold_stages(bigint)
 FROM PUBLIC;

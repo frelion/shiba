@@ -212,6 +212,8 @@ cargo pgrx install --release --pg-config "${pg_config_path}" \
   printf "shared_buffers = '1GB'\n"
   printf "work_mem = '64MB'\n"
   printf "maintenance_work_mem = '256MB'\n"
+  printf "shiba.runtime_work_mem = '64MB'\n"
+  printf "shiba.runtime_temp_file_limit = '1GB'\n"
   printf "max_wal_size = '4GB'\n"
   printf "checkpoint_timeout = '30min'\n"
   printf "synchronous_commit = on\n"

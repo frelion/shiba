@@ -265,6 +265,48 @@ AS $$
     WHERE progress.result_oid = result_table::oid
 $$;
 
+-- Resume only a DAG paused by a configured resource ceiling.  Deterministic
+-- operator failures remain quarantined and require fixing/re-registering the
+-- definition rather than blindly replaying the same poison commit.
+CREATE FUNCTION shiba.resume(result_table regclass)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, shiba, shiba_internal
+AS $$
+DECLARE
+    resumed boolean;
+    dag_creator_oid oid;
+BEGIN
+    SELECT creator_oid INTO dag_creator_oid
+    FROM shiba_internal.stream_views
+    WHERE result_oid=result_table::oid;
+    IF dag_creator_oid IS NULL THEN
+      RETURN false;
+    END IF;
+    IF session_user::regrole::oid<>dag_creator_oid
+       AND NOT has_table_privilege(session_user,result_table,'UPDATE') THEN
+      RAISE EXCEPTION 'permission denied to resume Shiba DAG %',result_table
+        USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    PERFORM pg_advisory_xact_lock(
+      shiba_internal.dag_lock_key(result_table::oid)
+    );
+    UPDATE shiba_internal.dag_runtime_state
+    SET active = true,
+        last_error = NULL,
+        failed_at = NULL
+    WHERE result_oid = result_table::oid
+      AND NOT active
+      AND last_error LIKE '[53400] %'
+    RETURNING true INTO resumed;
+    IF coalesce(resumed,false) THEN
+      PERFORM shiba._ensure_runtime();
+    END IF;
+    RETURN coalesce(resumed,false);
+END;
+$$;
+
 -- Stop the current Runtime without waiting for it to observe transactional
 -- catalog changes.  Once this function acquires the Runtime identity as an
 -- xact lock, no existing or replacement Runtime can claim that identity before
@@ -783,3 +825,4 @@ $$;
 
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA shiba FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION shiba.progress(regclass) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION shiba.resume(regclass) TO PUBLIC;

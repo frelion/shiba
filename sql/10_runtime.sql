@@ -203,6 +203,18 @@ BEGIN
       ) USING p_commit_lsn,source_record.source_oid;
     END LOOP;
 
+    UPDATE shiba_internal.routed_transactions routed
+    SET event_count=payload.event_count,
+        payload_bytes=payload.payload_bytes
+    FROM (
+      SELECT count(*)::bigint AS event_count,
+             coalesce(sum(pg_column_size(event.row_data)),0)::bigint
+               AS payload_bytes
+      FROM shiba_internal.change_log event
+      WHERE event.commit_lsn=p_commit_lsn
+    ) payload
+    WHERE routed.commit_lsn=p_commit_lsn;
+
     -- One transaction-level fan-out replaces a catalog lookup and conflicting
     -- inbox insert for every source row in a large commit.
     INSERT INTO shiba_internal.dag_inbox (result_oid,commit_lsn)

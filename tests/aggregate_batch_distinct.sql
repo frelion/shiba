@@ -290,6 +290,16 @@ $test$;
 
 -- A net-zero key still cannot retract a value before it exists. The batch
 -- update must fail atomically even though its final multiplicity would be 0.
+ALTER SYSTEM SET shiba.stage_chunk_rows = '32';
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+DO $test$
+BEGIN
+  IF current_setting('shiba.stage_chunk_rows')::integer<>32 THEN
+    RAISE EXCEPTION 'test backend did not load the cross-chunk Stage setting';
+  END IF;
+END
+$test$;
 DO $test$
 BEGIN
   BEGIN

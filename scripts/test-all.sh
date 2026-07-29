@@ -30,5 +30,7 @@ run_gate "Single-Runtime architecture and shared-log test" \
   "${project_root}/scripts/test-executor-architecture.sh"
 run_gate "Deterministic Runtime failpoint recovery test" \
   "${project_root}/scripts/test-failpoint-recovery.sh"
+run_gate "Runtime resource-bound and low-work_mem test" \
+  "${project_root}/scripts/test-memory-bounds.sh"
 
 printf '\nAll Shiba correctness gates passed.\n'

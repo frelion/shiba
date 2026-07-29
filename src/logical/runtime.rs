@@ -25,6 +25,7 @@ pub enum LoadOutcome {
 pub enum NextApplyOutcome {
     Applied,
     Retry,
+    ResourceBlocked,
     Quarantined,
     Inactive,
     Idle,
@@ -120,7 +121,9 @@ impl DagRuntime {
             let commit_lsn = row.get::<String>(2).map_err(|error| error.to_string())?;
             let outcome = parse_next_apply_outcome(&outcome)?;
             let lsn_is_consistent = match outcome {
-                NextApplyOutcome::Applied | NextApplyOutcome::Quarantined => commit_lsn.is_some(),
+                NextApplyOutcome::Applied
+                | NextApplyOutcome::ResourceBlocked
+                | NextApplyOutcome::Quarantined => commit_lsn.is_some(),
                 // A retry after claiming work identifies the commit; a retry
                 // caused by a busy DAG advisory lock intentionally does not.
                 NextApplyOutcome::Retry => true,
@@ -178,6 +181,7 @@ fn parse_next_apply_outcome(outcome: &str) -> Result<NextApplyOutcome, String> {
     match outcome {
         "applied" => Ok(NextApplyOutcome::Applied),
         "retry" => Ok(NextApplyOutcome::Retry),
+        "resource_blocked" => Ok(NextApplyOutcome::ResourceBlocked),
         "quarantined" => Ok(NextApplyOutcome::Quarantined),
         "inactive" => Ok(NextApplyOutcome::Inactive),
         "idle" => Ok(NextApplyOutcome::Idle),
@@ -218,6 +222,10 @@ mod tests {
         assert_eq!(
             parse_next_apply_outcome("retry"),
             Ok(NextApplyOutcome::Retry)
+        );
+        assert_eq!(
+            parse_next_apply_outcome("resource_blocked"),
+            Ok(NextApplyOutcome::ResourceBlocked)
         );
         assert_eq!(
             parse_next_apply_outcome("quarantined"),

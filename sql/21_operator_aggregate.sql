@@ -397,14 +397,16 @@ BEGIN
 END;
 $$;
 
--- Canonical single-source aggregate executor.  A delta relation is a query
--- value, not a session-scoped scratch relation.  The statement below decodes
--- change_log once and lets PostgreSQL materialize or spill that relation.
+-- Canonical single-source aggregate executor.  Each statement handles at most
+-- stage_chunk_rows input rows or folded keys/groups.  The caller still
+-- owns one outer transaction for the complete DAG commit, so state, sink,
+-- progress, inbox acknowledgement, and Stage cleanup remain atomic.
 --
--- DISTINCT state, aggregate state, and the sink are changed by one dynamic
--- data-modifying statement because PostgreSQL cannot parameterize relation or
--- column identifiers.  Sink values come from transition, not from state rows
--- written by the same statement, whose changes are hidden by its snapshot.
+-- A chunk summary (total,min-prefix) is associative:
+--   total(a || b) = total(a) + total(b)
+--   min(a || b) = least(min(a), total(a) + min(b))
+-- This preserves ordered retraction validation while bounding each window,
+-- hash/group, MERGE, and sink statement by a configured chunk.
 CREATE FUNCTION shiba._apply_single_source_aggregate_temp_free(
     stream_view shiba_internal.stream_views,
     p_commit_lsn pg_lsn,
@@ -421,6 +423,18 @@ DECLARE
     having_sql text;
     visible_sql text;
     count_input_sql text;
+    chunk_rows integer := coalesce(
+      nullif(current_setting('shiba.stage_chunk_rows',true),'')::integer,
+      2048
+    );
+    max_stage_rows bigint := coalesce(
+      nullif(current_setting('shiba.max_stage_rows',true),'')::bigint,
+      1000000
+    );
+    lower_sequence integer := 0;
+    upper_sequence integer;
+    folded_rows bigint;
+    folded_work bigint := 0;
 BEGIN
     IF stream_view.view_kind <> 'aggregate' THEN
       RAISE EXCEPTION
@@ -473,283 +487,432 @@ BEGIN
       ELSE 'NULL::jsonb'
     END;
 
-    EXECUTE format(
-      $statement$
-      WITH decoded AS MATERIALIZED (
-        SELECT event.sequence AS ordinality,
-               event.delta::bigint AS row_count_delta,
-               coalesce(
-                 to_jsonb((input.row).%2$I),'null'::jsonb
-               ) AS group_key,
-               %3$s AS value_key,
-               CASE WHEN (input.row).%4$I IS NULL
-                 THEN 0 ELSE event.delta
-               END::bigint AS sum_nonnull_delta,
-               (
-                 event.delta
-                   * coalesce(((input.row).%4$I)::numeric,0)
-               )::numeric AS sum_delta
+    IF chunk_rows<1 OR max_stage_rows<1 THEN
+      RAISE EXCEPTION 'invalid Shiba Stage resource configuration'
+        USING ERRCODE='53400';
+    END IF;
+
+    -- A result advisory lock is held by the dispatcher.  Clearing every row
+    -- for that result prevents stale/re-entrant Stage data from being mixed
+    -- with this replay; an error rolls the cleanup back with the outer apply.
+    DELETE FROM shiba_internal.aggregate_distinct_fold_stage
+    WHERE result_oid=stream_view.result_oid;
+    DELETE FROM shiba_internal.aggregate_group_fold_stage
+    WHERE result_oid=stream_view.result_oid;
+
+    LOOP
+      SELECT max(chunk.sequence)
+      INTO upper_sequence
+      FROM (
+        SELECT event.sequence
         FROM shiba_internal.change_log event
-        CROSS JOIN LATERAL (
-          SELECT jsonb_populate_record(
-            NULL::%1$s,event.row_data
-          ) AS row
-        ) input
-        WHERE event.commit_lsn=$2
-          AND event.source_oid=$3
-          AND event.delta IN (-1,1)
-          AND jsonb_typeof(event.row_data)='object'
-          AND coalesce((%5$s),false)
-      ),
-      running AS (
-        SELECT event.*,
-               sum(event.row_count_delta) OVER (
-                 PARTITION BY event.group_key
-                 ORDER BY event.ordinality
-                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-               )::bigint AS row_count_prefix,
-               sum(event.sum_nonnull_delta) OVER (
-                 PARTITION BY event.group_key
-                 ORDER BY event.ordinality
-                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-               )::bigint AS sum_nonnull_prefix,
-               CASE WHEN $4
-                      AND event.value_key IS NOT NULL
-                      AND event.value_key<>'null'::jsonb
-                 THEN sum(event.row_count_delta) OVER (
-                   PARTITION BY event.group_key,event.value_key
+        WHERE event.commit_lsn=p_commit_lsn
+          AND event.source_oid=stream_view.source_oid
+          AND event.sequence>lower_sequence
+        ORDER BY event.sequence
+        LIMIT chunk_rows
+      ) chunk;
+      EXIT WHEN upper_sequence IS NULL;
+
+      EXECUTE format(
+        $fold$
+        WITH decoded AS MATERIALIZED (
+          SELECT event.sequence AS ordinality,
+                 event.delta::bigint AS row_count_delta,
+                 coalesce(
+                   to_jsonb((input.row).%2$I),'null'::jsonb
+                 ) AS group_key,
+                 %3$s AS value_key,
+                 CASE WHEN (input.row).%4$I IS NULL
+                   THEN 0 ELSE event.delta
+                 END::bigint AS sum_nonnull_delta,
+                 (
+                   event.delta
+                     * coalesce(((input.row).%4$I)::numeric,0)
+                 )::numeric AS sum_delta
+          FROM shiba_internal.change_log event
+          CROSS JOIN LATERAL (
+            SELECT jsonb_populate_record(
+              NULL::%1$s,event.row_data
+            ) AS row
+          ) input
+          WHERE event.commit_lsn=$2
+            AND event.source_oid=$3
+            AND event.sequence>$4
+            AND event.sequence<=$5
+            AND event.delta IN (-1,1)
+            AND jsonb_typeof(event.row_data)='object'
+            AND coalesce((%5$s),false)
+        ),
+        running AS MATERIALIZED (
+          SELECT event.*,
+                 sum(event.row_count_delta) OVER (
+                   PARTITION BY event.group_key
                    ORDER BY event.ordinality
                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                 )::bigint
-                 ELSE NULL::bigint
-               END AS multiplicity_prefix
-        FROM decoded event
-      ),
-      group_contribution AS MATERIALIZED (
-        SELECT event.group_key,
-               sum(event.row_count_delta)::bigint AS row_count_delta,
-               sum(event.sum_nonnull_delta)::bigint
-                 AS sum_nonnull_delta,
-               sum(event.sum_delta)::numeric AS sum_delta,
-               min(event.row_count_prefix)::bigint
-                 AS row_count_min_prefix,
-               min(event.sum_nonnull_prefix)::bigint
-                 AS sum_nonnull_min_prefix
-        FROM running event
-        GROUP BY event.group_key
-      ),
-      key_contribution AS MATERIALIZED (
-        SELECT event.group_key,event.value_key,
-               sum(event.row_count_delta)::bigint AS multiplicity_delta,
-               min(event.multiplicity_prefix)::bigint
-                 AS multiplicity_min_prefix
-        FROM running event
-        WHERE $4
-          AND event.value_key IS NOT NULL
-          AND event.value_key<>'null'::jsonb
-        GROUP BY event.group_key,event.value_key
-      ),
-      key_transition AS MATERIALIZED (
-        SELECT contribution.group_key,contribution.value_key,
-               coalesce(state.multiplicity,0)::bigint
-                 AS old_multiplicity,
-               (
-                 coalesce(state.multiplicity,0)
-                   + contribution.multiplicity_delta
-               )::bigint AS new_multiplicity,
-               shiba._assert_aggregate_transition(
-                 coalesce(state.multiplicity,0)
-                   + contribution.multiplicity_min_prefix>=0
-                 AND coalesce(state.multiplicity,0)
-                   + contribution.multiplicity_delta>=0
-               ) AS valid
-        FROM key_contribution contribution
-        LEFT JOIN shiba_internal.distinct_state state
-          ON state.result_oid=$1
-         AND state.group_key=contribution.group_key
-         AND state.value_key=contribution.value_key
-      ),
-      key_count_delta AS (
-        SELECT transition.group_key,
-               sum(
-                 CASE
-                   WHEN transition.old_multiplicity=0
-                    AND transition.new_multiplicity>0 THEN 1
-                   WHEN transition.old_multiplicity>0
-                    AND transition.new_multiplicity=0 THEN -1
-                   ELSE 0
-                 END
-               )::bigint AS count_value_delta
-        FROM key_transition transition
-        WHERE transition.valid
-        GROUP BY transition.group_key
-      ),
-      contribution AS MATERIALIZED (
-        SELECT grouped.group_key,grouped.row_count_delta,
-               CASE WHEN $4
-                 THEN coalesce(keys.count_value_delta,0)
-                 ELSE grouped.row_count_delta
-               END::bigint AS count_value_delta,
-               grouped.sum_nonnull_delta,grouped.sum_delta,
-               grouped.row_count_min_prefix,
-               grouped.sum_nonnull_min_prefix
-        FROM group_contribution grouped
-        LEFT JOIN key_count_delta keys USING (group_key)
-      ),
-      transition AS MATERIALIZED (
-        SELECT contribution.group_key,
-               (
-                 coalesce(state.row_count,0)
-                   + contribution.row_count_delta
-               )::bigint AS row_count,
-               (
-                 coalesce(state.count_value,0)
-                   + contribution.count_value_delta
-               )::bigint AS count_value,
-               (
-                 coalesce(state.sum_nonnull_count,0)
-                   + contribution.sum_nonnull_delta
-               )::bigint AS sum_nonnull_count,
-               (
-                 coalesce(state.sum_value,0)
-                   + contribution.sum_delta
-               )::numeric AS sum_value
-        FROM contribution
-        LEFT JOIN shiba_internal.aggregate_state state
-          ON state.result_oid=$1
-         AND state.group_key=contribution.group_key
-        WHERE shiba._assert_aggregate_transition(
-          coalesce(state.row_count,0)
-            + contribution.row_count_min_prefix>=0
-          AND coalesce(state.sum_nonnull_count,0)
-            + contribution.sum_nonnull_min_prefix>=0
-          AND coalesce(state.row_count,0)
-            + contribution.row_count_delta>=0
-          AND coalesce(state.count_value,0)
-            + contribution.count_value_delta>=0
-          AND coalesce(state.sum_nonnull_count,0)
-            + contribution.sum_nonnull_delta>=0
-          AND (
-            (
-              $4
-              AND coalesce(state.count_value,0)
-                    + contribution.count_value_delta
-                  <= coalesce(state.row_count,0)
-                       + contribution.row_count_delta
-            )
-            OR
-            (
-              NOT $4
-              AND coalesce(state.count_value,0)
-                    + contribution.count_value_delta
-                  = coalesce(state.row_count,0)
-                      + contribution.row_count_delta
-            )
+                 )::bigint AS row_count_prefix,
+                 sum(event.sum_nonnull_delta) OVER (
+                   PARTITION BY event.group_key
+                   ORDER BY event.ordinality
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                 )::bigint AS sum_nonnull_prefix,
+                 CASE WHEN $6
+                        AND event.value_key IS NOT NULL
+                        AND event.value_key<>'null'::jsonb
+                   THEN sum(event.row_count_delta) OVER (
+                     PARTITION BY event.group_key,event.value_key
+                     ORDER BY event.ordinality
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                   )::bigint
+                   ELSE NULL::bigint
+                 END AS multiplicity_prefix
+          FROM decoded event
+        ),
+        group_upsert AS (
+          INSERT INTO shiba_internal.aggregate_group_fold_stage (
+            result_oid,commit_lsn,group_key,row_count_delta,
+            row_count_min_prefix,count_value_delta,sum_nonnull_delta,
+            sum_nonnull_min_prefix,sum_delta
           )
-          AND coalesce(state.sum_nonnull_count,0)
-                + contribution.sum_nonnull_delta
-              <= coalesce(state.row_count,0)
-                   + contribution.row_count_delta
-          AND (
-            coalesce(state.row_count,0)
-              + contribution.row_count_delta<>0
-            OR (
-              coalesce(state.count_value,0)
-                + contribution.count_value_delta=0
-              AND coalesce(state.sum_nonnull_count,0)
-                + contribution.sum_nonnull_delta=0
-            )
+          SELECT $1,$2,event.group_key,
+                 sum(event.row_count_delta)::bigint,
+                 min(event.row_count_prefix)::bigint,
+                 CASE WHEN $6 THEN 0
+                   ELSE sum(event.row_count_delta)::bigint
+                 END,
+                 sum(event.sum_nonnull_delta)::bigint,
+                 min(event.sum_nonnull_prefix)::bigint,
+                 sum(event.sum_delta)::numeric
+          FROM running event
+          GROUP BY event.group_key
+          ON CONFLICT (result_oid,commit_lsn,group_key) DO UPDATE
+          SET row_count_min_prefix=least(
+                aggregate_group_fold_stage.row_count_min_prefix,
+                aggregate_group_fold_stage.row_count_delta
+                  + EXCLUDED.row_count_min_prefix
+              ),
+              row_count_delta=
+                aggregate_group_fold_stage.row_count_delta
+                  + EXCLUDED.row_count_delta,
+              count_value_delta=
+                aggregate_group_fold_stage.count_value_delta
+                  + EXCLUDED.count_value_delta,
+              sum_nonnull_min_prefix=least(
+                aggregate_group_fold_stage.sum_nonnull_min_prefix,
+                aggregate_group_fold_stage.sum_nonnull_delta
+                  + EXCLUDED.sum_nonnull_min_prefix
+              ),
+              sum_nonnull_delta=
+                aggregate_group_fold_stage.sum_nonnull_delta
+                  + EXCLUDED.sum_nonnull_delta,
+              sum_delta=
+                aggregate_group_fold_stage.sum_delta+EXCLUDED.sum_delta
+          RETURNING 1
+        ),
+        key_upsert AS (
+          INSERT INTO shiba_internal.aggregate_distinct_fold_stage (
+            result_oid,commit_lsn,group_key,value_key,
+            multiplicity_delta,multiplicity_min_prefix
           )
+          SELECT $1,$2,event.group_key,event.value_key,
+                 sum(event.row_count_delta)::bigint,
+                 min(event.multiplicity_prefix)::bigint
+          FROM running event
+          WHERE $6
+            AND event.value_key IS NOT NULL
+            AND event.value_key<>'null'::jsonb
+          GROUP BY event.group_key,event.value_key
+          ON CONFLICT (result_oid,commit_lsn,group_key,value_key) DO UPDATE
+          SET multiplicity_min_prefix=least(
+                aggregate_distinct_fold_stage.multiplicity_min_prefix,
+                aggregate_distinct_fold_stage.multiplicity_delta
+                  + EXCLUDED.multiplicity_min_prefix
+              ),
+              multiplicity_delta=
+                aggregate_distinct_fold_stage.multiplicity_delta
+                  + EXCLUDED.multiplicity_delta
+          RETURNING 1
         )
-      ),
-      distinct_merged AS (
-        MERGE INTO shiba_internal.distinct_state AS state
-        USING (
-          SELECT $1::oid AS result_oid,transition.group_key,
-                 transition.value_key,transition.new_multiplicity
-          FROM key_transition transition
-          WHERE transition.valid
-        ) AS next
-        ON state.result_oid=next.result_oid
-       AND state.group_key=next.group_key
-       AND state.value_key=next.value_key
-        WHEN MATCHED AND next.new_multiplicity=0 THEN DELETE
-        WHEN MATCHED THEN UPDATE
-          SET multiplicity=next.new_multiplicity
-        WHEN NOT MATCHED AND next.new_multiplicity>0 THEN
-          INSERT (result_oid,group_key,value_key,multiplicity)
-          VALUES (
-            next.result_oid,next.group_key,next.value_key,
-            next.new_multiplicity
-          )
-      ),
-      aggregate_merged AS (
-        MERGE INTO shiba_internal.aggregate_state AS state
-        USING (
-          SELECT $1::oid AS result_oid,transition.*
+        SELECT (SELECT count(*) FROM group_upsert)
+                 +(SELECT count(*) FROM key_upsert)
+        $fold$,
+        source_name,
+        stream_view.group_column,
+        count_input_sql,
+        stream_view.sum_input_column,
+        filter_sql
+      ) INTO STRICT folded_rows
+        USING stream_view.result_oid,p_commit_lsn,stream_view.source_oid,
+              lower_sequence,upper_sequence,stream_view.count_distinct;
+      folded_work := folded_work+folded_rows;
+      IF folded_work>max_stage_rows THEN
+        RAISE EXCEPTION
+          'Shiba aggregate commit % for result % exceeded Stage work limit %',
+          p_commit_lsn,stream_view.result_oid::regclass,max_stage_rows
+          USING ERRCODE='53400',
+                HINT='Increase shiba.max_stage_rows or split the source transaction.';
+      END IF;
+      lower_sequence := upper_sequence;
+    END LOOP;
+
+    -- DISTINCT keys are independent once their complete ordered summaries
+    -- have been folded.  Apply bounded key sets and accumulate zero-boundary
+    -- changes into the corresponding group summary.
+    IF stream_view.count_distinct THEN
+      LOOP
+        EXIT WHEN NOT EXISTS (
+          SELECT 1
+          FROM shiba_internal.aggregate_distinct_fold_stage
+          WHERE result_oid=stream_view.result_oid
+            AND commit_lsn=p_commit_lsn
+        );
+        WITH selected AS MATERIALIZED (
+          SELECT stage.group_key,stage.value_key,
+                 stage.multiplicity_delta,
+                 stage.multiplicity_min_prefix
+          FROM shiba_internal.aggregate_distinct_fold_stage stage
+          WHERE stage.result_oid=stream_view.result_oid
+            AND stage.commit_lsn=p_commit_lsn
+          ORDER BY stage.group_key,stage.value_key
+          LIMIT chunk_rows
+        ),
+        transition AS MATERIALIZED (
+          SELECT selected.*,
+                 coalesce(state.multiplicity,0)::bigint
+                   AS old_multiplicity,
+                 (
+                   coalesce(state.multiplicity,0)
+                     + selected.multiplicity_delta
+                 )::bigint AS new_multiplicity,
+                 shiba._assert_aggregate_transition(
+                   coalesce(state.multiplicity,0)
+                     + selected.multiplicity_min_prefix>=0
+                   AND coalesce(state.multiplicity,0)
+                     + selected.multiplicity_delta>=0
+                 ) AS valid
+          FROM selected
+          LEFT JOIN shiba_internal.distinct_state state
+            ON state.result_oid=stream_view.result_oid
+           AND state.group_key=selected.group_key
+           AND state.value_key=selected.value_key
+        ),
+        distinct_merged AS (
+          MERGE INTO shiba_internal.distinct_state AS state
+          USING (
+            SELECT stream_view.result_oid AS result_oid,
+                   transition.group_key,transition.value_key,
+                   transition.new_multiplicity
+            FROM transition
+            WHERE transition.valid
+          ) AS next
+          ON state.result_oid=next.result_oid
+         AND state.group_key=next.group_key
+         AND state.value_key=next.value_key
+          WHEN MATCHED AND next.new_multiplicity=0 THEN DELETE
+          WHEN MATCHED THEN UPDATE
+            SET multiplicity=next.new_multiplicity
+          WHEN NOT MATCHED AND next.new_multiplicity>0 THEN
+            INSERT (result_oid,group_key,value_key,multiplicity)
+            VALUES (
+              next.result_oid,next.group_key,next.value_key,
+              next.new_multiplicity
+            )
+        ),
+        processed AS (
+          DELETE FROM shiba_internal.aggregate_distinct_fold_stage stage
+          USING selected
+          WHERE stage.result_oid=stream_view.result_oid
+            AND stage.commit_lsn=p_commit_lsn
+            AND stage.group_key=selected.group_key
+            AND stage.value_key=selected.value_key
+        ),
+        group_delta AS MATERIALIZED (
+          SELECT transition.group_key,
+                 sum(
+                   CASE
+                     WHEN transition.old_multiplicity=0
+                      AND transition.new_multiplicity>0 THEN 1
+                     WHEN transition.old_multiplicity>0
+                      AND transition.new_multiplicity=0 THEN -1
+                     ELSE 0
+                   END
+                 )::bigint AS count_value_delta
           FROM transition
-        ) AS next
-        ON state.result_oid=next.result_oid
-       AND state.group_key=next.group_key
-        WHEN MATCHED AND next.row_count=0 THEN DELETE
-        WHEN MATCHED THEN UPDATE
-          SET row_count=next.row_count,
-              count_value=next.count_value,
-              sum_nonnull_count=next.sum_nonnull_count,
-              sum_value=next.sum_value
-        WHEN NOT MATCHED AND next.row_count>0 THEN
-          INSERT (
-            result_oid,group_key,row_count,count_value,
-            sum_nonnull_count,sum_value
+          WHERE transition.valid
+          GROUP BY transition.group_key
+        )
+        UPDATE shiba_internal.aggregate_group_fold_stage stage
+        SET count_value_delta=
+              stage.count_value_delta+group_delta.count_value_delta
+        FROM group_delta
+        WHERE stage.result_oid=stream_view.result_oid
+          AND stage.commit_lsn=p_commit_lsn
+          AND stage.group_key=group_delta.group_key;
+      END LOOP;
+    END IF;
+
+    -- Apply bounded group sets.  Sink values are derived from transition
+    -- because writes made by aggregate_merged are hidden by this statement's
+    -- snapshot.
+    LOOP
+      EXIT WHEN NOT EXISTS (
+        SELECT 1
+        FROM shiba_internal.aggregate_group_fold_stage
+        WHERE result_oid=stream_view.result_oid
+          AND commit_lsn=p_commit_lsn
+      );
+      EXECUTE format(
+        $apply$
+        WITH selected AS MATERIALIZED (
+          SELECT stage.*
+          FROM shiba_internal.aggregate_group_fold_stage stage
+          WHERE stage.result_oid=$1
+            AND stage.commit_lsn=$2
+          ORDER BY stage.group_key
+          LIMIT $4
+        ),
+        transition AS MATERIALIZED (
+          SELECT contribution.group_key,
+                 (
+                   coalesce(state.row_count,0)
+                     + contribution.row_count_delta
+                 )::bigint AS row_count,
+                 (
+                   coalesce(state.count_value,0)
+                     + contribution.count_value_delta
+                 )::bigint AS count_value,
+                 (
+                   coalesce(state.sum_nonnull_count,0)
+                     + contribution.sum_nonnull_delta
+                 )::bigint AS sum_nonnull_count,
+                 (
+                   coalesce(state.sum_value,0)
+                     + contribution.sum_delta
+                 )::numeric AS sum_value
+          FROM selected contribution
+          LEFT JOIN shiba_internal.aggregate_state state
+            ON state.result_oid=$1
+           AND state.group_key=contribution.group_key
+          WHERE shiba._assert_aggregate_transition(
+            coalesce(state.row_count,0)
+              + contribution.row_count_min_prefix>=0
+            AND coalesce(state.sum_nonnull_count,0)
+              + contribution.sum_nonnull_min_prefix>=0
+            AND coalesce(state.row_count,0)
+              + contribution.row_count_delta>=0
+            AND coalesce(state.count_value,0)
+              + contribution.count_value_delta>=0
+            AND coalesce(state.sum_nonnull_count,0)
+              + contribution.sum_nonnull_delta>=0
+            AND (
+              (
+                $3
+                AND coalesce(state.count_value,0)
+                      + contribution.count_value_delta
+                    <= coalesce(state.row_count,0)
+                         + contribution.row_count_delta
+              )
+              OR
+              (
+                NOT $3
+                AND coalesce(state.count_value,0)
+                      + contribution.count_value_delta
+                    = coalesce(state.row_count,0)
+                        + contribution.row_count_delta
+              )
+            )
+            AND coalesce(state.sum_nonnull_count,0)
+                  + contribution.sum_nonnull_delta
+                <= coalesce(state.row_count,0)
+                     + contribution.row_count_delta
+            AND (
+              coalesce(state.row_count,0)
+                + contribution.row_count_delta<>0
+              OR (
+                coalesce(state.count_value,0)
+                  + contribution.count_value_delta=0
+                AND coalesce(state.sum_nonnull_count,0)
+                  + contribution.sum_nonnull_delta=0
+              )
+            )
           )
-          VALUES (
-            next.result_oid,next.group_key,next.row_count,
-            next.count_value,next.sum_nonnull_count,next.sum_value
-          )
-      ),
-      visibility AS MATERIALIZED (
-        SELECT (typed.row).%7$I AS group_value,
-               state.count_value,
-               CASE WHEN state.sum_nonnull_count=0
-                 THEN NULL ELSE state.sum_value
-               END AS sum_value,
-               (state.row_count<>0 AND %8$s) AS visible
-        FROM transition state
-        CROSS JOIN LATERAL (
-          SELECT jsonb_populate_record(
-            NULL::%6$s,
-            jsonb_build_object(%11$L,state.group_key)
-          ) row
-        ) typed
-      ),
-      sink_deleted AS (
-        DELETE FROM %6$s result
-        USING visibility
-        WHERE result.%7$I IS NOT DISTINCT FROM visibility.group_value
-          AND NOT visibility.visible
-        RETURNING 1
-      )
-      INSERT INTO %6$s (%7$I,%9$I,%10$I)
-      SELECT visibility.group_value,visibility.count_value,
-             visibility.sum_value
-      FROM visibility
-      WHERE visibility.visible
-      ON CONFLICT (%7$I) DO UPDATE
-      SET %9$I=EXCLUDED.%9$I,%10$I=EXCLUDED.%10$I
-      $statement$,
-      source_name,
-      stream_view.group_column,
-      count_input_sql,
-      stream_view.sum_input_column,
-      filter_sql,
-      result_name,
-      stream_view.result_group_column,
-      visible_sql,
-      stream_view.count_column,
-      stream_view.sum_column,
-      stream_view.result_group_column
-    ) USING stream_view.result_oid,p_commit_lsn,stream_view.source_oid,
-            stream_view.count_distinct;
+        ),
+        aggregate_merged AS (
+          MERGE INTO shiba_internal.aggregate_state AS state
+          USING (
+            SELECT $1::oid AS result_oid,transition.*
+            FROM transition
+          ) AS next
+          ON state.result_oid=next.result_oid
+         AND state.group_key=next.group_key
+          WHEN MATCHED AND next.row_count=0 THEN DELETE
+          WHEN MATCHED THEN UPDATE
+            SET row_count=next.row_count,
+                count_value=next.count_value,
+                sum_nonnull_count=next.sum_nonnull_count,
+                sum_value=next.sum_value
+          WHEN NOT MATCHED AND next.row_count>0 THEN
+            INSERT (
+              result_oid,group_key,row_count,count_value,
+              sum_nonnull_count,sum_value
+            )
+            VALUES (
+              next.result_oid,next.group_key,next.row_count,
+              next.count_value,next.sum_nonnull_count,next.sum_value
+            )
+        ),
+        visibility AS MATERIALIZED (
+          SELECT (typed.row).%2$I AS group_value,
+                 state.count_value,
+                 CASE WHEN state.sum_nonnull_count=0
+                   THEN NULL ELSE state.sum_value
+                 END AS sum_value,
+                 (state.row_count<>0 AND %3$s) AS visible
+          FROM transition state
+          CROSS JOIN LATERAL (
+            SELECT jsonb_populate_record(
+              NULL::%1$s,
+              jsonb_build_object(%6$L,state.group_key)
+            ) row
+          ) typed
+        ),
+        sink_deleted AS (
+          DELETE FROM %1$s result
+          USING visibility
+          WHERE result.%2$I IS NOT DISTINCT FROM visibility.group_value
+            AND NOT visibility.visible
+        ),
+        stage_deleted AS (
+          DELETE FROM shiba_internal.aggregate_group_fold_stage stage
+          USING selected
+          WHERE stage.result_oid=$1
+            AND stage.commit_lsn=$2
+            AND stage.group_key=selected.group_key
+        )
+        INSERT INTO %1$s (%2$I,%4$I,%5$I)
+        SELECT visibility.group_value,visibility.count_value,
+               visibility.sum_value
+        FROM visibility
+        WHERE visibility.visible
+        ON CONFLICT (%2$I) DO UPDATE
+        SET %4$I=EXCLUDED.%4$I,%5$I=EXCLUDED.%5$I
+        $apply$,
+        result_name,
+        stream_view.result_group_column,
+        visible_sql,
+        stream_view.count_column,
+        stream_view.sum_column,
+        stream_view.result_group_column
+      ) USING stream_view.result_oid,p_commit_lsn,
+              stream_view.count_distinct,chunk_rows;
+    END LOOP;
+
+    DELETE FROM shiba_internal.aggregate_distinct_fold_stage
+    WHERE result_oid=stream_view.result_oid
+      AND commit_lsn=p_commit_lsn;
+    DELETE FROM shiba_internal.aggregate_group_fold_stage
+    WHERE result_oid=stream_view.result_oid
+      AND commit_lsn=p_commit_lsn;
 END;
 $$;
 
