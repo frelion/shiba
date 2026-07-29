@@ -363,4 +363,177 @@ CREATE TABLE shiba_internal.runtime_state (
     CHECK (owner_pid IS NULL OR pending_launch_xid IS NULL)
 );
 
+-- V2 durable ingress is additive.  The v1 routed_transactions/change_log/
+-- dag_inbox relations above remain unchanged until all v1 readers have been
+-- migrated.
+--
+-- Every relation below is LOGGED (the PostgreSQL default).  Replication
+-- buffers and parser state are disposable; these rows are the crash-recovery
+-- authority.
+
+-- A generation changes whenever a logical slot is recreated.  Runtime code
+-- provisions this row before decoding and retires the preceding active
+-- generation explicitly.  persisted_lsn is the greatest decode batch whose
+-- table transaction committed.  confirmed_lsn and replay_safe_lsn advance
+-- independently: confirmation intent is not proof that the slot position has
+-- reached durable storage.
+CREATE TABLE shiba_internal.v2_ingress_replay_state (
+    slot_generation bigint PRIMARY KEY CHECK (slot_generation > 0),
+    slot_name name NOT NULL CHECK (length(slot_name::text) > 0),
+    database_oid oid NOT NULL CHECK (database_oid <> 0::oid),
+    plugin name NOT NULL DEFAULT 'pgoutput' CHECK (plugin = 'pgoutput'::name),
+    state text NOT NULL DEFAULT 'active'
+        CHECK (state IN ('active', 'retired', 'invalid')),
+    persisted_lsn pg_lsn,
+    confirmed_lsn pg_lsn,
+    replay_safe_lsn pg_lsn,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    retired_at timestamptz,
+    CHECK (confirmed_lsn IS NULL OR persisted_lsn IS NOT NULL),
+    CHECK (confirmed_lsn IS NULL OR confirmed_lsn <= persisted_lsn),
+    CHECK (replay_safe_lsn IS NULL OR confirmed_lsn IS NOT NULL),
+    CHECK (replay_safe_lsn IS NULL OR replay_safe_lsn <= confirmed_lsn),
+    CHECK ((state = 'active') = (retired_at IS NULL)),
+    UNIQUE (slot_name, slot_generation)
+);
+
+-- At most one generation for a database/slot pair may accept new ingress.
+CREATE UNIQUE INDEX shiba_v2_ingress_active_slot_idx
+    ON shiba_internal.v2_ingress_replay_state (database_oid, slot_name)
+    WHERE state = 'active';
+
+-- Open transactions cannot be keyed by commit LSN because it is unknown until
+-- Stream Commit.  first_stream_lsn separates wrapped/reused 32-bit XIDs within
+-- one slot generation.
+CREATE TABLE shiba_internal.v2_ingress_transactions (
+    ingress_txn_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    slot_generation bigint NOT NULL
+        REFERENCES shiba_internal.v2_ingress_replay_state(slot_generation)
+        ON DELETE RESTRICT,
+    source_xid bigint NOT NULL
+        CHECK (source_xid BETWEEN 0 AND 4294967295),
+    first_stream_lsn pg_lsn NOT NULL,
+    status text NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'committed', 'aborted')),
+    commit_lsn pg_lsn,
+    end_lsn pg_lsn,
+    next_input_seq bigint NOT NULL DEFAULT 1 CHECK (next_input_seq > 0),
+    event_count bigint NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+    payload_bytes bigint NOT NULL DEFAULT 0 CHECK (payload_bytes >= 0),
+    opened_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    finalized_at timestamptz,
+    UNIQUE (slot_generation, source_xid, first_stream_lsn),
+    UNIQUE (ingress_txn_id, commit_lsn),
+    CHECK (next_input_seq = event_count + 1),
+    CHECK (
+        (status = 'open'
+          AND commit_lsn IS NULL
+          AND end_lsn IS NULL
+          AND finalized_at IS NULL)
+        OR
+        (status = 'committed'
+          AND commit_lsn IS NOT NULL
+          AND end_lsn IS NOT NULL
+          AND finalized_at IS NOT NULL
+          AND first_stream_lsn <= commit_lsn
+          AND commit_lsn <= end_lsn)
+        OR
+        (status = 'aborted'
+          AND commit_lsn IS NULL
+          AND end_lsn IS NOT NULL
+          AND finalized_at IS NOT NULL
+          AND first_stream_lsn <= end_lsn)
+    )
+);
+
+-- Commit records have stable WAL positions.  This also prevents two source
+-- transactions from being admitted as the same source epoch.
+CREATE UNIQUE INDEX shiba_v2_ingress_commit_lsn_idx
+    ON shiba_internal.v2_ingress_transactions (commit_lsn)
+    WHERE status = 'committed';
+
+CREATE INDEX shiba_v2_ingress_open_txn_idx
+    ON shiba_internal.v2_ingress_transactions
+       (slot_generation, source_xid, first_stream_lsn)
+    WHERE status = 'open';
+
+-- A batch is the durability and feedback unit, not the event identity.  A
+-- 32-byte digest is supplied by the protocol parser (SHA-256 in v2).
+CREATE TABLE shiba_internal.v2_ingress_decode_batches (
+    slot_generation bigint NOT NULL
+        REFERENCES shiba_internal.v2_ingress_replay_state(slot_generation)
+        ON DELETE RESTRICT,
+    decode_end_lsn pg_lsn NOT NULL,
+    message_digest bytea NOT NULL
+        CHECK (octet_length(message_digest) = 32),
+    event_count bigint NOT NULL CHECK (event_count >= 0),
+    payload_bytes bigint NOT NULL CHECK (payload_bytes >= 0),
+    persisted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (slot_generation, decode_end_lsn, message_digest)
+);
+
+-- Payload is stored exactly once regardless of DAG fan-out.  input_seq is
+-- allocated only for a new stable event identity; replay keeps the original
+-- value.  JSONB is the v2 SQL ABI until physical operators consume typed Stage
+-- rows directly.
+CREATE TABLE shiba_internal.v2_change_log (
+    ingress_txn_id bigint NOT NULL
+        REFERENCES shiba_internal.v2_ingress_transactions(ingress_txn_id)
+        ON DELETE CASCADE,
+    change_lsn pg_lsn NOT NULL,
+    change_ordinal bigint NOT NULL CHECK (change_ordinal >= 0),
+    image_ordinal integer NOT NULL CHECK (image_ordinal >= 0),
+    input_seq bigint NOT NULL CHECK (input_seq > 0),
+    source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
+    weight bigint NOT NULL CHECK (weight <> 0),
+    typed_payload jsonb NOT NULL,
+    payload_bytes bigint NOT NULL CHECK (payload_bytes >= 0),
+    persisted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (
+        ingress_txn_id,
+        change_lsn,
+        change_ordinal,
+        image_ordinal
+    ),
+    UNIQUE (ingress_txn_id, input_seq)
+);
+
+-- Routing examines this bounded-per-source set rather than rescanning payload.
+CREATE TABLE shiba_internal.v2_ingress_sources (
+    ingress_txn_id bigint NOT NULL
+        REFERENCES shiba_internal.v2_ingress_transactions(ingress_txn_id)
+        ON DELETE CASCADE,
+    source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
+    PRIMARY KEY (ingress_txn_id, source_oid)
+);
+
+CREATE INDEX shiba_v2_ingress_sources_source_idx
+    ON shiba_internal.v2_ingress_sources (source_oid, ingress_txn_id);
+
+-- Commit creates one task only.  subscriber_cursor is the last result OID
+-- routed by keyset pagination; zero means that no subscriber has been visited.
+CREATE TABLE shiba_internal.v2_routing_tasks (
+    ingress_txn_id bigint PRIMARY KEY,
+    commit_lsn pg_lsn NOT NULL,
+    subscriber_cursor oid NOT NULL DEFAULT 0::oid,
+    status text NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'routing', 'complete', 'failed')),
+    attempts bigint NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    completed_at timestamptz,
+    last_error text,
+    FOREIGN KEY (ingress_txn_id, commit_lsn)
+        REFERENCES shiba_internal.v2_ingress_transactions
+                   (ingress_txn_id, commit_lsn)
+        ON DELETE CASCADE,
+    CHECK ((status = 'complete') = (completed_at IS NOT NULL)),
+    CHECK ((status = 'failed') = (last_error IS NOT NULL))
+);
+
+CREATE INDEX shiba_v2_routing_tasks_ready_idx
+    ON shiba_internal.v2_routing_tasks (commit_lsn, ingress_txn_id)
+    WHERE status IN ('pending', 'routing');
+
 INSERT INTO shiba_internal.runtime_state (singleton) VALUES (true);
