@@ -1,5 +1,10 @@
 # Commit-Scoped Relational DAG Execution
 
+> Current implementation (v1). This source-commit-atomic model is intentionally
+> replaced in the proposed target by
+> [DAG-EXECUTION-SPEC.md](DAG-EXECUTION-SPEC.md), where one bounded work
+> quantum is the transaction unit and partial result visibility is explicit.
+
 Status: implemented execution contract
 
 ## Decision

@@ -1,5 +1,10 @@
 # Architecture
 
+> This document describes the current v1 implementation. The proposed
+> normative v2 execution contract, including partial visibility, resumable
+> operators, durable Stages, and arbitrary finite fan-out, is defined in
+> [DAG-EXECUTION-SPEC.md](DAG-EXECUTION-SPEC.md).
+
 This document is a map of Shiba's execution path and its invariants. It is
 intended to be useful even if you are new to Rust, PostgreSQL extensions, or
 incremental view maintenance.

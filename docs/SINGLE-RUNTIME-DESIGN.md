@@ -1,5 +1,10 @@
 # Single Runtime design
 
+> Current implementation (v1). The proposed bounded, resumable v2 execution
+> contract is defined in
+> [DAG-EXECUTION-SPEC.md](DAG-EXECUTION-SPEC.md). Until v2 is implemented,
+> the commit-scoped limitations in this document remain real.
+
 Status: implemented contract. Durable metadata, input, operator state, result,
 and progress remain logged. Typed UNLOGGED storage is permitted only for
 rebuildable physical Stage intermediates.

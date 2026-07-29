@@ -1,5 +1,10 @@
 # Single Runtime resource contract
 
+> Current implementation (v1). Its total-commit quotas are not the target
+> solution for arbitrary finite source commits. See
+> [DAG-EXECUTION-SPEC.md](DAG-EXECUTION-SPEC.md) for the proposed per-quantum
+> resource contract.
+
 Shiba uses one PostgreSQL background worker per active database. DAG runtimes
 are backend-local plan metadata; source payload, operator state, intermediate
 folds, and results live in PostgreSQL relations.
