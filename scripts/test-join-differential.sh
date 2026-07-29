@@ -586,8 +586,11 @@ psql_diff -qc "
   COMMIT"
 wait_for_value "1" "
   SELECT count(*)
-  FROM shiba_internal.dag_inbox
-  WHERE result_oid='shiba.diff_multibatch_join'::regclass"
+  FROM shiba_internal.dag_inbox inbox
+  JOIN shiba_internal.ingress_transactions txn
+    ON txn.ingress_txn_id=inbox.ingress_txn_id
+  WHERE inbox.result_oid='shiba.diff_multibatch_join'::regclass
+    AND txn.status='committed'"
 multibatch_join_lsn="$(psql_diff -Atqc "
   SELECT commit_lsn
   FROM shiba_internal.dag_inbox

@@ -37,7 +37,7 @@ flowchart LR
     WS --> DECODE
     DECODE --> LOG
     LOG --> BATCH
-    BATCH -->|"pgoutput Commit is durable"| ROUTE
+    BATCH -->|"each stable range"| ROUTE
     ROUTE --> INBOX
     INBOX --> SCHEDULE
     SCHEDULE --> APPLY
@@ -51,17 +51,21 @@ flowchart LR
 
 Ingress normalizes DML into weighted rows: insert is `+1`, delete is `-1`, and
 update is `-1 old / +1 new`. It stores a source transaction once in
-`change_log` and records stable input ranges as it reads. The Runtime schedules
-the saved DAG only after the source `Commit` is durable.
+`change_log` and records stable input ranges as it reads. Because pgoutput
+transaction streaming is disabled, PostgreSQL emits `Begin` and rows only
+after the source transaction has committed. The Runtime can therefore route
+and apply each stable range before it receives the trailing pgoutput `Commit`.
 
 The scheduler reads one stable range per apply transaction. That transaction
 updates authoritative operator state, the result table, and the per-result
 batch cursor together. Each successful batch is immediately visible; a large
-source transaction is deliberately not one result-visibility boundary. The
-last range additionally advances apply progress and removes the inbox entry.
-If one source transaction affects results A and B, their cursors advance
-independently. Replication feedback advances after durable ingress,
-including pgoutput `Commit` finalization, independently of result application.
+source transaction is deliberately not one result-visibility boundary. If the
+consumer reaches the current end while the ingress transaction is still open,
+it keeps the inbox row and waits. The trailing `Commit` seals the batch list;
+only then may a consumer past the final range advance apply progress and remove
+the inbox entry. If one source transaction affects results A and B, their
+cursors advance independently. Replication feedback advances only after
+durable pgoutput `Commit` finalization, independently of result application.
 
 The detailed [architecture](docs/ARCHITECTURE.md) documents the stream model,
 operator state, scheduling, recovery, and resource bounds.

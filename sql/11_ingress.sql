@@ -5,9 +5,10 @@
 -- These functions never commit and never perform replication I/O.  The
 -- Runtime must call claim/create, event insertion(s), record_batch, and any
 -- Commit finalization for that batch inside one bounded SPI transaction, then
--- commit before reading or waiting on the replication socket. Prefix batches
--- do not advance durable replication progress; commit_ingress_transaction
--- atomically finalizes the header, creates routing work, and advances it.
+-- commit before reading or waiting on the replication socket. Every durable
+-- apply batch creates its own routing work and may execute while the ingress
+-- transaction is open. Prefix batches do not advance durable replication
+-- progress; commit_ingress_transaction only seals the header and advances it.
 -- Read feedback_upper_bound in a short SPI transaction, end that transaction,
 -- and only then send Standby Status Update.  After a
 -- successful send, record the confirmation intent in another short SPI
@@ -19,8 +20,7 @@
 -- 1. ingress_replay_state rows (ascending slot_generation)
 -- 2. ingress_transactions rows (ascending ingress_txn_id)
 -- 3. change_log stable identity / ingress_decode_batches
--- 4. ingress_sources
--- 5. routing_tasks
+-- 4. ingress_apply_batches / routing_tasks
 --
 -- Every mutating function below follows the applicable prefix of this order.
 -- PostgreSQL retains the row locks until the caller commits or rolls back the
@@ -441,17 +441,6 @@ BEGIN
         v_payload_bytes
     );
 
-    -- Lock-order level 4: per-transaction source set.
-    INSERT INTO shiba_internal.ingress_sources (
-        ingress_txn_id,
-        source_oid
-    )
-    VALUES (
-        p_ingress_txn_id,
-        p_source_oid
-    )
-    ON CONFLICT (ingress_txn_id, source_oid) DO NOTHING;
-
     UPDATE shiba_internal.ingress_transactions AS txn
        SET next_input_seq = txn.next_input_seq + 1,
            event_count = txn.event_count + 1,
@@ -663,6 +652,17 @@ BEGIN
             v_last_inserted_input_seq,
             inserted_count
         );
+
+        INSERT INTO shiba_internal.routing_tasks (
+            ingress_txn_id,
+            batch_ordinal,
+            commit_lsn
+        )
+        SELECT txn.ingress_txn_id,
+               v_batch_ordinal,
+               txn.final_lsn
+          FROM shiba_internal.ingress_transactions AS txn
+         WHERE txn.ingress_txn_id = p_ingress_txn_id;
     END IF;
 
     RETURN NEXT;
@@ -772,7 +772,6 @@ CREATE FUNCTION shiba_internal.commit_ingress_transaction(
 )
 RETURNS TABLE (
     finalized boolean,
-    routing_task_created boolean,
     event_count bigint,
     payload_bytes bigint
 )
@@ -942,37 +941,8 @@ BEGIN
         finalized := true;
     END IF;
 
-    -- Lock-order level 5: one routing task, never subscriber fan-out here.
-    INSERT INTO shiba_internal.routing_tasks (
-        ingress_txn_id,
-        commit_lsn
-    )
-    VALUES (
-        p_ingress_txn_id,
-        p_commit_lsn
-    )
-    ON CONFLICT (ingress_txn_id) DO NOTHING;
-
-    routing_task_created := FOUND;
-
-    IF NOT routing_task_created
-       AND EXISTS (
-           SELECT 1
-             FROM shiba_internal.routing_tasks AS task
-            WHERE task.ingress_txn_id = p_ingress_txn_id
-              AND task.commit_lsn IS DISTINCT FROM p_commit_lsn
-       ) THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'XX001',
-            MESSAGE = format(
-                'routing task identity conflict for transaction %s',
-                p_ingress_txn_id
-            );
-    END IF;
-
     -- This is the only API that advances durable replication progress.
-    -- Header finalization, routing-task creation, and this watermark update
-    -- commit or roll back together.
+    -- Header sealing and this watermark update commit or roll back together.
     UPDATE shiba_internal.ingress_replay_state AS replay
        SET persisted_lsn = CASE
                WHEN replay.persisted_lsn IS NULL
@@ -987,7 +957,7 @@ BEGIN
 END;
 $$;
 
--- Fan one committed transaction out to a bounded page of DAG subscribers.
+-- Fan one durable apply batch out to a bounded page of DAG subscribers.
 -- The shared payload remains in change_log and every inbox row points directly
 -- to the durable ingress transaction.
 CREATE FUNCTION shiba_internal.route_ingress_page(
@@ -1018,7 +988,7 @@ BEGIN
       INTO v_task
       FROM shiba_internal.routing_tasks AS task
      WHERE task.status IN ('pending', 'routing')
-     ORDER BY task.commit_lsn, task.ingress_txn_id
+     ORDER BY task.commit_lsn, task.ingress_txn_id, task.batch_ordinal
      LIMIT 1
      FOR UPDATE SKIP LOCKED;
 
@@ -1028,48 +998,57 @@ BEGIN
     END IF;
 
     PERFORM 1
-      FROM shiba_internal.ingress_transactions AS txn
+     FROM shiba_internal.ingress_transactions AS txn
      WHERE txn.ingress_txn_id = v_task.ingress_txn_id
-       AND txn.status = 'committed'
+       AND txn.final_lsn = v_task.commit_lsn
      FOR KEY SHARE;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION USING
             ERRCODE = 'XX001',
             MESSAGE = format(
-                'routing task %s does not reference a committed ingress transaction',
-                v_task.ingress_txn_id
+                'routing task %s/%s does not reference its ingress transaction',
+                v_task.ingress_txn_id,
+                v_task.batch_ordinal
             );
     END IF;
 
+    WITH batch_sources AS MATERIALIZED (
+        SELECT DISTINCT event.source_oid
+          FROM shiba_internal.ingress_apply_batches AS batch
+          JOIN shiba_internal.change_log AS event
+            ON event.ingress_txn_id = batch.ingress_txn_id
+           AND event.input_seq BETWEEN
+               batch.first_input_seq AND batch.last_input_seq
+         WHERE batch.ingress_txn_id = v_task.ingress_txn_id
+           AND batch.batch_ordinal = v_task.batch_ordinal
+    )
     SELECT pg_catalog.array_agg(candidate.result_oid ORDER BY candidate.result_oid)
       INTO v_candidates
       FROM (
           SELECT matched.result_oid
             FROM (
                 SELECT stream_view.result_oid
-                  FROM shiba_internal.ingress_sources AS source
+                  FROM batch_sources AS source
                   JOIN shiba_internal.stream_views AS stream_view
                     ON stream_view.source_oid = source.source_oid
                   JOIN shiba_internal.view_progress AS progress
                     ON progress.result_oid = stream_view.result_oid
-                 WHERE source.ingress_txn_id = v_task.ingress_txn_id
-                   AND stream_view.activation_lsn < v_task.commit_lsn
+                 WHERE stream_view.activation_lsn < v_task.commit_lsn
                    AND (
                        progress.applied_lsn IS NULL
                        OR progress.applied_lsn < v_task.commit_lsn
                    )
                 UNION
                 SELECT stream_view.result_oid
-                  FROM shiba_internal.ingress_sources AS source
+                  FROM batch_sources AS source
                   JOIN shiba_internal.inner_join_views AS join_view
                     ON join_view.right_source_oid = source.source_oid
                   JOIN shiba_internal.stream_views AS stream_view
                     ON stream_view.result_oid = join_view.result_oid
                   JOIN shiba_internal.view_progress AS progress
                     ON progress.result_oid = stream_view.result_oid
-                 WHERE source.ingress_txn_id = v_task.ingress_txn_id
-                   AND stream_view.activation_lsn < v_task.commit_lsn
+                 WHERE stream_view.activation_lsn < v_task.commit_lsn
                    AND (
                        progress.applied_lsn IS NULL
                        OR progress.applied_lsn < v_task.commit_lsn
@@ -1111,7 +1090,8 @@ BEGIN
            updated_at = clock_timestamp(),
            completed_at = CASE WHEN completed THEN clock_timestamp() ELSE NULL END,
            last_error = NULL
-     WHERE task.ingress_txn_id = v_task.ingress_txn_id;
+     WHERE task.ingress_txn_id = v_task.ingress_txn_id
+       AND task.batch_ordinal = v_task.batch_ordinal;
 
     worked := true;
     RETURN NEXT;

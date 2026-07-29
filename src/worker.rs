@@ -698,6 +698,7 @@ fn process_next_dag_transaction(result_oid: pg_sys::Oid, runtime: &logical::DagR
         logical::NextApplyOutcome::Quarantined => return DagStep::Quarantined,
         logical::NextApplyOutcome::Inactive => return DagStep::Inactive,
         logical::NextApplyOutcome::Idle => return DagStep::Idle,
+        logical::NextApplyOutcome::Waiting => return DagStep::Idle,
         logical::NextApplyOutcome::CommitCompleted => None,
     };
     #[cfg(any(test, feature = "pg_test"))]
@@ -725,8 +726,19 @@ fn process_next_dag_transaction(result_oid: pg_sys::Oid, runtime: &logical::DagR
     let has_more = Spi::get_one_with_args::<bool>(
         "SELECT EXISTS (
              SELECT 1
-             FROM shiba_internal.dag_inbox
-             WHERE result_oid = $1::oid
+             FROM shiba_internal.dag_inbox AS inbox
+             JOIN shiba_internal.ingress_transactions AS txn
+               ON txn.ingress_txn_id = inbox.ingress_txn_id
+             WHERE inbox.result_oid = $1::oid
+               AND (
+                   txn.status = 'committed'
+                   OR EXISTS (
+                       SELECT 1
+                       FROM shiba_internal.ingress_apply_batches AS batch
+                       WHERE batch.ingress_txn_id = inbox.ingress_txn_id
+                         AND batch.batch_ordinal = inbox.next_batch_ordinal
+                   )
+               )
          )",
         &result,
     )
@@ -1251,7 +1263,18 @@ fn ready_dag_oids_in_range(
                AND EXISTS (
                    SELECT 1
                    FROM shiba_internal.dag_inbox inbox
+                   JOIN shiba_internal.ingress_transactions txn
+                     ON txn.ingress_txn_id = inbox.ingress_txn_id
                    WHERE inbox.result_oid = runtime.result_oid
+                     AND (
+                         txn.status = 'committed'
+                         OR EXISTS (
+                             SELECT 1
+                             FROM shiba_internal.ingress_apply_batches batch
+                             WHERE batch.ingress_txn_id = inbox.ingress_txn_id
+                               AND batch.batch_ordinal = inbox.next_batch_ordinal
+                         )
+                     )
                )
              ORDER BY runtime.result_oid
              LIMIT {limit_parameter}"

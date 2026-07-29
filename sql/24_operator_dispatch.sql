@@ -226,8 +226,9 @@ $$;
 -- subtransaction:
 -- an operator/SPI error rolls back the current batch and its cursor advance.
 -- Earlier applied batches are already visible; the current batch and its
--- cursor advance remain atomic. The last batch also advances progress and
--- acknowledges the inbox row.
+-- cursor advance remain atomic. Progress and inbox acknowledgement happen
+-- only after the ingress header is sealed and the cursor is past its last
+-- stable batch.
 -- Explicitly transient concurrency failures leave the DAG active for retry;
 -- deterministic failures quarantine it.
 CREATE FUNCTION shiba._apply_claimed_dag_safely(
@@ -250,22 +251,18 @@ DECLARE
     claimed_batch_ordinal bigint;
     first_input_seq bigint;
     last_input_seq bigint;
-    final_batch boolean;
+    applied_batch boolean := false;
+    ingress_status text;
+    next_batch_ordinal bigint;
+    last_batch_ordinal bigint;
 BEGIN
     BEGIN
         SELECT inbox.next_batch_ordinal,
                batch.first_input_seq,
-               batch.last_input_seq,
-               NOT EXISTS (
-                 SELECT 1
-                 FROM shiba_internal.ingress_apply_batches AS later
-                 WHERE later.ingress_txn_id=p_ingress_txn_id
-                   AND later.batch_ordinal>inbox.next_batch_ordinal
-               )
-        INTO STRICT claimed_batch_ordinal,
-                    first_input_seq,
-                    last_input_seq,
-                    final_batch
+               batch.last_input_seq
+        INTO claimed_batch_ordinal,
+             first_input_seq,
+             last_input_seq
         FROM shiba_internal.dag_inbox AS inbox
         JOIN shiba_internal.ingress_apply_batches AS batch
           ON batch.ingress_txn_id=inbox.ingress_txn_id
@@ -274,16 +271,16 @@ BEGIN
           AND inbox.ingress_txn_id=p_ingress_txn_id
           AND inbox.commit_lsn=p_commit_lsn;
 
-        PERFORM shiba._apply_claimed_dag_batch(
-          result_relation,
-          execution_descriptor,
-          p_ingress_txn_id,
-          p_commit_lsn,
-          first_input_seq,
-          last_input_seq
-        );
+        IF FOUND THEN
+          PERFORM shiba._apply_claimed_dag_batch(
+            result_relation,
+            execution_descriptor,
+            p_ingress_txn_id,
+            p_commit_lsn,
+            first_input_seq,
+            last_input_seq
+          );
 
-        IF NOT final_batch THEN
           UPDATE shiba_internal.dag_inbox AS inbox
           SET next_batch_ordinal=inbox.next_batch_ordinal+1
           WHERE inbox.result_oid=result_relation
@@ -296,7 +293,51 @@ BEGIN
               result_relation::regclass,p_commit_lsn,acknowledged_rows
               USING ERRCODE='P0S01';
           END IF;
+          applied_batch := true;
+        END IF;
+
+        SELECT txn.status,
+               inbox.next_batch_ordinal,
+               coalesce(max(batch.batch_ordinal),0)
+          INTO STRICT ingress_status,
+                      next_batch_ordinal,
+                      last_batch_ordinal
+          FROM shiba_internal.ingress_transactions AS txn
+          JOIN shiba_internal.dag_inbox AS inbox
+            ON inbox.ingress_txn_id=txn.ingress_txn_id
+          LEFT JOIN shiba_internal.ingress_apply_batches AS batch
+            ON batch.ingress_txn_id=txn.ingress_txn_id
+         WHERE txn.ingress_txn_id=p_ingress_txn_id
+           AND txn.final_lsn=p_commit_lsn
+           AND inbox.result_oid=result_relation
+         GROUP BY txn.status,inbox.next_batch_ordinal;
+
+        IF ingress_status='open' THEN
+          RETURN CASE WHEN applied_batch THEN 'batch_applied' ELSE 'waiting' END;
+        END IF;
+
+        IF ingress_status<>'committed' THEN
+          RAISE EXCEPTION
+            'Shiba ingress transaction % has invalid status %',
+            p_ingress_txn_id,ingress_status
+            USING ERRCODE='P0S01';
+        END IF;
+
+        IF next_batch_ordinal<=last_batch_ordinal THEN
+          IF NOT applied_batch THEN
+            RAISE EXCEPTION
+              'Shiba DAG % is missing apply batch % for commit %',
+              result_relation::regclass,next_batch_ordinal,p_commit_lsn
+              USING ERRCODE='P0S01';
+          END IF;
           RETURN 'batch_applied';
+        END IF;
+        IF next_batch_ordinal<>last_batch_ordinal+1 THEN
+          RAISE EXCEPTION
+            'Shiba DAG % batch cursor % is beyond commit % final batch %',
+            result_relation::regclass,next_batch_ordinal,p_commit_lsn,
+            last_batch_ordinal
+            USING ERRCODE='P0S01';
         END IF;
 
         PERFORM shiba._advance_dag_progress(

@@ -598,8 +598,12 @@ FROM shiba_internal.view_progress p
 JOIN shiba.progress('shiba.perf_result') public ON true
 LEFT JOIN shiba_internal.ingress_transactions txn
   ON txn.commit_lsn=p.applied_lsn
-LEFT JOIN shiba_internal.routing_tasks route
-  ON route.ingress_txn_id=txn.ingress_txn_id
+LEFT JOIN LATERAL (
+  SELECT max(task.completed_at) AS completed_at
+  FROM shiba_internal.routing_tasks task
+  WHERE task.ingress_txn_id=txn.ingress_txn_id
+  HAVING bool_and(task.status='complete')
+) route ON true
 WHERE p.result_oid='shiba.perf_result'::regclass
 """
     )
@@ -634,9 +638,12 @@ SELECT coalesce((
     'routed_epoch_ms',extract(epoch FROM route.completed_at)*1000
   )::text
   FROM shiba_internal.ingress_transactions txn
-  JOIN shiba_internal.routing_tasks route
-    ON route.ingress_txn_id=txn.ingress_txn_id
-   AND route.status='complete'
+  JOIN LATERAL (
+    SELECT max(task.completed_at) AS completed_at
+    FROM shiba_internal.routing_tasks task
+    WHERE task.ingress_txn_id=txn.ingress_txn_id
+    HAVING bool_and(task.status='complete')
+  ) route ON route.completed_at IS NOT NULL
   WHERE txn.commit_lsn > '{after_lsn}'::pg_lsn
   ORDER BY txn.commit_lsn DESC LIMIT 1
 ),'null')

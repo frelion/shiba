@@ -197,23 +197,29 @@ wait_for_query "0" "${baseline_diff}" "the initial result"
 result_oid="$(psql_gate -Atqc "
   SELECT 'shiba.failpoint_result'::regclass::oid::integer")"
 
-printf '\n==> Runtime crash after a directly published batch\n'
-set_dag_active "${result_oid}" false
+printf '\n==> Runtime crash after a pre-seal batch\n'
 progress_before_batch="$(psql_gate -Atqc "
   SELECT coalesce(applied_lsn::text,'NULL')
   FROM shiba_internal.view_progress
   WHERE result_oid=${result_oid}::oid")"
+batch_runtime_pid="$(runtime_pid)"
+psql_gate -qc "
+  INSERT INTO public.shiba_runtime_failpoints
+    (kind,runtime_pid,result_oid,commit_lsn,pause_ms)
+  VALUES
+    ('runtime_apply_after_batch',${batch_runtime_pid},
+     ${result_oid}::oid,NULL,2000)"
 psql_gate -qc "
   INSERT INTO public.failpoint_source
   SELECT id,5,id
   FROM generate_series(100,20099) AS id"
-wait_for_query "1" "
-  SELECT count(*) FROM shiba_internal.dag_inbox
-  WHERE result_oid=${result_oid}::oid" \
-  "the multi-batch commit to reach the durable inbox"
+wait_for_query "t" "
+  SELECT fired FROM public.shiba_runtime_failpoints
+  WHERE kind='runtime_apply_after_batch'" \
+  "the Runtime to publish one batch before seeing pgoutput Commit"
 batch_lsn="$(psql_gate -Atqc "
-  SELECT commit_lsn FROM shiba_internal.dag_inbox
-  WHERE result_oid=${result_oid}::oid")"
+  SELECT commit_lsn FROM public.shiba_runtime_failpoints
+  WHERE kind='runtime_apply_after_batch'")"
 batch_log_lsn="$(psql_gate -Atqc "
   SELECT split_part('${batch_lsn}','/',1)
          || '/' ||
@@ -228,23 +234,6 @@ prefix_result="$(psql_gate -Atqc "
    AND event.sequence BETWEEN batch.first_input_seq AND batch.last_input_seq
   WHERE event.commit_lsn='${batch_lsn}'::pg_lsn
     AND event.source_oid='public.failpoint_source'::regclass")"
-assert_query "t" "
-  SELECT count(*)>1
-  FROM shiba_internal.ingress_apply_batches batch
-  JOIN shiba_internal.dag_inbox inbox
-    ON inbox.ingress_txn_id=batch.ingress_txn_id
-  WHERE inbox.result_oid=${result_oid}::oid
-    AND inbox.commit_lsn='${batch_lsn}'::pg_lsn"
-batch_runtime_pid="$(runtime_pid)"
-psql_gate -qc "
-  INSERT INTO public.shiba_runtime_failpoints
-    (kind,runtime_pid,result_oid,commit_lsn,pause_ms)
-  VALUES
-    ('runtime_apply_after_batch',${batch_runtime_pid},
-     ${result_oid}::oid,'${batch_lsn}'::pg_lsn,2000);
-  UPDATE shiba_internal.dag_runtime_state
-  SET active=true
-  WHERE result_oid=${result_oid}::oid"
 
 wait_for_log \
   "test failpoint reached: runtime_apply_after_batch result ${result_oid} commit ${batch_log_lsn}" \
@@ -253,8 +242,17 @@ wait_for_log \
 # while the Runtime is paused so the replacement cannot consume more batches
 # before the prefix-visibility and recovery assertions.
 set_dag_active "${result_oid}" false
-assert_query "2|${progress_before_batch}|true" "
+assert_query "open|1|2|${progress_before_batch}|true" "
   SELECT
+    (SELECT txn.status
+     FROM shiba_internal.ingress_transactions txn
+     WHERE txn.final_lsn='${batch_lsn}'::pg_lsn)
+    || '|' ||
+    (SELECT count(*) FROM shiba_internal.ingress_apply_batches batch
+     JOIN shiba_internal.ingress_transactions txn
+       ON txn.ingress_txn_id=batch.ingress_txn_id
+     WHERE txn.final_lsn='${batch_lsn}'::pg_lsn)
+    || '|' ||
     (SELECT next_batch_ordinal FROM shiba_internal.dag_inbox
      WHERE result_oid=${result_oid}::oid
        AND commit_lsn='${batch_lsn}'::pg_lsn)
@@ -284,6 +282,14 @@ wait_for_query "0" "
   "the failed Runtime to exit"
 wait_for_replacement_runtime "${batch_runtime_pid}"
 
+wait_for_query "committed|true" "
+  SELECT txn.status || '|' || (count(batch.batch_ordinal)>1)
+  FROM shiba_internal.ingress_transactions txn
+  LEFT JOIN shiba_internal.ingress_apply_batches batch
+    ON batch.ingress_txn_id=txn.ingress_txn_id
+  WHERE txn.final_lsn='${batch_lsn}'::pg_lsn
+  GROUP BY txn.status" \
+  "the replacement Runtime to retain the suffix and seal the transaction"
 psql_gate -qc "
   DELETE FROM public.shiba_runtime_failpoints
   WHERE kind='runtime_apply_after_batch';
@@ -313,9 +319,13 @@ psql_gate -qc "
   SELECT 30000+id,2,20
   FROM generate_series(1,5000) AS id"
 wait_for_query "1" "
-  SELECT count(*) FROM shiba_internal.dag_inbox
-  WHERE result_oid=${result_oid}::oid" \
-  "the apply failpoint commit to reach the durable inbox"
+  SELECT count(*)
+  FROM shiba_internal.dag_inbox inbox
+  JOIN shiba_internal.ingress_transactions txn
+    ON txn.ingress_txn_id=inbox.ingress_txn_id
+  WHERE inbox.result_oid=${result_oid}::oid
+    AND txn.status='committed'" \
+  "the apply failpoint transaction to be fully ingested and sealed"
 apply_lsn="$(psql_gate -Atqc "
   SELECT commit_lsn FROM shiba_internal.dag_inbox
   WHERE result_oid=${result_oid}::oid")"

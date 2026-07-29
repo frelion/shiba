@@ -19,7 +19,7 @@ flowchart LR
     APP -->|"COMMIT"| WAL
     WAL -->|"边接收边持久化"| LOG
     LOG --> RANGES
-    RANGES -->|"收到并持久化 Commit 后"| INBOX
+    RANGES -->|"每形成一个范围就路由"| INBOX
     INBOX --> APPLY
     APPLY -->|"同一 PostgreSQL 事务"| STATE
     APPLY -->|"同一 PostgreSQL 事务"| RESULT
@@ -29,10 +29,12 @@ flowchart LR
 这张图里最重要的是两件事：
 
 1. 当前关闭 pgoutput transaction streaming，所以回滚的源事务不会进入 Shiba
-   ingress。对于 PostgreSQL 已经提交并开始输出的逻辑事务，Runtime 先保存输入，
-   收到完整的 pgoutput `Commit` 以前不运行 DAG。
-2. `Commit` 持久化并完成 routing 后，DAG 每次只读一个稳定范围。这个范围计算成功
-   时，operator state、结果表和 batch 游标在同一个 PostgreSQL 事务里提交。
+   ingress。walsender 发出 `Begin` 和行变化时，源事务其实已经提交；末尾的
+   pgoutput `Commit` 只是 Shiba 尚未读到的结束记录，不是源事务仍未提交。
+2. Runtime 每持久化一个稳定范围，就可以路由并运行这个范围，不等末尾
+   `Commit`。operator state、结果表和 batch 游标在同一个 PostgreSQL 事务里提交。
+   `Commit` 只把 batch 列表标为完整；此后确认游标已经越过最后一个范围，才推进
+   progress、删除 inbox 并允许复制 feedback 前进。
 
 因此，对同一个结果表，源事务不再是原子可见边界。一笔 1000 万行的源事务会逐批
 出现在结果里。处理到一半时，用户可能看到前 500 万行产生的结果；这个中间结果
@@ -56,18 +58,16 @@ sequenceDiagram
         WAL-->>RT: INSERT / UPDATE / DELETE
         RT->>Input: append weighted rows
         RT->>Input: close a stable range when batch target is reached
-    end
-    WAL-->>RT: Commit record
-    RT->>Input: mark ingress transaction committed
-    RT->>Q: create one inbox entry per affected result
-    loop stable ranges
+        RT->>Q: route this stable range
         RT->>Q: claim next_batch_ordinal
         RT->>Input: read this range only
         RT->>Out: update state and result
         RT->>Q: advance next_batch_ordinal
         Note over RT,Out: state + result + cursor commit together
     end
-    RT->>Q: last range also advances view_progress and removes inbox
+    WAL-->>RT: Commit record
+    RT->>Input: mark ingress transaction committed
+    RT->>Q: if cursor is past the final range, advance progress and remove inbox
 ```
 
 `ingress_batch_rows` 和 `ingress_batch_bytes` 是 ingress 的软目标。完整的 CopyData
@@ -76,10 +76,10 @@ message 或单个 tuple 不会被切开，所以实际范围不保证正好等�
 保存自己的消费游标。
 
 Shiba 当前使用非 streaming pgoutput。应用事务提交后，walsender 才输出它的
-`Begin`、行变化和 `Commit`。Runtime 会先看到 `Begin` 和行变化，最后看到
-`Commit`；只有 `Commit` 被持久化并完成 routing 后，这笔事务才进入 DAG 调度。
-这里的“边接收边持久化”是指 Shiba 不把整笔事务放在 Rust 内存中，并不表示未
-提交变化会进入 ingress 或结果。
+`Begin`、行变化和 `Commit`。因此 Runtime 收到 `Begin` 时已经知道稳定的
+`final_lsn`，可以把随后形成的每个范围直接交给 DAG。若 DAG 已消费当前全部范围、
+但 Runtime 还没读到 `Commit`，inbox 保留在原处等待；它不会推进 progress，也
+不会被删除。这里没有未提交的源数据进入结果。
 
 一个 ingress batch 形成一个共享稳定范围；某个结果消费这个范围称为一个 DAG
 batch；提交这个 DAG batch 的 PostgreSQL 事务称为 apply 事务。
@@ -177,7 +177,7 @@ Router 进程、Executor pool、每 DAG worker 或 Rust 线程池。
 Runtime 主循环是：
 
 ```text
-ingress → routing → round-robin apply → GC
+ingress one batch → routing one page → round-robin apply → GC
 ```
 
 一次 apply 只处理一个 DAG 的一个 ingress batch。有后续 batch 的 DAG 会回到
@@ -197,7 +197,7 @@ Runtime 重启后，会从持久化的 physical plan 重新加载。
 | logical replication slot | 决定 PostgreSQL 还要保留哪些 WAL |
 | `ingress_transactions`、`change_log` | 已持久化的 source transaction 和 ordered row delta |
 | `ingress_apply_batches` | 不再变化的 `input_seq` 范围 |
-| routing cursor | routing 做到哪里 |
+| 每批 routing cursor | 这个稳定范围的结果订阅者路由到哪里 |
 | `dag_inbox.next_batch_ordinal` | 该结果下一批应该读哪个范围 |
 | operator state | 下一批计算使用的正式状态 |
 | result table | 用户当前看到的结果，包括已提交的部分 source transaction |
@@ -205,9 +205,10 @@ Runtime 重启后，会从持久化的 physical plan 重新加载。
 | `PhysicalDagPlan` | Runtime 要运行的 pipeline |
 
 `dag_inbox.next_batch_ordinal` 是处理大 source commit 时的精确恢复位置。
-`view_progress.applied_lsn` 只在最后一个 batch 提交时推进。因此，当一笔 source
-transaction 处理到一半时，结果表已经变化，`view_progress` 仍指向上一笔完整处理
-完的 source commit。它不是“当前结果精确对应哪个源快照”的证明。
+`view_progress.applied_lsn` 只在 pgoutput `Commit` 已持久化、batch 列表完整且
+游标越过最后一个 batch 时推进。因此，当一笔 source transaction 处理到一半时，
+结果表已经变化，`view_progress` 仍指向上一笔完整处理完的 source commit。它不是
+“当前结果精确对应哪个源快照”的证明。
 
 Replication feedback 只确认输入已经持久化，也不表示所有结果已经追上。
 
@@ -218,6 +219,8 @@ Replication feedback 只确认输入已经持久化，也不表示所有结果�
 
 - batch 提交前 Runtime 退出：本批 state、result 和 cursor 一起回滚，重启后重做；
 - batch 提交后 Runtime 退出：本批结果保持可见，重启后从下一 ordinal 继续；
+- `Commit` 到达前退出：已提交的批次保留，当前批次按事务回滚或提交；重放靠稳定
+  event identity 和 batch ordinal 去重，不会重复应用；
 - 最后一批失败：最后一批 state、result、`view_progress` 和 inbox 删除一起回滚；
 - ingress 落盘后、replication feedback 前退出：稳定 event identity 去重；
 - routing page 中途失败：本页 inbox 写入和 routing cursor 一起回滚。

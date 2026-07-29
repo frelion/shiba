@@ -25,6 +25,7 @@ pub enum LoadOutcome {
 pub enum NextApplyOutcome {
     BatchApplied,
     CommitCompleted,
+    Waiting,
     Retry,
     ResourceBlocked,
     Quarantined,
@@ -124,6 +125,7 @@ impl DagRuntime {
             let lsn_is_consistent = match outcome {
                 NextApplyOutcome::BatchApplied
                 | NextApplyOutcome::CommitCompleted
+                | NextApplyOutcome::Waiting
                 | NextApplyOutcome::ResourceBlocked
                 | NextApplyOutcome::Quarantined => commit_lsn.is_some(),
                 // A retry after claiming work identifies the commit; a retry
@@ -183,6 +185,7 @@ fn parse_next_apply_outcome(outcome: &str) -> Result<NextApplyOutcome, String> {
     match outcome {
         "batch_applied" => Ok(NextApplyOutcome::BatchApplied),
         "commit_completed" => Ok(NextApplyOutcome::CommitCompleted),
+        "waiting" => Ok(NextApplyOutcome::Waiting),
         "retry" => Ok(NextApplyOutcome::Retry),
         "resource_blocked" => Ok(NextApplyOutcome::ResourceBlocked),
         "quarantined" => Ok(NextApplyOutcome::Quarantined),
@@ -225,6 +228,10 @@ mod tests {
         assert_eq!(
             parse_next_apply_outcome("commit_completed"),
             Ok(NextApplyOutcome::CommitCompleted)
+        );
+        assert_eq!(
+            parse_next_apply_outcome("waiting"),
+            Ok(NextApplyOutcome::Waiting)
         );
         assert_eq!(
             parse_next_apply_outcome("retry"),

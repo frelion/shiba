@@ -147,13 +147,15 @@ SPI-connected backend. A logical `DagRuntime` is cached plan metadata, not a
 worker or thread. Result changes are therefore eventually consistent, and the
 number of result DAGs does not change PostgreSQL process count.
 
-The Runtime does not run SPI concurrently on Rust threads. After a source
-commit is fully ingested, it applies one stable ingress batch for one DAG per
-transaction and rotates ready DAGs between batches. Each transaction updates
-operator state, result rows, and the DAG batch cursor together, so earlier
-batches are visible before the complete source commit has been consumed. A
+The Runtime does not run SPI concurrently on Rust threads. With pgoutput
+transaction streaming disabled, `Begin` and row messages describe a source
+transaction that PostgreSQL has already committed. As soon as the Runtime
+persists a stable ingress batch, it can route and apply that batch without
+waiting to read the trailing pgoutput `Commit`. It applies one batch for one
+DAG per transaction and rotates ready DAGs between batches. Each transaction
+updates operator state, result rows, and the DAG batch cursor together. A
 PostgreSQL statement is still non-preemptible, so high-fanout operator work can
-temporarily delay routing, other DAGs, and garbage collection.
+temporarily delay ingress, routing, other DAGs, and garbage collection.
 
 Each committed transaction is durably deduplicated by its commit LSN, and each
 result records an activation LSN immediately after its locked CTAS backfill.
@@ -162,10 +164,12 @@ Every decoded delta is stored once in the shared durable `change_log`.
 and a batch cursor per affected DAG, so payload is not duplicated by fanout.
 Operator SQL reads one `ingress_apply_batches` input range and directly updates
 authoritative state and result rows in the same transaction that advances the
-cursor. On the last batch, that transaction also advances progress and
-acknowledges the DAG reference. This prevents crash replay from double-counting
-a committed batch and prevents pre-backfill WAL from entering a newly-created
-result. A partial source commit can remain visible if a later batch fails.
+cursor. Reaching the current end before pgoutput `Commit` keeps the inbox and
+waits without advancing progress. After `Commit` seals the batch list, a cursor
+past the final batch advances progress and acknowledges the DAG reference.
+This prevents crash replay from double-counting a committed batch and prevents
+pre-backfill WAL from entering a newly-created result. A partial source commit
+can remain visible if a later batch fails.
 `shiba_internal.view_progress.applied_lsn` exposes the per-result commit-LSN
 watermark for source commits whose every batch has completed; it does not
 describe an already-visible partial commit.

@@ -114,11 +114,23 @@ BEGIN
           AND txn.finalized_at < clock_timestamp()
               - pg_catalog.current_setting('shiba.ingress_retention')::interval
           AND replay.replay_safe_lsn >= txn.end_lsn
-          AND EXISTS (
+          AND NOT EXISTS (
               SELECT 1
                 FROM shiba_internal.routing_tasks AS task
                WHERE task.ingress_txn_id = txn.ingress_txn_id
-                 AND task.status = 'complete'
+                 AND task.status <> 'complete'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+                FROM shiba_internal.ingress_apply_batches AS batch
+               WHERE batch.ingress_txn_id = txn.ingress_txn_id
+                 AND NOT EXISTS (
+                     SELECT 1
+                       FROM shiba_internal.routing_tasks AS task
+                      WHERE task.ingress_txn_id = batch.ingress_txn_id
+                        AND task.batch_ordinal = batch.batch_ordinal
+                        AND task.status = 'complete'
+                 )
           )
           AND NOT EXISTS (
             SELECT 1

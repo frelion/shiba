@@ -380,7 +380,7 @@ CREATE TABLE shiba_internal.ingress_transactions (
     opened_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     finalized_at timestamptz,
     UNIQUE (slot_generation, source_xid, final_lsn),
-    UNIQUE (ingress_txn_id, commit_lsn),
+    UNIQUE (ingress_txn_id, final_lsn),
     CHECK (next_input_seq = event_count + 1),
     CHECK (
         (status = 'open'
@@ -504,19 +504,19 @@ CREATE UNLOGGED TABLE shiba_internal.join_batch_rows (
     ),
     FOREIGN KEY (ingress_txn_id,commit_lsn)
         REFERENCES shiba_internal.ingress_transactions
-                   (ingress_txn_id,commit_lsn)
+                   (ingress_txn_id,final_lsn)
         ON DELETE CASCADE
 );
 
 CREATE INDEX shiba_join_batch_commit_idx
     ON shiba_internal.join_batch_rows (result_oid,commit_lsn,input_side);
 
--- PostgreSQL has already applied top-level and subtransaction rollback
--- semantics before pgoutput emits rows when streaming=off.  Consumers only
--- need committed, normalized payload.
+-- With pgoutput streaming=off, PostgreSQL emits Begin and row messages only
+-- after the source transaction has committed. final_lsn is therefore the
+-- stable source epoch before Shiba receives the trailing pgoutput Commit.
 CREATE VIEW shiba_internal.effective_change_log AS
 SELECT event.ingress_txn_id,
-       txn.commit_lsn,
+       txn.final_lsn AS commit_lsn,
        event.input_seq AS sequence,
        event.change_lsn,
        event.change_ordinal,
@@ -529,25 +529,13 @@ SELECT event.ingress_txn_id,
   FROM shiba_internal.change_log AS event
  JOIN shiba_internal.ingress_transactions AS txn
     ON txn.ingress_txn_id = event.ingress_txn_id
-   AND txn.status = 'committed'
  WHERE event.canonical_payload IS NOT NULL;
 
--- Routing examines this bounded-per-source set rather than rescanning payload.
-CREATE TABLE shiba_internal.ingress_sources (
-    ingress_txn_id bigint NOT NULL
-        REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
-        ON DELETE CASCADE,
-    source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
-    PRIMARY KEY (ingress_txn_id, source_oid)
-);
-
-CREATE INDEX shiba_ingress_sources_source_idx
-    ON shiba_internal.ingress_sources (source_oid, ingress_txn_id);
-
--- Commit creates one task only.  subscriber_cursor is the last result OID
--- routed by keyset pagination; zero means that no subscriber has been visited.
+-- Every stable apply batch is independently routable before pgoutput Commit.
+-- subscriber_cursor is the last result OID visited for this batch.
 CREATE TABLE shiba_internal.routing_tasks (
-    ingress_txn_id bigint PRIMARY KEY,
+    ingress_txn_id bigint NOT NULL,
+    batch_ordinal bigint NOT NULL,
     commit_lsn pg_lsn NOT NULL,
     subscriber_cursor oid NOT NULL DEFAULT 0::oid,
     status text NOT NULL DEFAULT 'pending'
@@ -557,16 +545,22 @@ CREATE TABLE shiba_internal.routing_tasks (
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     completed_at timestamptz,
     last_error text,
+    PRIMARY KEY (ingress_txn_id,batch_ordinal),
+    FOREIGN KEY (ingress_txn_id,batch_ordinal)
+        REFERENCES shiba_internal.ingress_apply_batches
+                   (ingress_txn_id,batch_ordinal)
+        ON DELETE CASCADE,
     FOREIGN KEY (ingress_txn_id, commit_lsn)
         REFERENCES shiba_internal.ingress_transactions
-                   (ingress_txn_id, commit_lsn)
+                   (ingress_txn_id, final_lsn)
         ON DELETE CASCADE,
     CHECK ((status = 'complete') = (completed_at IS NOT NULL)),
     CHECK ((status = 'failed') = (last_error IS NOT NULL))
 );
 
 CREATE INDEX shiba_routing_tasks_ready_idx
-    ON shiba_internal.routing_tasks (commit_lsn, ingress_txn_id)
+    ON shiba_internal.routing_tasks
+       (commit_lsn, ingress_txn_id, batch_ordinal)
     WHERE status IN ('pending', 'routing');
 
 -- A DAG inbox row references the ingress transaction directly. Payload is
@@ -582,7 +576,7 @@ CREATE TABLE shiba_internal.dag_inbox (
     UNIQUE (result_oid, commit_lsn),
     FOREIGN KEY (ingress_txn_id, commit_lsn)
         REFERENCES shiba_internal.ingress_transactions
-                   (ingress_txn_id, commit_lsn)
+                   (ingress_txn_id, final_lsn)
         ON DELETE RESTRICT
 );
 

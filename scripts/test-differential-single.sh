@@ -518,9 +518,12 @@ psql_diff -qc "${large_batch_sql}"
 wait_for_value "t" "
   SELECT count(*)>0
   FROM shiba_internal.dag_inbox inbox
+  JOIN shiba_internal.ingress_transactions txn
+    ON txn.ingress_txn_id=inbox.ingress_txn_id
   JOIN shiba_internal.stream_views view
     ON view.result_oid=inbox.result_oid
-  WHERE view.source_oid='public.diff_events'::regclass"
+  WHERE view.source_oid='public.diff_events'::regclass
+    AND txn.status='committed'"
 large_batch_lsn="$(psql_diff -Atqc "
   SELECT max(inbox.commit_lsn)
   FROM shiba_internal.dag_inbox inbox

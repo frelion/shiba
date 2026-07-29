@@ -27,8 +27,9 @@ Shiba is tested against a real PostgreSQL 17 server, not a mock database.
    `COUNT(DISTINCT)`, top-level DISTINCT, TopN/OFFSET, windows, all supported
    joins, cross-input predicates, and semi/anti/null-aware anti joins.
 6. **Concurrency and recovery tests** exercise concurrent mixed DML, large
-   commit and rollback batches, crash after a directly applied batch, durable
-   cursor resume, last-batch rollback, persistent-slot replay across an
+   commit and rollback batches, crash after a batch applied before pgoutput
+   `Commit` is read, durable cursor resume, last-batch rollback,
+   persistent-slot replay across an
    immediate PostgreSQL restart, and result DROP racing with writers. Every
    blocking operation and poll has a hard timeout.
 
@@ -47,9 +48,13 @@ Shiba is tested against a real PostgreSQL 17 server, not a mock database.
 - replayed ingress produces stable, contiguous, non-overlapping
   `ingress_apply_batches`; each DAG cursor advances in the same transaction as
   authoritative operator state and result changes;
-- crashing after a committed apply batch leaves that batch visible while
-  progress remains on the previous complete source commit; a replacement
-  Runtime resumes at the next batch without double application;
+- a stable batch can route and apply while its `ingress_transactions` header is
+  still `open`; reaching the current end retains the inbox and does not advance
+  progress or delete input;
+- crashing after such a pre-seal batch leaves that batch visible while progress
+  remains on the previous complete source commit; a replacement Runtime
+  deduplicates retained input, reads the trailing `Commit`, and resumes at the
+  next batch without double application;
 - registration persists exactly one valid `PhysicalDagPlan` generation per
   DAG; Runtime execution loads that generation instead of compiling per
   commit;
