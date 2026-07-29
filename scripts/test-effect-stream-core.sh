@@ -764,7 +764,7 @@ if psql_core -qc "
   fail "concurrent append CAS loser unexpectedly committed"
 fi
 wait "${cas_winner_pid}"
-if ! rg -q "effect stream expected chunk" "${cas_loser_output}"; then
+if ! grep -Fq "effect stream expected chunk" "${cas_loser_output}"; then
   fail "concurrent append CAS loser returned the wrong error"
 fi
 assert_query "4|1" "

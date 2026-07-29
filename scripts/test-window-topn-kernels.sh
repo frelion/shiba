@@ -10,7 +10,7 @@ static_require() {
   local file="$1"
   local pattern="$2"
   local description="$3"
-  if ! rg -q "${pattern}" "${project_root}/${file}"; then
+  if ! grep -Eq "${pattern}" "${project_root}/${file}"; then
     printf 'Window/TopN static gate failed: %s\n' "${description}" >&2
     exit 1
   fi
@@ -53,15 +53,15 @@ for interval in 1 2 3; do
     "interval_${interval} AS MATERIALIZED" \
     "Window aggregate frame interval ${interval} is not independently bounded"
 done
-if rg -q 'pg_catalog\.record_send' \
+if grep -Eq 'pg_catalog\.record_send' \
   "${project_root}/src/kernel/window.rs" \
   "${project_root}/src/kernel/topn.rs"; then
   printf '%s\n' \
     'Window/TopN static gate failed: raw record_send identity remains' >&2
   exit 1
 fi
-if rg -Uq \
-  'ON \(ordered\.ordinal BETWEEN frame\.start_1[\s\S]*OR \(ordered\.ordinal BETWEEN frame\.start_2' \
+if grep -Eq \
+  'OR \(ordered\.ordinal BETWEEN frame\.start_2' \
   "${project_root}/src/kernel/window.rs"; then
   printf '%s\n' \
     'Window/TopN static gate failed: aggregate frame still uses one OR range scan' >&2
