@@ -4,17 +4,62 @@
 
 #[derive(Debug, PartialEq)]
 pub enum Message {
-    Begin { final_lsn: u64, xid: u32 },
-    Commit { commit_lsn: u64, end_lsn: u64 },
-    Relation { relid: u32, columns: Vec<String> },
-    Insert { relid: u32, row: Tuple },
-    Update { relid: u32, old: Tuple, new: Tuple },
-    Delete { relid: u32, old: Tuple },
+    Begin {
+        final_lsn: u64,
+        xid: u32,
+    },
+    Commit {
+        commit_lsn: u64,
+        end_lsn: u64,
+    },
+    StreamStart {
+        xid: u32,
+        first_segment: bool,
+    },
+    StreamStop,
+    StreamCommit {
+        xid: u32,
+        flags: u8,
+        commit_lsn: u64,
+        end_lsn: u64,
+        commit_time: i64,
+    },
+    StreamAbort {
+        xid: u32,
+        subxid: u32,
+    },
+    Relation {
+        relid: u32,
+        columns: Vec<String>,
+    },
+    Insert {
+        relid: u32,
+        row: Tuple,
+    },
+    Update {
+        relid: u32,
+        old: Tuple,
+        new: Tuple,
+    },
+    Delete {
+        relid: u32,
+        old: Tuple,
+    },
 }
 
 pub type Tuple = Vec<Option<String>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParseContext {
+    NonStreaming,
+    Streaming { expected_xid: u32 },
+}
+
 pub fn parse(input: &[u8]) -> Result<Message, &'static str> {
+    parse_with_context(input, ParseContext::NonStreaming)
+}
+
+pub fn parse_with_context(input: &[u8], context: ParseContext) -> Result<Message, &'static str> {
     let tag = *input.first().ok_or("empty pgoutput message")?;
     match tag {
         b'B' => Ok(Message::Begin {
@@ -23,7 +68,10 @@ pub fn parse(input: &[u8]) -> Result<Message, &'static str> {
         }),
         b'C' => Ok(Message::Commit {
             // Commit is: tag, flags, commit_lsn, end_lsn, commit_time.
-            commit_lsn: read_u64(input, 2)?,
+            commit_lsn: {
+                require_zero_flag(input, 1, "invalid commit flags")?;
+                read_u64(input, 2)?
+            },
             end_lsn: {
                 let end_lsn = read_u64(input, 10)?;
                 // Validate the ignored commit_time too, so a truncated fixed-size
@@ -32,31 +80,74 @@ pub fn parse(input: &[u8]) -> Result<Message, &'static str> {
                 end_lsn
             },
         }),
-        b'R' => parse_relation(input),
-        b'I' => {
-            let relid = read_u32(input, 1)?;
-            if input.get(5) != Some(&b'N') {
-                return Err("invalid insert tuple tag");
-            }
-            let (row, _) = parse_tuple(input, 5)?;
-            Ok(Message::Insert { relid, row })
+        b'S' => parse_stream_start(input),
+        b'E' => {
+            require_exact_len(input, 1, "invalid stream stop message length")?;
+            Ok(Message::StreamStop)
         }
-        b'U' => parse_update(input),
-        b'D' => {
-            let relid = read_u32(input, 1)?;
-            if !matches!(input.get(5), Some(b'K' | b'O')) {
-                return Err("invalid delete tuple tag");
-            }
-            let (old, _) = parse_tuple(input, 5)?;
-            Ok(Message::Delete { relid, old })
-        }
+        b'c' => parse_stream_commit(input),
+        b'A' => parse_stream_abort(input),
+        b'R' => parse_transactional(input, context, parse_relation),
+        b'I' => parse_transactional(input, context, parse_insert),
+        b'U' => parse_transactional(input, context, parse_update),
+        b'D' => parse_transactional(input, context, parse_delete),
         _ => Err("unsupported or truncated pgoutput message"),
     }
 }
 
-fn parse_relation(input: &[u8]) -> Result<Message, &'static str> {
-    let relid = read_u32(input, 1)?;
-    let (_, namespace_end) = read_cstr(input, 5)?;
+fn parse_transactional(
+    input: &[u8],
+    context: ParseContext,
+    parser: fn(&[u8], usize) -> Result<Message, &'static str>,
+) -> Result<Message, &'static str> {
+    match context {
+        ParseContext::NonStreaming => parser(input, 1),
+        ParseContext::Streaming { expected_xid } => {
+            let xid = read_u32(input, 1)?;
+            if xid != expected_xid {
+                return Err("streamed message xid does not match context");
+            }
+            parser(input, 5)
+        }
+    }
+}
+
+fn parse_stream_start(input: &[u8]) -> Result<Message, &'static str> {
+    require_exact_len(input, 6, "invalid stream start message length")?;
+    let first_segment = match input[5] {
+        0 => false,
+        1 => true,
+        _ => return Err("invalid stream start first-segment flag"),
+    };
+    Ok(Message::StreamStart {
+        xid: read_u32(input, 1)?,
+        first_segment,
+    })
+}
+
+fn parse_stream_commit(input: &[u8]) -> Result<Message, &'static str> {
+    require_exact_len(input, 30, "invalid stream commit message length")?;
+    require_zero_flag(input, 5, "invalid stream commit flags")?;
+    Ok(Message::StreamCommit {
+        xid: read_u32(input, 1)?,
+        flags: input[5],
+        commit_lsn: read_u64(input, 6)?,
+        end_lsn: read_u64(input, 14)?,
+        commit_time: read_i64(input, 22)?,
+    })
+}
+
+fn parse_stream_abort(input: &[u8]) -> Result<Message, &'static str> {
+    require_exact_len(input, 9, "invalid stream abort message length")?;
+    Ok(Message::StreamAbort {
+        xid: read_u32(input, 1)?,
+        subxid: read_u32(input, 5)?,
+    })
+}
+
+fn parse_relation(input: &[u8], offset: usize) -> Result<Message, &'static str> {
+    let relid = read_u32(input, offset)?;
+    let (_, namespace_end) = read_cstr(input, offset + 4)?;
     let (_, relation_end) = read_cstr(input, namespace_end)?;
     let column_count = read_u16(input, relation_end + 1)? as usize;
     let mut offset = relation_end + 3;
@@ -75,11 +166,22 @@ fn parse_relation(input: &[u8]) -> Result<Message, &'static str> {
     Ok(Message::Relation { relid, columns })
 }
 
-fn parse_update(input: &[u8]) -> Result<Message, &'static str> {
-    let relid = read_u32(input, 1)?;
-    let tag = *input.get(5).ok_or("truncated update message")?;
+fn parse_insert(input: &[u8], offset: usize) -> Result<Message, &'static str> {
+    let relid = read_u32(input, offset)?;
+    let tuple_offset = offset + 4;
+    if input.get(tuple_offset) != Some(&b'N') {
+        return Err("invalid insert tuple tag");
+    }
+    let (row, _) = parse_tuple(input, tuple_offset)?;
+    Ok(Message::Insert { relid, row })
+}
+
+fn parse_update(input: &[u8], offset: usize) -> Result<Message, &'static str> {
+    let relid = read_u32(input, offset)?;
+    let tuple_offset = offset + 4;
+    let tag = *input.get(tuple_offset).ok_or("truncated update message")?;
     let (old, offset) = match tag {
-        b'K' | b'O' => parse_tuple(input, 5)?,
+        b'K' | b'O' => parse_tuple(input, tuple_offset)?,
         b'N' => return Err("UPDATE lacks an old tuple; source must use REPLICA IDENTITY FULL"),
         _ => return Err("invalid update tuple tag"),
     };
@@ -88,6 +190,16 @@ fn parse_update(input: &[u8]) -> Result<Message, &'static str> {
     }
     let (new, _) = parse_tuple(input, offset)?;
     Ok(Message::Update { relid, old, new })
+}
+
+fn parse_delete(input: &[u8], offset: usize) -> Result<Message, &'static str> {
+    let relid = read_u32(input, offset)?;
+    let tuple_offset = offset + 4;
+    if !matches!(input.get(tuple_offset), Some(b'K' | b'O')) {
+        return Err("invalid delete tuple tag");
+    }
+    let (old, _) = parse_tuple(input, tuple_offset)?;
+    Ok(Message::Delete { relid, old })
 }
 
 fn parse_tuple(input: &[u8], offset: usize) -> Result<(Tuple, usize), &'static str> {
@@ -163,6 +275,37 @@ fn read_u64(input: &[u8], offset: usize) -> Result<u64, &'static str> {
     ))
 }
 
+fn read_i64(input: &[u8], offset: usize) -> Result<i64, &'static str> {
+    let end = offset.checked_add(8).ok_or("truncated pgoutput message")?;
+    Ok(i64::from_be_bytes(
+        input
+            .get(offset..end)
+            .ok_or("truncated pgoutput message")?
+            .try_into()
+            .map_err(|_| "truncated pgoutput message")?,
+    ))
+}
+
+fn require_zero_flag(input: &[u8], offset: usize, error: &'static str) -> Result<(), &'static str> {
+    match input.get(offset) {
+        Some(0) => Ok(()),
+        Some(_) => Err(error),
+        None => Err("truncated pgoutput message"),
+    }
+}
+
+fn require_exact_len(
+    input: &[u8],
+    expected: usize,
+    error: &'static str,
+) -> Result<(), &'static str> {
+    if input.len() == expected {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +323,36 @@ mod tests {
         message.extend_from_slice(&commit_lsn.to_be_bytes());
         message.extend_from_slice(&end_lsn.to_be_bytes());
         message.extend_from_slice(&123u64.to_be_bytes());
+        message
+    }
+
+    fn stream_start(xid: u32, first_segment: u8) -> Vec<u8> {
+        let mut message = vec![b'S'];
+        message.extend_from_slice(&xid.to_be_bytes());
+        message.push(first_segment);
+        message
+    }
+
+    fn stream_commit(
+        xid: u32,
+        flags: u8,
+        commit_lsn: u64,
+        end_lsn: u64,
+        commit_time: i64,
+    ) -> Vec<u8> {
+        let mut message = vec![b'c'];
+        message.extend_from_slice(&xid.to_be_bytes());
+        message.push(flags);
+        message.extend_from_slice(&commit_lsn.to_be_bytes());
+        message.extend_from_slice(&end_lsn.to_be_bytes());
+        message.extend_from_slice(&commit_time.to_be_bytes());
+        message
+    }
+
+    fn stream_abort(xid: u32, subxid: u32) -> Vec<u8> {
+        let mut message = vec![b'A'];
+        message.extend_from_slice(&xid.to_be_bytes());
+        message.extend_from_slice(&subxid.to_be_bytes());
         message
     }
 
@@ -227,11 +400,28 @@ mod tests {
         message
     }
 
+    fn streamed(xid: u32, message: &[u8]) -> Vec<u8> {
+        let mut streamed = vec![message[0]];
+        streamed.extend_from_slice(&xid.to_be_bytes());
+        streamed.extend_from_slice(&message[1..]);
+        streamed
+    }
+
     fn assert_every_strict_prefix_is_rejected(message: &[u8]) {
         for length in 0..message.len() {
             assert!(
                 parse(&message[..length]).is_err(),
                 "accepted prefix of length {length} from {message:?}"
+            );
+        }
+    }
+
+    fn assert_every_streaming_prefix_is_rejected(message: &[u8], expected_xid: u32) {
+        for length in 0..message.len() {
+            assert!(
+                parse_with_context(&message[..length], ParseContext::Streaming { expected_xid })
+                    .is_err(),
+                "accepted streaming prefix of length {length} from {message:?}"
             );
         }
     }
@@ -264,6 +454,178 @@ mod tests {
                 commit_lsn: 42,
                 end_lsn: 43
             })
+        );
+    }
+
+    #[test]
+    fn reads_stream_start_first_and_later_segments() {
+        assert_eq!(
+            parse(&stream_start(u32::MAX, 1)),
+            Ok(Message::StreamStart {
+                xid: u32::MAX,
+                first_segment: true,
+            })
+        );
+        assert_eq!(
+            parse(&stream_start(42, 0)),
+            Ok(Message::StreamStart {
+                xid: 42,
+                first_segment: false,
+            })
+        );
+    }
+
+    #[test]
+    fn reads_stream_stop() {
+        assert_eq!(parse(b"E"), Ok(Message::StreamStop));
+    }
+
+    #[test]
+    fn reads_stream_commit() {
+        assert_eq!(
+            parse(&stream_commit(u32::MAX, 0, u64::MAX, 43, i64::MIN)),
+            Ok(Message::StreamCommit {
+                xid: u32::MAX,
+                flags: 0,
+                commit_lsn: u64::MAX,
+                end_lsn: 43,
+                commit_time: i64::MIN,
+            })
+        );
+    }
+
+    #[test]
+    fn reads_stream_abort() {
+        assert_eq!(
+            parse(&stream_abort(u32::MAX, u32::MAX - 1)),
+            Ok(Message::StreamAbort {
+                xid: u32::MAX,
+                subxid: u32::MAX - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_streaming_tags_and_flags() {
+        for tag in [b's', b'e', b'a'] {
+            assert_eq!(
+                parse(&[tag]),
+                Err("unsupported or truncated pgoutput message")
+            );
+        }
+
+        for first_segment in [2, u8::MAX] {
+            assert_eq!(
+                parse(&stream_start(1, first_segment)),
+                Err("invalid stream start first-segment flag")
+            );
+        }
+
+        for flags in [1, u8::MAX] {
+            assert_eq!(
+                parse(&stream_commit(1, flags, 2, 3, 4)),
+                Err("invalid stream commit flags")
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_normal_commit_flags() {
+        for flags in [1, u8::MAX] {
+            let mut message = commit(1, 2);
+            message[1] = flags;
+            assert_eq!(parse(&message), Err("invalid commit flags"));
+        }
+    }
+
+    #[test]
+    fn streaming_messages_require_exact_lengths() {
+        for mut message in [
+            stream_start(1, 1),
+            vec![b'E'],
+            stream_commit(2, 0, 3, 4, 5),
+            stream_abort(6, 7),
+        ] {
+            assert!(parse(&message).is_ok(), "fixture is invalid: {message:?}");
+            assert_every_strict_prefix_is_rejected(&message);
+            message.push(0);
+            assert!(
+                parse(&message).is_err(),
+                "accepted trailing bytes: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_streamed_relation_with_embedded_xid() {
+        let relation = streamed(101, &relation(9, b"public", b"things", &[b"id", b"value"]));
+        assert_eq!(
+            parse_with_context(&relation, ParseContext::Streaming { expected_xid: 101 }),
+            Ok(Message::Relation {
+                relid: 9,
+                columns: vec!["id".into(), "value".into()],
+            })
+        );
+        assert_every_streaming_prefix_is_rejected(&relation, 101);
+    }
+
+    #[test]
+    fn reads_streamed_insert_update_and_delete_with_embedded_xid() {
+        let messages = [
+            (
+                streamed(102, &dml(b'I', 7, &[tuple(b'N', &[Some(b"new"), None])])),
+                102,
+                Message::Insert {
+                    relid: 7,
+                    row: vec![Some("new".into()), None],
+                },
+            ),
+            (
+                streamed(
+                    103,
+                    &dml(
+                        b'U',
+                        8,
+                        &[tuple(b'O', &[Some(b"old")]), tuple(b'N', &[Some(b"new")])],
+                    ),
+                ),
+                103,
+                Message::Update {
+                    relid: 8,
+                    old: vec![Some("old".into())],
+                    new: vec![Some("new".into())],
+                },
+            ),
+            (
+                streamed(104, &dml(b'D', 9, &[tuple(b'K', &[Some(b"key")])])),
+                104,
+                Message::Delete {
+                    relid: 9,
+                    old: vec![Some("key".into())],
+                },
+            ),
+        ];
+
+        for (message, expected_xid, expected) in messages {
+            assert_eq!(
+                parse_with_context(&message, ParseContext::Streaming { expected_xid }),
+                Ok(expected)
+            );
+            assert_every_streaming_prefix_is_rejected(&message, expected_xid);
+        }
+    }
+
+    #[test]
+    fn contexts_do_not_silently_accept_the_other_dml_layout() {
+        let ordinary = dml(b'I', 7, &[tuple(b'N', &[Some(b"value")])]);
+        let streaming = streamed(105, &ordinary);
+        assert!(
+            parse_with_context(&ordinary, ParseContext::Streaming { expected_xid: 105 }).is_err()
+        );
+        assert!(parse(&streaming).is_err());
+        assert_eq!(
+            parse_with_context(&streaming, ParseContext::Streaming { expected_xid: 106 }),
+            Err("streamed message xid does not match context")
         );
     }
 
@@ -438,6 +800,7 @@ mod tests {
         assert_eq!(read_u16(&[], usize::MAX), Err("truncated pgoutput message"));
         assert_eq!(read_u32(&[], usize::MAX), Err("truncated pgoutput message"));
         assert_eq!(read_u64(&[], usize::MAX), Err("truncated pgoutput message"));
+        assert_eq!(read_i64(&[], usize::MAX), Err("truncated pgoutput message"));
     }
 
     #[test]
@@ -445,17 +808,21 @@ mod tests {
         let messages = [
             begin(1, 2),
             commit(3, 4),
-            relation(5, b"public", b"things", &[b"id", b"value"]),
-            dml(b'I', 6, &[tuple(b'N', &[Some(b"text"), None, Some(b"")])]),
+            stream_start(5, 1),
+            vec![b'E'],
+            stream_commit(6, 0, 7, 8, 9),
+            stream_abort(10, 11),
+            relation(14, b"public", b"things", &[b"id", b"value"]),
+            dml(b'I', 15, &[tuple(b'N', &[Some(b"text"), None, Some(b"")])]),
             dml(
                 b'U',
-                7,
+                16,
                 &[
                     tuple(b'O', &[Some(b"old"), None]),
                     tuple(b'N', &[Some(b"new"), Some(b"value")]),
                 ],
             ),
-            dml(b'D', 8, &[tuple(b'K', &[Some(b"key")])]),
+            dml(b'D', 17, &[tuple(b'K', &[Some(b"key")])]),
         ];
         for message in &messages {
             assert!(parse(message).is_ok(), "fixture is invalid: {message:?}");
