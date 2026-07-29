@@ -4,68 +4,81 @@
 [![Latest release](https://img.shields.io/github/v/release/frelion/shiba)](https://github.com/frelion/shiba/releases)
 [![License: PostgreSQL](https://img.shields.io/badge/license-PostgreSQL-blue.svg)](LICENSE)
 
-Shiba is a small streaming database engine you can read end to end. It is
-written in Rust, runs inside PostgreSQL, and keeps SQL result tables updated
-from committed WAL changes—no refresh and no source-table rescan.
+Shiba is a PostgreSQL 17 extension for transaction-aware incremental view
+maintenance. It consumes committed transactions from `pgoutput`, transforms
+their row deltas through a persisted operator DAG, and asynchronously updates
+SQL result tables without rescanning registered source tables.
 
-> Status: experimental v0.1. Shiba targets PostgreSQL 17 and intentionally
-> supports a validated SQL subset. It is not yet a general-purpose streaming
-> platform or a distributed execution engine.
+> Status: experimental v0.1. Shiba supports a validated SQL subset and is not
+> a distributed execution engine.
 
-## How it works
+## Architecture
 
-When you declare a Shiba result table, Shiba validates the query, computes the
-initial rows, and saves a plan for maintaining them. That happens once.
+```mermaid
+flowchart LR
+    TX["source transaction"] -->|"COMMIT"| WAL["PostgreSQL WAL"]
+    WAL --> WS["pgoutput / walsender"]
 
-After that, follow one ordinary source-table commit:
+    subgraph PG["PostgreSQL relations"]
+        LOG[("shared change_log")]
+        INBOX[("per-result dag_inbox")]
+        PLAN[("PhysicalDagPlan")]
+        STATE[("operator state")]
+        RESULT[("result table")]
+    end
 
-```text
-INSERT / UPDATE / DELETE
-          │ COMMIT
-          ▼
-    PostgreSQL WAL
-          │
-          ▼
-  shared change_log
-          │
-          ▼
- per-result inbox task
-          │
-          ▼
- saved plan + SQL kernels
-          │
-          ▼
-      result table
+    subgraph R["one Shiba Runtime per active database"]
+        DECODE["decode + bounded batching"]
+        ROUTE["dependency routing"]
+        SCHEDULE["round-robin scheduler"]
+        APPLY["physical SQL pipeline"]
+        FEEDBACK["standby status feedback"]
+    end
+
+    WS --> DECODE
+    DECODE --> LOG
+    LOG --> ROUTE
+    ROUTE --> INBOX
+    INBOX --> SCHEDULE
+    SCHEDULE --> APPLY
+    PLAN -->|"read-only"| APPLY
+    STATE <-->|"read / write"| APPLY
+    APPLY --> RESULT
+    LOG -. "durable LSN" .-> FEEDBACK
+    FEEDBACK -.-> WS
 ```
 
-Each database has one Shiba background process called the Runtime. PostgreSQL
-logical decoding has its own walsender; Shiba adds no Router or worker pool.
-The Runtime reads committed WAL, saves each source transaction once in the
-change log, and gives every affected result table a small inbox task. It then
-processes those tasks in turn.
+The processing unit is a complete source transaction. Ingress normalizes DML
+into weighted rows: insert is `+1`, delete is `-1`, and update is
+`-1 old / +1 new`. A source transaction is stored once in `change_log`;
+`dag_inbox` contains durable per-result references to that shared input.
+Large source transactions may be persisted in bounded ingress batches, but
+they are not visible to routing or operator apply before the final `Commit`.
 
-For one task, the Runtime updates operator state, result rows, and progress,
-then removes the inbox task—all in one PostgreSQL transaction. If it crashes,
-WAL is replayed, the inbox task remains, or the whole update rolls back. It can
-therefore retry without rescanning the source table.
+The physical pipeline combines the transaction delta with retained operator
+state for joins, aggregates, distinct, windows, or TopN. Operator state, result
+rows, apply progress, and inbox removal commit atomically for each result
+update. Replication feedback advances after durable ingress, independently of
+result apply.
 
-The [architecture walkthrough](docs/ARCHITECTURE.md) follows this exact path
-step by step and then explains registration, recovery, and limits.
+The detailed [architecture](docs/ARCHITECTURE.md) documents the stream model,
+operator state, scheduling, recovery, and resource bounds.
 
-New to Rust? Follow the [guided Rust code tour](docs/LEARNING_RUST.md). It starts
-with small round-trip helpers and builds up to binary protocols, state
-machines, PostgreSQL FFI, and the Runtime loop.
+The [Rust code tour](docs/LEARNING_RUST.md) traces the implementation from
+protocol parsers and state machines to PostgreSQL FFI and the Runtime loop.
 
-## Why Shiba?
+## Design constraints
 
-Traditional materialized views require a refresh that repeatedly reads the
-source data. Shiba turns a PostgreSQL result table into an incrementally
-maintained projection:
-
-- source writes remain fast because maintenance is asynchronous;
-- result updates consume committed deltas instead of rescanning source tables;
-- one Shiba worker and one visible queue path make the implementation readable
-  end to end.
+- Result maintenance is asynchronous and does not run inside the source
+  transaction.
+- PostgreSQL owns durable state and set-oriented SQL execution; Rust owns
+  protocol decoding, validation, planning, and scheduling.
+- Each active database has one Shiba Runtime. PostgreSQL logical decoding uses
+  a separate walsender.
+- Per-result source-commit order is strict; different results are scheduled
+  round-robin.
+- A running apply is not preempted. Long applies cause head-of-line blocking
+  for the single Runtime.
 
 ## Quick start
 

@@ -1,239 +1,369 @@
-# Shiba 是怎么运作的
+# Shiba 架构
 
-本文是当前实现的唯一架构说明。先不要记事务边界、状态分类或表名，只记住这
-一句：
+Shiba 是嵌入 PostgreSQL 的增量流处理引擎。它读取逻辑复制产生的已提交变更，
+按 source commit 运行持久化的 operator DAG，并异步维护结果表。
 
-> PostgreSQL 把已提交的源表变化写进 WAL；Shiba 保存一份共享输入，给每个
-> 受影响的结果留一张待办卡，再由数据库里唯一的 Runtime 逐张处理。
+完整 source commit 是 apply 单元，不是单行事件。大事务的 ingress 可以拆成
+多个有界持久批次，但 final `Commit` 到达前不会进入 routing 或 operator apply。
 
-产品范围见 [`MVP.md`](MVP.md)，测试方法见 [`TESTING.md`](TESTING.md)。第一次
-读 Rust 代码可以跟随 [`LEARNING_RUST.md`](LEARNING_RUST.md)。
+- 同一源事务内的所有变化一起进入一个结果 DAG；
+- 每个结果严格按 `commit_lsn` 处理源事务；
+- operator state、result rows、`view_progress` 和该 DAG 的 `dag_inbox` delete
+  在一次 apply transaction 中原子提交。
 
-## 从一笔源事务看完整过程
+产品支持范围见 [`MVP.md`](MVP.md)，测试与验收见
+[`TESTING.md`](TESTING.md)，Rust 代码导读见
+[`LEARNING_RUST.md`](LEARNING_RUST.md)。
 
-假设已经声明了一个由 Shiba 维护的结果表：
+## 系统拓扑
 
-```sql
-CREATE TABLE shiba.sales_by_product AS
-SELECT product_id, count(*) AS rows, sum(amount) AS total
-FROM sales
-GROUP BY product_id;
+```mermaid
+flowchart LR
+    subgraph PG["PostgreSQL"]
+        SOURCE[("source tables")]
+        WAL["WAL"]
+        WS["logical walsender<br/>pgoutput"]
+        INGRESS[("ingress_transactions<br/>change_log")]
+        INBOX[("dag_inbox<br/>per-result references")]
+        LOGICAL[("LogicalPlan")]
+        PHYSICAL[("PhysicalDagPlan")]
+        STATE[("operator state")]
+        STAGE[("UNLOGGED Stage")]
+        RESULT[("managed result table")]
+    end
+
+    subgraph RT["Shiba Runtime: process-local actions and caches"]
+        DECODE["decode + normalize<br/>INSERT/DELETE/UPDATE → weighted rows"]
+        ROUTE["route by source OID"]
+        SCHEDULE["round-robin scheduler"]
+        EXECUTE["physical SQL pipeline"]
+        GC["bounded GC"]
+        FEEDBACK["standby status feedback"]
+    end
+
+    SOURCE -->|"COMMIT"| WAL
+    WAL --> WS
+    WS --> DECODE
+    DECODE --> INGRESS
+    INGRESS --> ROUTE
+    ROUTE --> INBOX
+    INBOX --> SCHEDULE
+    SCHEDULE --> EXECUTE
+    PHYSICAL -->|"read-only plan"| EXECUTE
+    STATE <-->|"read / write"| EXECUTE
+    EXECUTE --> RESULT
+    EXECUTE -. "materialized intermediate delta" .-> STAGE
+    INGRESS -. "durable LSN" .-> FEEDBACK
+    FEEDBACK -.-> WS
+    INBOX --> GC
+    INGRESS --> GC
+    LOGICAL --> PHYSICAL
 ```
 
-现在应用提交一笔普通事务：
+PostgreSQL 的 logical walsender 和 Shiba Runtime 是两个 backend。Shiba 每个
+active database 只有一个 Runtime；没有 Router 进程、Executor pool、每 DAG
+worker 或线程池。
 
-```sql
-BEGIN;
-INSERT INTO sales VALUES (7, 30);
-INSERT INTO sales VALUES (7, 20);
-COMMIT;
+图中的 `change_log` 保存一份共享输入。一个源事务若影响多个结果，只增加多条
+`dag_inbox` 引用，不复制 row payload。
+
+## 一个源事务的执行时序
+
+```mermaid
+sequenceDiagram
+    participant A as application backend
+    participant W as WAL / walsender
+    participant R as Shiba Runtime
+    participant Q as LOGGED ingress + inbox
+    participant K as SQL operator pipeline
+    participant O as state + result + progress
+
+    A->>W: source transaction COMMIT
+    W-->>R: pgoutput Begin / row changes / Commit
+    loop bounded ingress batches
+        R->>Q: persist row images and batch identity
+    end
+    R->>Q: final batch: mark committed,<br/>create routing task, advance persisted_lsn
+    Q-->>R: ingress transaction COMMIT
+    R-->>W: standby status feedback<br/>(write=flush=persisted_lsn, apply=0)
+    R->>Q: route one subscriber page → dag_inbox
+    R->>Q: claim oldest inbox for one result
+    R->>K: execute PhysicalDagPlan with transaction delta
+    K->>O: update operator state, result and progress
+    R->>Q: delete claimed inbox
+    Note over R,O: state + result + progress + inbox delete<br/>commit in one PostgreSQL transaction
 ```
 
-结果表不会在这笔应用事务里同步更新。提交后，数据沿着下面这条路向前走：
+Ingress 可以把一个大源事务分成多个持久批次，但这些批次不是结果可见性边界。
+只有看到 `Commit` 的 final batch 才会完成 transaction envelope、创建 routing
+work 并推进 `persisted_lsn`。
+
+Replication feedback 确认的是 durable ingress，不是 result apply。Shiba 发送
+的 standby status 使用 `write = flush = persisted_lsn`、`apply = 0`，因此不会
+把异步结果维护错误地报告成 `remote_apply`。
+
+Routing 按 source OID 找到订阅该源且 `activation_lsn < commit_lsn` 的结果，
+分页写入 `dag_inbox`。同一结果的 inbox 按 `commit_lsn` 严格处理；不同结果由
+Runtime round-robin 调度。
+
+一次 apply 开始后不会被 time-slice。operator state、result rows、
+`view_progress` 和 inbox delete 处于同一 PostgreSQL transaction。失败会整体
+回滚，不会暴露 source commit 的部分结果。
+
+同一 source commit 若影响多个结果，每个结果在自己的 apply transaction 中
+更新。单个结果内部是原子的，多个结果之间不提供共同原子可见性，因此它们的
+`applied_lsn` 可以不同。
+
+source trigger 只负责在源事务提交后唤醒 Runtime，不传递 row payload。Apply 的
+输入是 `change_log` 和既有 operator state，不读取源表的当前快照。
+
+系统维护三类不同进度：
+
+| 进度 | 含义 |
+| --- | --- |
+| `persisted_lsn` / replication feedback | 输入已持久化，不能推导结果已更新 |
+| `view_progress.applied_lsn` | 单个结果最近应用的相关 source commit；不是连续的全局 WAL watermark |
+| `replay_safe_lsn` | 结合真实 slot 位置得到的 GC 安全边界 |
+
+## 流与增量模型
+
+### 事务是微批次
+
+逻辑复制按顺序提供 `Begin`、row change 和 `Commit`。Shiba 将一个已提交源事务
+表示为：
 
 ```text
-sales COMMIT
-    -> PostgreSQL WAL
-    -> 一份持久的共享输入
-    -> 每个受影响结果的一张待办卡
-    -> 按保存的规则更新状态和结果
+ΔT = ordered [(source_oid, sequence, weight, row)]
 ```
 
-这里只有一个搬运者：当前数据库的 `shiba runtime` 后台进程。下面把这张图逐步
-展开。
-
-### 1. PostgreSQL 确认源事务
-
-应用事务提交后，PostgreSQL 才会通过逻辑解码交出它的最终变化。已中止的事务、
-回滚的 savepoint 和回滚的子事务都不会进入 Shiba 的结果。
-
-源表 trigger 只在提交后唤醒 Runtime，不携带行数据，也不计算结果；WAL 是唯一
-数据来源。
-
-### 2. Runtime 把 WAL 变成持久输入
-
-Runtime 使用独立的逻辑复制连接读取 `pgoutput`。它把一笔源事务写成：
-
-- `ingress_transactions`：这笔事务的身份和提交位置；
-- `change_log`：按顺序保存这笔事务里的行映像。
-
-一笔很大的事务可以分多个有界批次写入，不需要整体留在 Rust heap。最后一个
-批次才把事务标成已提交、创建路由任务并推进持久 LSN。
-
-只有整笔源事务、全部行映像和路由任务都已经提交后，Runtime 才向逻辑复制 slot
-反馈消费位置。这个反馈只表示“输入已进入 Shiba 的持久队列”，不表示结果表
-已经更新。
-
-稳定的事务和行身份会把 WAL 重发变成幂等重试，不会制造第二份输入。
-
-### 3. 每个结果表收到一张“待办卡”
-
-行映像在 `change_log` 中只保存一次。路由阶段根据这笔事务涉及的源表，给每个
-相关结果表插入一条待办引用（`dag_inbox`）。
-
-例如十个结果表都依赖 `sales`，仍然只有一份 `change_log` 数据，外加十条很小
-的待办引用。路由按页提交，并保存下一页的位置。
-
-### 4. Runtime 取出一张待办卡并更新结果
-
-Runtime 在有待办的结果之间轮流调度。它为一个结果表取最老的 inbox，加载注册
-时保存的物理计划，然后调用集合化 SQL kernel。
-
-以本例为例，kernel 会把 `product_id = 7` 的两条增量合并到聚合状态——也就是
-为后续增量保留的内部计数和总和——再更新 `shiba.sales_by_product`。下面这些
-动作在同一个 PostgreSQL 事务里完成：
+`weight` 表示 row multiplicity 的变化：
 
 ```text
-读取最老待办和共享输入
-    -> 更新内部状态
-    -> 更新结果行
-    -> 推进处理进度
-    -> 删除这张待办卡
-    -> COMMIT
+INSERT row       => (+1, row)
+DELETE old       => (-1, old)
+UPDATE old → new => (-1, old), (+1, new)
 ```
 
-提交后，第 7 组的 `rows` 增加 2、`total` 增加 50，之后的 `SELECT` 可以看到
-新结果。如果更新失败，整次处理会回滚，待办卡不会消失；具体恢复方式见后文。
+Ingress 的原始权重只有 `-1` 和 `+1`。operator 对相同 key 或 row 折叠后，可以
+得到任意整数 multiplicity delta。`sequence` 保留同一事务内的变化顺序，用于
+验证删除、更新和其他有序 retract 不会把状态推进到非法值。
 
-## 这份结果表最初是怎样建立的
+PostgreSQL 已经处理 top-level abort、savepoint rollback 和 subtransaction
+rollback。Shiba 的 `effective_change_log` 只暴露已提交并完成规范化的行映像。
 
-上面的过程有一个前提：Shiba 已经知道查询、初始结果和后续维护方式。这发生在
-声明结果表时。
+`commit_lsn` 表示源事务的提交顺序，不是 event-time watermark。Shiba 当前不
+处理乱序 event time、late event 或 watermark；SQL `Window` 也是关系上的 SQL
+window operator，不是时间窗口系统。
+
+### Operator DAG
+
+注册查询会生成一个持久化的 `LogicalPlan`。当前 grammar 的主要形状是：
 
 ```text
-CREATE TABLE shiba... AS SELECT...
-    │
-    ├── PostgreSQL 解析并类型化查询
-    ├── Shiba 复制成自有的 Rust 数据
-    ├── 验证查询并锁住源表
-    ├── 创建并回填结果表
-    ├── 保存 metadata、内部状态和进度
-    ├── 编译并持久化 LogicalPlan 和 PhysicalDagPlan
-    └── 加入 publication 并安装保护和唤醒 trigger
+single-source aggregate:
+Scan → [Filter] → [Distinct] → Aggregate
+     → [Having] → Project → Sink
+
+single-source unary:
+Scan → [Filter] → Distinct | Window | TopN
+     → Project → Sink
+
+join aggregate:
+Scan left  → [Filter left]  ┐
+                            Join → [post-join Filter] → [Distinct]
+Scan right → [Filter right] ┘
+     → Aggregate → [Having] → Project → Sink
 ```
 
-Shiba 不靠自行解析 SQL 文本来理解查询语义。`src/query_tree.rs` 是唯一读取
-PostgreSQL Query 指针的边界；离开它之后，分析使用自有的 Rust 类型。受支持的
-查询形状是封闭 enum，不能表示的查询会在注册完成前失败。
+节点集合是封闭的 `OperatorKind` enum。当前 physical runtime 支持五类固定
+pipeline：
 
-注册期间，Shiba 持有源表锁；原生 CTAS 回填、增量起点、计划、状态、publication
-membership 和保护 trigger 在同一用户事务中建立。事务提交后才释放源表锁，
-所以初始结果与随后读取的 WAL 增量之间没有写入缺口。
+- Aggregate；
+- Join + Aggregate；
+- Distinct；
+- Window；
+- TopN。
 
-计划只在注册时编译。Runtime 启动或重启时加载并复验已持久化的
-`PhysicalDagPlan`；处理每笔源事务时不会重新编译或猜执行方式。
+这不是通用 DAG interpreter。`PhysicalDagPlan` 记录 source、consumer、fusion
+和 materialization 决策，并携带一个经过验证的 execution descriptor。Runtime
+根据 descriptor 调用固定的集合化 SQL pipeline。
 
-部分计划需要在多个 SQL statement 之间复用中间结果。物理计划会为此使用
-预创建的 UNLOGGED Stage。Stage 只是工作区：成功后为空，崩溃后也可以从持久
-输入和内部状态重建。
+### 状态与结果增量
 
-## Runtime 实际上有多简单
+一次 DAG apply 的计算关系如下：
 
-每个启用 Shiba 的数据库只有一个 Shiba Runtime。PostgreSQL logical decoding 仍有
-自己的 walsender，但 Shiba 没有 Router 进程、Executor pool、每 DAG worker、
-线程池或连接池。Runtime 反复执行：
+```mermaid
+flowchart LR
+    DELTA["ΔT<br/>ordered weighted rows"]
+    OLDSTATE[("operator state S(t)")]
+    OP["physical operator pipeline"]
+    NEWSTATE[("operator state S(t+1)")]
+    DRESULT["ΔResult"]
+    OLDRESULT[("result R(t)")]
+    SINK["Sink"]
+    NEWRESULT[("result R(t+1)")]
 
-```rust
-loop {
-    ingest_and_route_some_work();
-    apply_ready_results_round_robin();
-    collect_some_finished_input();
-    wait_if_idle();
-}
+    DELTA --> OP
+    OLDSTATE --> OP
+    OP --> NEWSTATE
+    OP --> DRESULT
+    DRESULT --> SINK
+    OLDRESULT --> SINK
+    SINK --> NEWRESULT
 ```
 
-每一轮都有工作预算，但一次已经开始的结果更新不会被中途切走。所有 SPI 事务都
-在同一个 backend 中串行执行。
+不同 operator 保存不同的增量状态：
 
-这个选择消除了多个 worker 同时更新结果和协调 checkpoint 的问题，也让运行路径
-可以从一个函数读完。代价同样直接：一次很慢的 apply 会暂时挡住其他结果、WAL
-ingress 和 GC。
-
-处理完成的共享输入不会立刻删除。只有路由完成、所有待办引用消失、保留时间
-到期，并且复制 slot 的真实 `confirmed_flush_lsn` 已安全越过该输入后，GC 才会
-回收它。暂停或 quarantined 的结果仍有待办引用，因此修复后需要的输入也还在。
-
-## 崩溃后从哪里继续
-
-恢复逻辑只有三个顺序：
-
-1. **先保存输入，再反馈 WAL。** 反馈前可以重发，反馈后的输入已经持久化。
-2. **先创建所有引用，再回收共享输入。** 每个结果处理完成前，输入都还在。
-3. **结果更新和删除待办一起提交。** 失败时两者一起回滚，成功时一起前进。
-
-因此恢复不需要猜进程刚才执行到哪一行，只需查看持久状态：
-
-| 状态 | 放在哪里 | Runtime 或服务器重启后 |
+| Operator | 持久状态 | 增量处理 |
 | --- | --- | --- |
-| 计划、订阅、注册信息 | LOGGED catalog | 保留 |
-| 源事务、`change_log`、重放位置 | LOGGED relation | 保留 |
-| 路由位置、`dag_inbox` | LOGGED relation | 保留 |
-| 内部状态、结果、进度 | LOGGED relation | 保留 |
-| logical slot 的 `confirmed_flush_lsn` | PostgreSQL slot | 保留 |
-| physical Stage | UNLOGGED relation | 内容可清空，在 apply 时重算 |
-| relation cache、已加载计划、prepared program | Runtime memory | 重新加载 |
+| Filter / Project / Having | 无独立状态 | 对 `ΔT` 做谓词和投影 |
+| Join | `join_arrangements`：两侧 row bag、join key、multiplicity | 计算 `Δleft × old right`、`old left × Δright` 与 `Δleft × Δright` |
+| Aggregate | `aggregate_state`，必要时加 `distinct_state` | 按 key 折叠权重并更新受影响 group |
+| Distinct | `projection_state` 中的 row multiplicity | 只在 multiplicity 穿过 `0 ↔ 正数` 时产生结果增量 |
+| Window | `window_rows` 中的 partition retained rows | 重算受影响 partition |
+| TopN | `topn_rows` 中的 retained multiset | 重排集合并产生 old/new TopN 差异 |
+| Sink | result table | 把 `ΔResult` 应用到用户可读结果 |
 
-未完成的待办仍在 inbox 中，Runtime 会重新调度它：
+Filter、Project 等单 consumer stateless 节点可以与 source stage 融合。需要被多个
+consumer 复用的 delta 会 materialize。Join input delta 使用
+`StatementMaterialized`；Join output `join_delta` 跨 SQL statement 复用，使用
+注册时创建的 `Unlogged` Stage。Stage 是 commit-scoped scratch，不是恢复状态。
 
-- 输入提交前崩溃：slot 从旧反馈位置重发；
-- 输入提交后、反馈前崩溃：稳定身份去重；
-- 路由中途崩溃：从持久位置继续；
-- 结果更新中途崩溃：PostgreSQL 回滚，inbox 保留；
-- Stage 被清空：从持久输入重建；
-- Runtime 异常退出：postmaster 仍在时由 PostgreSQL 重启；
-- 整个 PostgreSQL 重启：下一次源表写入或 `shiba.activate()` 重新建立
-  dynamic Runtime。
+Physical stage 有三种 storage：
 
-处理失败后，短暂冲突会自动重试；明确的配额超限会暂停该结果，调高配额后可用
-`shiba.resume()` 继续。确定性 plan 或 operator 错误会 quarantine 该结果，不能
-resume；修复原因后必须 drop 并重新注册、重新回填。系统错误会让 Runtime 退出
-并由 PostgreSQL 重启。处理决定作出前，待办和共享输入都不会静默丢失。
-
-## 它会在哪里变慢或停下
-
-Shiba 的目标是边界明确，不是假装资源无限：
-
-- 单 Runtime 会产生 head-of-line blocking；
-- Join fan-out 可能产生很大的 delta；
-- Window 会重建受影响 partition；
-- TopN 需要排序 retained multiset；
-- retained change log 会消耗磁盘；
-- PostgreSQL 一个 query 中多个 plan node 可分别使用 `work_mem`。
-
-输入批次有行数和字节数的软目标；完整 CopyData message 或 tuple 不可拆，可能
-超过目标。relation cache、loaded-plan cache、SQL work/temp memory、单次提交
-和 Stage rows 则有明确上限。一次完整结果更新也不可拆，因此 backend RSS 不是
-严格常数。
-
-超过明确的源事务或 Stage 配额时，Shiba 回滚这次 apply、保留 inbox
-并暂停该结果；系统级资源错误会让 Runtime 退出并由 PostgreSQL 重启。两者都不
-会让半个源事务对用户可见。
-
-## 从哪里开始读代码
-
-先沿着一次源事务读，不要按目录从上到下读：
-
-| 现在追到哪一步 | 文件 |
+| Storage | 语义 |
 | --- | --- |
-| Runtime 主循环 | `src/worker.rs::shiba_runtime_main` |
-| logical replication transport | `src/replication.rs` |
-| `pgoutput` bytes 变成 message | `src/pgoutput.rs` |
-| message 变成 bounded ingress batch | `src/ingress.rs` |
-| input、routing、inbox 和 GC | `sql/10_runtime.sql`, `sql/11_ingress.sql` |
-| physical plan 的运行桥 | `src/logical/runtime.rs` |
-| 集合化 operator kernel | `sql/21_operator_aggregate.sql` 到 `sql/24_operator_dispatch.sql` |
+| `Inline` | 不单独物化，直接供唯一 consumer 使用 |
+| `StatementMaterialized` | 在一条 SQL statement 内复用 |
+| `Unlogged` | 在同一次 commit program 的多条 statement 之间复用 |
 
-理解运行路径后，再回头看声明路径：
+## Runtime 调度
 
-| 问题 | 文件 |
+Runtime 主循环位于 `src/worker.rs::shiba_runtime_main`，每轮按以下顺序调用实际
+phase：
+
+```text
+route_ingress_once
+    → ready_dag_oids
+    → apply_ready_dags_bounded
+    → gc_change_log
+    → wait on latch when idle
+```
+
+每个 phase 在工作单元之间检查预算：
+
+- routing 每次最多处理一个 subscriber page；
+- apply 每轮限制事务数和总调度时间；
+- GC 每次删除有限数量的已完成事务；
+- idle latch poll 为漏掉的 wakeup 和 `COMMIT PREPARED` 提供恢复路径。
+
+预算不抢占正在执行的 SQL。一次长 apply 会阻塞同一 Runtime 中的 ingress、其他
+结果和 GC。这是 single-Runtime 模型的主要吞吐限制。
+
+`DagRuntime` 是 Runtime 内存中的 plan/program cache entry，不是进程。cache
+按 LRU 淘汰；被淘汰或重启后从持久 physical plan 重新加载。
+
+## 持久状态与恢复
+
+| 状态 | 存储 | 恢复行为 |
+| --- | --- | --- |
+| registration metadata、LogicalPlan、PhysicalDagPlan | LOGGED catalog | 保留并复验 |
+| ingress transaction、decode batch、`change_log` | LOGGED relation | 保留并按稳定 identity 去重 |
+| routing cursor、`dag_inbox` | LOGGED relation | 从未完成位置继续 |
+| arrangement、operator state、result、progress | LOGGED relation | 保留 |
+| slot `confirmed_flush_lsn` | PostgreSQL logical slot | 作为真实 replay-safe 边界 |
+| Stage contents | UNLOGGED relation | 可丢失，在 apply 时重算 |
+| parser state、relation cache、DagRuntime cache、latch | Runtime memory | 丢失后重建 |
+
+恢复由三项顺序约束保证：
+
+1. committed transaction envelope、全部 row image 和可恢复的 routing work
+   durable 后才发送 feedback；
+2. routing complete、无 inbox 引用、retention 到期且 slot 已越过输入后才能 GC；
+3. state、result、progress 与 inbox acknowledgement 原子提交。
+
+对应的失败行为：
+
+- ingress commit 前退出：slot 从旧 feedback 位置重发；
+- ingress commit 后、feedback 前退出：稳定 event identity 去重；
+- routing page 中途失败：cursor 与本页 inbox 同事务回滚；
+- apply 中途失败：state、result、progress 与 acknowledgement 同事务回滚；
+- Runtime 异常退出：postmaster 存活时按 background-worker restart policy 重启；
+- postmaster restart：下一次 source write 或 `shiba.activate()` 重新注册 dynamic
+  Runtime。
+
+短暂锁冲突和 serialization error 会重试。显式 commit/Stage 配额超限会暂停该
+结果，调整配额后可 `shiba.resume()`。确定性 plan/operator corruption 会
+quarantine 该结果，不能 resume；需要修复后 drop 并重新注册。系统或非受控资源
+错误会终止 Runtime，由 PostgreSQL 重启。
+
+## 资源边界
+
+| 资源 | 行为 |
 | --- | --- |
-| CTAS 怎样被拦截 | `src/ddl.rs` |
-| PostgreSQL Query 指针怎样离开 unsafe 边界 | `src/query_tree.rs` |
-| Query 怎样变成封闭 Rust 类型 | `src/query_analysis.rs` |
-| logical/physical plan 怎样生成 | `src/logical/` |
-| activation、registration 和 lifecycle | `sql/10_runtime.sql`, `sql/30_registration.sql`, `sql/40_lifecycle.sql` |
+| ingress batch rows / bytes | 软目标；完整 CopyData message 或 tuple 可以超过 |
+| source commit rows / bytes | apply admission 硬上限 |
+| Stage rows | fan-out 硬上限 |
+| relation descriptor cache | 到达上限时 fail closed，不淘汰 |
+| DagRuntime cache | 有界 LRU |
+| `work_mem` | Runtime session 设置；每个 PostgreSQL plan node 可分别使用 |
+| `temp_file_limit` | Runtime session 临时文件总上限 |
 
-查看某个结果实际保存的 physical plan：
+一个完整 source commit 的 DAG apply 仍是不可拆的原子单元。Shiba 当前不支持把
+同一 source commit 分成多个部分可见的 result transaction，因此 backend RSS
+不是严格常数，长 apply 也不能由调度预算中断。
+
+积压分为两层：slot 尚未持久化的 WAL lag，以及已经路由但尚未 apply 的
+per-result inbox backlog。`shiba.progress().pending_wal_bytes` 表示前者，不是
+某个结果的 inbox backlog。暂停或 quarantined 的结果会保留 inbox 和对应的
+shared changelog；复制 slot 同时继续约束 WAL 与 changelog 的回收边界。
+
+## 查询注册
+
+`CREATE TABLE shiba... AS SELECT...` 同时建立初始快照和后续增量程序：
+
+```text
+PostgreSQL analyzed Query
+    → Shiba owned query model
+    → supported-shape validation
+    → lock source tables
+    → PostgreSQL CTAS backfill
+    → registration metadata + operator state
+    → LogicalPlan + PhysicalDagPlan
+    → publication membership + source triggers
+```
+
+`src/query_tree.rs` 是 PostgreSQL Query pointer 的 unsafe adapter。查询语义的
+识别基于 PostgreSQL 已分析、已类型化的 Query tree，而不是 Shiba 自行解析 SQL
+文本。
+
+源表锁覆盖 CTAS backfill、activation LSN、metadata、plan、state、publication
+membership 和 trigger 安装。锁在注册事务提交后释放，因此初始快照与随后消费
+的 WAL 增量之间没有写入缺口。
+
+计划只在注册时编译。Runtime 启动或重启时加载并复验
+`PhysicalDagPlan`，不会为每个 source commit 重新规划。
+
+## 代码入口
+
+| 主题 | 文件 |
+| --- | --- |
+| extension wiring 与 `_PG_init` | `src/lib.rs` |
+| CTAS hook | `src/ddl.rs` |
+| PostgreSQL Query adapter | `src/query_tree.rs` |
+| owned query validation | `src/query_analysis.rs` |
+| logical / physical plan | `src/logical/` |
+| replication transport | `src/replication.rs` |
+| pgoutput decoder | `src/pgoutput.rs` |
+| transaction-aware ingress state machine | `src/ingress.rs` |
+| Runtime scheduling and apply loop | `src/worker.rs` |
+| ingress、routing、feedback 与 GC | `sql/10_runtime.sql`, `sql/11_ingress.sql` |
+| operator kernels | `sql/20_operator_filters.sql` 到 `sql/24_operator_dispatch.sql` |
+| physical Stage | `sql/26_physical_stages.sql` |
+| registration | `sql/30_registration.sql` |
+| lifecycle | `sql/40_lifecycle.sql` |
+
+查看一个结果的持久化 physical plan：
 
 ```sql
 SELECT shiba.explain_physical('shiba.sales_by_product');
