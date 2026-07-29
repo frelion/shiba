@@ -132,7 +132,7 @@ BEGIN
         FROM running
         GROUP BY input_side,join_key,row_data
       )
-      INSERT INTO shiba_internal.join_pending_rows (
+      INSERT INTO shiba_internal.join_batch_rows (
         result_oid,ingress_txn_id,commit_lsn,input_side,
         join_key,row_data,multiplicity_delta,multiplicity_min_prefix
       )
@@ -143,12 +143,12 @@ BEGIN
         result_oid,ingress_txn_id,input_side,join_key,row_data
       ) DO UPDATE
       SET multiplicity_min_prefix=least(
-            join_pending_rows.multiplicity_min_prefix,
-            join_pending_rows.multiplicity_delta
+            join_batch_rows.multiplicity_min_prefix,
+            join_batch_rows.multiplicity_delta
               + EXCLUDED.multiplicity_min_prefix
           ),
           multiplicity_delta=
-            join_pending_rows.multiplicity_delta
+            join_batch_rows.multiplicity_delta
               + EXCLUDED.multiplicity_delta
       $prepare$,
       left_name,
@@ -164,20 +164,20 @@ BEGIN
 
     SELECT count(*)
     INTO STRICT pending_rows
-    FROM shiba_internal.join_pending_rows
+    FROM shiba_internal.join_batch_rows
     WHERE result_oid=result_relation
       AND ingress_txn_id=p_ingress_txn_id;
     IF pending_rows>max_stage_rows THEN
       RAISE EXCEPTION
-        'Shiba JOIN commit % for result % retained % pending rows, limit %',
+        'Shiba JOIN batch for commit % and result % produced % scratch rows, limit %',
         p_commit_lsn,result_relation::regclass,pending_rows,max_stage_rows
         USING ERRCODE='53400',
-              HINT='Increase shiba.max_stage_rows or reduce commit key cardinality.';
+              HINT='Increase shiba.max_stage_rows or reduce ingress batch key cardinality.';
     END IF;
 END;
 $$;
 
--- Apply one source commit as an exact relational JOIN transition.
+-- Apply one stable input batch as an exact relational JOIN transition.
 --
 -- The physical compiler owns one typed UNLOGGED join_delta stage per DAG.
 -- This function computes exact versioned multiplicity differences directly:
@@ -227,7 +227,7 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION shiba._apply_join_commit_temp_free(
+CREATE FUNCTION shiba._apply_join_batch_temp_free(
     result_relation oid,
     execution_descriptor jsonb,
     p_commit_lsn pg_lsn
@@ -301,7 +301,7 @@ BEGIN
     SELECT count(*) FILTER (WHERE event.input_side='left'),
            count(*) FILTER (WHERE event.input_side='right')
     INTO left_event_count,right_event_count
-    FROM shiba_internal.join_pending_rows event
+    FROM shiba_internal.join_batch_rows event
     WHERE event.result_oid=result_relation
       AND event.commit_lsn=p_commit_lsn;
     SELECT
@@ -366,17 +366,17 @@ BEGIN
         EXECUTE preflight_execute_sql INTO STRICT candidate_upper_bound;
         IF candidate_upper_bound>max_stage_rows THEN
           RAISE EXCEPTION
-            'Shiba JOIN commit % for result % may generate % candidates, limit %',
+            'Shiba JOIN batch for commit % and result % may generate % candidates, limit %',
             p_commit_lsn,result_relation::regclass,
             candidate_upper_bound,max_stage_rows
             USING ERRCODE='53400',
-                  HINT='Increase shiba.max_stage_rows, split the source transaction, or reduce JOIN fanout.';
+                  HINT='Increase shiba.max_stage_rows, reduce ingress batch size, or reduce JOIN fanout.';
         END IF;
       END IF;
       EXECUTE stage_execute_sql INTO STRICT staged_rows,arrangement_rows;
       IF staged_rows>max_stage_rows THEN
         RAISE EXCEPTION
-          'Shiba JOIN commit % for result % produced % Stage rows, limit %',
+          'Shiba JOIN batch for commit % and result % produced % Stage rows, limit %',
           p_commit_lsn,result_relation::regclass,staged_rows,max_stage_rows
           USING ERRCODE='53400',
                 HINT='Increase shiba.max_stage_rows or reduce JOIN fanout.';
@@ -386,13 +386,13 @@ BEGIN
       END IF;
       EXECUTE consume_execute_sql;
       -- The consume program leaves the Stage empty. Reset a large-batch
-      -- estimate so the next small commit does not reuse a generic plan
+      -- estimate so the next small batch does not reuse a generic plan
       -- costed as though the previous large Stage were still populated.
       IF staged_rows>=1024 THEN
         EXECUTE format('ANALYZE %s',stage_name);
       END IF;
       PERFORM shiba_internal._compact_physical_stages(result_relation);
-      DELETE FROM shiba_internal.join_pending_rows
+      DELETE FROM shiba_internal.join_batch_rows
       WHERE result_oid=result_relation
         AND commit_lsn=p_commit_lsn;
       RETURN;
@@ -461,14 +461,14 @@ BEGIN
     -- rows and retained rows per affected join key, rather than multiplying
     -- each side's event count by the entire opposite arrangement.  The latter
     -- badly overestimates sparse one-to-one updates and can quarantine healthy
-    -- DAGs.  This preflight only groups the bounded commit payload and scans
+    -- DAGs. This preflight only groups the bounded batch payload and scans
     -- indexed arrangement keys; it never enumerates the Cartesian candidates.
     candidate_preflight_sql := format(
       $candidate_preflight$
       WITH left_event_rows AS MATERIALIZED (
         SELECT event.join_key,event.row_data,
                event.multiplicity_delta AS weight
-        FROM shiba_internal.join_pending_rows event
+        FROM shiba_internal.join_batch_rows event
         WHERE event.result_oid=$1
           AND event.commit_lsn=$4
           AND event.input_side='left'
@@ -477,7 +477,7 @@ BEGIN
       right_event_rows AS MATERIALIZED (
         SELECT event.join_key,event.row_data,
                event.multiplicity_delta AS weight
-        FROM shiba_internal.join_pending_rows event
+        FROM shiba_internal.join_batch_rows event
         WHERE event.result_oid=$1
           AND event.commit_lsn=$4
           AND event.input_side='right'
@@ -718,11 +718,11 @@ BEGIN
       EXECUTE preflight_execute_sql INTO STRICT candidate_upper_bound;
       IF candidate_upper_bound>max_stage_rows THEN
         RAISE EXCEPTION
-          'Shiba JOIN commit % for result % may generate % candidates, limit %',
+          'Shiba JOIN batch for commit % and result % may generate % candidates, limit %',
           p_commit_lsn,result_relation::regclass,
           candidate_upper_bound,max_stage_rows
           USING ERRCODE='53400',
-                HINT='Increase shiba.max_stage_rows, split the source transaction, or reduce JOIN fanout.';
+                HINT='Increase shiba.max_stage_rows, reduce ingress batch size, or reduce JOIN fanout.';
       END IF;
     END IF;
 
@@ -732,7 +732,7 @@ BEGIN
         SELECT event.input_side,event.join_key,event.row_data,
                event.multiplicity_delta,
                event.multiplicity_min_prefix
-        FROM shiba_internal.join_pending_rows event
+        FROM shiba_internal.join_batch_rows event
         WHERE event.result_oid=$1
           AND event.commit_lsn=$4
       ),
@@ -1188,7 +1188,7 @@ BEGIN
     EXECUTE stage_execute_sql INTO STRICT staged_rows,arrangement_rows;
     IF staged_rows>max_stage_rows THEN
       RAISE EXCEPTION
-        'Shiba JOIN commit % for result % produced % Stage rows, limit %',
+        'Shiba JOIN batch for commit % and result % produced % Stage rows, limit %',
         p_commit_lsn,result_relation::regclass,staged_rows,max_stage_rows
         USING ERRCODE='53400',
               HINT='Increase shiba.max_stage_rows or reduce JOIN fanout.';
@@ -1444,7 +1444,7 @@ BEGIN
       EXECUTE format('ANALYZE %s',stage_name);
     END IF;
     PERFORM shiba_internal._compact_physical_stages(result_relation);
-    DELETE FROM shiba_internal.join_pending_rows
+    DELETE FROM shiba_internal.join_batch_rows
     WHERE result_oid=result_relation
       AND commit_lsn=p_commit_lsn;
 END;

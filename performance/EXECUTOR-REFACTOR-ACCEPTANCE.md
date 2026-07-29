@@ -45,10 +45,10 @@ filtered 或 aggregate-only 运行只能作为开发反馈。
    sequence、UPDATE 的 `-1,+1` 相对顺序丢失。
 5. Rust apply 路径按事件数量构造 `Vec<InboxEvent>`、`Vec<DeltaRow>` 或整批
    JSON；正式大事务测试必须观测到受控 RSS。
-6. 持续积压 DAG 能饿死另一个 runnable DAG。调度只能在完整 source
-   transaction 之间轮转，不宣称事务内抢占。
-7. 一次 apply 没有将 state、result、`view_progress` 和 inbox acknowledgement
-   一起提交或一起回滚。
+6. 持续积压 DAG 能饿死另一个 runnable DAG。调度必须在 ingress batch 之间
+   round-robin；已经运行的 PostgreSQL statement 不可抢占。
+7. 一次非末批 apply 没有将 state、result 和 batch cursor 一起提交或一起回滚；
+   或末批没有再把 `view_progress` 和 inbox acknowledgement 纳入同一事务。
 8. transient error 删除待办或部分提交；deterministic error 终止 Runtime、
    删除 poison 待办、阻止健康 DAG，或 `activate()` 自动清除 quarantine。
 9. Router 在 durable change log/inbox 提交前推进 logical slot，或 crash
@@ -66,25 +66,30 @@ filtered 或 aggregate-only 运行只能作为开发反馈。
 Router routing 与 DAG apply 使用不同 PostgreSQL transactions。Router 原子写
 `routed_transactions`、共享 payload 和所有 DAG 待办，提交后才能推进 slot。
 
-每个 DAG apply transaction 只处理一个 `(result_oid, commit_lsn)`：
+每个 DAG apply transaction 只处理一个
+`(result_oid, commit_lsn, batch_ordinal)`：
 
 1. 锁定并复核待办；
-2. 按 sequence 从 `change_log` 关系读取相关事件；
-3. 更新 state 和 result；
-4. 推进 progress；
-5. 删除该 DAG 的 inbox 行；
-6. 原子提交。
+2. 从 `ingress_apply_batches` 取得稳定的 sequence 范围；
+3. 从 `change_log` 读取这个范围内的相关事件；
+4. 更新正式 state 和 result；
+5. 非末批推进 `dag_inbox.next_batch_ordinal`；
+6. 末批推进 progress 并删除该 DAG 的 inbox 行；
+7. 原子提交。
 
-失败重试必须从完整事务边界开始。一个大 source transaction 是不可抢占单元，
-因此性能报告必须单独记录其 cross-DAG blocking latency，而不能用调度
-round-robin 掩盖。
+失败重试从当前 batch 边界开始。已提交 batch 的结果保持可见；失败 batch 的
+state、result 和 cursor 一起回滚。一个大 source transaction 会被多个 apply
+transactions 消费，其他 runnable DAG 可以在 batch 之间运行。性能报告必须同时
+记录单个 batch statement 的 head-of-line latency 和整笔 source transaction 的
+完成延迟。
 
 ## 恢复与 GC 覆盖
 
 确定性 failpoint 至少覆盖：
 
 - route 已提交、slot 尚未推进时 Runtime crash，重启后无重复 payload/待办；
-- apply 已修改 state/result、提交前 Runtime crash，所有效果回滚且待办保留；
+- apply 已修改当前 batch 的 state/result、提交前 Runtime crash，当前 batch
+  效果回滚且 cursor/inbox 保留；之前提交的 batch 不回滚；
 - replacement Runtime 重放一次，最终结果正确；
 - poison DAG quarantine、健康 DAG 继续、修复后显式 retry；
 - PostgreSQL postmaster restart 后由 source statement 或 `activate()` 恢复

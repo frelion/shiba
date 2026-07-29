@@ -18,11 +18,12 @@ BEGIN
 END;
 $$;
 
--- Prepare one stable ingress input_seq range into a durable row-bag summary.
+-- Fold one stable ingress input_seq range into shared UNLOGGED row-bag
+-- scratch. The apply transaction leaves it empty.
 -- TopN uses a JSON-null partition; Window supplies its actual partition
--- column. The caller advances dag_inbox.next_batch_ordinal in this same
--- transaction, so a retry cannot merge one batch twice.
-CREATE FUNCTION shiba._prepare_unary_pending_batch(
+-- column. The caller consumes this scratch and advances
+-- dag_inbox.next_batch_ordinal in this same transaction.
+CREATE FUNCTION shiba._prepare_unary_batch(
     stream_view shiba_internal.stream_views,
     p_ingress_txn_id bigint,
     p_commit_lsn pg_lsn,
@@ -116,7 +117,7 @@ BEGIN
         FROM running
         GROUP BY partition_key,row_data
       )
-      INSERT INTO shiba_internal.unary_pending_rows (
+      INSERT INTO shiba_internal.unary_batch_rows (
         result_oid,ingress_txn_id,partition_key,row_data,
         multiplicity_delta,minimum_prefix
       )
@@ -127,12 +128,12 @@ BEGIN
         result_oid,ingress_txn_id,partition_key,row_data
       ) DO UPDATE
       SET minimum_prefix=least(
-            unary_pending_rows.minimum_prefix,
-            unary_pending_rows.multiplicity_delta
+            unary_batch_rows.minimum_prefix,
+            unary_batch_rows.multiplicity_delta
               + EXCLUDED.minimum_prefix
           ),
           multiplicity_delta=
-            unary_pending_rows.multiplicity_delta
+            unary_batch_rows.multiplicity_delta
               + EXCLUDED.multiplicity_delta
       $prepare$,
       source_name,filter_sql,partition_sql
@@ -142,28 +143,27 @@ BEGIN
 
     SELECT count(*)
     INTO STRICT pending_rows
-    FROM shiba_internal.unary_pending_rows
+    FROM shiba_internal.unary_batch_rows
     WHERE result_oid=stream_view.result_oid
       AND ingress_txn_id=p_ingress_txn_id;
     IF pending_rows>max_stage_rows THEN
       RAISE EXCEPTION
-        'Shiba commit % for result % retained % pending rows, limit %',
+        'Shiba batch for commit % and result % produced % scratch rows, limit %',
         p_commit_lsn,stream_view.result_oid::regclass,
         pending_rows,max_stage_rows
         USING ERRCODE='53400',
-              HINT='Increase shiba.max_stage_rows or reduce commit key cardinality.';
+              HINT='Increase shiba.max_stage_rows or reduce ingress batch key cardinality.';
     END IF;
 END;
 $$;
 
--- DISTINCT folds one stable ingress batch into durable pending state. The
--- final batch publishes folded keys in stage_chunk_rows-sized statements.
+-- DISTINCT folds one stable ingress batch into shared UNLOGGED scratch and
+-- applies its keys directly in stage_chunk_rows-sized statements.
 CREATE FUNCTION shiba._apply_distinct_batch(
     stream_view shiba_internal.stream_views,
     p_commit_lsn pg_lsn,
     p_first_input_seq bigint,
-    p_last_input_seq bigint,
-    p_finalize boolean DEFAULT true
+    p_last_input_seq bigint
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -308,15 +308,11 @@ BEGIN
       AND commit_lsn=p_commit_lsn;
     IF folded_rows>max_stage_rows THEN
       RAISE EXCEPTION
-        'Shiba DISTINCT commit % for result % retained % pending keys, limit %',
+        'Shiba DISTINCT batch for commit % and result % produced % scratch keys, limit %',
         p_commit_lsn,stream_view.result_oid::regclass,
         folded_rows,max_stage_rows
         USING ERRCODE='53400',
-              HINT='Increase shiba.max_stage_rows or reduce commit key cardinality.';
-    END IF;
-
-    IF NOT p_finalize THEN
-      RETURN;
+              HINT='Increase shiba.max_stage_rows or reduce ingress batch key cardinality.';
     END IF;
 
     LOOP
@@ -433,8 +429,7 @@ CREATE FUNCTION shiba._apply_topn_batch(
     p_ingress_txn_id bigint,
     p_commit_lsn pg_lsn,
     p_first_input_seq bigint,
-    p_last_input_seq bigint,
-    p_finalize boolean DEFAULT true
+    p_last_input_seq bigint
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -480,7 +475,7 @@ BEGIN
     FROM unnest(topn_view.source_columns,topn_view.output_columns)
       WITH ORDINALITY columns(source_column,output_column,ordinal);
 
-    PERFORM shiba._prepare_unary_pending_batch(
+    PERFORM shiba._prepare_unary_batch(
       stream_view,
       p_ingress_txn_id,
       p_commit_lsn,
@@ -488,10 +483,6 @@ BEGIN
       p_last_input_seq,
       NULL
     );
-    IF NOT p_finalize THEN
-      RETURN;
-    END IF;
-
     EXECUTE format(
       $bound$
       SELECT
@@ -502,7 +493,7 @@ BEGIN
         )
         +(
           SELECT count(*)
-          FROM shiba_internal.unary_pending_rows pending
+          FROM shiba_internal.unary_batch_rows pending
           WHERE pending.result_oid=$1
             AND pending.ingress_txn_id=$2
             AND pending.multiplicity_delta>0
@@ -516,10 +507,10 @@ BEGIN
        OR topn_view.limit_offset::numeric+topn_view.limit_count::numeric
             > max_stage_rows::numeric THEN
       RAISE EXCEPTION
-        'Shiba TopN commit % for result % exceeds ranked-state limit %',
+        'Shiba TopN batch for commit % and result % exceeds ranked-state limit %',
         p_commit_lsn,stream_view.result_oid::regclass,max_stage_rows
         USING ERRCODE='53400',
-              HINT='Increase shiba.max_stage_rows, reduce OFFSET/LIMIT, or split the source transaction.';
+              HINT='Increase shiba.max_stage_rows or reduce retained state and OFFSET/LIMIT.';
     END IF;
 
     EXECUTE format(
@@ -528,7 +519,7 @@ BEGIN
         SELECT pending.row_data,
                pending.multiplicity_delta,
                pending.minimum_prefix
-        FROM shiba_internal.unary_pending_rows pending
+        FROM shiba_internal.unary_batch_rows pending
         WHERE pending.result_oid=$1
           AND pending.ingress_txn_id=$2
       ),
@@ -653,7 +644,7 @@ BEGIN
     )
     USING stream_view.result_oid,p_ingress_txn_id;
 
-    DELETE FROM shiba_internal.unary_pending_rows
+    DELETE FROM shiba_internal.unary_batch_rows
     WHERE result_oid=stream_view.result_oid
       AND ingress_txn_id=p_ingress_txn_id;
 END;
@@ -667,8 +658,7 @@ CREATE FUNCTION shiba._apply_window_batch(
     p_ingress_txn_id bigint,
     p_commit_lsn pg_lsn,
     p_first_input_seq bigint,
-    p_last_input_seq bigint,
-    p_finalize boolean DEFAULT true
+    p_last_input_seq bigint
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -717,7 +707,7 @@ BEGIN
     FROM unnest(window_view.target_expressions)
       WITH ORDINALITY target(expression,ordinal);
 
-    PERFORM shiba._prepare_unary_pending_batch(
+    PERFORM shiba._prepare_unary_batch(
       stream_view,
       p_ingress_txn_id,
       p_commit_lsn,
@@ -725,16 +715,12 @@ BEGIN
       p_last_input_seq,
       window_view.partition_column
     );
-    IF NOT p_finalize THEN
-      RETURN;
-    END IF;
-
     EXECUTE format(
       $bound$
       WITH pending_events AS MATERIALIZED (
         SELECT pending.partition_key,
                pending.multiplicity_delta
-        FROM shiba_internal.unary_pending_rows pending
+        FROM shiba_internal.unary_batch_rows pending
         WHERE pending.result_oid=$1
           AND pending.ingress_txn_id=$2
       ),
@@ -758,11 +744,11 @@ BEGIN
     USING stream_view.result_oid,p_ingress_txn_id;
     IF affected_row_upper_bound>max_stage_rows THEN
       RAISE EXCEPTION
-        'Shiba window commit % for result % may rebuild % rows, limit %',
+        'Shiba window batch for commit % and result % may rebuild % rows, limit %',
         p_commit_lsn,stream_view.result_oid::regclass,
         affected_row_upper_bound,max_stage_rows
         USING ERRCODE='53400',
-              HINT='Increase shiba.max_stage_rows or split the affected partition.';
+              HINT='Increase shiba.max_stage_rows or reduce the affected partition.';
     END IF;
 
     EXECUTE format(
@@ -772,7 +758,7 @@ BEGIN
                pending.row_data,
                pending.multiplicity_delta,
                pending.minimum_prefix
-        FROM shiba_internal.unary_pending_rows pending
+        FROM shiba_internal.unary_batch_rows pending
         WHERE pending.result_oid=$1
           AND pending.ingress_txn_id=$2
       ),
@@ -871,7 +857,7 @@ BEGIN
     )
     USING stream_view.result_oid,p_ingress_txn_id;
 
-    DELETE FROM shiba_internal.unary_pending_rows
+    DELETE FROM shiba_internal.unary_batch_rows
     WHERE result_oid=stream_view.result_oid
       AND ingress_txn_id=p_ingress_txn_id;
 END;

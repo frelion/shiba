@@ -94,7 +94,7 @@ pub fn init() {
     );
     GucRegistry::define_int_guc(
         c"shiba.max_stage_rows",
-        c"Maximum allowed rows in a commit-scoped Stage.",
+        c"Maximum allowed rows in one operator work set.",
         c"SQL operators can read this value with current_setting to enforce Stage row quotas.",
         &MAX_STAGE_ROWS,
         MIN_MAX_STAGE_ROWS,
@@ -104,7 +104,7 @@ pub fn init() {
     );
     GucRegistry::define_int_guc(
         c"shiba.ingress_batch_rows",
-        c"Target maximum row images in one ingress transaction.",
+        c"Target maximum row images in one persisted ingress batch.",
         c"One individual replication message or tuple remains indivisible.",
         &INGRESS_BATCH_ROWS,
         MIN_INGRESS_BATCH_ROWS,

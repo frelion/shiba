@@ -114,17 +114,16 @@ BEGIN
 END;
 $$;
 
--- Execute one already-claimed commit.  The caller must have used
+-- Execute one batch from an already-claimed commit. The caller must have used
 -- _claim_dag_commit in this transaction; this function deliberately performs
 -- no additional scheduler locks or inbox scans.
-CREATE FUNCTION shiba._apply_claimed_dag_commit(
+CREATE FUNCTION shiba._apply_claimed_dag_batch(
     result_relation oid,
     execution_descriptor jsonb,
     ingress_transaction_id bigint,
     commit_lsn pg_lsn,
     p_first_input_seq bigint,
-    p_last_input_seq bigint,
-    p_finalize boolean DEFAULT true
+    p_last_input_seq bigint
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -185,26 +184,22 @@ BEGIN
         p_first_input_seq,
         p_last_input_seq
       );
-      IF p_finalize THEN
-        PERFORM shiba._apply_join_commit_temp_free(
-          result_relation,execution_descriptor,commit_lsn
-        );
-      END IF;
+      PERFORM shiba._apply_join_batch_temp_free(
+        result_relation,execution_descriptor,commit_lsn
+      );
     ELSIF execution_pipeline='aggregate' THEN
       PERFORM shiba._apply_aggregate_batch(
         stream_view,
         commit_lsn,
         p_first_input_seq,
-        p_last_input_seq,
-        p_finalize
+        p_last_input_seq
       );
     ELSIF execution_pipeline='distinct' THEN
       PERFORM shiba._apply_distinct_batch(
         stream_view,
         commit_lsn,
         p_first_input_seq,
-        p_last_input_seq,
-        p_finalize
+        p_last_input_seq
       );
     ELSIF execution_pipeline='topn' THEN
       PERFORM shiba._apply_topn_batch(
@@ -212,8 +207,7 @@ BEGIN
         ingress_transaction_id,
         commit_lsn,
         p_first_input_seq,
-        p_last_input_seq,
-        p_finalize
+        p_last_input_seq
       );
     ELSIF execution_pipeline='window' THEN
       PERFORM shiba._apply_window_batch(
@@ -221,30 +215,26 @@ BEGIN
         ingress_transaction_id,
         commit_lsn,
         p_first_input_seq,
-        p_last_input_seq,
-        p_finalize
+        p_last_input_seq
       );
     END IF;
 
-    IF p_finalize THEN
-      PERFORM shiba._advance_dag_progress(result_relation,commit_lsn::text);
-    END IF;
 END;
 $$;
 
--- Apply an already-claimed commit inside an intentional PL/pgSQL
+-- Apply one batch from an already-claimed commit inside a PL/pgSQL
 -- subtransaction:
 -- an operator/SPI error rolls back the current batch and its cursor advance.
--- Earlier prepared batches are already durable; final publication keeps
--- state, result, progress, pending cleanup, and acknowledgement atomic.
+-- Earlier applied batches are already visible; the current batch and its
+-- cursor advance remain atomic. The last batch also advances progress and
+-- acknowledges the inbox row.
 -- Explicitly transient concurrency failures leave the DAG active for retry;
 -- deterministic failures quarantine it.
 CREATE FUNCTION shiba._apply_claimed_dag_safely(
     result_relation oid,
     execution_descriptor jsonb,
     p_ingress_txn_id bigint,
-    p_commit_lsn pg_lsn,
-    acknowledge boolean
+    p_commit_lsn pg_lsn
 )
 RETURNS text
 LANGUAGE plpgsql
@@ -252,7 +242,6 @@ SECURITY DEFINER
 SET search_path = pg_catalog, shiba, shiba_internal
 AS $$
 DECLARE
-    execution_pipeline text := execution_descriptor->>'pipeline';
     error_state text;
     error_message text;
     error_detail text;
@@ -285,14 +274,13 @@ BEGIN
           AND inbox.ingress_txn_id=p_ingress_txn_id
           AND inbox.commit_lsn=p_commit_lsn;
 
-        PERFORM shiba._apply_claimed_dag_commit(
+        PERFORM shiba._apply_claimed_dag_batch(
           result_relation,
           execution_descriptor,
           p_ingress_txn_id,
           p_commit_lsn,
           first_input_seq,
-          last_input_seq,
-          final_batch
+          last_input_seq
         );
 
         IF NOT final_batch THEN
@@ -308,22 +296,23 @@ BEGIN
               result_relation::regclass,p_commit_lsn,acknowledged_rows
               USING ERRCODE='P0S01';
           END IF;
-          RETURN 'prepared';
+          RETURN 'batch_applied';
         END IF;
 
-        IF acknowledge THEN
-          DELETE FROM shiba_internal.dag_inbox AS inbox
-          WHERE inbox.result_oid=result_relation
-            AND inbox.ingress_txn_id=p_ingress_txn_id;
-          GET DIAGNOSTICS acknowledged_rows = ROW_COUNT;
-          IF acknowledged_rows<>1 THEN
-            RAISE EXCEPTION
-              'Shiba DAG % acknowledgement for commit % affected % rows, expected 1',
-              result_relation::regclass,p_commit_lsn,acknowledged_rows
-              USING ERRCODE='P0S01';
-          END IF;
+        PERFORM shiba._advance_dag_progress(
+          result_relation,p_commit_lsn::text
+        );
+        DELETE FROM shiba_internal.dag_inbox AS inbox
+        WHERE inbox.result_oid=result_relation
+          AND inbox.ingress_txn_id=p_ingress_txn_id;
+        GET DIAGNOSTICS acknowledged_rows = ROW_COUNT;
+        IF acknowledged_rows<>1 THEN
+          RAISE EXCEPTION
+            'Shiba DAG % acknowledgement for commit % affected % rows, expected 1',
+            result_relation::regclass,p_commit_lsn,acknowledged_rows
+            USING ERRCODE='P0S01';
         END IF;
-        RETURN 'applied';
+        RETURN 'commit_completed';
     EXCEPTION
       WHEN serialization_failure OR deadlock_detected OR lock_not_available THEN
         -- The exception block is a subtransaction, so all apply mutations have
@@ -415,8 +404,7 @@ BEGIN
       result_relation,
       execution_descriptor,
       claimed_ingress_txn_id,
-      claimed_lsn,
-      true
+      claimed_lsn
     );
     RETURN QUERY SELECT apply_outcome,claimed_lsn;
 END;

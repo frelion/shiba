@@ -27,8 +27,8 @@ Shiba is tested against a real PostgreSQL 17 server, not a mock database.
    `COUNT(DISTINCT)`, top-level DISTINCT, TopN/OFFSET, windows, all supported
    joins, cross-input predicates, and semi/anti/null-aware anti joins.
 6. **Concurrency and recovery tests** exercise concurrent mixed DML, large
-   commit and rollback batches, crash after a committed prepare batch, durable
-   cursor resume, final-publication rollback, persistent-slot replay across an
+   commit and rollback batches, crash after a directly applied batch, durable
+   cursor resume, last-batch rollback, persistent-slot replay across an
    immediate PostgreSQL restart, and result DROP racing with writers. Every
    blocking operation and poll has a hard timeout.
 
@@ -46,10 +46,10 @@ Shiba is tested against a real PostgreSQL 17 server, not a mock database.
   commit, with no payload column;
 - replayed ingress produces stable, contiguous, non-overlapping
   `ingress_apply_batches`; each DAG cursor advances in the same transaction as
-  its LOGGED pending summary;
-- crashing after a committed prepare batch leaves result and progress
-  unchanged, then a replacement Runtime resumes at the next batch and
-  publishes exactly once;
+  authoritative operator state and result changes;
+- crashing after a committed apply batch leaves that batch visible while
+  progress remains on the previous complete source commit; a replacement
+  Runtime resumes at the next batch without double application;
 - registration persists exactly one valid `PhysicalDagPlan` generation per
   DAG; Runtime execution loads that generation instead of compiling per
   commit;
@@ -59,7 +59,7 @@ Shiba is tested against a real PostgreSQL 17 server, not a mock database.
 - `shiba.explain_physical(regclass)` reports the physical version, `plan_id`,
   Stage graph, storage choices, and typed schema/index metadata;
 - normal commit execution contains no Stage DDL and creates no temporary
-  table; typed UNLOGGED Stage DDL exists only in registration/finalization;
+  table; typed UNLOGGED Stage DDL exists only during registration;
 - after successful and deliberately rolled-back Join apply and Runtime reload,
   `join_delta` is empty and the durable result still matches PostgreSQL
   recomputation; the generic failpoint suite separately verifies that logged
@@ -95,13 +95,13 @@ Shiba is tested against a real PostgreSQL 17 server, not a mock database.
   the next registered-source statement trigger or an explicit
   `SELECT shiba.activate()` restores exactly one Runtime and drains
   WAL/change-log/inbox state retained durably;
-- Runtime crashes at apply-before-ack and route-before-slot-advance are
+- Runtime crashes after final-batch SQL but before transaction commit, and
+  route-before-slot-advance crashes, are
   recovered without duplicate process ownership, duplicate payload, lost
   references, or double application;
-- a DAG load/apply error rolls back the current commit, retains its inbox,
+- a DAG load/apply error rolls back the current batch, retains its inbox,
   shared payload, and progress position, marks only that DAG failed, and does
-  not stop healthy DAGs; `activate()` must not clear the quarantine, and an
-  explicit repair/clear/retry path must resume it;
+  not stop healthy DAGs; `activate()` must not silently clear the quarantine;
 - while a deliberately long apply is running, the same Runtime PID remains the
   sole owner and newly committed source work is not routed until that apply
   completes; this records the single-process head-of-line behavior;
@@ -152,9 +152,9 @@ Single-Runtime architecture acceptance must additionally prove the
 process/runtime boundary: result-DAG count does not increase PostgreSQL
 background-worker count; Router and Executor processes do not exist; payload
 fanout is shared; round-robin preserves per-DAG commit order; poison input
-retains replay data; batch cursors and LOGGED pending state survive restart;
-UNLOGGED Join Stage loss is rebuilt from logged input; and DROP allows
-unreferenced payload GC. Static
+retains replay data; committed state/result changes and batch cursors survive
+restart; all shared UNLOGGED scratch is empty between batches and is not used
+as recovery authority; and DROP allows unreferenced payload GC. Static
 architecture checks additionally reject apply-time `CREATE UNLOGGED`, TEMP
 tables, and per-data-row loops. The shell gate cannot directly prove the
 absence of a Rust transaction-sized `Vec`; that requires a Rust-level

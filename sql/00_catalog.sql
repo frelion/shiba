@@ -159,7 +159,7 @@ CREATE TABLE shiba_internal.physical_plans (
 
 -- Every cataloged v1 Stage relation is typed and UNLOGGED. Inline and
 -- statement-materialized Stages live only in the physical-plan descriptor.
--- A relation-backed Stage is a rebuildable commit-scoped cache, never durable
+-- A relation-backed Stage is a rebuildable batch-scoped cache, never durable
 -- operator state.
 CREATE TABLE shiba_internal.physical_stages (
     result_oid oid NOT NULL,
@@ -197,11 +197,10 @@ CREATE TABLE shiba_internal.distinct_state (
     PRIMARY KEY(result_oid,group_key,value_key)
 );
 
--- Durable, commit-private fold state for single-source aggregates. Each
--- ingress apply batch merges an ordered summary here and commits its inbox
--- cursor in the same transaction. The rows remain invisible to users until
--- the final batch publishes state and sink changes.
-CREATE TABLE shiba_internal.aggregate_group_fold_stage (
+-- Shared UNLOGGED scratch for folding one ingress batch before applying it to
+-- authoritative state and the result table. Apply must leave it empty between
+-- batches; it is not recovery authority.
+CREATE UNLOGGED TABLE shiba_internal.aggregate_group_fold_stage (
     result_oid oid NOT NULL
         REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
     commit_lsn pg_lsn NOT NULL,
@@ -215,7 +214,7 @@ CREATE TABLE shiba_internal.aggregate_group_fold_stage (
     PRIMARY KEY (result_oid,commit_lsn,group_key)
 );
 
-CREATE TABLE shiba_internal.aggregate_distinct_fold_stage (
+CREATE UNLOGGED TABLE shiba_internal.aggregate_distinct_fold_stage (
     result_oid oid NOT NULL
         REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
     commit_lsn pg_lsn NOT NULL,
@@ -226,7 +225,7 @@ CREATE TABLE shiba_internal.aggregate_distinct_fold_stage (
     PRIMARY KEY (result_oid,commit_lsn,group_key,value_key)
 );
 
-CREATE TABLE shiba_internal.distinct_fold_stage (
+CREATE UNLOGGED TABLE shiba_internal.distinct_fold_stage (
     result_oid oid NOT NULL
         REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
     commit_lsn pg_lsn NOT NULL,
@@ -323,10 +322,9 @@ CREATE TABLE shiba_internal.runtime_state (
     CHECK (owner_pid IS NULL OR pending_launch_xid IS NULL)
 );
 
--- Durable ingress is the only routing and operator input model.
--- Every relation below is LOGGED (the PostgreSQL default). Replication
--- buffers and parser state are disposable; these rows are the crash-recovery
--- authority.
+-- Durable ingress is the only routing and operator input model. Replication
+-- buffers and parser state are disposable; the LOGGED ingress, cursor,
+-- operator-state, and result relations are the crash-recovery authority.
 
 -- A generation changes whenever a logical slot is recreated.  Runtime code
 -- provisions this row before decoding and retires the preceding active
@@ -473,10 +471,9 @@ CREATE TABLE shiba_internal.ingress_apply_batches (
     CHECK (event_count = last_input_seq - first_input_seq + 1)
 );
 
--- Durable row-bag summaries prepared one ingress batch at a time for TopN and
--- Window. partition_key is JSON null for TopN. The associative total/minimum
--- prefix pair preserves ordered retraction validation across batch commits.
-CREATE TABLE shiba_internal.unary_pending_rows (
+-- Shared UNLOGGED row-bag scratch for one TopN or Window input batch. Apply
+-- must leave it empty between batches. partition_key is JSON null for TopN.
+CREATE UNLOGGED TABLE shiba_internal.unary_batch_rows (
     result_oid oid NOT NULL
         REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
     ingress_txn_id bigint NOT NULL
@@ -489,10 +486,9 @@ CREATE TABLE shiba_internal.unary_pending_rows (
     PRIMARY KEY (result_oid,ingress_txn_id,partition_key,row_data)
 );
 
--- Durable folded source rows prepared for one Join commit. Join candidate
--- generation remains a finalization step, so the complete left/right delta
--- and its cross term are computed together against committed arrangements.
-CREATE TABLE shiba_internal.join_pending_rows (
+-- Shared UNLOGGED folded rows for one Join input batch. Candidate generation
+-- consumes both sides and clears the rows in the same apply transaction.
+CREATE UNLOGGED TABLE shiba_internal.join_batch_rows (
     result_oid oid NOT NULL
         REFERENCES shiba_internal.inner_join_views(result_oid)
         ON DELETE CASCADE,
@@ -512,8 +508,8 @@ CREATE TABLE shiba_internal.join_pending_rows (
         ON DELETE CASCADE
 );
 
-CREATE INDEX shiba_join_pending_commit_idx
-    ON shiba_internal.join_pending_rows (result_oid,commit_lsn,input_side);
+CREATE INDEX shiba_join_batch_commit_idx
+    ON shiba_internal.join_batch_rows (result_oid,commit_lsn,input_side);
 
 -- PostgreSQL has already applied top-level and subtransaction rollback
 -- semantics before pgoutput emits rows when streaming=off.  Consumers only

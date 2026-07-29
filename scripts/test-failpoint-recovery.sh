@@ -197,9 +197,9 @@ wait_for_query "0" "${baseline_diff}" "the initial result"
 result_oid="$(psql_gate -Atqc "
   SELECT 'shiba.failpoint_result'::regclass::oid::integer")"
 
-printf '\n==> Runtime crash after a durable prepared batch\n'
+printf '\n==> Runtime crash after a directly published batch\n'
 set_dag_active "${result_oid}" false
-progress_before_prepare="$(psql_gate -Atqc "
+progress_before_batch="$(psql_gate -Atqc "
   SELECT coalesce(applied_lsn::text,'NULL')
   FROM shiba_internal.view_progress
   WHERE result_oid=${result_oid}::oid")"
@@ -211,75 +211,87 @@ wait_for_query "1" "
   SELECT count(*) FROM shiba_internal.dag_inbox
   WHERE result_oid=${result_oid}::oid" \
   "the multi-batch commit to reach the durable inbox"
-prepare_lsn="$(psql_gate -Atqc "
+batch_lsn="$(psql_gate -Atqc "
   SELECT commit_lsn FROM shiba_internal.dag_inbox
   WHERE result_oid=${result_oid}::oid")"
-prepare_log_lsn="$(psql_gate -Atqc "
-  SELECT split_part('${prepare_lsn}','/',1)
+batch_log_lsn="$(psql_gate -Atqc "
+  SELECT split_part('${batch_lsn}','/',1)
          || '/' ||
-         lpad(split_part('${prepare_lsn}','/',2),8,'0')")"
+         lpad(split_part('${batch_lsn}','/',2),8,'0')")"
+prefix_result="$(psql_gate -Atqc "
+  SELECT count(*) || '|' ||
+         coalesce(sum((event.row_data->>'amount')::bigint),0)
+  FROM shiba_internal.effective_change_log event
+  JOIN shiba_internal.ingress_apply_batches batch
+    ON batch.ingress_txn_id=event.ingress_txn_id
+   AND batch.batch_ordinal=1
+   AND event.sequence BETWEEN batch.first_input_seq AND batch.last_input_seq
+  WHERE event.commit_lsn='${batch_lsn}'::pg_lsn
+    AND event.source_oid='public.failpoint_source'::regclass")"
 assert_query "t" "
   SELECT count(*)>1
   FROM shiba_internal.ingress_apply_batches batch
   JOIN shiba_internal.dag_inbox inbox
     ON inbox.ingress_txn_id=batch.ingress_txn_id
   WHERE inbox.result_oid=${result_oid}::oid
-    AND inbox.commit_lsn='${prepare_lsn}'::pg_lsn"
-prepare_runtime_pid="$(runtime_pid)"
+    AND inbox.commit_lsn='${batch_lsn}'::pg_lsn"
+batch_runtime_pid="$(runtime_pid)"
 psql_gate -qc "
   INSERT INTO public.shiba_runtime_failpoints
     (kind,runtime_pid,result_oid,commit_lsn,pause_ms)
   VALUES
-    ('runtime_apply_after_prepared_batch',${prepare_runtime_pid},
-     ${result_oid}::oid,'${prepare_lsn}'::pg_lsn,2000);
+    ('runtime_apply_after_batch',${batch_runtime_pid},
+     ${result_oid}::oid,'${batch_lsn}'::pg_lsn,2000);
   UPDATE shiba_internal.dag_runtime_state
   SET active=true
   WHERE result_oid=${result_oid}::oid"
 
 wait_for_log \
-  "test failpoint reached: runtime_apply_after_prepared_batch result ${result_oid} commit ${prepare_log_lsn}" \
-  "the Runtime to commit one prepared batch"
-# The failpoint is claimed in a new transaction after the prepare transaction
-# commits. Freeze the DAG while the Runtime is paused so the replacement cannot
-# consume the remaining batches before the recovery assertions.
+  "test failpoint reached: runtime_apply_after_batch result ${result_oid} commit ${batch_log_lsn}" \
+  "the Runtime to publish one input batch"
+# The failpoint is claimed after the batch transaction commits. Freeze the DAG
+# while the Runtime is paused so the replacement cannot consume more batches
+# before the prefix-visibility and recovery assertions.
 set_dag_active "${result_oid}" false
-assert_query "2|0|${progress_before_prepare}|true" "
+assert_query "2|${progress_before_batch}|true" "
   SELECT
     (SELECT next_batch_ordinal FROM shiba_internal.dag_inbox
      WHERE result_oid=${result_oid}::oid
-       AND commit_lsn='${prepare_lsn}'::pg_lsn)
-    || '|' ||
-    (SELECT count(*) FROM shiba.failpoint_result WHERE group_id=5)
+       AND commit_lsn='${batch_lsn}'::pg_lsn)
     || '|' ||
     (SELECT coalesce(applied_lsn::text,'NULL')
      FROM shiba_internal.view_progress
      WHERE result_oid=${result_oid}::oid)
     || '|' ||
     (SELECT fired FROM public.shiba_runtime_failpoints
-     WHERE kind='runtime_apply_after_prepared_batch')"
-assert_query "1" "
+     WHERE kind='runtime_apply_after_batch')"
+assert_query "${prefix_result}" "
+  SELECT row_count || '|' || total
+  FROM shiba.failpoint_result
+  WHERE group_id=5"
+assert_query "0" "
   SELECT count(*)
   FROM shiba_internal.aggregate_group_fold_stage
   WHERE result_oid=${result_oid}::oid
-    AND commit_lsn='${prepare_lsn}'::pg_lsn"
+    AND commit_lsn='${batch_lsn}'::pg_lsn"
 
 wait_for_log \
-  "runtime exited after committing a prepared batch for ${prepare_log_lsn}" \
-  "the post-prepare failpoint"
+  "runtime exited after committing an applied batch for ${batch_log_lsn}" \
+  "the post-batch failpoint"
 wait_for_query "0" "
   SELECT count(*) FROM pg_stat_activity
-  WHERE backend_type='shiba runtime' AND pid=${prepare_runtime_pid}" \
+  WHERE backend_type='shiba runtime' AND pid=${batch_runtime_pid}" \
   "the failed Runtime to exit"
-wait_for_replacement_runtime "${prepare_runtime_pid}"
+wait_for_replacement_runtime "${batch_runtime_pid}"
 
 psql_gate -qc "
   DELETE FROM public.shiba_runtime_failpoints
-  WHERE kind='runtime_apply_after_prepared_batch';
+  WHERE kind='runtime_apply_after_batch';
   UPDATE shiba_internal.dag_runtime_state
   SET active=true
   WHERE result_oid=${result_oid}::oid"
 wait_for_query "0" "${baseline_diff}" \
-  "the replacement Runtime to resume at the next prepared batch"
+  "the replacement Runtime to resume at the next input batch"
 wait_for_query "0|0" "
   SELECT
     (SELECT count(*) FROM shiba_internal.dag_inbox
@@ -287,12 +299,19 @@ wait_for_query "0|0" "
     || '|' ||
     (SELECT count(*) FROM shiba_internal.aggregate_group_fold_stage
      WHERE result_oid=${result_oid}::oid
-       AND commit_lsn='${prepare_lsn}'::pg_lsn)" \
-  "the resumed commit to publish and clear pending state"
+       AND commit_lsn='${batch_lsn}'::pg_lsn)" \
+  "the resumed commit to finish and leave scratch empty"
+assert_query "${batch_lsn}" "
+  SELECT applied_lsn::text
+  FROM shiba_internal.view_progress
+  WHERE result_oid=${result_oid}::oid"
 
-printf '\n==> Runtime apply-before-ack rollback\n'
+printf '\n==> Runtime multi-batch final-apply rollback\n'
 set_dag_active "${result_oid}" false
-psql_gate -qc "INSERT INTO public.failpoint_source VALUES (2,2,20)"
+psql_gate -qc "
+  INSERT INTO public.failpoint_source
+  SELECT 30000+id,2,20
+  FROM generate_series(1,5000) AS id"
 wait_for_query "1" "
   SELECT count(*) FROM shiba_internal.dag_inbox
   WHERE result_oid=${result_oid}::oid" \
@@ -300,6 +319,24 @@ wait_for_query "1" "
 apply_lsn="$(psql_gate -Atqc "
   SELECT commit_lsn FROM shiba_internal.dag_inbox
   WHERE result_oid=${result_oid}::oid")"
+apply_final_ordinal="$(psql_gate -Atqc "
+  SELECT max(batch.batch_ordinal)
+  FROM shiba_internal.ingress_apply_batches batch
+  JOIN shiba_internal.dag_inbox inbox
+    ON inbox.ingress_txn_id=batch.ingress_txn_id
+  WHERE inbox.result_oid=${result_oid}::oid
+    AND inbox.commit_lsn='${apply_lsn}'::pg_lsn")"
+test "${apply_final_ordinal}" -gt 1
+apply_prefix_result="$(psql_gate -Atqc "
+  SELECT count(*) || '|' ||
+         coalesce(sum((event.row_data->>'amount')::bigint),0)
+  FROM shiba_internal.effective_change_log event
+  JOIN shiba_internal.ingress_apply_batches batch
+    ON batch.ingress_txn_id=event.ingress_txn_id
+   AND event.sequence BETWEEN batch.first_input_seq AND batch.last_input_seq
+  WHERE event.commit_lsn='${apply_lsn}'::pg_lsn
+    AND event.source_oid='public.failpoint_source'::regclass
+    AND batch.batch_ordinal<${apply_final_ordinal}")"
 apply_runtime_pid="$(runtime_pid)"
 progress_before="$(psql_gate -Atqc "
   SELECT coalesce(applied_lsn::text,'NULL')
@@ -309,27 +346,27 @@ psql_gate -qc "
   INSERT INTO public.shiba_runtime_failpoints
     (kind,runtime_pid,result_oid,commit_lsn,pause_ms)
   VALUES
-    ('runtime_apply_before_ack',${apply_runtime_pid},${result_oid}::oid,
+    ('runtime_apply_before_commit',${apply_runtime_pid},${result_oid}::oid,
      '${apply_lsn}'::pg_lsn,2000);
   UPDATE shiba_internal.dag_runtime_state
   SET active=true
   WHERE result_oid=${result_oid}::oid"
 
 wait_for_log \
-  "test failpoint reached: runtime_apply_before_ack result ${result_oid} commit ${apply_lsn}" \
-  "the Runtime to reach the apply-before-ack boundary"
+  "test failpoint reached: runtime_apply_before_commit result ${result_oid} commit ${apply_lsn}" \
+  "the Runtime to reach the final batch pre-commit boundary"
 # Keep the replacement from draining retained input before rollback assertions.
 set_dag_active "${result_oid}" false
 wait_for_log \
-  "runtime exited after applying commit ${apply_lsn} and before acknowledgement" \
-  "the apply-before-ack failpoint"
+  "runtime exited after final batch SQL for ${apply_lsn} and before transaction commit" \
+  "the final batch pre-commit failpoint"
 wait_for_query "0" "
   SELECT count(*) FROM pg_stat_activity
   WHERE backend_type='shiba runtime' AND pid=${apply_runtime_pid}" \
   "the failed Runtime to exit"
 wait_for_replacement_runtime "${apply_runtime_pid}"
 
-assert_query "1|1|0|${progress_before}" "
+assert_query "1|5000|${apply_final_ordinal}|${progress_before}" "
   SELECT
     (SELECT count(*) FROM shiba_internal.dag_inbox
      WHERE result_oid=${result_oid}::oid
@@ -338,19 +375,29 @@ assert_query "1|1|0|${progress_before}" "
     (SELECT count(*) FROM shiba_internal.effective_change_log
      WHERE commit_lsn='${apply_lsn}'::pg_lsn)
     || '|' ||
-    (SELECT count(*) FROM shiba.failpoint_result WHERE group_id=2)
+    (SELECT next_batch_ordinal FROM shiba_internal.dag_inbox
+     WHERE result_oid=${result_oid}::oid
+       AND commit_lsn='${apply_lsn}'::pg_lsn)
     || '|' ||
     (SELECT coalesce(applied_lsn::text,'NULL')
      FROM shiba_internal.view_progress
      WHERE result_oid=${result_oid}::oid)"
+assert_query "${apply_prefix_result}|${apply_prefix_result}" "
+  SELECT result.row_count || '|' || result.total || '|' ||
+         state.row_count || '|' || state.sum_value
+  FROM shiba.failpoint_result result
+  JOIN shiba_internal.aggregate_state state
+    ON state.result_oid=${result_oid}::oid
+   AND state.group_key=to_jsonb(result.group_id)
+  WHERE result.group_id=2"
 # The claim happens in the failed apply transaction and must roll back too.
 assert_query "f" "
   SELECT fired FROM public.shiba_runtime_failpoints
-  WHERE kind='runtime_apply_before_ack'"
+  WHERE kind='runtime_apply_before_commit'"
 
 psql_gate -qc "
   DELETE FROM public.shiba_runtime_failpoints
-  WHERE kind='runtime_apply_before_ack';
+  WHERE kind='runtime_apply_before_commit';
   UPDATE shiba_internal.dag_runtime_state
   SET active=true
   WHERE result_oid=${result_oid}::oid"
@@ -360,15 +407,15 @@ wait_for_query "0" "
   WHERE result_oid=${result_oid}::oid" \
   "the replayed inbox reference to be acknowledged"
 
-apply_panic="Shiba test failpoint: runtime exited after applying commit ${apply_lsn} and before acknowledgement"
+apply_panic="Shiba test failpoint: runtime exited after final batch SQL for ${apply_lsn} and before transaction commit"
 apply_exit="background worker \"shiba runtime\" (PID ${apply_runtime_pid}) exited with exit code 1"
-prepare_panic="Shiba test failpoint: runtime exited after committing a prepared batch for ${prepare_log_lsn}"
-prepare_exit="background worker \"shiba runtime\" (PID ${prepare_runtime_pid}) exited with exit code 1"
+batch_panic="Shiba test failpoint: runtime exited after committing an applied batch for ${batch_log_lsn}"
+batch_exit="background worker \"shiba runtime\" (PID ${batch_runtime_pid}) exited with exit code 1"
 
-assert_log_count 1 "${prepare_panic}" "the expected post-prepare panic"
-assert_log_count 1 "${prepare_exit}" "the failed post-prepare Runtime PID exit"
+assert_log_count 1 "${batch_panic}" "the expected post-batch panic"
+assert_log_count 1 "${batch_exit}" "the failed post-batch Runtime PID exit"
 assert_log_count 1 \
-  "Shiba test failpoint reached: runtime_apply_before_ack result ${result_oid} commit ${apply_lsn}" \
+  "Shiba test failpoint reached: runtime_apply_before_commit result ${result_oid} commit ${apply_lsn}" \
   "the apply boundary arrival with exact result OID and commit LSN"
 assert_log_count 1 "${apply_panic}" "the expected apply panic"
 assert_log_count 1 "${apply_exit}" "the failed apply Runtime PID exit"
@@ -377,7 +424,7 @@ runtime_exit_log="$(mktemp /tmp/shiba-runtime-failpoint-exits.XXXXXX)"
 grep 'background worker "shiba runtime"' \
   "${pg_log_file}" >"${runtime_exit_log}" || true
 if test "$(wc -l <"${runtime_exit_log}" | tr -d ' ')" != "2" ||
-   ! grep -Fq "${prepare_exit}" "${runtime_exit_log}" ||
+   ! grep -Fq "${batch_exit}" "${runtime_exit_log}" ||
    ! grep -Fq "${apply_exit}" "${runtime_exit_log}"; then
   sed -n '1,120p' "${runtime_exit_log}" >&2
   rm -f "${runtime_exit_log}"
@@ -387,7 +434,7 @@ rm -f "${runtime_exit_log}"
 
 unexpected_log="$(mktemp /tmp/shiba-runtime-failpoint-unexpected.XXXXXX)"
 grep -nE 'WARNING|ERROR|FATAL|PANIC' "${pg_log_file}" |
-  grep -Fv -e "${prepare_panic}" |
+  grep -Fv -e "${batch_panic}" |
   grep -Fv -e "${apply_panic}" \
   >"${unexpected_log}" || true
 if test -s "${unexpected_log}"; then

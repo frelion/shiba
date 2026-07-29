@@ -109,11 +109,12 @@ GROUP BY i.category_id;
 ```
 
 Shiba keeps a logged, multiplicity-preserving arrangement for each join input.
-For one source commit, a set-oriented physical program fixes the
-transaction-entry arrangements, derives final arrangements for affected keys,
-and emits the exact signed bag difference `new Join output - old Join output`.
-Outer, semi, anti, and null-aware anti visibility follows old/new match
-cardinality rather than a per-event callback.
+For each stable ingress batch, a set-oriented physical program reads the
+current arrangements, derives the next arrangements for affected keys, and
+emits the exact signed bag difference `new Join output - old Join output`.
+The batch updates arrangements, aggregate state, result rows, and its cursor in
+one transaction. Outer, semi, anti, and null-aware anti visibility follows
+old/new match cardinality rather than a per-event callback.
 
 Window and TopN operators retain their complete input multiset in Shiba-owned
 state. A window delta rebuilds only its affected old/new partition; TopN
@@ -147,25 +148,27 @@ worker or thread. Result changes are therefore eventually consistent, and the
 number of result DAGs does not change PostgreSQL process count.
 
 The Runtime does not run SPI concurrently on Rust threads. After a source
-commit is fully ingested, it prepares one stable ingress batch for one DAG per
-apply transaction and rotates ready DAGs between batches. The final batch
-publishes the complete source commit atomically. A PostgreSQL statement is
-still non-preemptible, so an expensive final publication can temporarily delay
-routing, other DAGs, and garbage collection.
+commit is fully ingested, it applies one stable ingress batch for one DAG per
+transaction and rotates ready DAGs between batches. Each transaction updates
+operator state, result rows, and the DAG batch cursor together, so earlier
+batches are visible before the complete source commit has been consumed. A
+PostgreSQL statement is still non-preemptible, so high-fanout operator work can
+temporarily delay routing, other DAGs, and garbage collection.
 
 Each committed transaction is durably deduplicated by its commit LSN, and each
 result records an activation LSN immediately after its locked CTAS backfill.
 Every decoded delta is stored once in the shared durable `change_log`.
 `dag_inbox` stores at most one lightweight `(result_oid, commit_lsn)` reference
 and a batch cursor per affected DAG, so payload is not duplicated by fanout.
-Operator SQL reads one `ingress_apply_batches` input range and merges it into
-LOGGED pending state in the same transaction that advances the cursor. On the
-last batch, operator state, result rows, progress, pending cleanup, and
-acknowledgement of the DAG reference commit together. This prevents crash
-replay double-counting and replaying pre-backfill WAL into a newly-created
-result.
+Operator SQL reads one `ingress_apply_batches` input range and directly updates
+authoritative state and result rows in the same transaction that advances the
+cursor. On the last batch, that transaction also advances progress and
+acknowledges the DAG reference. This prevents crash replay from double-counting
+a committed batch and prevents pre-backfill WAL from entering a newly-created
+result. A partial source commit can remain visible if a later batch fails.
 `shiba_internal.view_progress.applied_lsn` exposes the per-result commit-LSN
-watermark.
+watermark for source commits whose every batch has completed; it does not
+describe an already-visible partial commit.
 
 Registration persists a versioned `PhysicalDagPlan`. A physical Stage is a
 relation-reuse decision inside the one Runtime, not another worker. Inline
@@ -175,12 +178,12 @@ UNLOGGED `join_delta` Stage when its exact output must cross SQL statements.
 Join input delta remains statement-materialized.
 
 All recovery authority remains logged: `change_log`, stable apply ranges,
-`dag_inbox`, pending operator summaries, progress, arrangements, operator
-state, and result rows. The typed UNLOGGED Join Stage is derived data used only
-inside final publication. Normal apply creates no temporary table and performs
-no DDL. After a crash, the replacement Runtime resumes at the persisted batch
-cursor; a failed current batch is retried, while earlier pending summaries are
-retained.
+`dag_inbox`, progress, arrangements, operator state, and result rows. Fold and
+Join Stage relations are UNLOGGED scratch used only inside the current apply
+transaction. Normal apply creates no temporary table and performs no DDL.
+After a crash, the replacement Runtime resumes at the persisted batch cursor;
+a batch rolled back by a crash or transient concurrency failure is retried,
+while earlier committed state and result changes remain visible.
 
 The Runtime is configured for PostgreSQL to restart it after an abnormal exit
 while the postmaster stays up. Because it is dynamically registered, a
@@ -189,10 +192,10 @@ registered source table, or an explicit `SELECT shiba.activate()`, restores the
 single Runtime.
 
 If loading or applying one DAG fails, the current apply transaction rolls
-back. Previously committed pending batches, the inbox cursor, and shared input
-remain consistent. Resource-limit failures pause that DAG; deterministic
-plan/operator failures quarantine it while other DAGs continue. Shared payload
-is garbage-collected only after no DAG references its source transaction.
+back. Previously committed batches, the inbox cursor, and shared input remain
+consistent. Resource-limit failures pause that DAG; deterministic plan/operator
+failures quarantine it while other DAGs continue. Shared payload is
+garbage-collected only after no DAG references its source transaction.
 
 Applications can inspect a result's public progress surface without reading internal tables:
 

@@ -494,6 +494,61 @@ for ((round=1; round<=rounds; round++)); do
   fi
 done
 
+# One large source transaction must span multiple apply batches for every
+# single-source pipeline, and the final state must match a fresh PostgreSQL
+# execution. Prefix visibility is checked deterministically by the failpoint
+# recovery test.
+psql_diff -qc "
+  UPDATE shiba_internal.dag_runtime_state
+  SET active=false
+  WHERE result_oid IN (
+    SELECT view_name FROM public.diff_specs
+  )"
+large_batch_sql="
+INSERT INTO public.diff_events
+SELECT 100000+id,
+       (id % 7)-3,
+       CASE WHEN id % 8=0 THEN NULL ELSE (id % 8)-4 END,
+       (id % 5)-2,
+       (id % 11)-5,
+       ((id % 31)-15)*100000+id
+FROM generate_series(1,5000) AS id"
+printf '%s;\n' "${large_batch_sql}" >> "${replay_log}"
+psql_diff -qc "${large_batch_sql}"
+wait_for_value "t" "
+  SELECT count(*)>0
+  FROM shiba_internal.dag_inbox inbox
+  JOIN shiba_internal.stream_views view
+    ON view.result_oid=inbox.result_oid
+  WHERE view.source_oid='public.diff_events'::regclass"
+large_batch_lsn="$(psql_diff -Atqc "
+  SELECT max(inbox.commit_lsn)
+  FROM shiba_internal.dag_inbox inbox
+  JOIN shiba_internal.stream_views view
+    ON view.result_oid=inbox.result_oid
+  WHERE view.source_oid='public.diff_events'::regclass")"
+test "$(psql_diff -Atqc "
+  SELECT count(DISTINCT batch.batch_ordinal)>1
+  FROM shiba_internal.ingress_apply_batches batch
+  JOIN shiba_internal.dag_inbox inbox
+    ON inbox.ingress_txn_id=batch.ingress_txn_id
+  WHERE inbox.commit_lsn='${large_batch_lsn}'::pg_lsn")" = "t"
+psql_diff -qc "
+  UPDATE shiba_internal.dag_runtime_state
+  SET active=true
+  WHERE result_oid IN (
+    SELECT view_name FROM public.diff_specs
+  )"
+wait_for_value "ok" "
+  SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM shiba_internal.dag_inbox)
+     AND NOT EXISTS (
+       SELECT 1 FROM public.diff_failures() WHERE mismatch_count<>0
+     )
+    THEN 'ok'
+    ELSE 'wait'
+  END"
+
 test "$(psql_diff -Atqc \
   "SELECT count(*) FROM public.diff_failures() WHERE mismatch_count <> 0")" = "0"
 printf 'single-source differential test passed: seed=%s rounds=%s\n' \

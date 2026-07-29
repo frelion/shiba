@@ -22,7 +22,7 @@ flowchart LR
         BATCH[("stable input ranges")]
         INBOX[("per-result dag_inbox<br/>batch cursor")]
         PLAN[("PhysicalDagPlan")]
-        PENDING[("this transaction's<br/>unpublished summary")]
+        SCRATCH[("current-batch<br/>UNLOGGED scratch")]
         STATE[("operator state")]
         RESULT[("result table")]
     end
@@ -32,7 +32,6 @@ flowchart LR
         ROUTE["find affected results"]
         SCHEDULE["round-robin scheduler"]
         APPLY["run the saved SQL plan"]
-        FEEDBACK["standby status feedback"]
     end
 
     WS --> DECODE
@@ -43,12 +42,11 @@ flowchart LR
     INBOX --> SCHEDULE
     SCHEDULE --> APPLY
     PLAN -->|"read-only"| APPLY
-    APPLY --> PENDING
-    PENDING -->|"last batch publishes"| STATE
-    PENDING -->|"last batch publishes"| RESULT
+    APPLY --> SCRATCH
+    SCRATCH -->|"every batch commits"| STATE
+    SCRATCH -->|"every batch commits"| RESULT
     STATE <-->|"read / write"| APPLY
-    LOG -. "durable LSN" .-> FEEDBACK
-    FEEDBACK -.-> WS
+    APPLY -->|"advance batch cursor"| INBOX
 ```
 
 Ingress normalizes DML into weighted rows: insert is `+1`, delete is `-1`, and
@@ -56,14 +54,14 @@ update is `-1 old / +1 new`. It stores a source transaction once in
 `change_log` and records stable input ranges as it reads. The Runtime schedules
 the saved DAG only after the source `Commit` is durable.
 
-The scheduler then reads one stable range per apply transaction and merges it
-into a durable unpublished summary. For each result table, the last range
-atomically publishes the complete source transaction to operator state, the
-result table, and apply progress, then removes the inbox entry. If one source
-transaction affects results A and B, A may publish before B; Shiba does not
-publish multiple result tables in one shared PostgreSQL transaction.
-Replication feedback advances after durable ingress, independently of result
-publication.
+The scheduler reads one stable range per apply transaction. That transaction
+updates authoritative operator state, the result table, and the per-result
+batch cursor together. Each successful batch is immediately visible; a large
+source transaction is deliberately not one result-visibility boundary. The
+last range additionally advances apply progress and removes the inbox entry.
+If one source transaction affects results A and B, their cursors advance
+independently. Replication feedback advances after durable ingress,
+including pgoutput `Commit` finalization, independently of result application.
 
 The detailed [architecture](docs/ARCHITECTURE.md) documents the stream model,
 operator state, scheduling, recovery, and resource bounds.
@@ -79,10 +77,10 @@ protocol parsers and state machines to PostgreSQL FFI and the Runtime loop.
   protocol decoding, validation, planning, and scheduling.
 - Each active database has one Shiba Runtime. PostgreSQL logical decoding uses
   a separate walsender.
-- Per-result source-commit order is strict. Different results are scheduled
-  round-robin between ingress batches.
-- A running PostgreSQL statement is not preempted. Expensive final publication
-  can still block the single Runtime.
+- Per-result source-commit and batch order is strict. Different results are
+  scheduled round-robin between ingress batches.
+- A running PostgreSQL statement is not preempted. High-fanout Join and large
+  Window/TopN work can still block the single Runtime.
 
 ## Quick start
 

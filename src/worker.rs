@@ -529,8 +529,8 @@ enum DagStep {
     RuntimeInactive,
     Inactive,
     Retry,
-    Prepared { has_more: bool, commit_lsn: u64 },
-    Processed { has_more: bool },
+    BatchApplied { has_more: bool, commit_lsn: u64 },
+    InboxCompleted { has_more: bool },
     ResourceBlocked,
     Quarantined,
     Idle,
@@ -576,17 +576,17 @@ fn apply_ready_dags_bounded(
         let step = apply_one_dag_transaction(runtimes, result_oid);
         match step {
             DagStep::RuntimeInactive => return ApplyPhase::RuntimeInactive,
-            DagStep::Prepared {
+            DagStep::BatchApplied {
                 has_more,
                 commit_lsn,
             } => {
                 worked += 1;
-                crash_after_prepared_batch(result_oid, commit_lsn);
+                crash_after_applied_batch(result_oid, commit_lsn);
                 if has_more {
                     ready_dags.push_back(result_oid);
                 }
             }
-            DagStep::Processed { has_more } => {
+            DagStep::InboxCompleted { has_more } => {
                 worked += 1;
                 if has_more {
                     // Routing does not run during this bounded phase. Requeue a
@@ -683,40 +683,40 @@ fn process_next_dag_transaction(result_oid: pg_sys::Oid, runtime: &logical::DagR
     let apply_result = runtime
         .apply_next_transaction()
         .expect("Shiba could not execute the next DAG inbox transaction");
-    let prepared_commit_lsn = match apply_result.outcome {
-        logical::NextApplyOutcome::Prepared => Some(
+    let batch_commit_lsn = match apply_result.outcome {
+        logical::NextApplyOutcome::BatchApplied => Some(
             parse_lsn(
                 apply_result
                     .commit_lsn
                     .as_deref()
-                    .expect("prepared Shiba DAG transaction returned no commit LSN"),
+                    .expect("applied Shiba DAG batch returned no commit LSN"),
             )
-            .expect("prepared Shiba DAG transaction returned an invalid commit LSN"),
+            .expect("applied Shiba DAG batch returned an invalid commit LSN"),
         ),
         logical::NextApplyOutcome::Retry => return DagStep::Retry,
         logical::NextApplyOutcome::ResourceBlocked => return DagStep::ResourceBlocked,
         logical::NextApplyOutcome::Quarantined => return DagStep::Quarantined,
         logical::NextApplyOutcome::Inactive => return DagStep::Inactive,
         logical::NextApplyOutcome::Idle => return DagStep::Idle,
-        logical::NextApplyOutcome::Applied => None,
+        logical::NextApplyOutcome::CommitCompleted => None,
     };
     #[cfg(any(test, feature = "pg_test"))]
-    if apply_result.outcome == logical::NextApplyOutcome::Applied {
+    if apply_result.outcome == logical::NextApplyOutcome::CommitCompleted {
         let commit_lsn = apply_result
             .commit_lsn
             .as_deref()
             .expect("applied Shiba DAG transaction returned no commit LSN");
         if let Some(pause) = test_failpoints::claim(
-            "runtime_apply_before_ack",
+            "runtime_apply_before_commit",
             Some(result_oid),
             Some(commit_lsn),
         ) {
             log!(
-                "Shiba test failpoint reached: runtime_apply_before_ack result {result_oid} commit {commit_lsn}"
+                "Shiba test failpoint reached: runtime_apply_before_commit result {result_oid} commit {commit_lsn}"
             );
             std::thread::sleep(pause);
             panic!(
-                "Shiba test failpoint: runtime exited after applying commit {commit_lsn} and before acknowledgement"
+                "Shiba test failpoint: runtime exited after final batch SQL for {commit_lsn} and before transaction commit"
             );
         }
     }
@@ -733,38 +733,38 @@ fn process_next_dag_transaction(result_oid: pg_sys::Oid, runtime: &logical::DagR
     .expect("Shiba could not inspect the remaining DAG inbox backlog")
     .expect("Shiba DAG inbox backlog check returned NULL");
     update_dag_last_scheduled(result_oid);
-    match prepared_commit_lsn {
-        Some(commit_lsn) => DagStep::Prepared {
+    match batch_commit_lsn {
+        Some(commit_lsn) => DagStep::BatchApplied {
             has_more,
             commit_lsn,
         },
-        None => DagStep::Processed { has_more },
+        None => DagStep::InboxCompleted { has_more },
     }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-fn crash_after_prepared_batch(result_oid: pg_sys::Oid, commit_lsn: u64) {
+fn crash_after_applied_batch(result_oid: pg_sys::Oid, commit_lsn: u64) {
     let commit_lsn = format_lsn(commit_lsn);
     let pause = BackgroundWorker::transaction(|| {
         test_failpoints::claim(
-            "runtime_apply_after_prepared_batch",
+            "runtime_apply_after_batch",
             Some(result_oid),
             Some(&commit_lsn),
         )
     });
     if let Some(pause) = pause {
         log!(
-            "Shiba test failpoint reached: runtime_apply_after_prepared_batch result {result_oid} commit {commit_lsn}"
+            "Shiba test failpoint reached: runtime_apply_after_batch result {result_oid} commit {commit_lsn}"
         );
         std::thread::sleep(pause);
         panic!(
-            "Shiba test failpoint: runtime exited after committing a prepared batch for {commit_lsn}"
+            "Shiba test failpoint: runtime exited after committing an applied batch for {commit_lsn}"
         );
     }
 }
 
 #[cfg(not(any(test, feature = "pg_test")))]
-fn crash_after_prepared_batch(_result_oid: pg_sys::Oid, _commit_lsn: u64) {}
+fn crash_after_applied_batch(_result_oid: pg_sys::Oid, _commit_lsn: u64) {}
 
 fn gc_change_log(generation: i64) -> i64 {
     let generation_argument = unsafe { [DatumWithOid::new(generation, pg_sys::INT8OID)] };

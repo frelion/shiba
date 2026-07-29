@@ -1,6 +1,6 @@
 -- Resolve a compiler-created Stage relation through catalog identity rather
--- than reconstructing its name.  Only UNLOGGED relations in shiba_internal
--- are accepted as commit-scoped physical storage.
+-- than reconstructing its name. Only UNLOGGED relations in shiba_internal
+-- are accepted as batch-scoped physical storage.
 CREATE FUNCTION shiba._physical_stage_name(
     result_relation oid,
     p_stage_name text
@@ -157,7 +157,7 @@ $$;
 
 -- Seed planner statistics after registration without extending the user's
 -- CTAS/backfill transaction. DagRuntime calls this once, immediately before
--- the first commit program for a physical-plan generation.
+-- the first batch program for a physical-plan generation.
 CREATE FUNCTION shiba_internal._analyze_dag_runtime_relations(
     result_relation oid
 )
@@ -302,7 +302,7 @@ END;
 $$;
 
 -- Stage cleanup is a plan-level loop, never a data-row loop.  It is used when
--- a Runtime first loads a DAG and after every successful commit program.
+-- a Runtime first loads a DAG and after every successful batch program.
 CREATE FUNCTION shiba._truncate_physical_stages(result_relation oid)
 RETURNS void
 LANGUAGE plpgsql
@@ -393,7 +393,7 @@ BEGIN
 END;
 $$;
 
--- Shared operator-private fold Stages are also emptied before the DAG commit.
+-- Shared operator-private fold Stages are also emptied before a batch ends.
 -- Reclaim their heap/index files only after coarse growth, using one global
 -- lifecycle lock because the relations are shared across result OIDs.
 CREATE FUNCTION shiba_internal._compact_shared_fold_stages(
@@ -424,7 +424,9 @@ BEGIN
     FOREACH stage_name IN ARRAY ARRAY[
       'shiba_internal.aggregate_group_fold_stage',
       'shiba_internal.aggregate_distinct_fold_stage',
-      'shiba_internal.distinct_fold_stage'
+      'shiba_internal.distinct_fold_stage',
+      'shiba_internal.unary_batch_rows',
+      'shiba_internal.join_batch_rows'
     ]
     LOOP
       stage_oid := to_regclass(stage_name);

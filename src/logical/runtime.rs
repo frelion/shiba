@@ -23,8 +23,8 @@ pub enum LoadOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NextApplyOutcome {
-    Prepared,
-    Applied,
+    BatchApplied,
+    CommitCompleted,
     Retry,
     ResourceBlocked,
     Quarantined,
@@ -122,8 +122,8 @@ impl DagRuntime {
             let commit_lsn = row.get::<String>(2).map_err(|error| error.to_string())?;
             let outcome = parse_next_apply_outcome(&outcome)?;
             let lsn_is_consistent = match outcome {
-                NextApplyOutcome::Prepared
-                | NextApplyOutcome::Applied
+                NextApplyOutcome::BatchApplied
+                | NextApplyOutcome::CommitCompleted
                 | NextApplyOutcome::ResourceBlocked
                 | NextApplyOutcome::Quarantined => commit_lsn.is_some(),
                 // A retry after claiming work identifies the commit; a retry
@@ -181,8 +181,8 @@ pub fn release_physical_programs(result_oid: pg_sys::Oid, generation: &str) -> R
 
 fn parse_next_apply_outcome(outcome: &str) -> Result<NextApplyOutcome, String> {
     match outcome {
-        "prepared" => Ok(NextApplyOutcome::Prepared),
-        "applied" => Ok(NextApplyOutcome::Applied),
+        "batch_applied" => Ok(NextApplyOutcome::BatchApplied),
+        "commit_completed" => Ok(NextApplyOutcome::CommitCompleted),
         "retry" => Ok(NextApplyOutcome::Retry),
         "resource_blocked" => Ok(NextApplyOutcome::ResourceBlocked),
         "quarantined" => Ok(NextApplyOutcome::Quarantined),
@@ -219,12 +219,12 @@ mod tests {
     #[test]
     fn parses_next_apply_outcomes() {
         assert_eq!(
-            parse_next_apply_outcome("prepared"),
-            Ok(NextApplyOutcome::Prepared)
+            parse_next_apply_outcome("batch_applied"),
+            Ok(NextApplyOutcome::BatchApplied)
         );
         assert_eq!(
-            parse_next_apply_outcome("applied"),
-            Ok(NextApplyOutcome::Applied)
+            parse_next_apply_outcome("commit_completed"),
+            Ok(NextApplyOutcome::CommitCompleted)
         );
         assert_eq!(
             parse_next_apply_outcome("retry"),

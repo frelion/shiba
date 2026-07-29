@@ -510,7 +510,7 @@ BEGIN
             physical_schema_spec,
             physical_index_specs
         );
-        -- A Stage is intentionally empty between commit programs.  Record
+        -- A Stage is intentionally empty between batch programs. Record
         -- that fact immediately; otherwise PostgreSQL initially assumes an
         -- unknown cardinality and only corrects the plan after auto-analyze.
         EXECUTE format(

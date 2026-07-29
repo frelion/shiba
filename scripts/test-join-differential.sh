@@ -557,5 +557,77 @@ for sublink_step in {1..24}; do
   assert_sublink_results "random-${sublink_step}"
 done
 
-printf 'join differential tests passed (seed=%s, 68 committed mutations, 424 comparisons)\n' \
+# A single source transaction whose left and right deltas land in different
+# ingress batches must converge when each batch is published directly.
+psql_diff -qc "
+  CREATE TABLE join_diff.batch_left (
+    row_id integer NOT NULL,
+    join_key integer NOT NULL,
+    amount integer NOT NULL
+  );
+  CREATE TABLE join_diff.batch_right (
+    join_key integer NOT NULL,
+    group_id integer NOT NULL
+  );
+  CREATE TABLE shiba.diff_multibatch_join AS
+  SELECT r.group_id,count(*) AS row_count,sum(l.amount) AS total_amount
+  FROM join_diff.batch_left l
+  JOIN join_diff.batch_right r USING(join_key)
+  GROUP BY r.group_id;
+  UPDATE shiba_internal.dag_runtime_state
+  SET active=false
+  WHERE result_oid='shiba.diff_multibatch_join'::regclass"
+psql_diff -qc "
+  BEGIN;
+  INSERT INTO join_diff.batch_left
+  SELECT id,1,1 FROM generate_series(1,5000) AS id;
+  INSERT INTO join_diff.batch_right VALUES (1,7);
+  COMMIT"
+wait_for_value "1" "
+  SELECT count(*)
+  FROM shiba_internal.dag_inbox
+  WHERE result_oid='shiba.diff_multibatch_join'::regclass"
+multibatch_join_lsn="$(psql_diff -Atqc "
+  SELECT commit_lsn
+  FROM shiba_internal.dag_inbox
+  WHERE result_oid='shiba.diff_multibatch_join'::regclass")"
+test "$(psql_diff -Atqc "
+  SELECT count(*)>1
+  FROM shiba_internal.ingress_apply_batches batch
+  JOIN shiba_internal.dag_inbox inbox
+    ON inbox.ingress_txn_id=batch.ingress_txn_id
+  WHERE inbox.result_oid='shiba.diff_multibatch_join'::regclass
+    AND inbox.commit_lsn='${multibatch_join_lsn}'::pg_lsn")" = "t"
+test "$(psql_diff -Atqc "
+  WITH event_batches AS (
+    SELECT event.source_oid,batch.batch_ordinal
+    FROM shiba_internal.effective_change_log event
+    JOIN shiba_internal.ingress_apply_batches batch
+      ON batch.ingress_txn_id=event.ingress_txn_id
+     AND event.sequence BETWEEN batch.first_input_seq AND batch.last_input_seq
+    WHERE event.commit_lsn='${multibatch_join_lsn}'::pg_lsn
+  )
+  SELECT
+    (SELECT min(batch_ordinal) FROM event_batches
+     WHERE source_oid='join_diff.batch_right'::regclass)
+    >
+    (SELECT min(batch_ordinal) FROM event_batches
+     WHERE source_oid='join_diff.batch_left'::regclass)")" = "t"
+psql_diff -qc "
+  UPDATE shiba_internal.dag_runtime_state
+  SET active=true
+  WHERE result_oid='shiba.diff_multibatch_join'::regclass"
+wait_for_value "1|5000|5000|0" "
+  SELECT count(*) || '|' ||
+         coalesce(max(row_count),0) || '|' ||
+         coalesce(max(total_amount),0) || '|' ||
+         (
+           SELECT count(*)
+           FROM shiba_internal.dag_inbox
+           WHERE result_oid='shiba.diff_multibatch_join'::regclass
+         )
+  FROM shiba.diff_multibatch_join
+  WHERE group_id=7"
+
+printf 'join differential tests passed (seed=%s, 69 committed mutations, 424 comparisons)\n' \
   "${seed}"

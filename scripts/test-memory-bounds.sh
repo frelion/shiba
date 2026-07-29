@@ -217,7 +217,9 @@ BEGIN
   FOREACH shared_stage_name IN ARRAY ARRAY[
     'shiba_internal.aggregate_group_fold_stage',
     'shiba_internal.aggregate_distinct_fold_stage',
-    'shiba_internal.distinct_fold_stage'
+    'shiba_internal.distinct_fold_stage',
+    'shiba_internal.unary_batch_rows',
+    'shiba_internal.join_batch_rows'
   ]
   LOOP
     shared_stage_oid := to_regclass(shared_stage_name);

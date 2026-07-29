@@ -187,10 +187,10 @@ BEGIN
 END;
 $$;
 
--- Fold one stable ingress batch into durable pending state. The last batch
--- also publishes the complete source transaction atomically. stage_chunk_rows
--- is used only while publishing folded keys; ingress already chose the input
--- batch boundary.
+-- Fold one stable ingress batch into shared UNLOGGED scratch, then apply it
+-- directly to authoritative state and the result table. stage_chunk_rows is
+-- used only while applying folded keys; ingress chose the input boundary.
+-- The apply transaction leaves the shared scratch empty.
 --
 -- A chunk summary (total,min-prefix) is associative:
 --   total(a || b) = total(a) + total(b)
@@ -201,8 +201,7 @@ CREATE FUNCTION shiba._apply_aggregate_batch(
     stream_view shiba_internal.stream_views,
     p_commit_lsn pg_lsn,
     p_first_input_seq bigint,
-    p_last_input_seq bigint,
-    p_finalize boolean DEFAULT true
+    p_last_input_seq bigint
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -426,18 +425,14 @@ BEGIN
     INTO STRICT pending_rows;
     IF pending_rows>max_stage_rows THEN
       RAISE EXCEPTION
-        'Shiba aggregate commit % for result % retained % pending keys, limit %',
+        'Shiba aggregate batch for commit % and result % produced % scratch keys, limit %',
         p_commit_lsn,stream_view.result_oid::regclass,
         pending_rows,max_stage_rows
         USING ERRCODE='53400',
-              HINT='Increase shiba.max_stage_rows or reduce commit key cardinality.';
+              HINT='Increase shiba.max_stage_rows or reduce ingress batch key cardinality.';
     END IF;
 
-    IF NOT p_finalize THEN
-      RETURN;
-    END IF;
-
-    -- DISTINCT keys are independent once their complete ordered summaries
+    -- DISTINCT keys are independent once their batch-local ordered summaries
     -- have been folded.  Apply bounded key sets and accumulate zero-boundary
     -- changes into the corresponding group summary.
     IF stream_view.count_distinct THEN
