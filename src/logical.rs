@@ -4,25 +4,18 @@
 //! persisted model -> compiler -> validator -> PostgreSQL runtime bridge.
 
 mod compile;
-#[allow(dead_code)]
 mod model;
 mod persist;
 mod physical;
 mod runtime;
 mod validate;
 
-#[allow(unused_imports)]
-pub use compile::compile_logical_plan;
-#[allow(unused_imports)]
-pub use model::{LogicalEdge, LogicalNode, LogicalPlan, OperatorKind};
-#[allow(unused_imports)]
-pub use persist::compile_physical_plan;
-pub use runtime::{release_physical_programs, DagRuntime, LoadOutcome, NextApplyOutcome};
+pub(crate) use runtime::{release_physical_programs, DagRuntime, LoadOutcome, NextApplyOutcome};
 
 #[cfg(test)]
 use compile::{build_logical_plan, LogicalPlanBuilder};
 #[cfg(test)]
-use model::LOGICAL_PLAN_VERSION;
+use model::{LogicalEdge, LogicalNode, LogicalPlan, OperatorKind, LOGICAL_PLAN_VERSION};
 #[cfg(test)]
 use validate::{ExecutionJoinType, ExecutionPipeline};
 #[cfg(test)]

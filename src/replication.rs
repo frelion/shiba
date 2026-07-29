@@ -5,6 +5,7 @@
 //! module parses only the replication envelope; `pgoutput` payload bytes are
 //! deliberately left opaque for the caller.
 
+use crate::postgres::{format_lsn, quote_identifier};
 use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -36,7 +37,6 @@ unsafe extern "C" {
     fn PQstatus(conn: *const PGconn) -> c_int;
     fn PQerrorMessage(conn: *const PGconn) -> *mut c_char;
     fn PQsetnonblocking(conn: *mut PGconn, arg: c_int) -> c_int;
-    fn PQsocket(conn: *const PGconn) -> c_int;
     fn PQexec(conn: *mut PGconn, query: *const c_char) -> *mut PGresult;
     fn PQresultStatus(result: *const PGresult) -> c_int;
     fn PQresultErrorMessage(result: *const PGresult) -> *mut c_char;
@@ -339,18 +339,6 @@ impl ReplicationTransport {
         Ok(())
     }
 
-    /// Return the libpq socket for integration with a scheduler's poll set.
-    pub fn socket(&self) -> Result<c_int, ReplicationError> {
-        let socket = unsafe { PQsocket(self.conn.as_ptr()) };
-        if socket < 0 {
-            Err(ReplicationError::InvalidState(
-                "libpq connection has no open socket",
-            ))
-        } else {
-            Ok(socket)
-        }
-    }
-
     /// Consume currently available input and retrieve at most one CopyData
     /// frame without blocking.
     pub fn poll_copy_data(&mut self) -> Result<CopyDataPoll, ReplicationError> {
@@ -509,14 +497,6 @@ fn validate_slot_name(slot: &str) -> Result<(), ReplicationError> {
         return Err(ReplicationError::InvalidSlotName(slot.to_owned()));
     }
     Ok(())
-}
-
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-fn format_lsn(lsn: u64) -> String {
-    format!("{:X}/{:08X}", lsn >> 32, lsn as u32)
 }
 
 fn postgres_timestamp_now() -> i64 {
@@ -700,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_slot_names_and_formats_lsn() {
+    fn validates_slot_names() {
         assert!(validate_slot_name("shiba_slot_17").is_ok());
         for invalid in ["", "UPPER", "has-dash", "has space"] {
             assert!(matches!(
@@ -710,13 +690,5 @@ mod tests {
         }
         assert!(validate_slot_name(&"a".repeat(63)).is_ok());
         assert!(validate_slot_name(&"a".repeat(64)).is_err());
-        assert_eq!(format_lsn(0), "0/00000000");
-        assert_eq!(format_lsn(0x0123_4567_89ab_cdef), "1234567/89ABCDEF");
-    }
-
-    #[test]
-    fn quotes_publication_identifiers_without_parsing_payloads() {
-        assert_eq!(quote_identifier("ordinary"), "\"ordinary\"");
-        assert_eq!(quote_identifier("odd\"name"), "\"odd\"\"name\"");
     }
 }

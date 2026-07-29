@@ -4,7 +4,7 @@ Shiba is tested against a real PostgreSQL 17 server, not a mock database.
 
 ## Layers
 
-1. **Rust unit tests** exhaustively exercise the filter grammar, logical-plan
+1. **Rust unit tests** exercise query-shape validation, logical-plan
    serialization, deterministic `PhysicalDagPlan` compilation and round trips,
    Stage fusion/fanout/materialization decisions, tuple mapping, LSN
    formatting, and every supported or malformed `pgoutput` message shape.

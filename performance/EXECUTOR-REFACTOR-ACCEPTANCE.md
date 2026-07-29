@@ -18,7 +18,7 @@
 - 算子 SQL 直接读取 `change_log`；Rust 不得把一个 source transaction
   收集成 payload `Vec` 或重新编码为完整 JSON 数组。
 
-完整设计契约见 `docs/SINGLE-RUNTIME-DESIGN.md`。
+当前设计契约见 `docs/ARCHITECTURE.md`。
 
 ## 可直接运行的命令
 

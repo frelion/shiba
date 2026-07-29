@@ -1,15 +1,28 @@
+//! A focused PostgreSQL streaming engine written in Rust.
+//!
+//! The shortest reading path through the code is:
+//!
+//! 1. `postgres` contains tiny, round-tripped PostgreSQL text encodings.
+//! 2. `pgoutput` decodes PostgreSQL WAL messages.
+//! 3. `ingress` turns committed WAL transactions into row changes.
+//! 4. `logical` compiles and validates the execution plan.
+//! 5. `worker` runs the single database-scoped event loop.
+//!
+//! PostgreSQL-facing catalog and operator code lives in `sql/`. Start with
+//! `README.md`, then follow `docs/LEARNING_RUST.md` for a guided code tour.
+
 use pgrx::prelude::*;
 
 mod config;
 mod ddl;
-mod filter;
 mod index_management;
 mod ingress;
 mod logical;
 mod pgoutput;
-pub mod query_analysis;
+mod postgres;
+mod query_analysis;
 mod query_tree;
-pub mod replication;
+mod replication;
 mod worker;
 
 ::pgrx::pg_module_magic!();
@@ -63,15 +76,9 @@ pgrx::extension_sql_file!(
 );
 
 pgrx::extension_sql_file!(
-    "../sql/25_operator_compat.sql",
-    name = "shiba_operator_compat",
-    requires = ["shiba_operator_dispatch"],
-);
-
-pgrx::extension_sql_file!(
     "../sql/26_physical_stages.sql",
     name = "shiba_physical_stages",
-    requires = ["shiba_operator_compat"],
+    requires = ["shiba_operator_dispatch"],
 );
 
 pgrx::extension_sql_file!(

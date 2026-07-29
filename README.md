@@ -4,14 +4,28 @@
 [![Latest release](https://img.shields.io/github/v/release/frelion/shiba)](https://github.com/frelion/shiba/releases)
 [![License: PostgreSQL](https://img.shields.io/badge/license-PostgreSQL-blue.svg)](LICENSE)
 
-Shiba is a Rust PostgreSQL extension for single-node, asynchronously maintained
-streaming tables. Define a derived table with ordinary SQL; Shiba backfills it
-once and then maintains it from committed WAL changes without refreshing or
-rescanning the source table.
+Shiba is a small streaming database engine you can read end to end. It is
+written in Rust, runs inside PostgreSQL, and keeps SQL result tables updated
+from committed WAL changes—no refresh and no source-table rescan.
 
 > Status: experimental v0.1. Shiba targets PostgreSQL 17 and intentionally
 > supports a validated SQL subset. It is not yet a general-purpose streaming
 > platform or a distributed execution engine.
+
+## The whole idea
+
+```text
+SQL declaration -> logical plan -> committed WAL -> row deltas -> result table
+```
+
+There is one background Runtime per database. It reads one durable change log,
+schedules every result in turn, and commits result changes with its progress
+checkpoint. That is the architecture; the rest of the project makes those
+boundaries safe.
+
+New to Rust? Follow the [guided Rust code tour](docs/LEARNING_RUST.md). It starts
+with small round-trip helpers and builds up to binary protocols, state
+machines, PostgreSQL FFI, and the Runtime loop.
 
 ## Why Shiba?
 
@@ -24,16 +38,9 @@ maintained projection:
 - result state, output rows, progress, and inbox acknowledgement commit
   atomically per source transaction;
 - crash recovery is based on durable commit-LSN checkpoints and idempotent
-  replay.
-
-### Performance in user terms
-
-The single-Runtime and shared-change-log design is being rebenchmarked. Older
-per-DAG-worker and Router/Executor measurements do not describe this topology
-and are not presented as a current SLA. Source commit latency, route lag, apply
-lag, long-transaction blocking, and operator throughput are measured
-separately because one large non-preemptible apply can delay all work in the
-database-scoped Runtime.
+  replay;
+- the implementation is intentionally one process and one visible data path,
+  so its correctness story can be inspected rather than assumed.
 
 ## Quick start
 
@@ -84,35 +91,8 @@ GROUP BY product_id;
 
 `shiba` is reserved for Shiba-managed result tables. Native PostgreSQL
 materialized views keep their normal `REFRESH MATERIALIZED VIEW` behavior.
-Result tables are owned by the extension owner. Index management is a separate
-privilege from reading result data: explicitly authorized consumers can add and
-remove their own workload-specific non-unique B-tree indexes through the
-controlled `shiba.create_index` and `shiba.drop_index` functions. Constraint
-DDL and unique indexes are not exposed for Shiba results.
-
-```sql
-GRANT USAGE ON SCHEMA shiba TO report_reader;
-GRANT SELECT ON shiba.order_stats TO report_reader;
-GRANT EXECUTE ON FUNCTION
-    shiba.create_index(regclass, text, text[]),
-    shiba.drop_index(regclass)
-TO report_reader;
-
-SELECT shiba.create_index(
-    'shiba.order_stats'::regclass,
-    'order_stats_product_id_idx',
-    ARRAY['product_id']
-);
-
-SELECT shiba.drop_index('shiba.order_stats_product_id_idx'::regclass);
-```
-
-Call both functions as standalone autocommit statements, not inside `BEGIN`.
-Each result supports at most eight managed indexes with at most eight columns
-per index. To guarantee that later Runtime writes cannot exceed PostgreSQL's
-B-tree index-tuple limit, managed keys are restricted to fixed-width built-in
-types with a conservative combined width of at most 1024 bytes. Variable-width
-types such as `text`, `bytea`, `numeric`, arrays, and JSON are rejected.
+The complete SQL subset, permissions, and managed-index contract live in
+[docs/MVP.md](docs/MVP.md).
 
 ## Supported query families
 
@@ -122,7 +102,7 @@ semi/anti joins from `EXISTS` and `IN`, grouped `COUNT`/`SUM`,
 partitioned windows. The exact contract and rejected SQL shapes are documented
 in [docs/MVP.md](docs/MVP.md).
 
-## Architecture
+## Read the architecture
 
 ```text
 Analyzed PostgreSQL Query
@@ -140,44 +120,24 @@ Analyzed PostgreSQL Query
   -> operator state and result table
 ```
 
-The Rust layer owns PostgreSQL hooks, WAL decoding, plan validation, and exactly
-one dynamic PostgreSQL background worker named `shiba runtime` per active
-database. Routing, scheduling, DAG application, and garbage collection are
-bounded phases in that one SPI-connected backend. A `DagRuntime` is cached plan
-metadata, not a process or thread, so adding a result DAG does not allocate
-another PostgreSQL worker or CPU resource. SQL functions own catalog state and
-operator kernels. See
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the detailed execution and
-recovery invariants.
+Three invariants organize the implementation:
 
-Each decoded row delta is stored once in the shared `change_log`, even when
-several DAGs consume it. `dag_inbox` stores only one lightweight reference per
-DAG and source transaction. Scheduling is round-robin at atomic source-commit
-boundaries; a large commit is not time-sliced and temporarily blocks routing
-and other DAGs. A failed DAG is quarantined with its inbox reference retained
-while healthy DAGs continue on later scheduling turns. Repair and retry are
-explicit.
+1. Rust owns PostgreSQL hooks, WAL decoding, plan validation, and the one
+   database-scoped Runtime; SQL owns catalogs and set-oriented operator kernels.
+2. A row delta is stored once in `change_log`; each result receives only an
+   inbox reference to the source transaction.
+3. Result state, progress, and inbox acknowledgement commit atomically. Failed
+   results keep their replay input and are quarantined independently.
 
-Registration compiles and persists a versioned `PhysicalDagPlan`. Its Stage
-storage choices are part of the inspectable execution plan: fused expressions
-stay inline, reusable relations inside one statement use `MATERIALIZED` CTEs,
-and a relation that must cross statements may use a pre-created typed
-`UNLOGGED` Stage. The current Join kernel uses statement-materialized input
-deltas and one typed `join_delta` UNLOGGED Stage. Durable routing, inbox,
-progress, result, arrangement, and operator-state tables remain logged and
-authoritative. Stage contents are commit-scoped derived data; after a crash
-they are rebuilt by replaying the retained `dag_inbox` reference and
-`change_log` payload.
-
-Normal apply performs no DDL and creates no temporary table. Inspect the
-persisted plan and its materialized Stage relations with:
+Inspect the persisted physical plan with:
 
 ```sql
 SELECT shiba.explain_physical('shiba.order_stats');
 ```
 
-The Runtime is dynamically registered. After a postmaster restart, the next
-registered-source statement or `SELECT shiba.activate()` restores it.
+See the [guided code tour](docs/LEARNING_RUST.md) for the reading order and
+[detailed architecture](docs/ARCHITECTURE.md) for execution and recovery
+invariants.
 
 ## Development and testing
 

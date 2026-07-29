@@ -1,38 +1,3 @@
--- These entry points remain for callers of the former deferred-sink protocol.
--- A batch no longer owns backend-local state: the commit-level JOIN kernel
--- below carries its delta as a relation and synchronizes the sink itself.
-CREATE FUNCTION shiba._begin_join_batch(result_relation oid)
-RETURNS void
-LANGUAGE plpgsql
-SET search_path = pg_catalog, shiba_internal
-AS $$
-BEGIN
-    PERFORM 1
-    FROM shiba_internal.inner_join_views
-    WHERE result_oid=result_relation;
-    IF NOT FOUND THEN
-      RAISE EXCEPTION 'Shiba JOIN metadata is missing for result %',result_relation
-        USING ERRCODE='P0S01';
-    END IF;
-END;
-$$;
-
-CREATE FUNCTION shiba._finish_join_batch(result_relation oid)
-RETURNS void
-LANGUAGE plpgsql
-SET search_path = pg_catalog, shiba_internal
-AS $$
-BEGIN
-    PERFORM 1
-    FROM shiba_internal.inner_join_views
-    WHERE result_oid=result_relation;
-    IF NOT FOUND THEN
-      RAISE EXCEPTION 'Shiba JOIN metadata is missing for result %',result_relation
-        USING ERRCODE='P0S01';
-    END IF;
-END;
-$$;
-
 CREATE FUNCTION shiba._assert_join_transition(valid boolean)
 RETURNS boolean
 LANGUAGE plpgsql

@@ -4,6 +4,7 @@
 //! garbage collection are bounded phases of one SPI-connected PostgreSQL
 //! backend. A DAG runtime is plan metadata, never a process or thread.
 
+use crate::postgres::{format_lsn, parse_lsn};
 use crate::{config, ingress, logical, replication};
 use pgrx::bgworkers::*;
 use pgrx::datum::DatumWithOid;
@@ -11,8 +12,8 @@ use pgrx::prelude::*;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const RUNTIME_IDLE_WAIT: Duration = Duration::from_millis(25);
@@ -147,9 +148,8 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
     let mut ingress_runtime = initialize_ingress();
 
     log!("Shiba Runtime started for database {database_name}");
-    let runtimes = Mutex::new(DeterministicLru::<pg_sys::Oid, logical::DagRuntime>::new(
-        config::max_cached_dags(),
-    ));
+    let mut runtimes =
+        DeterministicLru::<pg_sys::Oid, logical::DagRuntime>::new(config::max_cached_dags());
     let mut round_robin_cursor = None;
     let mut idle = false;
     let mut next_gc = Instant::now();
@@ -179,16 +179,11 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
         }) else {
             break 'runtime;
         };
-        let obsolete_runtimes = {
-            let mut runtimes = runtimes
-                .lock()
-                .expect("Shiba DAG runtime cache mutex was poisoned");
-            runtimes
-                .set_capacity(config::max_cached_dags())
-                .into_iter()
-                .map(|(result_oid, runtime)| (result_oid, runtime.generation().to_owned()))
-                .collect::<Vec<_>>()
-        };
+        let obsolete_runtimes = runtimes
+            .set_capacity(config::max_cached_dags())
+            .into_iter()
+            .map(|(result_oid, runtime)| (result_oid, runtime.generation().to_owned()))
+            .collect::<Vec<_>>();
         if !obsolete_runtimes.is_empty() {
             BackgroundWorker::transaction(|| {
                 for (result_oid, generation) in &obsolete_runtimes {
@@ -198,7 +193,8 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
             });
         }
 
-        let apply_phase = apply_ready_dags_bounded(&runtimes, &mut round_robin_cursor, ready_dags);
+        let apply_phase =
+            apply_ready_dags_bounded(&mut runtimes, &mut round_robin_cursor, ready_dags);
         match apply_phase {
             ApplyPhase::RuntimeInactive | ApplyPhase::SignalReceived => break 'runtime,
             ApplyPhase::Worked | ApplyPhase::Idle => {}
@@ -548,7 +544,7 @@ enum ApplyPhase {
 }
 
 fn apply_ready_dags_bounded(
-    runtimes: &Mutex<DeterministicLru<pg_sys::Oid, logical::DagRuntime>>,
+    runtimes: &mut DeterministicLru<pg_sys::Oid, logical::DagRuntime>,
     round_robin_cursor: &mut Option<pg_sys::Oid>,
     mut ready_dags: Vec<pg_sys::Oid>,
 ) -> ApplyPhase {
@@ -605,13 +601,12 @@ fn apply_ready_dags_bounded(
 }
 
 fn apply_one_dag_transaction(
-    runtimes: &Mutex<DeterministicLru<pg_sys::Oid, logical::DagRuntime>>,
+    runtimes: &mut DeterministicLru<pg_sys::Oid, logical::DagRuntime>,
     result_oid: pg_sys::Oid,
 ) -> DagStep {
-    let step = BackgroundWorker::transaction(|| {
-        let mut runtimes = runtimes
-            .lock()
-            .expect("Shiba DAG runtime cache mutex was poisoned");
+    // A panic terminates this single-threaded worker, so its backend-local
+    // cache cannot be observed in a partially updated state.
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
         if !runtime_is_active() {
             return DagStep::RuntimeInactive;
         }
@@ -670,15 +665,7 @@ fn apply_one_dag_transaction(
             }
         }
         outcome
-    });
-
-    if matches!(step, DagStep::RuntimeInactive) {
-        runtimes
-            .lock()
-            .expect("Shiba DAG runtime cache mutex was poisoned")
-            .remove(&result_oid);
-    }
-    step
+    }))
 }
 
 fn process_next_dag_transaction(result_oid: pg_sys::Oid, runtime: &logical::DagRuntime) -> DagStep {
@@ -1294,34 +1281,9 @@ mod test_failpoints {
     }
 }
 
-fn format_lsn(lsn: u64) -> String {
-    format!("{:X}/{:X}", lsn >> 32, lsn & 0xffff_ffff)
-}
-
-fn parse_lsn(lsn: &str) -> Result<u64, &'static str> {
-    let (high, low) = lsn.split_once('/').ok_or("LSN is missing slash")?;
-    let high = u32::from_str_radix(high, 16).map_err(|_| "invalid high LSN word")?;
-    let low = u32::from_str_radix(low, 16).map_err(|_| "invalid low LSN word")?;
-    Ok((u64::from(high) << 32) | u64::from(low))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn format_lsn_covers_word_boundaries() {
-        assert_eq!(format_lsn(0), "0/0");
-        assert_eq!(format_lsn(1), "0/1");
-        assert_eq!(format_lsn(u32::MAX as u64), "0/FFFFFFFF");
-        assert_eq!(format_lsn(1_u64 << 32), "1/0");
-        assert_eq!(format_lsn(u64::MAX), "FFFFFFFF/FFFFFFFF");
-        for lsn in [0, 1, u32::MAX as u64, 1_u64 << 32, u64::MAX] {
-            assert_eq!(parse_lsn(&format_lsn(lsn)), Ok(lsn));
-        }
-        assert!(parse_lsn("not-an-lsn").is_err());
-        assert!(parse_lsn("100000000/0").is_err());
-    }
 
     #[test]
     fn runtime_wakeup_is_deduplicated_and_prepare_clears_it() {

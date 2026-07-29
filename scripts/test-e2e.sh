@@ -256,32 +256,7 @@ test "$(psql_e2e -Atqc "
   PREPARE shiba_join_consume_r42_p7 AS SELECT 1;
   SELECT shiba_internal._deallocate_join_physical_plans(42::oid,7)
 ")" = "2"
-# The compatibility begin/finish entry points are intentionally stateless.
-# Exercise two cycles and verify that they do not create a catalog-backed
-# scratch relation in the caller session.
-psql_e2e -qc "
-  BEGIN;
-  SELECT shiba._begin_join_batch('shiba.allowed_order_stats'::regclass);
-  SELECT shiba._finish_join_batch('shiba.allowed_order_stats'::regclass);
-  COMMIT;
-  BEGIN;
-  SELECT shiba._begin_join_batch('shiba.allowed_order_stats'::regclass);
-  SELECT shiba._finish_join_batch('shiba.allowed_order_stats'::regclass);
-  DO \$block\$
-  BEGIN
-    IF EXISTS (
-      SELECT 1
-      FROM pg_class relation
-      WHERE relation.relpersistence='t'
-        AND relation.relname='shiba_join_batch_groups'
-    ) THEN
-      RAISE EXCEPTION 'join execution created a temp scratch relation';
-    END IF;
-  END
-  \$block\$;
-  COMMIT;
-"
- test "$(psql_e2e -Atqc "SELECT count(*) FROM ${allowed_stage_relation}")" = "0"
+test "$(psql_e2e -Atqc "SELECT count(*) FROM ${allowed_stage_relation}")" = "0"
 psql_e2e -qc "DELETE FROM allowed_products WHERE permit_id=10"
 wait_for_value "0" "SELECT count(*) FROM shiba_internal.join_arrangements WHERE result_oid='shiba.allowed_order_stats'::regclass AND input_side='right' AND row_data->>'permit_id'='10'"
 allowed_stage_relfilenode="$(psql_e2e -Atqc "SELECT relfilenode FROM pg_class WHERE oid=${allowed_stage_oid}::oid")"

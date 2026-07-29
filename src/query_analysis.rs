@@ -93,7 +93,8 @@ impl QueryAnalysis {
         serde_json::to_string(self)
     }
 
-    /// Decode a persisted registration protocol value.
+    /// Decode a registration value in unit tests that pin the wire contract.
+    #[cfg(test)]
     pub fn from_wire_json(json: &str) -> serde_json::Result<Self> {
         serde_json::from_str(json)
     }
@@ -662,12 +663,6 @@ impl ValidatedQuery {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrdinaryColumnNumber(i16);
-
-impl OrdinaryColumnNumber {
-    pub fn get(self) -> i16 {
-        self.0
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColumnRef {

@@ -142,8 +142,7 @@ if grep -Ein \
   'CREATE[[:space:]]+(TEMP|TEMPORARY)[[:space:]]+TABLE[[:space:]]+shiba_|pg_temp\.shiba_' \
   sql/21_operator_aggregate.sql \
   sql/22_operator_unary_batches.sql \
-  sql/23_operator_join_batch.sql \
-  sql/25_operator_compat.sql; then
+  sql/23_operator_join_batch.sql; then
   fail "operator execution contains an explicit pg_temp scratch relation"
 fi
 
@@ -156,7 +155,6 @@ if grep -Ein \
   sql/22_operator_unary_batches.sql \
   sql/23_operator_join_batch.sql \
   sql/24_operator_dispatch.sql \
-  sql/25_operator_compat.sql \
   sql/26_physical_stages.sql; then
   fail "commit execution contains per-commit UNLOGGED Stage DDL"
 fi
