@@ -277,7 +277,7 @@ assert_log_count 1 "${apply_panic}" "the expected apply panic"
 assert_log_count 1 "${apply_exit}" "the failed apply Runtime PID exit"
 
 runtime_exit_log="$(mktemp /tmp/shiba-runtime-failpoint-exits.XXXXXX)"
-rg 'background worker "shiba runtime"' \
+grep 'background worker "shiba runtime"' \
   "${pg_log_file}" >"${runtime_exit_log}" || true
 if test "$(wc -l <"${runtime_exit_log}" | tr -d ' ')" != "1" ||
    ! grep -Fq "${apply_exit}" "${runtime_exit_log}"; then
@@ -288,7 +288,7 @@ fi
 rm -f "${runtime_exit_log}"
 
 unexpected_log="$(mktemp /tmp/shiba-runtime-failpoint-unexpected.XXXXXX)"
-rg -n 'WARNING|ERROR|FATAL|PANIC' "${pg_log_file}" |
+grep -nE 'WARNING|ERROR|FATAL|PANIC' "${pg_log_file}" |
   grep -Fv -e "${apply_panic}" \
   >"${unexpected_log}" || true
 if test -s "${unexpected_log}"; then

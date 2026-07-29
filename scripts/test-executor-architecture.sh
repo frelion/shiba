@@ -645,14 +645,14 @@ assert_one_runtime
 
 architecture_log_errors="$(mktemp /tmp/shiba-runtime-log-errors.XXXXXX)"
 expected_escalation_count="$(
-  rg -c 'FATAL:  terminating background worker "shiba runtime" due to administrator command' \
+  grep -c 'FATAL:  terminating background worker "shiba runtime" due to administrator command' \
     "${pg_log_file}" || true
 )"
 if test "${expected_escalation_count}" != "1"; then
   fail "expected exactly one deliberate Runtime SIGTERM escalation, saw ${expected_escalation_count}"
 fi
-rg -n 'WARNING|ERROR|FATAL|PANIC' "${pg_log_file}" \
-  | rg -v 'FATAL:  terminating background worker "shiba runtime" due to administrator command' \
+grep -nE 'WARNING|ERROR|FATAL|PANIC' "${pg_log_file}" \
+  | grep -v 'FATAL:  terminating background worker "shiba runtime" due to administrator command' \
   >"${architecture_log_errors}" || true
 if test -s "${architecture_log_errors}"; then
   sed -n '1,120p' "${architecture_log_errors}" >&2

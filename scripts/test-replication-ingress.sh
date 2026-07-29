@@ -417,7 +417,7 @@ wait_for_query "1" "
 " "a fresh generation for the recreated slot"
 
 unexpected_log="$(mktemp /tmp/shiba-ingress-unexpected.XXXXXX)"
-rg -n 'WARNING|ERROR|FATAL|PANIC' "${pg_log_file}" |
+grep -nE 'WARNING|ERROR|FATAL|PANIC' "${pg_log_file}" |
   grep -Fv 'Shiba test failpoint: Runtime exited after a partial ingress batch' \
   >"${unexpected_log}" || true
 if test -s "${unexpected_log}"; then
