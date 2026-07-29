@@ -76,6 +76,8 @@ pg_log_file="${pg_data_dir}/postgresql.log"
 pg_port="${SHIBA_WINDOW_TOPN_TEST_PORT:-$((62000 + $$ % 3000))}"
 database_name="shiba_window_topn"
 wait_attempts="${SHIBA_WINDOW_TOPN_WAIT_ATTEMPTS:-2400}"
+progress_hard_seconds="${SHIBA_WINDOW_TOPN_PROGRESS_HARD_SECONDS:-600}"
+progress_stall_seconds="${SHIBA_WINDOW_TOPN_PROGRESS_STALL_SECONDS:-120}"
 
 cleanup() {
   if test "${SHIBA_KEEP_TEST_CLUSTER:-0}" = "1"; then
@@ -129,6 +131,64 @@ wait_for_query() {
   fail "timed out waiting for ${description}; last value was [${actual}]"
 }
 
+wait_for_target_progress_query() {
+  local expected="$1"
+  local query="$2"
+  local result_oid="$3"
+  local description="$4"
+  local snapshot=""
+  local previous_snapshot=""
+  local actual=""
+  local started_at="${SECONDS}"
+  local last_progress_at="${SECONDS}"
+  while test $((SECONDS - started_at)) -lt "${progress_hard_seconds}"; do
+    if snapshot="$(psql_gate -Atqc "
+      WITH observed AS (${query})
+      SELECT observed.value,
+             coalesce((
+               SELECT string_agg(
+                 checkpoint.stage_id || ':' ||
+                 checkpoint.revision || ':' ||
+                 checkpoint.has_continuation,
+                 ',' ORDER BY checkpoint.stage_id
+               )
+               FROM shiba_internal.operator_checkpoints AS checkpoint
+               WHERE checkpoint.result_oid=${result_oid}::oid
+             ),''),
+             coalesce((
+               SELECT string_agg(
+                 consumer.consumer_stage_id || ':' ||
+                 consumer.input_port || ':' ||
+                 consumer.next_chunk_seq || '/' ||
+                 input.next_chunk_seq || ':' ||
+                 consumer.consumed_frontier_lsn,
+                 ',' ORDER BY
+                   consumer.consumer_stage_id,consumer.input_port
+               )
+               FROM shiba_internal.effect_stream_consumers AS consumer
+               JOIN shiba_internal.effect_streams AS input
+                 ON input.stream_id=consumer.stream_id
+               WHERE consumer.result_oid=${result_oid}::oid
+             ),'')
+      FROM observed" 2>/dev/null)"; then
+      actual="${snapshot%%|*}"
+      if test "${actual}" = "${expected}"; then
+        return
+      fi
+      if test "${snapshot}" != "${previous_snapshot}"; then
+        previous_snapshot="${snapshot}"
+        last_progress_at="${SECONDS}"
+      fi
+    fi
+    if test $((SECONDS - last_progress_at)) \
+      -ge "${progress_stall_seconds}"; then
+      fail "stalled waiting for ${description}; target snapshot was [${snapshot}]"
+    fi
+    sleep 1
+  done
+  fail "timed out waiting for ${description}; last value was [${actual}]"
+}
+
 wait_for_log() {
   local pattern="$1"
   local description="$2"
@@ -155,6 +215,23 @@ assert_bag_equal() {
       (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
     )
     SELECT count(*) FROM difference" "${description}"
+}
+
+assert_bag_equal_with_progress() {
+  local expected_sql="$1"
+  local actual_sql="$2"
+  local result_oid="$3"
+  local description="$4"
+  wait_for_target_progress_query "0" "
+    WITH expected AS (${expected_sql}),
+    actual AS (${actual_sql}),
+    difference AS (
+      (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
+      UNION ALL
+      (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
+    )
+    SELECT count(*) AS value FROM difference" \
+    "${result_oid}" "${description}"
 }
 
 runtime_pid() {
@@ -1155,6 +1232,13 @@ psql_gate -qc "
   SELECT id,(id%11)::integer,10000,'fanout-'||id,
          (2+id%4)::integer
   FROM generate_series(2001,2257) AS id"
+assert_bag_equal_with_progress "${window_expected}" "
+  SELECT id,grp,score,payload,row_number_value,rank_value,
+         dense_rank_value,tile_value,lag_value,lead_value,
+         first_value_value,last_value_value,nth_value_value,
+         frame_count,frame_max
+  FROM shiba.window_result" \
+  "${window_result_oid}" "large TopN fanout: Window"
 assert_all_results "large TopN fanout"
 assert_bag_equal "
   SELECT id,grp,score,payload
