@@ -29,21 +29,48 @@ pub enum Message {
         subxid: u32,
     },
     Relation {
+        source_xid: Option<u32>,
         relid: u32,
         columns: Vec<String>,
     },
+    Type {
+        source_xid: Option<u32>,
+        typeid: u32,
+        namespace: String,
+        name: String,
+    },
+    Origin {
+        origin_lsn: u64,
+        name: String,
+    },
+    LogicalMessage {
+        source_xid: Option<u32>,
+        transactional: bool,
+        message_lsn: u64,
+        prefix: String,
+        content: Vec<u8>,
+    },
     Insert {
+        source_xid: Option<u32>,
         relid: u32,
         row: Tuple,
     },
     Update {
+        source_xid: Option<u32>,
         relid: u32,
         old: Tuple,
         new: Tuple,
     },
     Delete {
+        source_xid: Option<u32>,
         relid: u32,
         old: Tuple,
+    },
+    Truncate {
+        source_xid: Option<u32>,
+        relids: Vec<u32>,
+        cascade: bool,
+        restart_identity: bool,
     },
 }
 
@@ -52,7 +79,7 @@ pub type Tuple = Vec<Option<String>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParseContext {
     NonStreaming,
-    Streaming { expected_xid: u32 },
+    Streaming,
 }
 
 pub fn parse(input: &[u8]) -> Result<Message, &'static str> {
@@ -88,9 +115,13 @@ pub fn parse_with_context(input: &[u8], context: ParseContext) -> Result<Message
         b'c' => parse_stream_commit(input),
         b'A' => parse_stream_abort(input),
         b'R' => parse_transactional(input, context, parse_relation),
+        b'Y' => parse_transactional(input, context, parse_type),
+        b'O' => parse_origin(input),
+        b'M' => parse_transactional(input, context, parse_logical_message),
         b'I' => parse_transactional(input, context, parse_insert),
         b'U' => parse_transactional(input, context, parse_update),
         b'D' => parse_transactional(input, context, parse_delete),
+        b'T' => parse_transactional(input, context, parse_truncate),
         _ => Err("unsupported or truncated pgoutput message"),
     }
 }
@@ -98,16 +129,16 @@ pub fn parse_with_context(input: &[u8], context: ParseContext) -> Result<Message
 fn parse_transactional(
     input: &[u8],
     context: ParseContext,
-    parser: fn(&[u8], usize) -> Result<Message, &'static str>,
+    parser: fn(&[u8], usize, Option<u32>) -> Result<Message, &'static str>,
 ) -> Result<Message, &'static str> {
     match context {
-        ParseContext::NonStreaming => parser(input, 1),
-        ParseContext::Streaming { expected_xid } => {
+        ParseContext::NonStreaming => parser(input, 1, None),
+        ParseContext::Streaming => {
             let xid = read_u32(input, 1)?;
-            if xid != expected_xid {
-                return Err("streamed message xid does not match context");
+            if xid == 0 {
+                return Err("invalid transaction ID in streamed replication transaction");
             }
-            parser(input, 5)
+            parser(input, 5, Some(xid))
         }
     }
 }
@@ -145,7 +176,11 @@ fn parse_stream_abort(input: &[u8]) -> Result<Message, &'static str> {
     })
 }
 
-fn parse_relation(input: &[u8], offset: usize) -> Result<Message, &'static str> {
+fn parse_relation(
+    input: &[u8],
+    offset: usize,
+    source_xid: Option<u32>,
+) -> Result<Message, &'static str> {
     let relid = read_u32(input, offset)?;
     let (_, namespace_end) = read_cstr(input, offset + 4)?;
     let (_, relation_end) = read_cstr(input, namespace_end)?;
@@ -163,20 +198,96 @@ fn parse_relation(input: &[u8], offset: usize) -> Result<Message, &'static str> 
             return Err("truncated relation message");
         }
     }
-    Ok(Message::Relation { relid, columns })
+    Ok(Message::Relation {
+        source_xid,
+        relid,
+        columns,
+    })
 }
 
-fn parse_insert(input: &[u8], offset: usize) -> Result<Message, &'static str> {
+fn parse_type(
+    input: &[u8],
+    offset: usize,
+    source_xid: Option<u32>,
+) -> Result<Message, &'static str> {
+    let typeid = read_u32(input, offset)?;
+    let (namespace, namespace_end) = read_cstr(input, offset + 4)?;
+    let (name, name_end) = read_cstr(input, namespace_end)?;
+    require_exact_len(input, name_end, "invalid type message length")?;
+    Ok(Message::Type {
+        source_xid,
+        typeid,
+        namespace: namespace.to_owned(),
+        name: name.to_owned(),
+    })
+}
+
+fn parse_origin(input: &[u8]) -> Result<Message, &'static str> {
+    let origin_lsn = read_u64(input, 1)?;
+    let (name, name_end) = read_cstr(input, 9)?;
+    require_exact_len(input, name_end, "invalid origin message length")?;
+    Ok(Message::Origin {
+        origin_lsn,
+        name: name.to_owned(),
+    })
+}
+
+fn parse_logical_message(
+    input: &[u8],
+    offset: usize,
+    source_xid: Option<u32>,
+) -> Result<Message, &'static str> {
+    let transactional = match input.get(offset) {
+        Some(0) => false,
+        Some(1) => true,
+        Some(_) => return Err("invalid logical message flags"),
+        None => return Err("truncated pgoutput message"),
+    };
+    let message_lsn = read_u64(input, offset + 1)?;
+    let (prefix, prefix_end) = read_cstr(input, offset + 9)?;
+    let content_len = read_u32(input, prefix_end)? as usize;
+    let content_start = prefix_end
+        .checked_add(4)
+        .ok_or("truncated logical message")?;
+    let content_end = content_start
+        .checked_add(content_len)
+        .ok_or("truncated logical message")?;
+    let content = input
+        .get(content_start..content_end)
+        .ok_or("truncated logical message")?;
+    require_exact_len(input, content_end, "invalid logical message length")?;
+    Ok(Message::LogicalMessage {
+        source_xid,
+        transactional,
+        message_lsn,
+        prefix: prefix.to_owned(),
+        content: content.to_vec(),
+    })
+}
+
+fn parse_insert(
+    input: &[u8],
+    offset: usize,
+    source_xid: Option<u32>,
+) -> Result<Message, &'static str> {
     let relid = read_u32(input, offset)?;
     let tuple_offset = offset + 4;
     if input.get(tuple_offset) != Some(&b'N') {
         return Err("invalid insert tuple tag");
     }
     let (row, _) = parse_tuple(input, tuple_offset)?;
-    Ok(Message::Insert { relid, row })
+    Ok(Message::Insert {
+        source_xid,
+        relid,
+        row,
+    })
 }
 
-fn parse_update(input: &[u8], offset: usize) -> Result<Message, &'static str> {
+fn parse_update(
+    input: &[u8],
+    offset: usize,
+    source_xid: Option<u32>,
+) -> Result<Message, &'static str> {
     let relid = read_u32(input, offset)?;
     let tuple_offset = offset + 4;
     let tag = *input.get(tuple_offset).ok_or("truncated update message")?;
@@ -189,17 +300,61 @@ fn parse_update(input: &[u8], offset: usize) -> Result<Message, &'static str> {
         return Err("UPDATE lacks a new tuple");
     }
     let (new, _) = parse_tuple(input, offset)?;
-    Ok(Message::Update { relid, old, new })
+    Ok(Message::Update {
+        source_xid,
+        relid,
+        old,
+        new,
+    })
 }
 
-fn parse_delete(input: &[u8], offset: usize) -> Result<Message, &'static str> {
+fn parse_delete(
+    input: &[u8],
+    offset: usize,
+    source_xid: Option<u32>,
+) -> Result<Message, &'static str> {
     let relid = read_u32(input, offset)?;
     let tuple_offset = offset + 4;
     if !matches!(input.get(tuple_offset), Some(b'K' | b'O')) {
         return Err("invalid delete tuple tag");
     }
     let (old, _) = parse_tuple(input, tuple_offset)?;
-    Ok(Message::Delete { relid, old })
+    Ok(Message::Delete {
+        source_xid,
+        relid,
+        old,
+    })
+}
+
+fn parse_truncate(
+    input: &[u8],
+    offset: usize,
+    source_xid: Option<u32>,
+) -> Result<Message, &'static str> {
+    let relation_count = read_u32(input, offset)? as usize;
+    let options = *input.get(offset + 4).ok_or("truncated truncate message")?;
+    if options & !0b11 != 0 {
+        return Err("invalid truncate options");
+    }
+    let relids_start = offset.checked_add(5).ok_or("truncated truncate message")?;
+    let relids_bytes = relation_count
+        .checked_mul(4)
+        .ok_or("truncated truncate message")?;
+    let expected_len = relids_start
+        .checked_add(relids_bytes)
+        .ok_or("truncated truncate message")?;
+    require_exact_len(input, expected_len, "invalid truncate message length")?;
+
+    let mut relids = Vec::with_capacity(relation_count);
+    for index in 0..relation_count {
+        relids.push(read_u32(input, relids_start + index * 4)?);
+    }
+    Ok(Message::Truncate {
+        source_xid,
+        relids,
+        cascade: options & 0b01 != 0,
+        restart_identity: options & 0b10 != 0,
+    })
 }
 
 fn parse_tuple(input: &[u8], offset: usize) -> Result<(Tuple, usize), &'static str> {
@@ -400,6 +555,44 @@ mod tests {
         message
     }
 
+    fn type_message(typeid: u32, namespace: &[u8], name: &[u8]) -> Vec<u8> {
+        let mut message = vec![b'Y'];
+        message.extend_from_slice(&typeid.to_be_bytes());
+        message.extend_from_slice(namespace);
+        message.push(0);
+        message.extend_from_slice(name);
+        message.push(0);
+        message
+    }
+
+    fn origin(origin_lsn: u64, name: &[u8]) -> Vec<u8> {
+        let mut message = vec![b'O'];
+        message.extend_from_slice(&origin_lsn.to_be_bytes());
+        message.extend_from_slice(name);
+        message.push(0);
+        message
+    }
+
+    fn logical_message(flags: u8, message_lsn: u64, prefix: &[u8], content: &[u8]) -> Vec<u8> {
+        let mut message = vec![b'M', flags];
+        message.extend_from_slice(&message_lsn.to_be_bytes());
+        message.extend_from_slice(prefix);
+        message.push(0);
+        message.extend_from_slice(&(content.len() as u32).to_be_bytes());
+        message.extend_from_slice(content);
+        message
+    }
+
+    fn truncate(options: u8, relids: &[u32]) -> Vec<u8> {
+        let mut message = vec![b'T'];
+        message.extend_from_slice(&(relids.len() as u32).to_be_bytes());
+        message.push(options);
+        for relid in relids {
+            message.extend_from_slice(&relid.to_be_bytes());
+        }
+        message
+    }
+
     fn streamed(xid: u32, message: &[u8]) -> Vec<u8> {
         let mut streamed = vec![message[0]];
         streamed.extend_from_slice(&xid.to_be_bytes());
@@ -416,11 +609,10 @@ mod tests {
         }
     }
 
-    fn assert_every_streaming_prefix_is_rejected(message: &[u8], expected_xid: u32) {
+    fn assert_every_streaming_prefix_is_rejected(message: &[u8]) {
         for length in 0..message.len() {
             assert!(
-                parse_with_context(&message[..length], ParseContext::Streaming { expected_xid })
-                    .is_err(),
+                parse_with_context(&message[..length], ParseContext::Streaming).is_err(),
                 "accepted streaming prefix of length {length} from {message:?}"
             );
         }
@@ -560,13 +752,140 @@ mod tests {
     fn reads_streamed_relation_with_embedded_xid() {
         let relation = streamed(101, &relation(9, b"public", b"things", &[b"id", b"value"]));
         assert_eq!(
-            parse_with_context(&relation, ParseContext::Streaming { expected_xid: 101 }),
+            parse_with_context(&relation, ParseContext::Streaming),
             Ok(Message::Relation {
+                source_xid: Some(101),
                 relid: 9,
                 columns: vec!["id".into(), "value".into()],
             })
         );
-        assert_every_streaming_prefix_is_rejected(&relation, 101);
+        assert_every_streaming_prefix_is_rejected(&relation);
+    }
+
+    #[test]
+    fn reads_type_origin_logical_message_and_truncate() {
+        assert_eq!(
+            parse(&type_message(23, b"pg_catalog", b"int4")),
+            Ok(Message::Type {
+                source_xid: None,
+                typeid: 23,
+                namespace: "pg_catalog".into(),
+                name: "int4".into(),
+            })
+        );
+        assert_eq!(
+            parse(&origin(42, b"upstream")),
+            Ok(Message::Origin {
+                origin_lsn: 42,
+                name: "upstream".into(),
+            })
+        );
+        assert_eq!(
+            parse(&logical_message(1, 43, b"extension", b"\0binary\xff")),
+            Ok(Message::LogicalMessage {
+                source_xid: None,
+                transactional: true,
+                message_lsn: 43,
+                prefix: "extension".into(),
+                content: b"\0binary\xff".to_vec(),
+            })
+        );
+        assert_eq!(
+            parse(&truncate(0b11, &[7, 8])),
+            Ok(Message::Truncate {
+                source_xid: None,
+                relids: vec![7, 8],
+                cascade: true,
+                restart_identity: true,
+            })
+        );
+        assert_eq!(
+            parse(&truncate(0, &[])),
+            Ok(Message::Truncate {
+                source_xid: None,
+                relids: vec![],
+                cascade: false,
+                restart_identity: false,
+            })
+        );
+    }
+
+    #[test]
+    fn reads_streamed_type_logical_message_and_truncate_with_current_subxid() {
+        let subxid = 202;
+        let messages = [
+            (
+                streamed(subxid, &type_message(23, b"pg_catalog", b"int4")),
+                Message::Type {
+                    source_xid: Some(subxid),
+                    typeid: 23,
+                    namespace: "pg_catalog".into(),
+                    name: "int4".into(),
+                },
+            ),
+            (
+                streamed(subxid, &logical_message(0, 44, b"notice", b"payload")),
+                Message::LogicalMessage {
+                    source_xid: Some(subxid),
+                    transactional: false,
+                    message_lsn: 44,
+                    prefix: "notice".into(),
+                    content: b"payload".to_vec(),
+                },
+            ),
+            (
+                streamed(subxid, &truncate(0b10, &[9, 10])),
+                Message::Truncate {
+                    source_xid: Some(subxid),
+                    relids: vec![9, 10],
+                    cascade: false,
+                    restart_identity: true,
+                },
+            ),
+        ];
+
+        for (message, expected) in messages {
+            assert_eq!(
+                parse_with_context(&message, ParseContext::Streaming),
+                Ok(expected)
+            );
+            assert_every_streaming_prefix_is_rejected(&message);
+        }
+    }
+
+    #[test]
+    fn metadata_and_truncate_messages_reject_truncation_and_trailing_bytes() {
+        for message in [
+            type_message(23, b"pg_catalog", b"int4"),
+            origin(42, b"upstream"),
+            logical_message(1, 43, b"extension", b"payload"),
+            truncate(0b11, &[7, 8]),
+        ] {
+            assert!(parse(&message).is_ok(), "fixture is invalid: {message:?}");
+            assert_every_strict_prefix_is_rejected(&message);
+            let mut with_trailing_byte = message;
+            with_trailing_byte.push(0);
+            assert!(
+                parse(&with_trailing_byte).is_err(),
+                "accepted trailing byte: {with_trailing_byte:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_logical_message_flags_and_truncate_options() {
+        for flags in [2, u8::MAX] {
+            assert_eq!(
+                parse(&logical_message(flags, 1, b"prefix", b"payload")),
+                Err("invalid logical message flags")
+            );
+        }
+        for options in [0b100, u8::MAX] {
+            assert_eq!(
+                parse(&truncate(options, &[1])),
+                Err("invalid truncate options")
+            );
+        }
     }
 
     #[test]
@@ -574,8 +893,8 @@ mod tests {
         let messages = [
             (
                 streamed(102, &dml(b'I', 7, &[tuple(b'N', &[Some(b"new"), None])])),
-                102,
                 Message::Insert {
+                    source_xid: Some(102),
                     relid: 7,
                     row: vec![Some("new".into()), None],
                 },
@@ -589,8 +908,8 @@ mod tests {
                         &[tuple(b'O', &[Some(b"old")]), tuple(b'N', &[Some(b"new")])],
                     ),
                 ),
-                103,
                 Message::Update {
+                    source_xid: Some(103),
                     relid: 8,
                     old: vec![Some("old".into())],
                     new: vec![Some("new".into())],
@@ -598,20 +917,86 @@ mod tests {
             ),
             (
                 streamed(104, &dml(b'D', 9, &[tuple(b'K', &[Some(b"key")])])),
-                104,
                 Message::Delete {
+                    source_xid: Some(104),
                     relid: 9,
                     old: vec![Some("key".into())],
                 },
             ),
         ];
 
-        for (message, expected_xid, expected) in messages {
+        for (message, expected) in messages {
             assert_eq!(
-                parse_with_context(&message, ParseContext::Streaming { expected_xid }),
+                parse_with_context(&message, ParseContext::Streaming),
                 Ok(expected)
             );
-            assert_every_streaming_prefix_is_rejected(&message, expected_xid);
+            assert_every_streaming_prefix_is_rejected(&message);
+        }
+    }
+
+    #[test]
+    fn streamed_messages_preserve_subxid_distinct_from_stream_top_level_xid() {
+        let top_level_xid = 500;
+        let subxid = 501;
+        assert_eq!(
+            parse(&stream_start(top_level_xid, 1)),
+            Ok(Message::StreamStart {
+                xid: top_level_xid,
+                first_segment: true,
+            })
+        );
+
+        let messages = [
+            (
+                streamed(
+                    subxid,
+                    &relation(9, b"public", b"things", &[b"id", b"value"]),
+                ),
+                Message::Relation {
+                    source_xid: Some(subxid),
+                    relid: 9,
+                    columns: vec!["id".into(), "value".into()],
+                },
+            ),
+            (
+                streamed(subxid, &dml(b'I', 9, &[tuple(b'N', &[Some(b"new"), None])])),
+                Message::Insert {
+                    source_xid: Some(subxid),
+                    relid: 9,
+                    row: vec![Some("new".into()), None],
+                },
+            ),
+            (
+                streamed(
+                    subxid,
+                    &dml(
+                        b'U',
+                        9,
+                        &[tuple(b'O', &[Some(b"old")]), tuple(b'N', &[Some(b"new")])],
+                    ),
+                ),
+                Message::Update {
+                    source_xid: Some(subxid),
+                    relid: 9,
+                    old: vec![Some("old".into())],
+                    new: vec![Some("new".into())],
+                },
+            ),
+            (
+                streamed(subxid, &dml(b'D', 9, &[tuple(b'K', &[Some(b"key")])])),
+                Message::Delete {
+                    source_xid: Some(subxid),
+                    relid: 9,
+                    old: vec![Some("key".into())],
+                },
+            ),
+        ];
+
+        for (message, expected) in messages {
+            assert_eq!(
+                parse_with_context(&message, ParseContext::Streaming),
+                Ok(expected)
+            );
         }
     }
 
@@ -619,14 +1004,33 @@ mod tests {
     fn contexts_do_not_silently_accept_the_other_dml_layout() {
         let ordinary = dml(b'I', 7, &[tuple(b'N', &[Some(b"value")])]);
         let streaming = streamed(105, &ordinary);
-        assert!(
-            parse_with_context(&ordinary, ParseContext::Streaming { expected_xid: 105 }).is_err()
-        );
+        assert!(parse_with_context(&ordinary, ParseContext::Streaming).is_err());
         assert!(parse(&streaming).is_err());
-        assert_eq!(
-            parse_with_context(&streaming, ParseContext::Streaming { expected_xid: 106 }),
-            Err("streamed message xid does not match context")
-        );
+    }
+
+    #[test]
+    fn rejects_zero_xid_in_streamed_transactional_messages() {
+        for message in [
+            streamed(0, &relation(1, b"public", b"things", &[b"id"])),
+            streamed(0, &type_message(23, b"pg_catalog", b"int4")),
+            streamed(0, &logical_message(0, 1, b"prefix", b"payload")),
+            streamed(0, &dml(b'I', 1, &[tuple(b'N', &[Some(b"value")])])),
+            streamed(
+                0,
+                &dml(
+                    b'U',
+                    1,
+                    &[tuple(b'O', &[Some(b"old")]), tuple(b'N', &[Some(b"new")])],
+                ),
+            ),
+            streamed(0, &dml(b'D', 1, &[tuple(b'K', &[Some(b"key")])])),
+            streamed(0, &truncate(0, &[1])),
+        ] {
+            assert_eq!(
+                parse_with_context(&message, ParseContext::Streaming),
+                Err("invalid transaction ID in streamed replication transaction")
+            );
+        }
     }
 
     #[test]
@@ -634,6 +1038,7 @@ mod tests {
         assert_eq!(
             parse(&relation(9, b"", b"", &[b"id", b""])),
             Ok(Message::Relation {
+                source_xid: None,
                 relid: 9,
                 columns: vec!["id".into(), "".into()]
             })
@@ -641,6 +1046,7 @@ mod tests {
         assert_eq!(
             parse(&relation(10, b"public", b"empty", &[])),
             Ok(Message::Relation {
+                source_xid: None,
                 relid: 10,
                 columns: vec![]
             })
@@ -656,6 +1062,7 @@ mod tests {
                 &[tuple(b'N', &[Some(b"42"), None, Some(b"")])]
             )),
             Ok(Message::Insert {
+                source_xid: None,
                 relid: 7,
                 row: vec![Some("42".into()), None, Some("".into())]
             })
@@ -663,6 +1070,7 @@ mod tests {
         assert_eq!(
             parse(&dml(b'I', 8, &[tuple(b'N', &[])])),
             Ok(Message::Insert {
+                source_xid: None,
                 relid: 8,
                 row: vec![]
             })
@@ -682,6 +1090,7 @@ mod tests {
                     ]
                 )),
                 Ok(Message::Update {
+                    source_xid: None,
                     relid: 11,
                     old: vec![Some("old".into())],
                     new: vec![Some("new".into()), None]
@@ -696,6 +1105,7 @@ mod tests {
             assert_eq!(
                 parse(&dml(b'D', 12, &[tuple(old_tag, &[Some(b"gone"), None])])),
                 Ok(Message::Delete {
+                    source_xid: None,
                     relid: 12,
                     old: vec![Some("gone".into()), None]
                 })
@@ -766,6 +1176,22 @@ mod tests {
             parse(&relation(1, b"public", b"table", &[&[0xff]])),
             Err("pgoutput string is not UTF-8")
         );
+        assert_eq!(
+            parse(&type_message(1, &[0xff], b"type")),
+            Err("pgoutput string is not UTF-8")
+        );
+        assert_eq!(
+            parse(&type_message(1, b"public", &[0xff])),
+            Err("pgoutput string is not UTF-8")
+        );
+        assert_eq!(
+            parse(&origin(1, &[0xff])),
+            Err("pgoutput string is not UTF-8")
+        );
+        assert_eq!(
+            parse(&logical_message(0, 1, &[0xff], b"payload")),
+            Err("pgoutput string is not UTF-8")
+        );
     }
 
     #[test]
@@ -793,6 +1219,19 @@ mod tests {
         let count_offset = b"R".len() + 4 + b"public\0".len() + b"table\0".len() + 1;
         columns[count_offset..count_offset + 2].copy_from_slice(&u16::MAX.to_be_bytes());
         assert!(parse(&columns).is_err());
+
+        let mut logical = logical_message(0, 1, b"prefix", b"payload");
+        let content_length_offset = b"M".len() + 1 + 8 + b"prefix\0".len();
+        logical[content_length_offset..content_length_offset + 4]
+            .copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse(&logical), Err("truncated logical message"));
+
+        let mut truncated_relations = truncate(0, &[1]);
+        truncated_relations[1..5].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(
+            parse(&truncated_relations),
+            Err("invalid truncate message length")
+        );
     }
 
     #[test]
