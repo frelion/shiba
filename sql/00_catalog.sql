@@ -362,8 +362,8 @@ CREATE UNIQUE INDEX shiba_ingress_active_slot_idx
     ON shiba_internal.ingress_replay_state (database_oid, slot_name)
     WHERE state = 'active';
 
--- Ordinary transactions use Begin.final_lsn as identity. Streamed transactions
--- use the first observed segment LSN because their commit LSN is not known yet.
+-- With pgoutput streaming=off, Begin.final_lsn is known before any row
+-- messages are emitted and must equal the later Commit.commit_lsn.
 CREATE TABLE shiba_internal.ingress_transactions (
     ingress_txn_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     slot_generation bigint NOT NULL
@@ -371,10 +371,9 @@ CREATE TABLE shiba_internal.ingress_transactions (
         ON DELETE RESTRICT,
     source_xid bigint NOT NULL
         CHECK (source_xid BETWEEN 0 AND 4294967295),
-    streamed boolean NOT NULL,
-    identity_lsn pg_lsn NOT NULL,
+    final_lsn pg_lsn NOT NULL,
     status text NOT NULL DEFAULT 'open'
-        CHECK (status IN ('open', 'committed', 'aborted')),
+        CHECK (status IN ('open', 'committed')),
     commit_lsn pg_lsn,
     end_lsn pg_lsn,
     next_input_seq bigint NOT NULL DEFAULT 1 CHECK (next_input_seq > 0),
@@ -382,7 +381,7 @@ CREATE TABLE shiba_internal.ingress_transactions (
     payload_bytes bigint NOT NULL DEFAULT 0 CHECK (payload_bytes >= 0),
     opened_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     finalized_at timestamptz,
-    UNIQUE (slot_generation, source_xid, streamed, identity_lsn),
+    UNIQUE (slot_generation, source_xid, final_lsn),
     UNIQUE (ingress_txn_id, commit_lsn),
     CHECK (next_input_seq = event_count + 1),
     CHECK (
@@ -395,18 +394,8 @@ CREATE TABLE shiba_internal.ingress_transactions (
           AND commit_lsn IS NOT NULL
           AND end_lsn IS NOT NULL
           AND finalized_at IS NOT NULL
-          AND (
-              (streamed AND identity_lsn <= commit_lsn)
-              OR (NOT streamed AND identity_lsn = commit_lsn)
-          )
+          AND final_lsn = commit_lsn
           AND commit_lsn <= end_lsn)
-        OR
-        (status = 'aborted'
-          AND streamed
-          AND commit_lsn IS NULL
-          AND end_lsn IS NOT NULL
-          AND finalized_at IS NOT NULL
-          AND identity_lsn <= end_lsn)
     )
 );
 
@@ -418,7 +407,7 @@ CREATE UNIQUE INDEX shiba_ingress_commit_lsn_idx
 
 CREATE INDEX shiba_ingress_open_txn_idx
     ON shiba_internal.ingress_transactions
-       (slot_generation, source_xid, streamed, identity_lsn)
+       (slot_generation, source_xid, final_lsn)
     WHERE status = 'open';
 
 -- A batch is the durability and feedback unit, not the event identity.  A
@@ -447,8 +436,6 @@ CREATE TABLE shiba_internal.change_log (
     change_lsn pg_lsn NOT NULL,
     change_ordinal bigint NOT NULL CHECK (change_ordinal >= 0),
     image_ordinal integer NOT NULL CHECK (image_ordinal >= 0),
-    source_subxid bigint NOT NULL
-        CHECK (source_subxid BETWEEN 0 AND 4294967295),
     input_seq bigint NOT NULL CHECK (input_seq > 0),
     source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
     weight bigint NOT NULL CHECK (weight IN (-1, 1)),
@@ -467,55 +454,9 @@ CREATE TABLE shiba_internal.change_log (
     UNIQUE (ingress_txn_id, input_seq)
 );
 
--- The first durable event establishes a streamed subtransaction's immutable
--- lower bound.  Later StreamAbort handling can therefore append one compact
--- interval without scanning or rewriting any payload rows.
-CREATE TABLE shiba_internal.ingress_subxacts (
-    ingress_txn_id bigint NOT NULL
-        REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
-        ON DELETE CASCADE,
-    source_subxid bigint NOT NULL
-        CHECK (source_subxid BETWEEN 0 AND 4294967295),
-    first_input_seq bigint NOT NULL CHECK (first_input_seq > 0),
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (ingress_txn_id, source_subxid),
-    UNIQUE (ingress_txn_id, first_input_seq),
-    UNIQUE (ingress_txn_id, source_subxid, first_input_seq),
-    FOREIGN KEY (ingress_txn_id, first_input_seq)
-        REFERENCES shiba_internal.change_log
-                   (ingress_txn_id, input_seq)
-        ON DELETE CASCADE
-);
-
--- Rollback is append-only.  Intervals use [from_input_seq,
--- through_input_seq), so events appended after StreamAbort remain visible.
--- One source subtransaction and one control WAL identity can each describe at
--- most one interval inside an ingress transaction.
-CREATE TABLE shiba_internal.ingress_rollbacks (
-    ingress_txn_id bigint NOT NULL,
-    from_input_seq bigint NOT NULL CHECK (from_input_seq > 0),
-    through_input_seq bigint NOT NULL,
-    aborted_subxid bigint NOT NULL
-        CHECK (aborted_subxid BETWEEN 0 AND 4294967295),
-    control_lsn pg_lsn NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (ingress_txn_id, control_lsn),
-    UNIQUE (ingress_txn_id, aborted_subxid),
-    CHECK (from_input_seq < through_input_seq),
-    FOREIGN KEY (ingress_txn_id, aborted_subxid, from_input_seq)
-        REFERENCES shiba_internal.ingress_subxacts
-                   (ingress_txn_id, source_subxid, first_input_seq)
-        ON DELETE CASCADE
-);
-
--- Supports the event-driven anti-join used by effective_change_log.
-CREATE INDEX shiba_ingress_rollbacks_interval_idx
-    ON shiba_internal.ingress_rollbacks
-       (ingress_txn_id, from_input_seq, through_input_seq);
-
--- The reusable consumer surface: only committed top-level transactions are
--- visible, and append-only rollback intervals mask aborted subtransaction
--- payload without mutating it.
+-- PostgreSQL has already applied top-level and subtransaction rollback
+-- semantics before pgoutput emits rows when streaming=off.  Consumers only
+-- need committed, normalized payload.
 CREATE VIEW shiba_internal.effective_change_log AS
 SELECT event.ingress_txn_id,
        txn.commit_lsn,
@@ -523,24 +464,16 @@ SELECT event.ingress_txn_id,
        event.change_lsn,
        event.change_ordinal,
        event.image_ordinal,
-       event.source_subxid,
        event.source_oid,
        event.weight::integer AS delta,
        event.canonical_payload AS row_data,
        event.payload_bytes,
        event.persisted_at
   FROM shiba_internal.change_log AS event
-  JOIN shiba_internal.ingress_transactions AS txn
+ JOIN shiba_internal.ingress_transactions AS txn
     ON txn.ingress_txn_id = event.ingress_txn_id
    AND txn.status = 'committed'
- WHERE event.canonical_payload IS NOT NULL
-   AND NOT EXISTS (
-       SELECT 1
-         FROM shiba_internal.ingress_rollbacks AS rollback
-        WHERE rollback.ingress_txn_id = event.ingress_txn_id
-          AND rollback.from_input_seq <= event.input_seq
-          AND event.input_seq < rollback.through_input_seq
- );
+ WHERE event.canonical_payload IS NOT NULL;
 
 -- Routing examines this bounded-per-source set rather than rescanning payload.
 CREATE TABLE shiba_internal.ingress_sources (

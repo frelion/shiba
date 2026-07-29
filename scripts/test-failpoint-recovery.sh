@@ -153,6 +153,8 @@ cargo pgrx install --pg-config "${pg_config_path}" --features pg_test
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
+  printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s'\n" \
+    "${pg_socket_dir}" "${pg_port}" "${database_name}" "$(id -un)"
 } >>"${pg_data_dir}/postgresql.conf"
 
 "${pg_bin_dir}/pg_ctl" \
@@ -240,7 +242,7 @@ assert_query "1|1|0|${progress_before}" "
      WHERE result_oid=${result_oid}::oid
        AND commit_lsn='${apply_lsn}'::pg_lsn)
     || '|' ||
-    (SELECT count(*) FROM shiba_internal.change_log
+    (SELECT count(*) FROM shiba_internal.effective_change_log
      WHERE commit_lsn='${apply_lsn}'::pg_lsn)
     || '|' ||
     (SELECT count(*) FROM shiba.failpoint_result WHERE group_id=2)
@@ -265,96 +267,29 @@ wait_for_query "0" "
   WHERE result_oid=${result_oid}::oid" \
   "the replayed inbox reference to be acknowledged"
 
-printf '\n==> Runtime route-before-slot-advance replay idempotence\n'
-set_dag_active "${result_oid}" false
-route_runtime_pid="$(runtime_pid)"
-slot_lsn_before="$(psql_gate -Atqc "
-  SELECT confirmed_flush_lsn FROM pg_replication_slots
-  WHERE slot_name=shiba_internal.slot_name()::text")"
-psql_gate -qc "
-  INSERT INTO public.shiba_runtime_failpoints(kind,runtime_pid,pause_ms)
-  VALUES ('runtime_route_before_slot_advance',${route_runtime_pid},100);
-  INSERT INTO public.failpoint_source VALUES (3,3,30)"
-
-wait_for_log \
-  "runtime exited after routing and before slot advancement" \
-  "the route-before-slot-advance failpoint"
-route_lsn="$(psql_gate -Atqc "
-  SELECT commit_lsn FROM shiba_internal.change_log
-  WHERE source_oid='public.failpoint_source'::regclass
-    AND row_data->>'event_id'='3'")"
-wait_for_query "0" "
-  SELECT count(*) FROM pg_stat_activity
-  WHERE backend_type='shiba runtime' AND pid=${route_runtime_pid}" \
-  "the routing Runtime to exit"
-wait_for_replacement_runtime "${route_runtime_pid}"
-
-assert_query "true|${route_runtime_pid}|${route_lsn}" "
-  SELECT fired || '|' || runtime_pid || '|' || commit_lsn
-  FROM public.shiba_runtime_failpoints
-  WHERE kind='runtime_route_before_slot_advance'"
-wait_for_query "t" "
-  SELECT confirmed_flush_lsn>'${slot_lsn_before}'::pg_lsn
-  FROM pg_replication_slots
-  WHERE slot_name=shiba_internal.slot_name()::text" \
-  "the replacement Runtime to advance the logical slot"
-# GC may concurrently remove older, fully acknowledged transactions. Assert
-# the replayed commit's checkpoint directly instead of relying on a global
-# catalog count that is intentionally not stable.
-assert_query "1" "
-  SELECT count(*) FROM shiba_internal.routed_transactions
-  WHERE commit_lsn='${route_lsn}'::pg_lsn"
-assert_query "1|1" "
-  SELECT
-    (SELECT count(*) FROM shiba_internal.change_log
-     WHERE commit_lsn='${route_lsn}'::pg_lsn
-       AND source_oid='public.failpoint_source'::regclass
-       AND row_data->>'event_id'='3')
-    || '|' ||
-    (SELECT count(*) FROM shiba_internal.dag_inbox
-     WHERE result_oid=${result_oid}::oid
-       AND commit_lsn='${route_lsn}'::pg_lsn)"
-
-psql_gate -qc "
-  DELETE FROM public.shiba_runtime_failpoints
-  WHERE kind='runtime_route_before_slot_advance';
-  UPDATE shiba_internal.dag_runtime_state
-  SET active=true
-  WHERE result_oid=${result_oid}::oid"
-wait_for_query "0" "${baseline_diff}" "the replay-idempotent final result"
-wait_for_query "0" "
-  SELECT count(*) FROM shiba_internal.dag_inbox
-  WHERE result_oid=${result_oid}::oid" \
-  "the final inbox acknowledgement"
-
 apply_panic="Shiba test failpoint: runtime exited after applying commit ${apply_lsn} and before acknowledgement"
-route_panic="Shiba test failpoint: runtime exited after routing and before slot advancement"
 apply_exit="background worker \"shiba runtime\" (PID ${apply_runtime_pid}) exited with exit code 1"
-route_exit="background worker \"shiba runtime\" (PID ${route_runtime_pid}) exited with exit code 1"
 
 assert_log_count 1 \
   "Shiba test failpoint reached: runtime_apply_before_ack result ${result_oid} commit ${apply_lsn}" \
   "the apply boundary arrival with exact result OID and commit LSN"
 assert_log_count 1 "${apply_panic}" "the expected apply panic"
-assert_log_count 1 "${route_panic}" "the expected route panic"
 assert_log_count 1 "${apply_exit}" "the failed apply Runtime PID exit"
-assert_log_count 1 "${route_exit}" "the failed route Runtime PID exit"
 
 runtime_exit_log="$(mktemp /tmp/shiba-runtime-failpoint-exits.XXXXXX)"
 rg 'background worker "shiba runtime"' \
   "${pg_log_file}" >"${runtime_exit_log}" || true
-if test "$(wc -l <"${runtime_exit_log}" | tr -d ' ')" != "2" ||
-   ! grep -Fq "${apply_exit}" "${runtime_exit_log}" ||
-   ! grep -Fq "${route_exit}" "${runtime_exit_log}"; then
+if test "$(wc -l <"${runtime_exit_log}" | tr -d ' ')" != "1" ||
+   ! grep -Fq "${apply_exit}" "${runtime_exit_log}"; then
   sed -n '1,120p' "${runtime_exit_log}" >&2
   rm -f "${runtime_exit_log}"
-  fail "expected exactly the two deliberately failed Runtime exit records"
+  fail "expected exactly one deliberately failed Runtime exit record"
 fi
 rm -f "${runtime_exit_log}"
 
 unexpected_log="$(mktemp /tmp/shiba-runtime-failpoint-unexpected.XXXXXX)"
 rg -n 'WARNING|ERROR|FATAL|PANIC' "${pg_log_file}" |
-  grep -Fv -e "${apply_panic}" -e "${route_panic}" \
+  grep -Fv -e "${apply_panic}" \
   >"${unexpected_log}" || true
 if test -s "${unexpected_log}"; then
   sed -n '1,120p' "${unexpected_log}" >&2

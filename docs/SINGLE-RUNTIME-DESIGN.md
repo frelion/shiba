@@ -1,9 +1,8 @@
 # Single Runtime design
 
-> Current implementation (v1). The proposed bounded, resumable v2 execution
-> contract is defined in
-> [DAG-EXECUTION-SPEC.md](DAG-EXECUTION-SPEC.md). Until v2 is implemented,
-> the commit-scoped limitations in this document remain real.
+> The process topology remains current. Its old slot-peek/router details are
+> superseded by
+> [REPLICATION-INGRESS-DESIGN.md](REPLICATION-INGRESS-DESIGN.md).
 
 Status: implemented contract. Durable metadata, input, operator state, result,
 and progress remain logged. Typed UNLOGGED storage is permitted only for
@@ -38,37 +37,36 @@ and apply duration.
 
 ## Durable event model
 
-`shiba_internal.change_log` stores each decoded row delta once:
+After PostgreSQL has committed and filtered a source transaction, the
+replication walsender sends its pgoutput protocol-v2 messages to the Runtime.
+The Runtime persists bounded batches before sending feedback.
+`shiba_internal.change_log` stores each decoded row image once:
 
 ```text
-(commit_lsn, sequence, source_oid, delta, row_data)
+(ingress_txn_id, change_lsn, change_ordinal, image_ordinal, source_oid, weight,
+ typed_payload, canonical_payload)
 ```
 
-Its primary key is `(commit_lsn, sequence)`. `sequence` preserves source
-transaction order. `row_data` remains JSONB initially; column pruning is a later
-optimization.
+`ingress_transactions` owns source transaction identity and final commit LSN.
+`effective_change_log` exposes committed, canonicalized events. PostgreSQL
+itself removes aborted top-level and subtransaction changes because pgoutput
+transaction streaming is disabled.
 
 `shiba_internal.dag_inbox` stores transaction-level DAG work:
 
 ```text
-(result_oid, commit_lsn)
+(result_oid, ingress_txn_id, commit_lsn)
 ```
 
 There is at most one inbox row for a DAG and source transaction, regardless of
 the number of changed rows. A source transaction payload is therefore not copied
 for every subscribing DAG.
 
-The Router transaction atomically:
-
-1. claims `commit_lsn` in `routed_transactions`;
-2. inserts each decoded delta once into `change_log`;
-3. inserts one `dag_inbox` row for every DAG affected by at least one delta.
-
-The logical slot advances only after that routing transaction commits.
-
-`routed_transactions`, `change_log`, and `dag_inbox` are logged recovery
-authority. `dag_inbox` has no payload column: it points to the one shared
-transaction payload in `change_log`.
+Commit finalization creates one `routing_tasks` row. Bounded keyset pages add
+the DAG inbox references. Slot feedback never exceeds committed
+`ingress_decode_batches`; GC additionally waits for actual
+`pg_replication_slots.confirmed_flush_lsn` reconciliation into
+`replay_safe_lsn`.
 
 ## Persisted physical plan and Stages
 

@@ -110,18 +110,15 @@ BEGIN
         FROM shiba_internal.ingress_transactions AS txn
         JOIN shiba_internal.ingress_replay_state AS replay
           ON replay.slot_generation = txn.slot_generation
-        WHERE txn.status IN ('committed', 'aborted')
+        WHERE txn.status = 'committed'
           AND txn.finalized_at < clock_timestamp()
               - pg_catalog.current_setting('shiba.ingress_retention')::interval
           AND replay.replay_safe_lsn >= txn.end_lsn
-          AND (
-              txn.status = 'aborted'
-              OR EXISTS (
-                  SELECT 1
-                    FROM shiba_internal.routing_tasks AS task
-                   WHERE task.ingress_txn_id = txn.ingress_txn_id
-                     AND task.status = 'complete'
-              )
+          AND EXISTS (
+              SELECT 1
+                FROM shiba_internal.routing_tasks AS task
+               WHERE task.ingress_txn_id = txn.ingress_txn_id
+                 AND task.status = 'complete'
           )
           AND NOT EXISTS (
             SELECT 1
@@ -179,22 +176,25 @@ BEGIN
             'shiba.replication_conninfo must be configured before activation'
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
-    -- Logical slot creation must precede transactional catalog writes in this
-    -- transaction.  Publication creation is safe after the slot exists.
+    -- The empty publication is created with the extension and survives
+    -- deactivation. A slot baseline must never precede publication creation:
+    -- pgoutput would decode that catalog transaction with a snapshot in which
+    -- the publication does not yet exist.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_publication WHERE pubname = 'shiba_publication'
+    ) THEN
+        RAISE EXCEPTION
+            'publication shiba_publication is missing; recreate the extension-owned publication before activation'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    -- Logical slot creation must precede the transactional ingress catalog
+    -- writes below.
     slot_created := shiba._ensure_logical_slot();
     PERFORM shiba_internal.ensure_ingress_generation(
         shiba_internal.slot_name(),
         slot_created
     );
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_publication WHERE pubname = 'shiba_publication'
-    ) THEN
-        -- V2 has bounded row-delta kernels but no bounded TRUNCATE kernel.
-        -- Exclude TRUNCATE at the publication boundary instead of accepting
-        -- a message the Runtime cannot apply correctly.
-        CREATE PUBLICATION shiba_publication
-          WITH (publish = 'insert, update, delete');
-    ELSIF EXISTS (
+    IF EXISTS (
         SELECT 1
         FROM pg_publication
         WHERE pubname = 'shiba_publication'

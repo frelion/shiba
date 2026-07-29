@@ -64,6 +64,8 @@ cargo pgrx install --pg-config "${pg_config_path}"
   printf "max_replication_slots = 4\\n"
   printf "unix_socket_directories = '%s'\\n" "${pg_socket_dir}"
   printf "port = %s\\n" "${pg_port}"
+  printf "shiba.replication_conninfo = 'host=%s port=%s dbname=shiba_e2e user=%s'\\n" \
+    "${pg_socket_dir}" "${pg_port}" "$(id -un)"
 } >> "${pg_data_dir}/postgresql.conf"
 
 "${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -l "${pg_log_file}" -o "-k ${pg_socket_dir} -p ${pg_port}" -w start
@@ -138,52 +140,6 @@ expect_failure_as_contains \
   "SELECT shiba.create_index('shiba.index_numeric_result'::regclass, 'index_numeric_result_total_idx', ARRAY['total_amount'])"
 psql_e2e -qc "DROP TABLE shiba.index_numeric_result"
 psql_e2e -qc "DROP TABLE index_numeric_source"
-# The internal JSON ABI accepts integer text as well as JSON numbers. A
-# string "-1" must select the ordered-prefix path, never the insertion-only
-# fast path. Sixty-four events force batch specialization.
-if psql_e2e -qc "
-  BEGIN;
-  WITH event_rows AS (
-    SELECT 1 AS sequence,
-           jsonb_build_object('product_id',999,'amount',1) AS row_data,
-           to_jsonb('-1'::text) AS delta
-    UNION ALL
-    SELECT 2,jsonb_build_object('product_id',999,'amount',1),to_jsonb(1)
-    UNION ALL
-    SELECT 2+n*2,
-           jsonb_build_object('product_id',1000+n,'amount',1),to_jsonb(1)
-    FROM generate_series(1,31) n
-    UNION ALL
-    SELECT 3+n*2,
-           jsonb_build_object('product_id',1000+n,'amount',1),to_jsonb(-1)
-    FROM generate_series(1,31) n
-  ),
-  insert_header AS (
-    INSERT INTO shiba_internal.routed_transactions(commit_lsn)
-    VALUES ('0/100001') RETURNING commit_lsn
-  ),
-  insert_events AS (
-    INSERT INTO shiba_internal.change_log(
-      commit_lsn,sequence,source_oid,delta,row_data
-    )
-    SELECT insert_header.commit_lsn,event_rows.sequence,
-           'orders'::regclass,(event_rows.delta #>> '{}')::integer,
-           event_rows.row_data
-    FROM event_rows CROSS JOIN insert_header
-  )
-  INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
-  VALUES ('shiba.order_stats'::regclass,'0/100001');
-  SELECT shiba._apply_dag_commit(
-    'shiba.order_stats'::regclass,
-    shiba._logical_execution_descriptor('shiba.order_stats'::regclass),
-    '0/100001'
-  );
-  COMMIT
-" >/dev/null 2>&1; then
-  printf 'aggregate batch accepted a string retraction before insertion\n' >&2
-  exit 1
-fi
-test "$(psql_e2e -Atqc "SELECT row_count || ':' || sum_value FROM shiba_internal.aggregate_state WHERE result_oid = 'shiba.order_stats'::regclass AND group_key = '1'::jsonb")" = "2:30"
 psql_e2e -qc "CREATE MATERIALIZED VIEW public.native_snapshot AS SELECT count(*) AS order_count FROM orders"
 if psql_e2e -qc "CREATE TABLE shiba.unsupported AS SELECT product_id, count(*) AS order_count, sum(amount) AS total_amount, row_number() OVER (ORDER BY product_id) AS position FROM orders GROUP BY product_id" >/dev/null 2>&1; then
   printf 'unsupported Shiba query unexpectedly succeeded\n' >&2
@@ -325,111 +281,7 @@ psql_e2e -qc "
   \$block\$;
   COMMIT;
 "
-# Compare the public ordered single-delta compatibility path with one
-# commit-level batch on identical starting state. Both executions run in
-# rolled-back subtransactions, so the registered semi join remains unchanged.
-psql_e2e -qc "
-  DO \$oracle\$
-  DECLARE
-    reference_state jsonb;
-    batch_state jsonb;
-    states_differ boolean := false;
-  BEGIN
-    BEGIN
-      INSERT INTO shiba_internal.routed_transactions(commit_lsn)
-      VALUES ('0/200001'),('0/200002');
-      INSERT INTO shiba_internal.change_log
-        (commit_lsn,sequence,source_oid,delta,row_data)
-      VALUES
-        ('0/200001',1,'allowed_products'::regclass,1,
-         jsonb_build_object('permit_id',901,'product_id',2)),
-        ('0/200002',1,'allowed_products'::regclass,1,
-         jsonb_build_object('permit_id',902,'product_id',2));
-      INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
-      VALUES
-        ('shiba.allowed_order_stats'::regclass,'0/200001'),
-        ('shiba.allowed_order_stats'::regclass,'0/200002');
-      PERFORM shiba._apply_dag_commit(
-        'shiba.allowed_order_stats'::regclass,
-        shiba._logical_execution_descriptor(
-          'shiba.allowed_order_stats'::regclass
-        ),
-        '0/200001'
-      );
-      DELETE FROM shiba_internal.dag_inbox
-      WHERE result_oid='shiba.allowed_order_stats'::regclass
-        AND commit_lsn='0/200001';
-      PERFORM shiba._apply_dag_commit(
-        'shiba.allowed_order_stats'::regclass,
-        shiba._logical_execution_descriptor(
-          'shiba.allowed_order_stats'::regclass
-        ),
-        '0/200002'
-      );
-      DELETE FROM shiba_internal.dag_inbox
-      WHERE result_oid='shiba.allowed_order_stats'::regclass
-        AND commit_lsn='0/200002';
-      SELECT jsonb_build_object(
-        'sink',(SELECT jsonb_agg(to_jsonb(s) ORDER BY product_id::text)
-                FROM shiba.allowed_order_stats s),
-        'aggregate',(SELECT jsonb_agg(to_jsonb(a) ORDER BY group_key::text)
-                     FROM shiba_internal.aggregate_state a
-                     WHERE result_oid='shiba.allowed_order_stats'::regclass),
-        'arrangements',(SELECT jsonb_agg(to_jsonb(a)
-                           ORDER BY input_side,join_key,row_data::text)
-                        FROM shiba_internal.join_arrangements a
-                        WHERE result_oid='shiba.allowed_order_stats'::regclass)
-      ) INTO reference_state;
-      RAISE EXCEPTION 'rollback ordered oracle';
-    EXCEPTION WHEN raise_exception THEN
-      IF SQLERRM<>'rollback ordered oracle' THEN RAISE; END IF;
-    END;
-
-    BEGIN
-      INSERT INTO shiba_internal.routed_transactions(commit_lsn)
-      VALUES ('0/200003');
-      INSERT INTO shiba_internal.change_log
-        (commit_lsn,sequence,source_oid,delta,row_data)
-      VALUES
-        ('0/200003',1,'allowed_products'::regclass,1,
-         jsonb_build_object('permit_id',901,'product_id',2)),
-        ('0/200003',2,'allowed_products'::regclass,1,
-         jsonb_build_object('permit_id',902,'product_id',2));
-      INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
-      VALUES ('shiba.allowed_order_stats'::regclass,'0/200003');
-      PERFORM shiba._apply_dag_commit(
-        'shiba.allowed_order_stats'::regclass,
-        shiba._logical_execution_descriptor(
-          'shiba.allowed_order_stats'::regclass
-        ),
-        '0/200003'
-      );
-      DELETE FROM shiba_internal.dag_inbox
-      WHERE result_oid='shiba.allowed_order_stats'::regclass
-        AND commit_lsn='0/200003';
-      SELECT jsonb_build_object(
-        'sink',(SELECT jsonb_agg(to_jsonb(s) ORDER BY product_id::text)
-                FROM shiba.allowed_order_stats s),
-        'aggregate',(SELECT jsonb_agg(to_jsonb(a) ORDER BY group_key::text)
-                     FROM shiba_internal.aggregate_state a
-                     WHERE result_oid='shiba.allowed_order_stats'::regclass),
-        'arrangements',(SELECT jsonb_agg(to_jsonb(a)
-                           ORDER BY input_side,join_key,row_data::text)
-                        FROM shiba_internal.join_arrangements a
-                        WHERE result_oid='shiba.allowed_order_stats'::regclass)
-      ) INTO batch_state;
-      states_differ := batch_state IS DISTINCT FROM reference_state;
-      RAISE EXCEPTION 'rollback batch oracle';
-    EXCEPTION WHEN raise_exception THEN
-      IF SQLERRM<>'rollback batch oracle' THEN RAISE; END IF;
-    END;
-    IF states_differ THEN
-      RAISE EXCEPTION 'join batch state differs from ordered reference';
-    END IF;
-  END
-  \$oracle\$;
-"
-test "$(psql_e2e -Atqc "SELECT count(*) FROM ${allowed_stage_relation}")" = "0"
+ test "$(psql_e2e -Atqc "SELECT count(*) FROM ${allowed_stage_relation}")" = "0"
 psql_e2e -qc "DELETE FROM allowed_products WHERE permit_id=10"
 wait_for_value "0" "SELECT count(*) FROM shiba_internal.join_arrangements WHERE result_oid='shiba.allowed_order_stats'::regclass AND input_side='right' AND row_data->>'permit_id'='10'"
 allowed_stage_relfilenode="$(psql_e2e -Atqc "SELECT relfilenode FROM pg_class WHERE oid=${allowed_stage_oid}::oid")"
@@ -506,29 +358,6 @@ psql_e2e -qc "INSERT INTO window_events VALUES (1,1,10),(2,1,20),(3,1,20)"
 psql_e2e -qc "CREATE TABLE shiba.event_windows AS SELECT event_id,category_id,score,row_number() OVER w AS position,rank() OVER w AS ranking,dense_rank() OVER w AS dense_ranking,count(*) OVER w AS running_count,sum(score) OVER w AS running_sum,avg(score) OVER w AS running_avg,min(score) OVER w AS running_min,max(score) OVER w AS running_max FROM window_events WINDOW w AS (PARTITION BY category_id ORDER BY score)"
 wait_for_value "1" "SELECT count(*) FROM shiba.event_windows WHERE event_id=1 AND position=1 AND ranking=1 AND dense_ranking=1 AND running_count=1 AND running_sum=10 AND running_avg=10 AND running_min=10 AND running_max=10"
 wait_for_value "2" "SELECT count(*) FROM shiba.event_windows WHERE score=20 AND ranking=2 AND dense_ranking=2 AND running_count=3 AND running_sum=50"
-if psql_e2e -qc "
-  BEGIN;
-  INSERT INTO shiba_internal.routed_transactions(commit_lsn)
-  VALUES ('0/100002');
-  INSERT INTO shiba_internal.change_log
-    (commit_lsn,sequence,source_oid,delta,row_data)
-  VALUES
-    ('0/100002',1,'window_events'::regclass,-1,
-     jsonb_build_object('event_id',999,'category_id',9,'score',999)),
-    ('0/100002',2,'window_events'::regclass,1,
-     jsonb_build_object('event_id',999,'category_id',9,'score',999));
-  INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
-  VALUES ('shiba.event_windows'::regclass,'0/100002');
-  SELECT shiba._apply_dag_commit(
-    'shiba.event_windows'::regclass,
-    shiba._logical_execution_descriptor('shiba.event_windows'::regclass),
-    '0/100002'
-  );
-  COMMIT
-" >/dev/null 2>&1; then
-  printf 'window batch accepted a retraction-before-insertion from zero state\n' >&2
-  exit 1
-fi
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid='shiba.event_windows'::regclass")" = "scan,window,project,sink"
 test "$(psql_e2e -Atqc "SELECT count(*) || ':' || count(*) FILTER (WHERE stateful) FROM shiba_internal.operator_instances WHERE result_oid='shiba.event_windows'::regclass")" = "4:1"
 psql_e2e -qc "INSERT INTO window_events VALUES (4,1,15)"
@@ -567,29 +396,6 @@ psql_e2e -qc "CREATE TABLE distinct_rows (row_id integer NOT NULL, category_id i
 psql_e2e -qc "INSERT INTO distinct_rows VALUES (1,1,10),(2,1,10),(3,1,20),(4,NULL,30)"
 psql_e2e -qc "CREATE TABLE shiba.unique_labels AS SELECT DISTINCT category_id,label FROM distinct_rows"
 wait_for_value "3" "SELECT count(*) FROM shiba.unique_labels"
-if psql_e2e -qc "
-  BEGIN;
-  INSERT INTO shiba_internal.routed_transactions(commit_lsn)
-  VALUES ('0/100003');
-  INSERT INTO shiba_internal.change_log
-    (commit_lsn,sequence,source_oid,delta,row_data)
-  VALUES
-    ('0/100003',1,'distinct_rows'::regclass,-1,
-     jsonb_build_object('row_id',999,'category_id',9,'label',999)),
-    ('0/100003',2,'distinct_rows'::regclass,1,
-     jsonb_build_object('row_id',999,'category_id',9,'label',999));
-  INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
-  VALUES ('shiba.unique_labels'::regclass,'0/100003');
-  SELECT shiba._apply_dag_commit(
-    'shiba.unique_labels'::regclass,
-    shiba._logical_execution_descriptor('shiba.unique_labels'::regclass),
-    '0/100003'
-  );
-  COMMIT
-" >/dev/null 2>&1; then
-  printf 'DISTINCT batch accepted a retraction-before-insertion from zero state\n' >&2
-  exit 1
-fi
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid='shiba.unique_labels'::regclass")" = "scan,distinct,project,sink"
 test "$(psql_e2e -Atqc "SELECT multiplicity FROM shiba_internal.projection_state WHERE result_oid='shiba.unique_labels'::regclass AND row_key=jsonb_build_object('category_id',1,'label',10)")" = "2"
 psql_e2e -qc "INSERT INTO distinct_rows VALUES (5,1,10)"
@@ -620,29 +426,6 @@ psql_e2e -qc "CREATE TABLE scored_rows (row_id integer NOT NULL, score integer)"
 psql_e2e -qc "INSERT INTO scored_rows VALUES (1,10),(2,20),(3,15),(4,NULL)"
 psql_e2e -qc "CREATE TABLE shiba.top_scores AS SELECT row_id,score FROM scored_rows ORDER BY score DESC NULLS LAST LIMIT 3"
 wait_for_value "2,3,1" "SELECT string_agg(row_id::text,',' ORDER BY score DESC NULLS LAST) FROM shiba.top_scores"
-if psql_e2e -qc "
-  BEGIN;
-  INSERT INTO shiba_internal.routed_transactions(commit_lsn)
-  VALUES ('0/100004');
-  INSERT INTO shiba_internal.change_log
-    (commit_lsn,sequence,source_oid,delta,row_data)
-  VALUES
-    ('0/100004',1,'scored_rows'::regclass,-1,
-     jsonb_build_object('row_id',999,'score',999)),
-    ('0/100004',2,'scored_rows'::regclass,1,
-     jsonb_build_object('row_id',999,'score',999));
-  INSERT INTO shiba_internal.dag_inbox(result_oid,commit_lsn)
-  VALUES ('shiba.top_scores'::regclass,'0/100004');
-  SELECT shiba._apply_dag_commit(
-    'shiba.top_scores'::regclass,
-    shiba._logical_execution_descriptor('shiba.top_scores'::regclass),
-    '0/100004'
-  );
-  COMMIT
-" >/dev/null 2>&1; then
-  printf 'TopN batch accepted a retraction-before-insertion from zero state\n' >&2
-  exit 1
-fi
 test "$(psql_e2e -Atqc "SELECT string_agg(node->>'operator', ',' ORDER BY ordinality) FROM shiba_internal.stream_graphs, jsonb_array_elements(logical_plan->'nodes') WITH ORDINALITY AS n(node, ordinality) WHERE result_oid='shiba.top_scores'::regclass")" = "scan,top_n,project,sink"
 psql_e2e -qc "INSERT INTO scored_rows VALUES (5,25)"
 wait_for_value "5,2,3" "SELECT string_agg(row_id::text,',' ORDER BY score DESC NULLS LAST) FROM shiba.top_scores"
@@ -1057,7 +840,7 @@ if psql_e2e -qc "DROP EXTENSION shiba" >/dev/null 2>&1; then
 fi
 psql_e2e -qc "SELECT shiba.deactivate()"
 wait_for_value "0" "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'shiba_%'"
-wait_for_value "0" "SELECT count(*) FROM pg_publication WHERE pubname = 'shiba_publication'"
+wait_for_value "1" "SELECT count(*) FROM pg_publication WHERE pubname = 'shiba_publication'"
 psql_e2e -qc "DROP EXTENSION shiba"
 
 printf 'Shiba asynchronous extension flow verified on PostgreSQL 17.\n'

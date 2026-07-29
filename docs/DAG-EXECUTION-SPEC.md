@@ -1,21 +1,21 @@
 # Shiba DAG execution specification
 
-Status: proposed normative contract for execution architecture v2
+Status: historical design specification; not the current runtime contract
 
 Target: PostgreSQL 17
 
 Last updated: 2026-07-29
 
-This document defines the execution semantics that the next Shiba runtime must
-implement. It is intentionally stricter than an architecture sketch: `MUST`,
-`MUST NOT`, `SHOULD`, and `MAY` are normative.
+This document records the broader resumable-operator design exploration. The
+implemented ingress and process contract is
+[REPLICATION-INGRESS-DESIGN.md](REPLICATION-INGRESS-DESIGN.md). Requirements
+here that conflict with that document are not active.
 
-The current implementation is still commit-scoped. Its behavior is documented
-in [SINGLE-RUNTIME-DESIGN.md](SINGLE-RUNTIME-DESIGN.md),
+The current DAG apply implementation is still commit-scoped. Its behavior is
+documented in [SINGLE-RUNTIME-DESIGN.md](SINGLE-RUNTIME-DESIGN.md),
 [COMMIT-SCOPED-DAG-EXECUTION.md](COMMIT-SCOPED-DAG-EXECUTION.md), and
-[MEMORY-BOUND-RUNTIME.md](MEMORY-BOUND-RUNTIME.md). This specification
-supersedes those documents only as the target contract; it does not claim that
-v2 is already implemented.
+[MEMORY-BOUND-RUNTIME.md](MEMORY-BOUND-RUNTIME.md). This document no longer
+supersedes those contracts; it is retained only as design history.
 
 ## 1. Product definition
 
@@ -268,12 +268,10 @@ segments. It MUST NOT require a transaction-sized Rust collection, a
 transaction-sized JSON value, or one Shiba database transaction containing the
 complete source payload.
 
-The target is one long-lived logical decoding context in a PostgreSQL
-walsender, using `pgoutput`, protocol version 2, and `streaming = on`. The
-Runtime BGW is the replication client. It receives complete wire messages,
-persists them with ordinary short SPI transactions, and multiplexes ingestion
-with DAG scheduling. Streamed transaction blocks are provisional until a
-`Stream Commit` is received.
+Historical proposal: one long-lived logical decoding context in a PostgreSQL
+walsender, using `pgoutput`, protocol version 2, and transaction streaming.
+This was rejected. The implemented contract uses `streaming = off`; see
+[REPLICATION-INGRESS-DESIGN.md](REPLICATION-INGRESS-DESIGN.md).
 
 The replication connection and the Runtime's SPI connection are distinct
 PostgreSQL backend sessions. The Runtime MUST NOT hold an SPI transaction open

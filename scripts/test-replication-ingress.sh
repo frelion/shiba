@@ -10,6 +10,11 @@ pg_log_file="${pg_data_dir}/postgresql.log"
 pg_port="${SHIBA_INGRESS_TEST_PORT:-$((58000 + $$ % 3000))}"
 database_name="shiba_ingress"
 database_user="$(id -un)"
+large_tx_rows="${SHIBA_INGRESS_LARGE_TX_ROWS:-1000}"
+rollback_parent_id="$((large_tx_rows + 2))"
+rollback_first_id="$((large_tx_rows + 3))"
+rollback_last_id="$((large_tx_rows + 102))"
+rollback_after_id="$((large_tx_rows + 103))"
 
 cleanup() {
   if test "${SHIBA_KEEP_TEST_CLUSTER:-0}" = "1"; then
@@ -126,6 +131,25 @@ assert_query "1" "
 "
 
 psql_ingress -qc "
+  BEGIN;
+  INSERT INTO public.ingress_source VALUES (-2, 'top-level-rollback');
+  ROLLBACK;
+  INSERT INTO public.ingress_source VALUES (-1, 'rollback-barrier');
+"
+wait_for_query "1" "
+  SELECT count(*)
+  FROM shiba_internal.effective_change_log
+  WHERE source_oid='public.ingress_source'::regclass
+    AND row_data->>'id'='-1'
+" "the top-level rollback barrier transaction"
+assert_query "0" "
+  SELECT count(*)
+  FROM shiba_internal.change_log
+  WHERE source_oid='public.ingress_source'::regclass
+    AND canonical_payload->>'id'='-2'
+"
+
+psql_ingress -qc "
   CREATE TABLE public.ingress_dag_source (
     id bigint PRIMARY KEY,
     group_id bigint NOT NULL,
@@ -153,6 +177,33 @@ wait_for_query "1|15" "
   WHERE group_id=7
 " "ingress update/delete DAG application"
 
+psql_ingress -qc "ALTER SYSTEM SET shiba.max_commit_rows = '2'"
+psql_ingress -qc "SELECT pg_reload_conf()"
+psql_ingress -qc "
+  BEGIN;
+  INSERT INTO public.ingress_dag_source VALUES (10, 9, 40);
+  SAVEPOINT admission_rollback;
+  INSERT INTO public.ingress_dag_source
+  SELECT 10000 + id, 99, id
+  FROM generate_series(1,100) AS id;
+  ROLLBACK TO SAVEPOINT admission_rollback;
+  INSERT INTO public.ingress_dag_source VALUES (11, 9, 60);
+  COMMIT;
+"
+wait_for_query "2|100" "
+  SELECT row_count, total_amount
+  FROM shiba.ingress_dag_totals
+  WHERE group_id=9
+" "effective rollback-aware apply admission"
+assert_query "0" "
+  SELECT count(*)
+  FROM shiba_internal.dag_runtime_state
+  WHERE result_oid='shiba.ingress_dag_totals'::regclass
+    AND NOT active
+"
+psql_ingress -qc "ALTER SYSTEM RESET shiba.max_commit_rows"
+psql_ingress -qc "SELECT pg_reload_conf()"
+
 psql_ingress -qc "
   CREATE TABLE public.shiba_runtime_failpoints (
     kind text PRIMARY KEY,
@@ -162,12 +213,22 @@ psql_ingress -qc "
     pause_ms integer NOT NULL DEFAULT 0 CHECK (pause_ms >= 0),
     fired boolean NOT NULL DEFAULT false
   );
-  INSERT INTO public.shiba_runtime_failpoints(kind)
-  VALUES ('runtime_ingress_before_feedback');
+  INSERT INTO public.shiba_runtime_failpoints(kind, pause_ms)
+  VALUES ('runtime_ingress_after_partial_batch', 1000);
 "
 runtime_pid_before="$(psql_ingress -Atqc "
   SELECT pid FROM pg_stat_activity WHERE backend_type='shiba runtime'
 ")"
+persisted_before_large_tx="$(psql_ingress -Atqc "
+  SELECT persisted_lsn::text
+  FROM shiba_internal.ingress_replay_state
+  WHERE state='active'
+")"
+wait_for_query "${persisted_before_large_tx}" "
+  SELECT confirmed_flush_lsn::text
+  FROM pg_replication_slots
+  WHERE slot_name=shiba_internal.slot_name()::text
+" "slot feedback to reach the previous complete transaction"
 
 psql_ingress -qc "
   INSERT INTO public.ingress_source
@@ -176,14 +237,28 @@ psql_ingress -qc "
            SELECT string_agg(md5(source_id::text || ':' || chunk_id::text), '')
            FROM generate_series(1, 128) AS chunk_id
          )
-  FROM generate_series(2, 101) AS source_id;
+  FROM generate_series(2, ${large_tx_rows} + 1) AS source_id;
 "
 
 wait_for_query "t" "
   SELECT fired
   FROM public.shiba_runtime_failpoints
-  WHERE kind='runtime_ingress_before_feedback'
-" "the post-ingress/pre-feedback crash failpoint"
+  WHERE kind='runtime_ingress_after_partial_batch'
+" "the post-partial-batch crash failpoint"
+assert_query "${persisted_before_large_tx}|${persisted_before_large_tx}|t" "
+  SELECT slot.confirmed_flush_lsn::text,
+         replay.persisted_lsn::text,
+         EXISTS (
+           SELECT 1
+           FROM shiba_internal.ingress_transactions
+           WHERE status='open' AND event_count > 0
+         )
+  FROM pg_replication_slots AS slot
+  JOIN shiba_internal.ingress_replay_state AS replay
+    ON replay.slot_name::text=slot.slot_name
+   AND replay.state='active'
+  WHERE slot.slot_name=shiba_internal.slot_name()::text
+"
 wait_for_query "1" "
   SELECT count(*)
   FROM pg_stat_activity
@@ -193,28 +268,28 @@ wait_for_query "1" "
 wait_for_query "1" "
   SELECT count(*)
   FROM shiba_internal.ingress_transactions
-  WHERE status='committed' AND event_count=100
+  WHERE status='committed' AND event_count=${large_tx_rows}
 " "the bounded large source transaction"
 
-assert_query "100" "
+assert_query "${large_tx_rows}" "
   SELECT event_count
   FROM shiba_internal.ingress_transactions
   WHERE status='committed'
   ORDER BY event_count DESC
   LIMIT 1
 "
-assert_query "t" "
-  SELECT streamed AND identity_lsn < commit_lsn
-  FROM shiba_internal.ingress_transactions
-  WHERE event_count=100
-"
-assert_query "t" "
-  SELECT stream_txns > 0
+assert_query "0" "
+  SELECT stream_txns
   FROM pg_stat_replication_slots
   WHERE slot_name=shiba_internal.slot_name()::text
 "
 assert_query "t" "
   SELECT count(*) > 10
+  FROM shiba_internal.ingress_decode_batches
+"
+assert_query "t|t" "
+  SELECT max(event_count) <= 4,
+         max(payload_bytes) <= 32768
   FROM shiba_internal.ingress_decode_batches
 "
 assert_query "t|t" "
@@ -226,14 +301,22 @@ assert_query "t|t" "
 "
 assert_query "1" "
   SELECT count(*)
-  FROM pg_replication_slots
-  WHERE slot_name=shiba_internal.slot_name()::text
-    AND active_pid IS NOT NULL
+  FROM pg_replication_slots AS slot
+  JOIN pg_stat_activity AS sender
+    ON sender.pid=slot.active_pid
+  JOIN pg_stat_activity AS runtime
+    ON runtime.backend_type='shiba runtime'
+   AND runtime.datname=current_database()
+  WHERE slot.slot_name=shiba_internal.slot_name()::text
+    AND sender.backend_type='walsender'
+    AND sender.application_name='shiba'
+    AND sender.pid <> runtime.pid
 "
 
 psql_ingress -qc "
   BEGIN;
-  INSERT INTO public.ingress_source VALUES (102, 'parent-kept');
+  INSERT INTO public.ingress_source
+  VALUES (${rollback_parent_id}, 'parent-kept');
   SAVEPOINT doomed;
   INSERT INTO public.ingress_source
   SELECT source_id,
@@ -241,26 +324,60 @@ psql_ingress -qc "
            SELECT string_agg(md5(source_id::text || ':rollback:' || chunk_id::text), '')
            FROM generate_series(1, 128) AS chunk_id
          )
-  FROM generate_series(103, 202) AS source_id;
+  FROM generate_series(
+    ${rollback_first_id}, ${rollback_first_id} + 49
+  ) AS source_id;
+  SAVEPOINT nested_doomed;
+  INSERT INTO public.ingress_source
+  SELECT source_id,
+         (
+           SELECT string_agg(md5(source_id::text || ':nested:' || chunk_id::text), '')
+           FROM generate_series(1, 128) AS chunk_id
+         )
+  FROM generate_series(
+    ${rollback_first_id} + 50, ${rollback_last_id}
+  ) AS source_id;
+  RELEASE SAVEPOINT nested_doomed;
   ROLLBACK TO SAVEPOINT doomed;
-  INSERT INTO public.ingress_source VALUES (203, 'after-rollback-kept');
+  INSERT INTO public.ingress_source
+  VALUES (${rollback_after_id}, 'after-rollback-kept');
   COMMIT;
 "
 
-wait_for_query "t|2|102,203" "
-  SELECT raw.event_count > 2,
+wait_for_query "2|2|${rollback_parent_id},${rollback_after_id}" "
+  SELECT raw.event_count,
          count(effective.sequence),
          string_agg(effective.row_data ->> 'id', ',' ORDER BY effective.sequence)
   FROM shiba_internal.ingress_transactions AS raw
-  JOIN shiba_internal.ingress_rollbacks AS rollback
-    ON rollback.ingress_txn_id = raw.ingress_txn_id
   JOIN shiba_internal.effective_change_log AS effective
     ON effective.ingress_txn_id = raw.ingress_txn_id
+  WHERE effective.source_oid='public.ingress_source'::regclass
+    AND (effective.row_data->>'id')::bigint IN (
+      ${rollback_parent_id}, ${rollback_after_id}
+    )
   GROUP BY raw.ingress_txn_id, raw.event_count
-" "the streamed savepoint rollback"
-assert_query "1" "
-  SELECT count(*) FROM shiba_internal.ingress_rollbacks
+" "PostgreSQL-filtered nested savepoint rollback"
+
+gc_txn_id="$(psql_ingress -Atqc "
+  SELECT ingress_txn_id
+  FROM shiba_internal.ingress_transactions
+  WHERE status='committed' AND event_count=${large_tx_rows}
+")"
+assert_query "t|t" "
+  SELECT replay.replay_safe_lsn IS NOT NULL,
+         replay.replay_safe_lsn <= slot.confirmed_flush_lsn
+  FROM shiba_internal.ingress_replay_state AS replay
+  JOIN pg_replication_slots AS slot
+    ON slot.slot_name=replay.slot_name::text
+  WHERE replay.state='active'
 "
+psql_ingress -qc "ALTER SYSTEM SET shiba.ingress_retention = '0ms'"
+psql_ingress -qc "SELECT pg_reload_conf()"
+wait_for_query "0" "
+  SELECT count(*)
+  FROM shiba_internal.ingress_transactions
+  WHERE ingress_txn_id=${gc_txn_id}
+" "confirmed-LSN-fenced ingress garbage collection"
 
 old_generation="$(psql_ingress -Atqc "
   SELECT slot_generation
@@ -282,6 +399,11 @@ assert_query "0|1" "
 "
 assert_query "0" "
   SELECT count(*)
+  FROM shiba_internal.ingress_decode_batches
+  WHERE slot_generation=${old_generation}
+"
+assert_query "0" "
+  SELECT count(*)
   FROM pg_replication_slots
   WHERE slot_name=shiba_internal.slot_name()::text
 "
@@ -294,4 +416,15 @@ wait_for_query "1" "
     AND slot_generation > ${old_generation}
 " "a fresh generation for the recreated slot"
 
-printf 'replication ingress test passed: bounded streaming, crash replay, subxact rollback, and slot rotation.\n'
+unexpected_log="$(mktemp /tmp/shiba-ingress-unexpected.XXXXXX)"
+rg -n 'WARNING|ERROR|FATAL|PANIC' "${pg_log_file}" |
+  grep -Fv 'Shiba test failpoint: Runtime exited after a partial ingress batch' \
+  >"${unexpected_log}" || true
+if test -s "${unexpected_log}"; then
+  sed -n '1,120p' "${unexpected_log}" >&2
+  rm -f "${unexpected_log}"
+  fail "PostgreSQL log contains unexpected warning-or-higher messages"
+fi
+rm -f "${unexpected_log}"
+
+printf 'replication ingress test passed: bounded committed-transaction delivery, crash replay, PostgreSQL-filtered savepoints, GC, and slot rotation.\n'

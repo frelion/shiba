@@ -314,7 +314,7 @@ impl ReplicationTransport {
 
         let command = format!(
             "START_REPLICATION SLOT {} LOGICAL {} \
-             (proto_version '2', publication_names {}, streaming 'on')",
+             (proto_version '2', publication_names {}, streaming 'off')",
             options.slot,
             format_lsn(options.start_lsn),
             escaped_publications

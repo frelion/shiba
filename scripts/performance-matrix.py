@@ -11,6 +11,7 @@ the workload.
 from __future__ import annotations
 
 import csv
+import getpass
 import hashlib
 import json
 import math
@@ -203,6 +204,16 @@ def runtime_topology_ready() -> bool:
         and scalar(
             "SELECT count(*) FROM pg_stat_activity "
             "WHERE datname=current_database() AND backend_type='shiba runtime'"
+        )
+        == "1"
+        and scalar(
+            "SELECT count(*) FROM pg_replication_slots slot "
+            "JOIN pg_stat_activity sender ON sender.pid=slot.active_pid "
+            "JOIN shiba_internal.runtime_state state ON state.singleton "
+            "WHERE slot.slot_name=shiba_internal.slot_name()::text "
+            "AND sender.backend_type='walsender' "
+            "AND sender.application_name='shiba' "
+            "AND sender.pid<>state.owner_pid"
         )
         == "1"
         and legacy_shiba_backend_count() == 0
@@ -580,12 +591,15 @@ def progress() -> dict[str, Any]:
 SELECT json_build_object(
   'applied_lsn',p.applied_lsn::text,
   'updated_epoch_ms',extract(epoch FROM p.updated_at)*1000,
-  'routed_epoch_ms',extract(epoch FROM r.routed_at)*1000,
+  'routed_epoch_ms',extract(epoch FROM route.completed_at)*1000,
   'pending_wal_bytes',public.pending_wal_bytes
 )::text
 FROM shiba_internal.view_progress p
 JOIN shiba.progress('shiba.perf_result') public ON true
-LEFT JOIN shiba_internal.routed_transactions r ON r.commit_lsn=p.applied_lsn
+LEFT JOIN shiba_internal.ingress_transactions txn
+  ON txn.commit_lsn=p.applied_lsn
+LEFT JOIN shiba_internal.routing_tasks route
+  ON route.ingress_txn_id=txn.ingress_txn_id
 WHERE p.result_oid='shiba.perf_result'::regclass
 """
     )
@@ -606,7 +620,7 @@ def wait_for_progress(after_epoch_ms: float) -> dict[str, Any]:
 def max_routed_lsn() -> str:
     return scalar(
         "SELECT coalesce(max(commit_lsn),'0/0'::pg_lsn)::text "
-        "FROM shiba_internal.routed_transactions"
+        "FROM shiba_internal.ingress_transactions"
     )
 
 
@@ -616,12 +630,15 @@ def wait_for_routed(after_lsn: str) -> dict[str, Any]:
             f"""
 SELECT coalesce((
   SELECT json_build_object(
-    'commit_lsn',commit_lsn::text,
-    'routed_epoch_ms',extract(epoch FROM routed_at)*1000
+    'commit_lsn',txn.commit_lsn::text,
+    'routed_epoch_ms',extract(epoch FROM route.completed_at)*1000
   )::text
-  FROM shiba_internal.routed_transactions
-  WHERE commit_lsn > '{after_lsn}'::pg_lsn
-  ORDER BY commit_lsn DESC LIMIT 1
+  FROM shiba_internal.ingress_transactions txn
+  JOIN shiba_internal.routing_tasks route
+    ON route.ingress_txn_id=txn.ingress_txn_id
+   AND route.status='complete'
+  WHERE txn.commit_lsn > '{after_lsn}'::pg_lsn
+  ORDER BY txn.commit_lsn DESC LIMIT 1
 ),'null')
 """
         )
@@ -1525,7 +1542,7 @@ FROM generate_series(1,{MUTATIONS * 10}) value
             routed = wait_for_routed(before_routed)
             payload_rows = int(
                 scalar(
-                    "SELECT count(*) FROM shiba_internal.change_log "
+                    "SELECT count(*) FROM shiba_internal.effective_change_log "
                     f"WHERE commit_lsn='{routed['commit_lsn']}'::pg_lsn"
                 )
             )
@@ -1799,7 +1816,7 @@ FROM generate_series(1,{MUTATIONS * 5}) value
             routed = wait_for_routed(before_routed)
             payload_rows = int(
                 scalar(
-                    "SELECT count(*) FROM shiba_internal.change_log "
+                    "SELECT count(*) FROM shiba_internal.effective_change_log "
                     f"WHERE commit_lsn='{routed['commit_lsn']}'::pg_lsn"
                 )
             )
@@ -2172,7 +2189,7 @@ FROM generate_series(1,{LARGE_TRANSACTION_ROWS}) value
             routed = wait_for_routed(before_routed)
             payload_rows = int(
                 scalar(
-                    "SELECT count(*) FROM shiba_internal.change_log "
+                    "SELECT count(*) FROM shiba_internal.effective_change_log "
                     f"WHERE commit_lsn='{routed['commit_lsn']}'::pg_lsn"
                 )
             )
@@ -2505,6 +2522,7 @@ max_worker_processes = 32
 listen_addresses = ''
 unix_socket_directories = '{SOCKET_DIR}'
 port = {PORT}
+shiba.replication_conninfo = 'host={SOCKET_DIR} port={PORT} dbname={DATABASE} user={getpass.getuser()}'
 shared_buffers = '1GB'
 work_mem = '64MB'
 maintenance_work_mem = '256MB'

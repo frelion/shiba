@@ -318,7 +318,9 @@ fn ensure_shiba_slot_inactive() {
                  SELECT 1 FROM shiba_internal.dag_runtime_state WHERE active
                )
                AND NOT EXISTS (
-                 SELECT 1 FROM pg_publication WHERE pubname='shiba_publication'
+                 SELECT 1
+                 FROM shiba_internal.ingress_replay_state
+                 WHERE state='active'
                )",
         )
         .expect("Shiba failed to inspect worker state before DROP EXTENSION")

@@ -458,7 +458,19 @@ BEGIN
     WHERE singleton;
     UPDATE shiba_internal.dag_runtime_state SET active = false;
     DELETE FROM shiba_internal.ingress_transactions;
-    DROP PUBLICATION IF EXISTS shiba_publication;
+    DELETE FROM shiba_internal.ingress_decode_batches
+    WHERE slot_generation = (
+        SELECT slot_generation
+        FROM shiba_internal.ingress_replay_state
+        WHERE database_oid = (
+            SELECT oid FROM pg_catalog.pg_database
+            WHERE datname = pg_catalog.current_database()
+        )
+          AND slot_name = shiba_internal.slot_name()
+          AND state = 'active'
+    );
+    -- Keep the empty extension-owned publication across deactivation. A new
+    -- slot must not start before the publication's creating transaction.
     PERFORM shiba_internal.retire_ingress_generation(
         shiba_internal.slot_name()
     );

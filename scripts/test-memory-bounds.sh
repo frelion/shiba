@@ -281,6 +281,8 @@ cargo pgrx install --pg-config "${pg_config_path}"
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
+  printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s'\n" \
+    "${pg_socket_dir}" "${pg_port}" "${database_name}" "$(id -un)"
   printf "work_mem = '%s'\n" "${runtime_work_mem}"
   printf "hash_mem_multiplier = 1\n"
   printf "temp_file_limit = '%s'\n" "${runtime_temp_file_limit}"
@@ -357,9 +359,10 @@ wait_for_query "1|${aggregate_rows}|1" "
          || '|' || count(change.sequence)
          || '|' || count(DISTINCT change.commit_lsn)
   FROM shiba_internal.dag_inbox inbox
-  JOIN shiba_internal.change_log change USING(commit_lsn)
+  JOIN shiba_internal.effective_change_log change
+    USING(ingress_txn_id,commit_lsn)
   WHERE inbox.result_oid='shiba.memory_aggregate_result'::regclass" \
-  "one routed source commit with every high-cardinality delta"
+  "one ingested source commit with every high-cardinality delta"
 psql_memory -qc "
   UPDATE shiba_internal.dag_runtime_state
   SET active=true
@@ -629,11 +632,12 @@ psql_memory -qc "
 wait_for_resource_pause \
   "shiba.memory_limited_result" "${initial_runtime_pid}"
 assert_query "2|1" "
-  SELECT routed.event_count || '|' || count(inbox.*)
+  SELECT ingress.event_count || '|' || count(inbox.*)
   FROM shiba_internal.dag_inbox inbox
-  JOIN shiba_internal.routed_transactions routed USING(commit_lsn)
+  JOIN shiba_internal.ingress_transactions ingress
+    USING(ingress_txn_id,commit_lsn)
   WHERE inbox.result_oid='shiba.memory_limited_result'::regclass
-  GROUP BY routed.event_count"
+  GROUP BY ingress.event_count"
 psql_memory -qc "ALTER SYSTEM SET shiba.max_commit_rows = '1000000'"
 psql_memory -Atqc "SELECT pg_reload_conf()" >/dev/null
 assert_query "t" "SELECT shiba.resume('shiba.memory_limited_result')"
@@ -649,9 +653,10 @@ psql_memory -qc "
 wait_for_resource_pause \
   "shiba.memory_limited_result" "${initial_runtime_pid}"
 assert_query "t" "
-  SELECT routed.payload_bytes>1
+  SELECT ingress.payload_bytes>1
   FROM shiba_internal.dag_inbox inbox
-  JOIN shiba_internal.routed_transactions routed USING(commit_lsn)
+  JOIN shiba_internal.ingress_transactions ingress
+    USING(ingress_txn_id,commit_lsn)
   WHERE inbox.result_oid='shiba.memory_limited_result'::regclass"
 psql_memory -qc \
   "ALTER SYSTEM SET shiba.max_commit_bytes = '1073741824'"

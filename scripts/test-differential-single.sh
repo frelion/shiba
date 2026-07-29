@@ -175,6 +175,8 @@ cargo pgrx install --pg-config "${pg_config_path}"
   printf "max_worker_processes = 32\\n"
   printf "unix_socket_directories = '%s'\\n" "${pg_socket_dir}"
   printf "port = %s\\n" "${pg_port}"
+  printf "shiba.replication_conninfo = 'host=%s port=%s dbname=shiba_diff user=%s'\\n" \
+    "${pg_socket_dir}" "${pg_port}" "$(id -un)"
 } >> "${pg_data_dir}/postgresql.conf"
 
 "${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -l "${pg_log_file}" \

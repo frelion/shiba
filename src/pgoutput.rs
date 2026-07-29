@@ -1,6 +1,5 @@
-//! A deliberately small parser for the `pgoutput` protocol used by PostgreSQL
-//! logical decoding. Shiba peeks messages, durably routes them, and only then
-//! advances the slot with `pg_logical_slot_get_binary_changes()`.
+//! A deliberately small parser for pgoutput protocol-v2 messages received as
+//! CopyData on Shiba's logical-replication connection.
 
 #[derive(Debug, PartialEq)]
 pub enum Message {
@@ -43,7 +42,7 @@ pub enum Message {
         origin_lsn: u64,
         name: String,
     },
-    LogicalMessage {
+    Logical {
         source_xid: Option<u32>,
         transactional: bool,
         message_lsn: u64,
@@ -79,6 +78,7 @@ pub type Tuple = Vec<Option<String>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParseContext {
     NonStreaming,
+    #[cfg(test)]
     Streaming,
 }
 
@@ -90,24 +90,21 @@ pub fn parse(input: &[u8]) -> Result<Message, &'static str> {
 pub fn parse_with_context(input: &[u8], context: ParseContext) -> Result<Message, &'static str> {
     let tag = *input.first().ok_or("empty pgoutput message")?;
     match tag {
-        b'B' => Ok(Message::Begin {
-            final_lsn: read_u64(input, 1)?,
-            xid: read_u32(input, 17)?,
-        }),
-        b'C' => Ok(Message::Commit {
-            // Commit is: tag, flags, commit_lsn, end_lsn, commit_time.
-            commit_lsn: {
-                require_zero_flag(input, 1, "invalid commit flags")?;
-                read_u64(input, 2)?
-            },
-            end_lsn: {
-                let end_lsn = read_u64(input, 10)?;
-                // Validate the ignored commit_time too, so a truncated fixed-size
-                // message is not accepted as a complete COMMIT.
-                read_u64(input, 18)?;
-                end_lsn
-            },
-        }),
+        b'B' => {
+            require_exact_len(input, 21, "invalid begin message length")?;
+            Ok(Message::Begin {
+                final_lsn: read_u64(input, 1)?,
+                xid: read_u32(input, 17)?,
+            })
+        }
+        b'C' => {
+            require_exact_len(input, 26, "invalid commit message length")?;
+            require_zero_flag(input, 1, "invalid commit flags")?;
+            Ok(Message::Commit {
+                commit_lsn: read_u64(input, 2)?,
+                end_lsn: read_u64(input, 10)?,
+            })
+        }
         b'S' => parse_stream_start(input),
         b'E' => {
             require_exact_len(input, 1, "invalid stream stop message length")?;
@@ -127,13 +124,16 @@ pub fn parse_with_context(input: &[u8], context: ParseContext) -> Result<Message
     }
 }
 
+type TransactionalParser = fn(&[u8], usize, Option<u32>) -> Result<Message, &'static str>;
+
 fn parse_transactional(
     input: &[u8],
     context: ParseContext,
-    parser: fn(&[u8], usize, Option<u32>) -> Result<Message, &'static str>,
+    parser: TransactionalParser,
 ) -> Result<Message, &'static str> {
     match context {
         ParseContext::NonStreaming => parser(input, 1, None),
+        #[cfg(test)]
         ParseContext::Streaming => {
             let xid = read_u32(input, 1)?;
             if xid == 0 {
@@ -199,6 +199,7 @@ fn parse_relation(
             return Err("truncated relation message");
         }
     }
+    require_exact_len(input, offset, "invalid relation message length")?;
     Ok(Message::Relation {
         source_xid,
         relid,
@@ -257,7 +258,7 @@ fn parse_logical_message(
         .get(content_start..content_end)
         .ok_or("truncated logical message")?;
     require_exact_len(input, content_end, "invalid logical message length")?;
-    Ok(Message::LogicalMessage {
+    Ok(Message::Logical {
         source_xid,
         transactional,
         message_lsn,
@@ -276,7 +277,8 @@ fn parse_insert(
     if input.get(tuple_offset) != Some(&b'N') {
         return Err("invalid insert tuple tag");
     }
-    let (row, _) = parse_tuple(input, tuple_offset)?;
+    let (row, tuple_end) = parse_tuple(input, tuple_offset)?;
+    require_exact_len(input, tuple_end, "invalid insert message length")?;
     Ok(Message::Insert {
         source_xid,
         relid,
@@ -300,7 +302,8 @@ fn parse_update(
     if input.get(offset) != Some(&b'N') {
         return Err("UPDATE lacks a new tuple");
     }
-    let (new, _) = parse_tuple(input, offset)?;
+    let (new, tuple_end) = parse_tuple(input, offset)?;
+    require_exact_len(input, tuple_end, "invalid update message length")?;
     Ok(Message::Update {
         source_xid,
         relid,
@@ -319,7 +322,8 @@ fn parse_delete(
     if !matches!(input.get(tuple_offset), Some(b'K' | b'O')) {
         return Err("invalid delete tuple tag");
     }
-    let (old, _) = parse_tuple(input, tuple_offset)?;
+    let (old, tuple_end) = parse_tuple(input, tuple_offset)?;
+    require_exact_len(input, tuple_end, "invalid delete message length")?;
     Ok(Message::Delete {
         source_xid,
         relid,
@@ -783,7 +787,7 @@ mod tests {
         );
         assert_eq!(
             parse(&logical_message(1, 43, b"extension", b"\0binary\xff")),
-            Ok(Message::LogicalMessage {
+            Ok(Message::Logical {
                 source_xid: None,
                 transactional: true,
                 message_lsn: 43,
@@ -826,7 +830,7 @@ mod tests {
             ),
             (
                 streamed(subxid, &logical_message(0, 44, b"notice", b"payload")),
-                Message::LogicalMessage {
+                Message::Logical {
                     source_xid: Some(subxid),
                     transactional: false,
                     message_lsn: 44,
@@ -857,9 +861,19 @@ mod tests {
     #[test]
     fn metadata_and_truncate_messages_reject_truncation_and_trailing_bytes() {
         for message in [
+            begin(1, 2),
+            commit(3, 4),
+            relation(5, b"public", b"items", &[b"id", b"value"]),
             type_message(23, b"pg_catalog", b"int4"),
             origin(42, b"upstream"),
             logical_message(1, 43, b"extension", b"payload"),
+            dml(b'I', 6, &[tuple(b'N', &[Some(b"new")])]),
+            dml(
+                b'U',
+                7,
+                &[tuple(b'O', &[Some(b"old")]), tuple(b'N', &[Some(b"new")])],
+            ),
+            dml(b'D', 8, &[tuple(b'O', &[Some(b"old")])]),
             truncate(0b11, &[7, 8]),
         ] {
             assert!(parse(&message).is_ok(), "fixture is invalid: {message:?}");

@@ -16,12 +16,12 @@ run_gate() {
 run_gate "Rust formatting" cargo fmt -- --check
 run_gate "Rust lints" cargo clippy --all-targets -- -D warnings
 run_gate "Rust unit and pgrx integration tests" cargo test --lib
+run_gate "Durable logical-replication ingress test" \
+  "${project_root}/scripts/test-replication-ingress.sh"
 run_gate "PostgreSQL asynchronous acceptance test" \
   "${project_root}/scripts/test-e2e.sh"
 run_gate "Single-source deterministic differential test" \
   "${project_root}/scripts/test-differential-single.sh"
-run_gate "Aggregate batch COUNT(DISTINCT) test" \
-  "${project_root}/scripts/test-aggregate-batch-distinct.sh"
 run_gate "Join and subquery deterministic differential test" \
   "${project_root}/scripts/test-join-differential.sh"
 run_gate "Concurrency, transaction, and recovery test" \

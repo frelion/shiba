@@ -1,9 +1,10 @@
 # Architecture
 
-> This document describes the current v1 implementation. The proposed
-> normative v2 execution contract, including partial visibility, resumable
-> operators, durable Stages, and arbitrary finite fan-out, is defined in
-> [DAG-EXECUTION-SPEC.md](DAG-EXECUTION-SPEC.md).
+> The current ingress and process contract is
+> [REPLICATION-INGRESS-DESIGN.md](REPLICATION-INGRESS-DESIGN.md). Historical
+> sections below that describe `routed_transactions` or slot peeking are
+> superseded; the implementation has one durable ingress model and no legacy
+> fallback.
 
 This document is a map of Shiba's execution path and its invariants. It is
 intended to be useful even if you are new to Rust, PostgreSQL extensions, or
@@ -146,36 +147,41 @@ head-of-line blocking remains observable.
 
 ```text
 logical replication slot
-  -> shiba runtime Router phase
-  -> routed_transactions checkpoint
-  -> shared change_log payload rows
-  -> lightweight dag_inbox transaction references
+  -> PostgreSQL walsender / pgoutput protocol v2
+  -> bounded Runtime ingress transactions
+  -> ingress_transactions + shared change_log rows
+  -> bounded routing_tasks fan-out
+  -> dag_inbox transaction references
   -> round-robin scheduler
   -> per-result DagRuntime
   -> persisted PhysicalDagPlan
   -> inline / statement-materialized / UNLOGGED Stages
   -> operator state and result sink
   -> view_progress and inbox acknowledgement
-  -> bounded unreferenced change_log GC
+  -> confirmed-LSN-fenced ingress GC
 ```
 
 `src/worker.rs` contains one cooperative process loop with bounded phases:
 
-1. route a bounded burst of complete source transactions;
-2. apply one source transaction for one ready DAG;
-3. rotate the round-robin cursor;
-4. garbage-collect a bounded number of unreferenced transactions;
-5. service signals and wait on the latch when idle.
+1. persist a bounded replication batch;
+2. route a bounded subscriber page;
+3. apply one source transaction for one ready DAG;
+4. rotate the round-robin cursor;
+5. garbage-collect a bounded number of safe transactions;
+6. service signals and wait on the latch when idle.
 
-The Router phase owns the logical slot. Its short database transaction
-idempotently claims a commit LSN, stores every decoded delta once in
-`change_log`, and inserts at most one `(result_oid, commit_lsn)` inbox row per
-affected DAG. Slot advancement is separate and occurs only after routing
-commits, so a crash between the two causes a harmless replay.
+The Runtime owns a replication client; PostgreSQL's walsender owns the logical
+decoding context. Replication socket I/O never occurs inside an SPI
+transaction. Stable event identities make a crash after ingress commit but
+before feedback a harmless replay. Transaction streaming is disabled:
+PostgreSQL spills decoding state when needed and emits only committed,
+savepoint-filtered changes, while Shiba consumes that output in bounded
+CopyData batches.
 
 The apply phase chooses a ready DAG, locks and revalidates its oldest inbox
-reference, and invokes the logical runtime with `(result_oid, commit_lsn)`.
-Operator SQL reads ordered rows directly from `change_log`; Rust must not
+reference, and invokes the logical runtime with
+`(result_oid, ingress_txn_id, commit_lsn)`. Operator SQL reads ordered rows
+from `effective_change_log`; Rust must not
 collect the transaction payload into a `Vec`, construct a JSON array, or copy
 it back through SPI. State, result, progress, and deletion of the one inbox
 reference commit together.
@@ -189,10 +195,10 @@ UNLOGGED `join_delta` Stage, and updates the durable arrangements. The second co
 Stage is necessary because the exact Join delta has multiple consumers across
 that statement boundary; it does not change the transaction boundary.
 
-GC may delete a change-log transaction only when no inbox row references its
-commit LSN and its one-second observability/replay grace period has elapsed. It
-runs in its own bounded transaction. A quarantined DAG therefore retains the
-payload needed for explicit repair and replay.
+GC may delete an ingress transaction only after routing is complete, no inbox
+references it, retention elapsed, and `replay_safe_lsn` reached its end LSN.
+`replay_safe_lsn` comes from the slot's actual confirmed flush position, not
+from feedback intent.
 
 The SQL execution layer is split into `sql/20_operator_filters.sql` through
 `sql/26_physical_stages.sql`: common filters, Aggregate, unary batch kernels,
@@ -248,9 +254,10 @@ These rules are more important than any individual optimization:
 ## Stage storage, lifecycle, and locks
 
 All durable authority remains in ordinary logged PostgreSQL relations:
-registration metadata and physical plans, `routed_transactions`, `change_log`,
-`dag_inbox`, operator arrangements and state, result rows, and
-`view_progress`. The UNLOGGED `join_delta` relation is only a typed,
+registration metadata and physical plans, `ingress_replay_state`,
+`ingress_transactions`, `change_log`, `routing_tasks`, `dag_inbox`, operator
+arrangements and state, result rows, and `view_progress`. The UNLOGGED
+`join_delta` relation is only a typed,
 commit-scoped cache of derived rows. It may avoid WAL for an intermediate that
 can be recomputed, but it is not a substitute for durable state.
 

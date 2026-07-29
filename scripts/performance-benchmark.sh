@@ -209,6 +209,8 @@ cargo pgrx install --release --pg-config "${pg_config_path}" \
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
+  printf "shiba.replication_conninfo = 'host=%s port=%s dbname=shiba_perf user=%s'\n" \
+    "${pg_socket_dir}" "${pg_port}" "$(id -un)"
   printf "shared_buffers = '1GB'\n"
   printf "work_mem = '64MB'\n"
   printf "maintenance_work_mem = '256MB'\n"
@@ -417,6 +419,16 @@ if test "${correctness_difference_count}" != "0"; then
   exit 1
 fi
 
+gc_start_ms="$(now_ms)"
+wait_for_sql shiba_perf "0" \
+  "SELECT count(*) FROM shiba_internal.ingress_transactions" \
+  "confirmed, unreferenced ingress transactions to be garbage-collected"
+gc_end_ms="$(now_ms)"
+metric garbage_collection drain_wall_time \
+  "$(awk -v start="${gc_start_ms}" -v finish="${gc_end_ms}" \
+    'BEGIN {printf "%.3f", finish-start}')" \
+  ms "retention, slot confirmation reconciliation, and bounded ingress GC"
+
 psql_db shiba_perf -Atqc "
   SELECT jsonb_pretty(jsonb_build_object(
     'database_size_bytes',pg_database_size(current_database()),
@@ -436,8 +448,8 @@ psql_db shiba_perf -Atqc "
     'pending_change_log_rows',(
       SELECT count(*) FROM shiba_internal.change_log
     ),
-    'pending_routed_transactions',(
-      SELECT count(*) FROM shiba_internal.routed_transactions
+    'retained_ingress_transactions',(
+      SELECT count(*) FROM shiba_internal.ingress_transactions
     ),
     'progress',(SELECT to_jsonb(progress) FROM shiba.progress('shiba.bench_stats') progress)
   ))" > "${output_dir}/final-state.json"

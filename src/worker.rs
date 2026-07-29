@@ -242,7 +242,6 @@ struct IngressBootstrap {
     generation: i64,
     slot_name: String,
     start_lsn: u64,
-    open_streams: Vec<(u32, u64)>,
 }
 
 fn initialize_ingress() -> IngressRuntime {
@@ -260,14 +259,10 @@ fn initialize_ingress() -> IngressRuntime {
             start_lsn: bootstrap.start_lsn,
             publication_names: &["shiba_publication"],
         })
-        .unwrap_or_else(|error| panic!("Shiba could not start v2 logical replication: {error}"));
+        .unwrap_or_else(|error| panic!("Shiba could not start logical replication: {error}"));
     IngressRuntime {
         generation: bootstrap.generation,
-        ingress: ingress::ReplicationIngress::new(
-            transport,
-            bootstrap.open_streams,
-            config::max_cached_relations(),
-        ),
+        ingress: ingress::ReplicationIngress::new(transport, config::max_cached_relations()),
         persisted_lsn: bootstrap.start_lsn,
         pending_feedback: None,
         queued_feedback: None,
@@ -294,41 +289,10 @@ fn bootstrap_ingress() -> IngressBootstrap {
     )
     .expect("Shiba could not read its durable ingress position")
     .expect("ingress generation has no feedback state");
-    let open_streams = Spi::connect(|client| {
-        client
-            .select(
-                "SELECT source_xid, identity_lsn::text
-                 FROM shiba_internal.ingress_transactions
-                 WHERE slot_generation = $1
-                   AND status = 'open'
-                   AND streamed
-                 ORDER BY source_xid, identity_lsn",
-                None,
-                &generation_argument,
-            )
-            .expect("Shiba could not restore open ingress transactions")
-            .map(|row| {
-                let xid = row
-                    .get::<i64>(1)
-                    .expect("invalid source xid")
-                    .expect("NULL source xid");
-                let xid = u32::try_from(xid).expect("source xid exceeds uint32");
-                let first_lsn = row
-                    .get::<String>(2)
-                    .expect("invalid first stream LSN")
-                    .expect("NULL first stream LSN");
-                (
-                    xid,
-                    parse_lsn(&first_lsn).expect("invalid durable first stream LSN"),
-                )
-            })
-            .collect()
-    });
     IngressBootstrap {
         generation,
         slot_name,
         start_lsn: parse_lsn(&persisted_lsn).expect("invalid durable ingress LSN"),
-        open_streams,
     }
 }
 
@@ -348,21 +312,27 @@ fn route_ingress_once(runtime: &mut IngressRuntime) -> RuntimePhase {
         .unwrap_or_else(|error| panic!("Shiba ingress failed: {error}"))
     {
         ingress::IngressPoll::Batch(batch) => {
-            let persisted_lsn =
+            let feedback_lsn =
                 BackgroundWorker::transaction(|| persist_ingress_batch(runtime.generation, &batch));
             #[cfg(any(test, feature = "pg_test"))]
-            if let Some(pause) = BackgroundWorker::transaction(|| {
-                let decode_lsn = format_lsn(batch.decode_end_lsn);
-                test_failpoints::claim("runtime_ingress_before_feedback", None, Some(&decode_lsn))
-            }) {
-                std::thread::sleep(pause);
-                panic!(
-                    "Shiba test failpoint: Runtime exited after ingress commit and before replication feedback"
-                );
+            if feedback_lsn.is_none() {
+                if let Some(pause) = BackgroundWorker::transaction(|| {
+                    let decode_lsn = format_lsn(batch.decode_end_lsn);
+                    test_failpoints::claim(
+                        "runtime_ingress_after_partial_batch",
+                        None,
+                        Some(&decode_lsn),
+                    )
+                }) {
+                    std::thread::sleep(pause);
+                    panic!("Shiba test failpoint: Runtime exited after a partial ingress batch");
+                }
             }
-            runtime.persisted_lsn = runtime.persisted_lsn.max(persisted_lsn);
-            runtime.pending_feedback = Some(runtime.persisted_lsn);
-            flush_ingress_feedback(runtime);
+            if let Some(feedback_lsn) = feedback_lsn {
+                runtime.persisted_lsn = runtime.persisted_lsn.max(feedback_lsn);
+                runtime.pending_feedback = Some(runtime.persisted_lsn);
+                flush_ingress_feedback(runtime);
+            }
             1
         }
         ingress::IngressPoll::Pending { reply_requested } => {
@@ -455,19 +425,18 @@ fn record_ingress_feedback(generation: i64, feedback_lsn: u64) {
     });
 }
 
-fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> u64 {
-    let identity_lsn = format_lsn(batch.identity_lsn);
+fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> Option<u64> {
+    let final_lsn = format_lsn(batch.final_lsn);
     let claim_arguments = unsafe {
         [
             DatumWithOid::new(generation, pg_sys::INT8OID),
             DatumWithOid::new(i64::from(batch.source_xid), pg_sys::INT8OID),
-            DatumWithOid::new(batch.streamed, pg_sys::BOOLOID),
-            DatumWithOid::new(identity_lsn.as_str(), pg_sys::TEXTOID),
+            DatumWithOid::new(final_lsn.as_str(), pg_sys::TEXTOID),
         ]
     };
     let ingress_txn_id = Spi::get_one_with_args::<i64>(
         "SELECT ingress_txn_id
-         FROM shiba_internal.claim_ingress_transaction($1, $2, $3, $4::pg_lsn)",
+         FROM shiba_internal.claim_ingress_transaction($1, $2, $3::pg_lsn)",
         &claim_arguments,
     )
     .expect("Shiba could not claim a ingress transaction")
@@ -482,7 +451,6 @@ fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> u64 
                     "change_lsn": format_lsn(event.change_lsn),
                     "change_ordinal": event.change_ordinal,
                     "image_ordinal": event.image_ordinal,
-                    "source_subxid": event.source_subxid,
                     "source_oid": event.source_oid,
                     "weight": event.weight,
                     "typed_payload": event.payload,
@@ -504,6 +472,12 @@ fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> u64 
     .expect("Shiba could not persist a bounded ingress event batch");
 
     let decode_end_lsn = format_lsn(batch.decode_end_lsn);
+    let feedback_lsn = batch
+        .finalization
+        .as_ref()
+        .map(|finalization| match finalization {
+            ingress::IngressFinalization::Commit { end_lsn, .. } => *end_lsn,
+        });
     let digest = batch.digest.to_vec();
     let batch_arguments = unsafe {
         [
@@ -548,45 +522,10 @@ fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> u64 
             )
             .expect("Shiba could not finalize a committed ingress transaction");
         }
-        Some(ingress::IngressFinalization::Abort { end_lsn }) => {
-            let end_lsn = format_lsn(*end_lsn);
-            let arguments = unsafe {
-                [
-                    DatumWithOid::new(ingress_txn_id, pg_sys::INT8OID),
-                    DatumWithOid::new(end_lsn.as_str(), pg_sys::TEXTOID),
-                ]
-            };
-            Spi::run_with_args(
-                "SELECT shiba_internal.abort_ingress_transaction($1, $2::pg_lsn)",
-                &arguments,
-            )
-            .expect("Shiba could not finalize an aborted ingress transaction");
-        }
-        Some(ingress::IngressFinalization::SubtransactionAbort {
-            subxid,
-            control_lsn,
-        }) => {
-            let control_lsn = format_lsn(*control_lsn);
-            let arguments = unsafe {
-                [
-                    DatumWithOid::new(ingress_txn_id, pg_sys::INT8OID),
-                    DatumWithOid::new(i64::from(batch.source_xid), pg_sys::INT8OID),
-                    DatumWithOid::new(i64::from(*subxid), pg_sys::INT8OID),
-                    DatumWithOid::new(control_lsn.as_str(), pg_sys::TEXTOID),
-                ]
-            };
-            Spi::run_with_args(
-                "SELECT shiba_internal.rollback_ingress_subtransaction(
-                     $1, $2, $3, $4::pg_lsn
-                 )",
-                &arguments,
-            )
-            .expect("Shiba could not persist a streamed subtransaction rollback");
-        }
         None => {}
     }
 
-    batch.decode_end_lsn
+    feedback_lsn
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -826,6 +765,57 @@ fn gc_change_log(generation: i64) -> i64 {
         &generation_argument,
     )
     .expect("Shiba could not garbage-collect ingress decode batches");
+    Spi::run(
+        "WITH garbage AS (
+             SELECT batch.slot_generation,
+                    batch.decode_end_lsn,
+                    batch.message_digest
+             FROM shiba_internal.ingress_decode_batches AS batch
+             JOIN shiba_internal.ingress_replay_state AS replay
+               ON replay.slot_generation = batch.slot_generation
+              AND replay.state = 'retired'
+             WHERE NOT EXISTS (
+                       SELECT 1
+                       FROM shiba_internal.ingress_transactions AS txn
+                       WHERE txn.slot_generation = batch.slot_generation
+                   )
+               AND batch.persisted_at < clock_timestamp()
+                   - current_setting('shiba.ingress_retention')::interval
+             ORDER BY batch.slot_generation, batch.decode_end_lsn
+             LIMIT 64
+         )
+         DELETE FROM shiba_internal.ingress_decode_batches AS batch
+         USING garbage
+         WHERE batch.slot_generation = garbage.slot_generation
+           AND batch.decode_end_lsn = garbage.decode_end_lsn
+           AND batch.message_digest = garbage.message_digest",
+    )
+    .expect("Shiba could not garbage-collect retired ingress decode batches");
+    Spi::run(
+        "WITH garbage AS (
+             SELECT replay.slot_generation
+             FROM shiba_internal.ingress_replay_state AS replay
+             WHERE replay.state = 'retired'
+               AND replay.retired_at < clock_timestamp()
+                   - current_setting('shiba.ingress_retention')::interval
+               AND NOT EXISTS (
+                       SELECT 1
+                       FROM shiba_internal.ingress_transactions AS txn
+                       WHERE txn.slot_generation = replay.slot_generation
+                   )
+               AND NOT EXISTS (
+                       SELECT 1
+                       FROM shiba_internal.ingress_decode_batches AS batch
+                       WHERE batch.slot_generation = replay.slot_generation
+                   )
+             ORDER BY replay.slot_generation
+             LIMIT 8
+         )
+         DELETE FROM shiba_internal.ingress_replay_state AS replay
+         USING garbage
+         WHERE replay.slot_generation = garbage.slot_generation",
+    )
+    .expect("Shiba could not garbage-collect retired ingress generations");
     Spi::run("SELECT shiba_internal._compact_shared_fold_stages()")
         .expect("Shiba could not compact its empty shared fold Stages");
     collected

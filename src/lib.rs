@@ -199,14 +199,14 @@ mod tests {
         let first = Spi::get_one::<bool>(
             "SELECT created
                FROM shiba_internal.claim_ingress_transaction(
-                   1, 42, false, '0/123456'
+                   1, 42, '0/123456'
                )",
         )
         .expect("first ingress claim should execute");
         let second = Spi::get_one::<bool>(
             "SELECT created
                FROM shiba_internal.claim_ingress_transaction(
-                   1, 42, false, '0/123456'
+                   1, 42, '0/123456'
                )",
         )
         .expect("duplicate ingress claim should execute");
@@ -215,7 +215,7 @@ mod tests {
                FROM shiba_internal.ingress_transactions
               WHERE slot_generation=1
                 AND source_xid=42
-                AND identity_lsn='0/123456'",
+                AND final_lsn='0/123456'",
         )
         .expect("ingress claims should be queryable");
 

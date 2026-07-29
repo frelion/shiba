@@ -100,6 +100,8 @@ cargo pgrx install --pg-config "${pg_config_path}"
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
+  printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s'\n" \
+    "${pg_socket_dir}" "${pg_port}" "${database_name}" "$(id -un)"
 } >> "${pg_data_dir}/postgresql.conf"
 
 "${pg_bin_dir}/pg_ctl" \
@@ -504,14 +506,18 @@ assert_query "f" "
 assert_query "0" "
   SELECT count(*) FROM pg_replication_slots
   WHERE slot_name=shiba_internal.slot_name()::text"
-assert_query "0" "
+assert_query "1" "
   SELECT count(*) FROM pg_publication WHERE pubname='shiba_publication'"
+assert_query "0" "
+  SELECT count(*) FROM pg_publication_tables
+  WHERE pubname='shiba_publication'"
 assert_query "t" "
   SELECT to_regclass('shiba.registration_after_deactivate') IS NULL"
 assert_query "0" "SELECT count(*) FROM shiba_internal.stream_views"
 
-# activate() remains idempotent after a full deactivation: it recreates the
-# publication and slot and launches exactly one dynamic Runtime.
+# activate() remains idempotent after a full deactivation: it reuses the empty
+# extension-owned publication, creates a fresh slot, and launches exactly one
+# dynamic Runtime.
 psql_gate -Atqc "SELECT shiba.activate()" >/dev/null
 wait_for_query "1" \
   "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" \

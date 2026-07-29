@@ -3,11 +3,13 @@
 -- CALLING TRANSACTION BOUNDARIES
 -- --------------------------------
 -- These functions never commit and never perform replication I/O.  The
--- Runtime must call claim/create, event insertion(s), and record_batch inside
--- one bounded SPI transaction, then commit before reading or waiting on the
--- replication socket.  Commit/abort finalization is a separate short SPI
--- transaction.  Read feedback_upper_bound in a short SPI transaction, end
--- that transaction, and only then send Standby Status Update.  After a
+-- Runtime must call claim/create, event insertion(s), record_batch, and any
+-- Commit finalization for that batch inside one bounded SPI transaction, then
+-- commit before reading or waiting on the replication socket. Prefix batches
+-- do not advance durable replication progress; commit_ingress_transaction
+-- atomically finalizes the header, creates routing work, and advances it.
+-- Read feedback_upper_bound in a short SPI transaction, end that transaction,
+-- and only then send Standby Status Update.  After a
 -- successful send, record the confirmation intent in another short SPI
 -- transaction with record_ingress_feedback.
 --
@@ -16,8 +18,7 @@
 -- 0. ingress_replay_state table lock (generation creation only)
 -- 1. ingress_replay_state rows (ascending slot_generation)
 -- 2. ingress_transactions rows (ascending ingress_txn_id)
--- 3. change_log stable identity / ingress_subxacts /
---    ingress_rollbacks / ingress_decode_batches
+-- 3. change_log stable identity / ingress_decode_batches
 -- 4. ingress_sources
 -- 5. routing_tasks
 --
@@ -131,11 +132,9 @@ BEGIN
                AND v_slot_confirmed_lsn <> v_baseline_lsn)
            OR (v_persisted_lsn IS NOT NULL
                AND v_slot_confirmed_lsn > v_persisted_lsn) THEN
-            UPDATE shiba_internal.ingress_replay_state AS replay
-               SET state = 'invalid',
-                   retired_at = clock_timestamp(),
-                   updated_at = clock_timestamp()
-             WHERE replay.slot_generation = v_slot_generation;
+            -- Fail closed without pretending to persist an `invalid` state:
+            -- the exception rolls back this lifecycle transaction. Recovery
+            -- requires repairing/replacing the mismatched slot explicitly.
             RAISE EXCEPTION USING
                 ERRCODE = '55000',
                 MESSAGE = format(
@@ -215,8 +214,7 @@ $$;
 CREATE FUNCTION shiba_internal.claim_ingress_transaction(
     p_slot_generation bigint,
     p_source_xid bigint,
-    p_streamed boolean,
-    p_identity_lsn pg_lsn
+    p_final_lsn pg_lsn
 )
 RETURNS TABLE (
     ingress_txn_id bigint,
@@ -236,8 +234,7 @@ DECLARE
 BEGIN
     IF p_slot_generation IS NULL
        OR p_source_xid IS NULL
-       OR p_streamed IS NULL
-       OR p_identity_lsn IS NULL THEN
+       OR p_final_lsn IS NULL THEN
         RAISE EXCEPTION USING
             ERRCODE = '22004',
             MESSAGE = 'ingress transaction identity must not contain NULL';
@@ -266,16 +263,14 @@ BEGIN
     INSERT INTO shiba_internal.ingress_transactions (
         slot_generation,
         source_xid,
-        streamed,
-        identity_lsn
+        final_lsn
     )
     VALUES (
         p_slot_generation,
         p_source_xid,
-        p_streamed,
-        p_identity_lsn
+        p_final_lsn
     )
-    ON CONFLICT (slot_generation, source_xid, streamed, identity_lsn)
+    ON CONFLICT (slot_generation, source_xid, final_lsn)
         DO NOTHING
     RETURNING ingress_transactions.ingress_txn_id
          INTO v_ingress_txn_id;
@@ -286,11 +281,10 @@ BEGIN
         -- Lock-order level 2: transaction header.
         SELECT txn.ingress_txn_id
           INTO STRICT v_ingress_txn_id
-          FROM shiba_internal.ingress_transactions AS txn
+         FROM shiba_internal.ingress_transactions AS txn
          WHERE txn.slot_generation = p_slot_generation
            AND txn.source_xid = p_source_xid
-           AND txn.streamed = p_streamed
-           AND txn.identity_lsn = p_identity_lsn
+           AND txn.final_lsn = p_final_lsn
          FOR UPDATE;
     END IF;
 
@@ -311,7 +305,6 @@ CREATE FUNCTION shiba_internal.insert_ingress_event(
     p_change_lsn pg_lsn,
     p_change_ordinal bigint,
     p_image_ordinal integer,
-    p_source_subxid bigint,
     p_source_oid oid,
     p_weight bigint,
     p_typed_payload jsonb
@@ -327,10 +320,7 @@ AS $$
 DECLARE
     v_slot_generation bigint;
     v_status text;
-    v_streamed boolean;
-    v_identity_lsn pg_lsn;
     v_next_input_seq bigint;
-    v_existing_source_subxid bigint;
     v_existing_source_oid oid;
     v_existing_weight bigint;
     v_existing_payload jsonb;
@@ -340,22 +330,12 @@ BEGIN
        OR p_change_lsn IS NULL
        OR p_change_ordinal IS NULL
        OR p_image_ordinal IS NULL
-       OR p_source_subxid IS NULL
        OR p_source_oid IS NULL
        OR p_weight IS NULL
        OR p_typed_payload IS NULL THEN
         RAISE EXCEPTION USING
             ERRCODE = '22004',
             MESSAGE = 'ingress event fields must not contain NULL';
-    END IF;
-
-    IF p_source_subxid NOT BETWEEN 0 AND 4294967295 THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '22023',
-            MESSAGE = format(
-                'ingress source subxid %s is outside the PostgreSQL xid range',
-                p_source_subxid
-            );
     END IF;
 
     SELECT txn.slot_generation
@@ -382,12 +362,8 @@ BEGIN
     -- Lock-order level 2.  This serializes input_seq allocation for one source
     -- transaction and makes replay retain the first allocation.
     SELECT txn.status,
-           txn.streamed,
-           txn.identity_lsn,
            txn.next_input_seq
       INTO STRICT v_status,
-                  v_streamed,
-                  v_identity_lsn,
                   v_next_input_seq
       FROM shiba_internal.ingress_transactions AS txn
      WHERE txn.ingress_txn_id = p_ingress_txn_id
@@ -403,23 +379,11 @@ BEGIN
             );
     END IF;
 
-    IF v_streamed AND p_change_lsn < v_identity_lsn THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '22023',
-            MESSAGE = format(
-                'event LSN %s precedes transaction identity LSN %s',
-                p_change_lsn,
-                v_identity_lsn
-            );
-    END IF;
-
     SELECT event.input_seq,
-           event.source_subxid,
            event.source_oid,
            event.weight,
            event.typed_payload
       INTO input_seq,
-           v_existing_source_subxid,
            v_existing_source_oid,
            v_existing_weight,
            v_existing_payload
@@ -430,8 +394,7 @@ BEGIN
        AND event.image_ordinal = p_image_ordinal;
 
     IF FOUND THEN
-        IF v_existing_source_subxid IS DISTINCT FROM p_source_subxid
-           OR v_existing_source_oid IS DISTINCT FROM p_source_oid
+        IF v_existing_source_oid IS DISTINCT FROM p_source_oid
            OR v_existing_weight IS DISTINCT FROM p_weight
            OR v_existing_payload IS DISTINCT FROM p_typed_payload THEN
             RAISE EXCEPTION USING
@@ -460,7 +423,6 @@ BEGIN
         change_lsn,
         change_ordinal,
         image_ordinal,
-        source_subxid,
         input_seq,
         source_oid,
         weight,
@@ -472,28 +434,12 @@ BEGIN
         p_change_lsn,
         p_change_ordinal,
         p_image_ordinal,
-        p_source_subxid,
         input_seq,
         p_source_oid,
         p_weight,
         p_typed_payload,
         v_payload_bytes
     );
-
-    -- The transaction header lock serializes first-event registration.  This
-    -- is append-only and idempotent; a later event for the same subxid never
-    -- changes its immutable first_input_seq.
-    INSERT INTO shiba_internal.ingress_subxacts (
-        ingress_txn_id,
-        source_subxid,
-        first_input_seq
-    )
-    VALUES (
-        p_ingress_txn_id,
-        p_source_subxid,
-        input_seq
-    )
-    ON CONFLICT (ingress_txn_id, source_subxid) DO NOTHING;
 
     -- Lock-order level 4: per-transaction source set.
     INSERT INTO shiba_internal.ingress_sources (
@@ -523,7 +469,6 @@ $$;
 --   "change_lsn": "0/16B6A20",
 --   "change_ordinal": 0,
 --   "image_ordinal": 0,
---   "source_subxid": 812,
 --   "source_oid": 16384,
 --   "weight": 1,
 --   "typed_payload": {...}
@@ -581,7 +526,6 @@ BEGIN
                v_event ? 'change_lsn'
                AND v_event ? 'change_ordinal'
                AND v_event ? 'image_ordinal'
-               AND v_event ? 'source_subxid'
                AND v_event ? 'source_oid'
                AND v_event ? 'weight'
                AND v_event ? 'typed_payload'
@@ -603,7 +547,6 @@ BEGIN
                    (v_event ->> 'change_lsn')::pg_lsn,
                    (v_event ->> 'change_ordinal')::bigint,
                    (v_event ->> 'image_ordinal')::integer,
-                   (v_event ->> 'source_subxid')::bigint,
                    (v_event ->> 'source_oid')::oid,
                    (v_event ->> 'weight')::bigint,
                    v_event -> 'typed_payload'
@@ -668,211 +611,6 @@ BEGIN
 END;
 $$;
 
--- Record a streamed subtransaction abort without rewriting its durable
--- payload.  The Runtime passes the top-level xid and subxid from StreamAbort
--- plus a stable enclosing replication-message LSN.  Replaying the same
--- control identity is idempotent; conflicting identities fail closed.
-CREATE FUNCTION shiba_internal.rollback_ingress_subtransaction(
-    p_ingress_txn_id bigint,
-    p_top_xid bigint,
-    p_aborted_subxid bigint,
-    p_control_lsn pg_lsn
-)
-RETURNS TABLE (
-    recorded boolean,
-    from_input_seq bigint,
-    through_input_seq bigint
-)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-    v_slot_generation bigint;
-    v_source_xid bigint;
-    v_status text;
-    v_streamed boolean;
-    v_identity_lsn pg_lsn;
-    v_next_input_seq bigint;
-    v_existing_subxid bigint;
-    v_existing_control_lsn pg_lsn;
-BEGIN
-    IF p_ingress_txn_id IS NULL
-       OR p_top_xid IS NULL
-       OR p_aborted_subxid IS NULL
-       OR p_control_lsn IS NULL THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '22004',
-            MESSAGE = 'ingress subtransaction rollback fields must not contain NULL';
-    END IF;
-
-    IF p_top_xid NOT BETWEEN 0 AND 4294967295
-       OR p_aborted_subxid NOT BETWEEN 0 AND 4294967295 THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '22023',
-            MESSAGE = 'ingress rollback xid is outside the PostgreSQL xid range';
-    END IF;
-
-    IF p_top_xid = p_aborted_subxid THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '22023',
-            MESSAGE = 'top-level StreamAbort must use abort_ingress_transaction';
-    END IF;
-
-    SELECT txn.slot_generation
-      INTO STRICT v_slot_generation
-      FROM shiba_internal.ingress_transactions AS txn
-     WHERE txn.ingress_txn_id = p_ingress_txn_id;
-
-    -- Lock-order levels 1 then 2.  The header lock fixes the interval upper
-    -- bound against concurrent event allocation for this source transaction.
-    PERFORM 1
-      FROM shiba_internal.ingress_replay_state AS replay
-     WHERE replay.slot_generation = v_slot_generation
-       AND replay.state = 'active'
-     FOR UPDATE;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55000',
-            MESSAGE = format(
-                'ingress slot generation %s is not active',
-                v_slot_generation
-            );
-    END IF;
-
-    SELECT txn.source_xid,
-           txn.status,
-           txn.streamed,
-           txn.identity_lsn,
-           txn.next_input_seq
-      INTO STRICT v_source_xid,
-                  v_status,
-                  v_streamed,
-                  v_identity_lsn,
-                  v_next_input_seq
-      FROM shiba_internal.ingress_transactions AS txn
-     WHERE txn.ingress_txn_id = p_ingress_txn_id
-     FOR UPDATE;
-
-    IF v_status <> 'open' THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55000',
-            MESSAGE = format(
-                'cannot roll back a subtransaction of ingress transaction %s in state %s',
-                p_ingress_txn_id,
-                v_status
-            );
-    END IF;
-
-    IF NOT v_streamed THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55000',
-            MESSAGE = format(
-                'cannot roll back a subtransaction of ordinary ingress transaction %s',
-                p_ingress_txn_id
-            );
-    END IF;
-
-    IF v_source_xid IS DISTINCT FROM p_top_xid THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'XX001',
-            MESSAGE = format(
-                'ingress StreamAbort top xid %s conflicts with transaction %s source xid %s',
-                p_top_xid,
-                p_ingress_txn_id,
-                v_source_xid
-            );
-    END IF;
-
-    IF p_control_lsn < v_identity_lsn THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '22023',
-            MESSAGE = format(
-                'rollback control LSN %s precedes transaction identity LSN %s',
-                p_control_lsn,
-                v_identity_lsn
-            );
-    END IF;
-
-    SELECT rollback.aborted_subxid,
-           rollback.from_input_seq,
-           rollback.through_input_seq
-      INTO v_existing_subxid,
-           from_input_seq,
-           through_input_seq
-      FROM shiba_internal.ingress_rollbacks AS rollback
-     WHERE rollback.ingress_txn_id = p_ingress_txn_id
-       AND rollback.control_lsn = p_control_lsn;
-
-    IF FOUND THEN
-        IF v_existing_subxid IS DISTINCT FROM p_aborted_subxid THEN
-            RAISE EXCEPTION USING
-                ERRCODE = 'XX001',
-                MESSAGE = format(
-                    'ingress rollback control identity conflict for transaction %s at %s',
-                    p_ingress_txn_id,
-                    p_control_lsn
-                );
-        END IF;
-
-        recorded := false;
-        RETURN NEXT;
-        RETURN;
-    END IF;
-
-    SELECT rollback.control_lsn
-      INTO v_existing_control_lsn
-      FROM shiba_internal.ingress_rollbacks AS rollback
-     WHERE rollback.ingress_txn_id = p_ingress_txn_id
-       AND rollback.aborted_subxid = p_aborted_subxid;
-
-    IF FOUND THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'XX001',
-            MESSAGE = format(
-                'ingress subtransaction %s already rolled back at control LSN %s',
-                p_aborted_subxid,
-                v_existing_control_lsn
-            );
-    END IF;
-
-    SELECT subxact.first_input_seq
-      INTO from_input_seq
-      FROM shiba_internal.ingress_subxacts AS subxact
-     WHERE subxact.ingress_txn_id = p_ingress_txn_id
-       AND subxact.source_subxid = p_aborted_subxid;
-
-    IF NOT FOUND THEN
-        -- Empty streamed subtransactions have no payload boundary to mask.
-        recorded := false;
-        through_input_seq := NULL;
-        RETURN NEXT;
-        RETURN;
-    END IF;
-
-    through_input_seq := v_next_input_seq;
-
-    INSERT INTO shiba_internal.ingress_rollbacks (
-        ingress_txn_id,
-        from_input_seq,
-        through_input_seq,
-        aborted_subxid,
-        control_lsn
-    )
-    VALUES (
-        p_ingress_txn_id,
-        from_input_seq,
-        through_input_seq,
-        p_aborted_subxid,
-        p_control_lsn
-    );
-
-    recorded := true;
-    RETURN NEXT;
-END;
-$$;
-
 CREATE FUNCTION shiba_internal.record_ingress_batch(
     p_slot_generation bigint,
     p_decode_end_lsn pg_lsn,
@@ -880,15 +618,13 @@ CREATE FUNCTION shiba_internal.record_ingress_batch(
     p_event_count bigint,
     p_payload_bytes bigint
 )
-RETURNS TABLE (
-    inserted boolean,
-    persisted_lsn pg_lsn
-)
+RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+    v_inserted boolean;
     v_existing_digest bytea;
     v_existing_event_count bigint;
     v_existing_payload_bytes bigint;
@@ -903,7 +639,8 @@ BEGIN
             MESSAGE = 'ingress batch fields must not contain NULL';
     END IF;
 
-    -- Lock-order level 1.  This serializes persisted_lsn advancement.
+    -- Lock-order level 1. This prevents generation retirement while the
+    -- bounded batch is being checkpointed.
     PERFORM 1
       FROM shiba_internal.ingress_replay_state AS replay
      WHERE replay.slot_generation = p_slot_generation
@@ -937,7 +674,7 @@ BEGIN
     )
     ON CONFLICT (slot_generation, decode_end_lsn, message_digest) DO NOTHING;
 
-    inserted := FOUND;
+    v_inserted := FOUND;
 
     SELECT batch.message_digest,
            batch.event_count,
@@ -963,19 +700,10 @@ BEGIN
             );
     END IF;
 
-    UPDATE shiba_internal.ingress_replay_state AS replay
-       SET persisted_lsn = CASE
-               WHEN replay.persisted_lsn IS NULL
-                 OR replay.persisted_lsn < p_decode_end_lsn
-               THEN p_decode_end_lsn
-               ELSE replay.persisted_lsn
-           END,
-           updated_at = clock_timestamp()
-     WHERE replay.slot_generation = p_slot_generation
-     RETURNING replay.persisted_lsn
-          INTO persisted_lsn;
-
-    RETURN NEXT;
+    -- Prefix batches are durable and idempotent but never advance the
+    -- replication acknowledgement boundary. Only transaction finalization
+    -- has enough database state to do that safely.
+    RETURN v_inserted;
 END;
 $$;
 
@@ -997,8 +725,7 @@ AS $$
 DECLARE
     v_slot_generation bigint;
     v_status text;
-    v_streamed boolean;
-    v_identity_lsn pg_lsn;
+    v_final_lsn pg_lsn;
     v_existing_commit_lsn pg_lsn;
     v_existing_end_lsn pg_lsn;
 BEGIN
@@ -1019,18 +746,26 @@ BEGIN
     PERFORM 1
       FROM shiba_internal.ingress_replay_state AS replay
      WHERE replay.slot_generation = v_slot_generation
+       AND replay.state = 'active'
      FOR UPDATE;
 
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = format(
+                'ingress slot generation %s is not active',
+                v_slot_generation
+            );
+    END IF;
+
     SELECT txn.status,
-           txn.streamed,
-           txn.identity_lsn,
+           txn.final_lsn,
            txn.commit_lsn,
            txn.end_lsn,
            txn.event_count,
            txn.payload_bytes
       INTO STRICT v_status,
-                  v_streamed,
-                  v_identity_lsn,
+                  v_final_lsn,
                   v_existing_commit_lsn,
                   v_existing_end_lsn,
                   event_count,
@@ -1039,27 +774,19 @@ BEGIN
      WHERE txn.ingress_txn_id = p_ingress_txn_id
      FOR UPDATE;
 
-    IF (v_streamed AND p_commit_lsn < v_identity_lsn)
-       OR (NOT v_streamed AND p_commit_lsn <> v_identity_lsn)
+    IF p_commit_lsn <> v_final_lsn
        OR p_end_lsn < p_commit_lsn THEN
         RAISE EXCEPTION USING
             ERRCODE = '22023',
             MESSAGE = format(
-                'invalid commit/end LSNs %s/%s for transaction beginning at %s',
+                'invalid commit/end LSNs %s/%s for Begin.final_lsn %s',
                 p_commit_lsn,
                 p_end_lsn,
-                v_identity_lsn
+                v_final_lsn
             );
     END IF;
 
-    IF v_status = 'aborted' THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55000',
-            MESSAGE = format(
-                'cannot commit aborted ingress transaction %s',
-                p_ingress_txn_id
-            );
-    ELSIF v_status = 'committed' THEN
+    IF v_status = 'committed' THEN
         IF v_existing_commit_lsn IS DISTINCT FROM p_commit_lsn
            OR v_existing_end_lsn IS DISTINCT FROM p_end_lsn THEN
             RAISE EXCEPTION USING
@@ -1123,120 +850,18 @@ BEGIN
             );
     END IF;
 
-    RETURN NEXT;
-END;
-$$;
-
-CREATE FUNCTION shiba_internal.abort_ingress_transaction(
-    p_ingress_txn_id bigint,
-    p_end_lsn pg_lsn
-)
-RETURNS TABLE (
-    finalized boolean,
-    event_count bigint,
-    payload_bytes bigint
-)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-    v_slot_generation bigint;
-    v_status text;
-    v_streamed boolean;
-    v_identity_lsn pg_lsn;
-    v_existing_end_lsn pg_lsn;
-BEGIN
-    IF p_ingress_txn_id IS NULL OR p_end_lsn IS NULL THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '22004',
-            MESSAGE = 'ingress abort fields must not contain NULL';
-    END IF;
-
-    SELECT txn.slot_generation
-      INTO STRICT v_slot_generation
-      FROM shiba_internal.ingress_transactions AS txn
-     WHERE txn.ingress_txn_id = p_ingress_txn_id;
-
-    -- Lock-order levels 1 then 2.
-    PERFORM 1
-      FROM shiba_internal.ingress_replay_state AS replay
-     WHERE replay.slot_generation = v_slot_generation
-     FOR UPDATE;
-
-    SELECT txn.status,
-           txn.streamed,
-           txn.identity_lsn,
-           txn.end_lsn,
-           txn.event_count,
-           txn.payload_bytes
-      INTO STRICT v_status,
-                  v_streamed,
-                  v_identity_lsn,
-                  v_existing_end_lsn,
-                  event_count,
-                  payload_bytes
-      FROM shiba_internal.ingress_transactions AS txn
-     WHERE txn.ingress_txn_id = p_ingress_txn_id
-     FOR UPDATE;
-
-    IF NOT v_streamed THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55000',
-            MESSAGE = format(
-                'ordinary ingress transaction %s cannot receive StreamAbort',
-                p_ingress_txn_id
-            );
-    END IF;
-
-    IF p_end_lsn < v_identity_lsn THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '22023',
-            MESSAGE = format(
-                'abort LSN %s precedes transaction identity LSN %s',
-                p_end_lsn,
-                v_identity_lsn
-            );
-    END IF;
-
-    IF v_status = 'committed' THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55000',
-            MESSAGE = format(
-                'cannot abort committed ingress transaction %s',
-                p_ingress_txn_id
-            );
-    ELSIF v_status = 'aborted' THEN
-        IF v_existing_end_lsn IS DISTINCT FROM p_end_lsn THEN
-            RAISE EXCEPTION USING
-                ERRCODE = 'XX001',
-                MESSAGE = format(
-                    'ingress abort identity conflict for transaction %s',
-                    p_ingress_txn_id
-                );
-        END IF;
-        finalized := false;
-    ELSE
-        UPDATE shiba_internal.ingress_transactions AS txn
-           SET status = 'aborted',
-               end_lsn = p_end_lsn,
-               finalized_at = clock_timestamp()
-         WHERE txn.ingress_txn_id = p_ingress_txn_id;
-        finalized := true;
-    END IF;
-
-    IF EXISTS (
-        SELECT 1
-          FROM shiba_internal.routing_tasks AS task
-         WHERE task.ingress_txn_id = p_ingress_txn_id
-    ) THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'XX001',
-            MESSAGE = format(
-                'aborted ingress transaction %s has a routing task',
-                p_ingress_txn_id
-            );
-    END IF;
+    -- This is the only API that advances durable replication progress.
+    -- Header finalization, routing-task creation, and this watermark update
+    -- commit or roll back together.
+    UPDATE shiba_internal.ingress_replay_state AS replay
+       SET persisted_lsn = CASE
+               WHEN replay.persisted_lsn IS NULL
+                 OR replay.persisted_lsn < p_end_lsn
+               THEN p_end_lsn
+               ELSE replay.persisted_lsn
+           END,
+           updated_at = clock_timestamp()
+     WHERE replay.slot_generation = v_slot_generation;
 
     RETURN NEXT;
 END;
@@ -1566,20 +1191,15 @@ REVOKE ALL ON FUNCTION
     shiba_internal.retire_ingress_generation(name)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
-    shiba_internal.claim_ingress_transaction(bigint, bigint, boolean, pg_lsn)
+    shiba_internal.claim_ingress_transaction(bigint, bigint, pg_lsn)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
     shiba_internal.insert_ingress_event(
-        bigint, pg_lsn, bigint, integer, bigint, oid, bigint, jsonb
+        bigint, pg_lsn, bigint, integer, oid, bigint, jsonb
     )
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
     shiba_internal.insert_ingress_events(bigint, jsonb)
-    FROM PUBLIC;
-REVOKE ALL ON FUNCTION
-    shiba_internal.rollback_ingress_subtransaction(
-        bigint, bigint, bigint, pg_lsn
-    )
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
     shiba_internal.record_ingress_batch(
@@ -1588,9 +1208,6 @@ REVOKE ALL ON FUNCTION
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
     shiba_internal.commit_ingress_transaction(bigint, pg_lsn, pg_lsn)
-    FROM PUBLIC;
-REVOKE ALL ON FUNCTION
-    shiba_internal.abort_ingress_transaction(bigint, pg_lsn)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
     shiba_internal.route_ingress_page(integer)

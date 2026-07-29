@@ -8,7 +8,7 @@ set -euo pipefail
 # Required implementation contract:
 #   backend_type = 'shiba runtime'
 #   shiba_internal.runtime_state singleton ownership row
-#   shiba_internal.change_log(commit_lsn,sequence,source_oid,delta,row_data)
+#   shiba_internal.effective_change_log(commit_lsn,sequence,source_oid,delta,row_data)
 #   shiba_internal.dag_inbox(result_oid,commit_lsn), with no payload columns
 #
 # Tunables:
@@ -177,6 +177,8 @@ cargo pgrx install --pg-config "${pg_config_path}"
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
+  printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s'\n" \
+    "${pg_socket_dir}" "${pg_port}" "${database_name}" "$(id -un)"
 } >>"${pg_data_dir}/postgresql.conf"
 
 "${pg_bin_dir}/pg_ctl" \
@@ -251,19 +253,19 @@ psql_arch -qc "
   COMMIT"
 wait_for_query "1" "
   SELECT count(DISTINCT commit_lsn)
-  FROM shiba_internal.change_log
+  FROM shiba_internal.effective_change_log
   WHERE source_oid='public.arch_shared_source'::regclass
     AND row_data->>'event_id'='700001'" \
   "the shared source transaction to be routed"
 shared_lsn="$(psql_arch -Atqc "
   SELECT min(commit_lsn)
-  FROM shiba_internal.change_log
+  FROM shiba_internal.effective_change_log
   WHERE source_oid='public.arch_shared_source'::regclass
     AND row_data->>'event_id'='700001'")"
 assert_query "3|3|{1,-1,1}" "
   SELECT count(*) || '|' || count(DISTINCT sequence) || '|' ||
          array_agg(delta ORDER BY sequence)::text
-  FROM shiba_internal.change_log
+  FROM shiba_internal.effective_change_log
   WHERE commit_lsn='${shared_lsn}'::pg_lsn
     AND source_oid='public.arch_shared_source'::regclass
     AND row_data->>'event_id'='700001'"
@@ -295,7 +297,7 @@ assert_query "1|3" "
      WHERE result_oid='shiba.arch_shared_b'::regclass
        AND commit_lsn='${shared_lsn}'::pg_lsn)
     || '|' ||
-    (SELECT count(*) FROM shiba_internal.change_log
+    (SELECT count(*) FROM shiba_internal.effective_change_log
      WHERE commit_lsn='${shared_lsn}'::pg_lsn)"
 
 set_dag_active "shiba.arch_shared_b" true
@@ -304,11 +306,11 @@ wait_for_query "0" "
   WHERE commit_lsn='${shared_lsn}'::pg_lsn" \
   "the final shared-payload reference to be acknowledged"
 wait_for_query "0" "
-  SELECT count(*) FROM shiba_internal.change_log
+  SELECT count(*) FROM shiba_internal.effective_change_log
   WHERE commit_lsn='${shared_lsn}'::pg_lsn" \
   "bounded GC to remove unreferenced shared payload"
 wait_for_query "0" "
-  SELECT count(*) FROM shiba_internal.routed_transactions
+  SELECT count(*) FROM shiba_internal.ingress_transactions
   WHERE commit_lsn='${shared_lsn}'::pg_lsn" \
   "bounded GC to remove the unreferenced transaction header"
 wait_for_result "public.arch_shared_source" "shiba.arch_shared_a"
@@ -455,7 +457,7 @@ runtime_pid="$(psql_arch -Atqc "
 psql_arch -qc "
   INSERT INTO public.arch_fair_source_b VALUES (730002,2,200)"
 assert_query "0" "
-  SELECT count(*) FROM shiba_internal.change_log
+  SELECT count(*) FROM shiba_internal.effective_change_log
   WHERE source_oid='public.arch_fair_source_b'::regclass
     AND row_data->>'event_id'='730002'"
 assert_query "${runtime_pid}|1" "
@@ -544,7 +546,7 @@ wait_for_query "false|true" "
   WHERE result_oid='shiba.arch_poison_result'::regclass" \
   "only the poison DAG to be quarantined"
 poison_lsn="$(psql_arch -Atqc "
-  SELECT commit_lsn FROM shiba_internal.change_log
+  SELECT commit_lsn FROM shiba_internal.effective_change_log
   WHERE source_oid='public.arch_poison_source'::regclass
     AND row_data->>'event_id'='740001'")"
 assert_query "1|2" "
@@ -553,7 +555,7 @@ assert_query "1|2" "
      WHERE result_oid='shiba.arch_poison_result'::regclass
        AND commit_lsn='${poison_lsn}'::pg_lsn)
     || '|' ||
-    (SELECT count(*) FROM shiba_internal.change_log
+    (SELECT count(*) FROM shiba_internal.effective_change_log
      WHERE commit_lsn='${poison_lsn}'::pg_lsn)"
 wait_for_result "public.arch_healthy_source" "shiba.arch_healthy_result"
 psql_arch -Atqc "SELECT shiba.activate()" >/dev/null
@@ -577,11 +579,11 @@ wait_for_query "0" "
   "the repaired DAG to replay retained input"
 wait_for_result "public.arch_poison_source" "shiba.arch_poison_result"
 wait_for_query "0" "
-  SELECT count(*) FROM shiba_internal.change_log
+  SELECT count(*) FROM shiba_internal.effective_change_log
   WHERE commit_lsn='${poison_lsn}'::pg_lsn" \
   "GC after repaired poison input is acknowledged"
 wait_for_query "0" "
-  SELECT count(*) FROM shiba_internal.routed_transactions
+  SELECT count(*) FROM shiba_internal.ingress_transactions
   WHERE commit_lsn='${poison_lsn}'::pg_lsn" \
   "GC of the repaired poison transaction header"
 
@@ -605,7 +607,7 @@ wait_for_query "1" "
 drop_result_oid="$(psql_arch -Atqc "
   SELECT 'shiba.arch_drop_result'::regclass::oid::integer")"
 drop_lsn="$(psql_arch -Atqc "
-  SELECT commit_lsn FROM shiba_internal.change_log
+  SELECT commit_lsn FROM shiba_internal.effective_change_log
   WHERE source_oid='public.arch_drop_source'::regclass
     AND row_data->>'event_id'='750001'")"
 psql_arch -qc "DROP TABLE shiba.arch_drop_result"
@@ -634,11 +636,11 @@ assert_query "0" "
     UNION ALL SELECT count(*) FROM shiba_internal.dag_runtime_state WHERE result_oid=${drop_result_oid}::oid
   ) residual"
 wait_for_query "0" "
-  SELECT count(*) FROM shiba_internal.change_log
+  SELECT count(*) FROM shiba_internal.effective_change_log
   WHERE commit_lsn='${drop_lsn}'::pg_lsn" \
   "DROP to release the final reference for GC"
 wait_for_query "0" "
-  SELECT count(*) FROM shiba_internal.routed_transactions
+  SELECT count(*) FROM shiba_internal.ingress_transactions
   WHERE commit_lsn='${drop_lsn}'::pg_lsn" \
   "DROP to permit transaction-header GC"
 assert_one_runtime

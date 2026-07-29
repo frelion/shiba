@@ -1,6 +1,6 @@
-# V2 replication ingress design
+# Durable replication ingress design
 
-Status: implementation contract
+Status: current implementation contract
 
 Target: PostgreSQL 17
 
@@ -13,7 +13,7 @@ connection.
 ```text
 source transactions
   -> WAL
-  -> PostgreSQL walsender / pgoutput v2
+  -> PostgreSQL walsender / pgoutput protocol v2
   -> replication CopyData
   -> Shiba Runtime bounded ingress transaction
   -> durable change log
@@ -42,7 +42,7 @@ database. The connection:
 
 - uses `replication=database`;
 - starts `pgoutput` with `proto_version '2'`,
-  `publication_names 'shiba_publication'`, and `streaming 'on'`;
+  `publication_names 'shiba_publication'`, and `streaming 'off'`;
 - is nonblocking after connection establishment;
 - is polled only outside an SPI transaction;
 - reconnects from durable ingress progress after errors;
@@ -57,10 +57,26 @@ socket, or an equivalent PostgreSQL mechanism supplies credentials.
 The replication connection, its receive buffer, relation metadata cache, and
 all parser state are disposable. LOGGED PostgreSQL relations are authoritative.
 
+With transaction streaming disabled, PostgreSQL owns savepoint,
+subtransaction rollback, and top-level abort semantics. Its logical-decoding
+reorder buffer spills beyond `logical_decoding_work_mem` and emits only the
+final committed transaction. Shiba still receives that output as individual
+CopyData messages and persists bounded batches; it never materializes the
+whole transaction in Runtime memory.
+
+The authoritative catalog is:
+
+- `ingress_replay_state`: slot generation and the persisted, confirmed, and
+  replay-safe LSN fences;
+- `ingress_transactions`: one header per source transaction;
+- `change_log`: payload stored once regardless of DAG fan-out;
+- `routing_tasks`: resumable subscriber fan-out;
+- `dag_inbox`: one `(result_oid, ingress_txn_id)` work reference.
+
 An open source transaction is identified by:
 
 ```text
-(slot_generation, xid, identity_lsn)
+(slot_generation, xid, final_lsn)
 ```
 
 One decoded row image is identified by:
@@ -73,8 +89,8 @@ Replay of the same identity and payload is a no-op. Replay of the same identity
 with a different source, weight, or payload is corruption.
 
 Open and committed transaction payload uses the same physical durable event
-rows. Receiving `Stream Commit` updates only the transaction header and creates
-a routing task; it does not rewrite every payload row.
+rows. Receiving the ordinary Commit message updates only the transaction
+header and creates a routing task; it does not rewrite every payload row.
 
 ## Batch and transaction boundary
 
@@ -82,10 +98,7 @@ The Runtime receives complete protocol messages until one of these conditions:
 
 - ingress row budget;
 - ingress byte budget;
-- `Stream Stop`;
 - ordinary Commit;
-- `Stream Commit`;
-- `Stream Abort`;
 - scheduler fairness deadline.
 
 It then opens one SPI transaction and atomically:
@@ -94,38 +107,44 @@ It then opens one SPI transaction and atomically:
 2. inserts events idempotently in wire order;
 3. records the replication batch and its ending WAL position;
 4. advances durable counters and input sequence;
-5. records commit or abort control state when present.
+5. records commit control state when present.
 
 No replication socket read or wait occurs inside that SPI transaction.
 
-After commit, the Runtime may send a Standby Status Update. The reported flush
-and apply LSN MUST NOT exceed the greatest committed ingress batch. Reporting
-an LSN before the corresponding LOGGED commit is data loss.
+Prefix batches of an ordinary source transaction never advance
+`persisted_lsn` and never produce replication feedback. Only the batch
+containing Commit may atomically advance durable progress to `Commit.end_lsn`.
+After that database commit, the Runtime may send a Standby Status Update.
+Reporting an LSN before the entire source transaction is durably finalized is
+data loss.
 
 A crash after ingress commit but before feedback causes replay and
 deduplication. A crash after feedback can still replay from an older
 checkpoint, so event identities remain retained behind the conservative
 `replay_safe_lsn` GC fence.
 
-## Scheduling
+## Scheduling and apply
 
-One Runtime turn performs at most:
+One Runtime loop interleaves:
 
-1. one bounded ingress transaction, if a complete message batch is ready;
-2. one bounded DAG work quantum selected fairly;
-3. bounded ingress, Stage, and task GC when due.
+1. one bounded ingress transaction when a complete message batch is ready;
+2. one bounded routing page;
+3. one complete source transaction for one DAG selected round-robin;
+4. bounded ingress, Stage, and task GC.
 
 The Runtime does not wait indefinitely for replication input. When the socket
 has no complete message, DAG work remains eligible immediately.
 
-## Delivery stages
+Applying a DAG commit is atomic today: operator state, result rows,
+`view_progress`, and deletion of the exact inbox identity commit together.
+Ingress is bounded independently, so an arbitrarily large source transaction
+does not need to fit in Runtime memory. Socket backpressure pauses the
+walsender while the Runtime commits a batch. A highly expanding operator can still
+make its apply transaction large; resumable operator output is a separate
+execution feature, not part of ingress correctness.
 
-1. Replication transport and protocol-v2 parser.
-2. Durable provisional ingress and replay-safe feedback.
-3. Bounded commit finalization and routing.
-4. Existing DAG reader migration to the new transaction-header/event schema.
-5. Large-transaction, interleaving, crash, memory, and performance gates.
+## Removed architecture
 
-The old protocol-v1 SQL SRF router remains available only until stages 2–4 are
-complete. V2 MUST NOT claim bounded large-transaction ingress while that path
-is active.
+There is no protocol-v1 SQL decoding fallback, slot-peek loop,
+`routed_transactions` catalog, per-DAG background worker, or worker pool.
+Activation fails closed unless `shiba.replication_conninfo` is configured.

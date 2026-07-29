@@ -19,7 +19,6 @@ pub(crate) struct IngressEvent {
     pub change_lsn: u64,
     pub change_ordinal: u64,
     pub image_ordinal: u32,
-    pub source_subxid: u32,
     pub source_oid: u32,
     pub weight: i64,
     pub payload: Value,
@@ -28,15 +27,12 @@ pub(crate) struct IngressEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum IngressFinalization {
     Commit { commit_lsn: u64, end_lsn: u64 },
-    Abort { end_lsn: u64 },
-    SubtransactionAbort { subxid: u32, control_lsn: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct IngressBatch {
     pub source_xid: u32,
-    pub streamed: bool,
-    pub identity_lsn: u64,
+    pub final_lsn: u64,
     pub decode_end_lsn: u64,
     pub digest: [u8; 32],
     pub message_count: u64,
@@ -95,33 +91,14 @@ impl From<ReplicationError> for IngressError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ActiveSegment {
-    Ordinary { xid: u32, first_lsn: u64 },
-    Streaming { xid: u32, first_lsn: u64 },
-}
-
-impl ActiveSegment {
-    fn xid(self) -> u32 {
-        match self {
-            Self::Ordinary { xid, .. } | Self::Streaming { xid, .. } => xid,
-        }
-    }
-
-    fn first_lsn(self) -> u64 {
-        match self {
-            Self::Ordinary { first_lsn, .. } | Self::Streaming { first_lsn, .. } => first_lsn,
-        }
-    }
-
-    fn is_streamed(self) -> bool {
-        matches!(self, Self::Streaming { .. })
-    }
+struct ActiveTransaction {
+    xid: u32,
+    final_lsn: u64,
 }
 
 struct PendingBatch {
     source_xid: u32,
-    streamed: bool,
-    identity_lsn: u64,
+    final_lsn: u64,
     decode_end_lsn: u64,
     hasher: Sha256,
     message_count: u64,
@@ -131,12 +108,14 @@ struct PendingBatch {
 }
 
 impl PendingBatch {
-    fn new(segment: ActiveSegment) -> Self {
+    fn new(transaction: ActiveTransaction) -> Self {
         Self {
-            source_xid: segment.xid(),
-            streamed: segment.is_streamed(),
-            identity_lsn: segment.first_lsn(),
-            decode_end_lsn: segment.first_lsn(),
+            source_xid: transaction.xid,
+            final_lsn: transaction.final_lsn,
+            // This is the greatest wire position actually observed in this
+            // batch. Begin.final_lsn identifies the whole transaction and
+            // must never be treated as durable progress for a prefix batch.
+            decode_end_lsn: 0,
             hasher: Sha256::new(),
             message_count: 0,
             wire_bytes: 0,
@@ -171,8 +150,7 @@ impl PendingBatch {
     fn finish(self) -> IngressBatch {
         IngressBatch {
             source_xid: self.source_xid,
-            streamed: self.streamed,
-            identity_lsn: self.identity_lsn,
+            final_lsn: self.final_lsn,
             decode_end_lsn: self.decode_end_lsn,
             digest: self.hasher.finalize().into(),
             message_count: self.message_count,
@@ -187,26 +165,20 @@ pub(crate) struct ReplicationIngress {
     transport: ReplicationTransport,
     relations: HashMap<u32, Vec<String>>,
     max_cached_relations: usize,
-    open_streams: HashMap<u32, u64>,
-    active_segment: Option<ActiveSegment>,
+    active_transaction: Option<ActiveTransaction>,
     last_change_lsn: HashMap<u32, (u64, u64)>,
     pending: Option<PendingBatch>,
     reply_requested: bool,
 }
 
 impl ReplicationIngress {
-    pub(crate) fn new(
-        transport: ReplicationTransport,
-        open_streams: impl IntoIterator<Item = (u32, u64)>,
-        max_cached_relations: usize,
-    ) -> Self {
+    pub(crate) fn new(transport: ReplicationTransport, max_cached_relations: usize) -> Self {
         assert!(max_cached_relations > 0);
         Self {
             transport,
             relations: HashMap::new(),
             max_cached_relations,
-            open_streams: open_streams.into_iter().collect(),
-            active_segment: None,
+            active_transaction: None,
             last_change_lsn: HashMap::new(),
             pending: None,
             reply_requested: false,
@@ -288,59 +260,43 @@ impl ReplicationIngress {
     }
 
     fn process_pgoutput(&mut self, wal_start: u64, payload: &[u8]) -> Result<bool, IngressError> {
-        let context = match self.active_segment {
-            Some(ActiveSegment::Streaming { .. }) => ParseContext::Streaming,
-            _ => ParseContext::NonStreaming,
-        };
-        let message =
-            pgoutput::parse_with_context(payload, context).map_err(IngressError::Protocol)?;
+        let message = pgoutput::parse_with_context(payload, ParseContext::NonStreaming)
+            .map_err(IngressError::Protocol)?;
 
         let mut boundary = false;
         match message {
             Message::Begin { final_lsn, xid } => {
-                if self.active_segment.is_some() {
+                if self.active_transaction.is_some() {
                     return Err(IngressError::State(
-                        "ordinary BEGIN arrived inside an active segment".into(),
+                        "BEGIN arrived inside an active transaction".into(),
                     ));
                 }
-                let segment = ActiveSegment::Ordinary {
+                let transaction = ActiveTransaction {
                     xid,
                     // Begin.final_lsn is the stable transaction identity.
                     // XLogData.wal_start is only an envelope position.
-                    first_lsn: final_lsn,
+                    final_lsn,
                 };
-                self.active_segment = Some(segment);
-                self.ensure_pending(segment)?;
+                self.active_transaction = Some(transaction);
+                self.ensure_pending(transaction)?;
             }
-            Message::StreamStart { xid, first_segment } => {
-                if self.active_segment.is_some() {
-                    return Err(IngressError::State(
-                        "Stream Start arrived inside an active segment".into(),
-                    ));
-                }
-                let first_lsn = if first_segment {
-                    // "first" is scoped to the current decoding session.  A
-                    // reconnect after a durably persisted mid-transaction
-                    // position can emit another first segment for an already
-                    // open durable transaction; preserve its original key.
-                    *self.open_streams.entry(xid).or_insert(wal_start)
-                } else {
-                    *self.open_streams.get(&xid).ok_or_else(|| {
-                        IngressError::State(format!("later stream segment for unknown xid {xid}"))
-                    })?
-                };
-                let segment = ActiveSegment::Streaming { xid, first_lsn };
-                self.active_segment = Some(segment);
-                self.ensure_pending(segment)?;
+            Message::StreamStart { .. }
+            | Message::StreamStop
+            | Message::StreamCommit { .. }
+            | Message::StreamAbort { .. } => {
+                return Err(IngressError::State(
+                    "received a streamed-transaction message while pgoutput streaming is disabled"
+                        .into(),
+                ));
             }
             Message::Relation {
                 source_xid,
                 relid,
                 columns,
             } => {
-                let segment = self.require_active_segment("Relation")?;
-                self.validate_message_xid(segment, source_xid, "Relation")?;
-                self.ensure_pending(segment)?;
+                let transaction = self.require_active_transaction("Relation")?;
+                self.validate_message_xid(source_xid, "Relation")?;
+                self.ensure_pending(transaction)?;
                 if !self.relations.contains_key(&relid)
                     && self.relations.len() >= self.max_cached_relations
                 {
@@ -352,24 +308,25 @@ impl ReplicationIngress {
                 self.relations.insert(relid, columns);
             }
             Message::Type { source_xid, .. } => {
-                let segment = self.require_active_segment("Type")?;
-                self.validate_message_xid(segment, source_xid, "Type")?;
-                self.ensure_pending(segment)?;
+                let transaction = self.require_active_transaction("Type")?;
+                self.validate_message_xid(source_xid, "Type")?;
+                self.ensure_pending(transaction)?;
             }
             Message::Origin { .. } => {
-                let segment = self.require_ordinary_segment("Origin")?;
-                self.ensure_pending(segment)?;
+                let transaction = self.require_active_transaction("Origin")?;
+                self.ensure_pending(transaction)?;
             }
-            Message::LogicalMessage {
+            Message::Logical {
                 source_xid,
                 transactional,
                 ..
             } => {
                 if transactional {
-                    let segment = self.require_active_segment("transactional logical Message")?;
-                    self.validate_message_xid(segment, source_xid, "logical Message")?;
-                    self.ensure_pending(segment)?;
-                } else if self.active_segment.is_some() {
+                    let transaction =
+                        self.require_active_transaction("transactional logical Message")?;
+                    self.validate_message_xid(source_xid, "logical Message")?;
+                    self.ensure_pending(transaction)?;
+                } else if self.active_transaction.is_some() {
                     return Err(IngressError::State(
                         "non-transactional logical Message arrived inside a source transaction"
                             .into(),
@@ -381,8 +338,8 @@ impl ReplicationIngress {
                 relid,
                 row,
             } => {
-                let source_subxid = self.source_subxid(source_xid, "Insert")?;
-                self.push_change(wal_start, source_subxid, relid, &[(0, 1, row)])?;
+                self.validate_message_xid(source_xid, "Insert")?;
+                self.push_change(wal_start, relid, &[(0, 1, row)])?;
             }
             Message::Update {
                 source_xid,
@@ -390,21 +347,16 @@ impl ReplicationIngress {
                 old,
                 new,
             } => {
-                let source_subxid = self.source_subxid(source_xid, "Update")?;
-                self.push_change(
-                    wal_start,
-                    source_subxid,
-                    relid,
-                    &[(0, -1, old), (1, 1, new)],
-                )?;
+                self.validate_message_xid(source_xid, "Update")?;
+                self.push_change(wal_start, relid, &[(0, -1, old), (1, 1, new)])?;
             }
             Message::Delete {
                 source_xid,
                 relid,
                 old,
             } => {
-                let source_subxid = self.source_subxid(source_xid, "Delete")?;
-                self.push_change(wal_start, source_subxid, relid, &[(0, -1, old)])?;
+                self.validate_message_xid(source_xid, "Delete")?;
+                self.push_change(wal_start, relid, &[(0, -1, old)])?;
             }
             Message::Truncate { .. } => {
                 return Err(IngressError::State(
@@ -412,86 +364,29 @@ impl ReplicationIngress {
                         .into(),
                 ));
             }
-            Message::StreamStop => {
-                let segment = self.require_streaming_segment("Stream Stop")?;
-                self.ensure_pending(segment)?;
-                self.active_segment = None;
-                boundary = true;
-            }
             Message::Commit {
                 commit_lsn,
                 end_lsn,
             } => {
-                let segment = self.require_ordinary_segment("COMMIT")?;
-                let pending = self.ensure_pending(segment)?;
+                let transaction = self.require_active_transaction("COMMIT")?;
+                let pending = self.ensure_pending(transaction)?;
                 pending.decode_end_lsn = end_lsn;
                 pending.finalization = Some(IngressFinalization::Commit {
                     commit_lsn,
                     end_lsn,
                 });
-                self.active_segment = None;
-                self.last_change_lsn.remove(&segment.xid());
-                boundary = true;
-            }
-            Message::StreamCommit {
-                xid,
-                commit_lsn,
-                end_lsn,
-                ..
-            } => {
-                if self.active_segment.is_some() {
-                    return Err(IngressError::State(
-                        "Stream Commit arrived inside an active segment".into(),
-                    ));
-                }
-                let first_lsn = *self.open_streams.get(&xid).ok_or_else(|| {
-                    IngressError::State(format!("Stream Commit for unknown xid {xid}"))
-                })?;
-                let segment = ActiveSegment::Streaming { xid, first_lsn };
-                let pending = self.ensure_pending(segment)?;
-                pending.decode_end_lsn = end_lsn;
-                pending.finalization = Some(IngressFinalization::Commit {
-                    commit_lsn,
-                    end_lsn,
-                });
-                self.open_streams.remove(&xid);
-                self.last_change_lsn.remove(&xid);
-                boundary = true;
-            }
-            Message::StreamAbort { xid, subxid } => {
-                if self.active_segment.is_some() {
-                    return Err(IngressError::State(
-                        "Stream Abort arrived inside an active segment".into(),
-                    ));
-                }
-                let first_lsn = *self.open_streams.get(&xid).ok_or_else(|| {
-                    IngressError::State(format!("Stream Abort for unknown xid {xid}"))
-                })?;
-                let segment = ActiveSegment::Streaming { xid, first_lsn };
-                let pending = self.ensure_pending(segment)?;
-                if xid == subxid {
-                    pending.finalization = Some(IngressFinalization::Abort { end_lsn: wal_start });
-                    self.open_streams.remove(&xid);
-                    self.last_change_lsn.remove(&xid);
-                } else {
-                    pending.finalization = Some(IngressFinalization::SubtransactionAbort {
-                        subxid,
-                        control_lsn: wal_start,
-                    });
-                }
+                self.active_transaction = None;
+                self.last_change_lsn.remove(&transaction.xid);
                 boundary = true;
             }
         }
 
-        let segment = self
-            .pending
-            .as_ref()
-            .map(|pending| ActiveSegment::Streaming {
-                xid: pending.source_xid,
-                first_lsn: pending.identity_lsn,
-            });
-        if let Some(segment) = segment {
-            let pending = self.ensure_pending(segment)?;
+        let transaction = self.pending.as_ref().map(|pending| ActiveTransaction {
+            xid: pending.source_xid,
+            final_lsn: pending.final_lsn,
+        });
+        if let Some(transaction) = transaction {
+            let pending = self.ensure_pending(transaction)?;
             pending.observe_frame(wal_start, payload)?;
         }
         Ok(boundary)
@@ -500,12 +395,11 @@ impl ReplicationIngress {
     fn push_change(
         &mut self,
         wal_start: u64,
-        source_subxid: u32,
         relid: u32,
         images: &[(u32, i64, Tuple)],
     ) -> Result<(), IngressError> {
-        let segment = self.require_active_segment("row change")?;
-        let xid = segment.xid();
+        let transaction = self.require_active_transaction("row change")?;
+        let xid = transaction.xid;
         let change_ordinal = match self.last_change_lsn.get_mut(&xid) {
             Some((last_lsn, next_ordinal)) if *last_lsn == wal_start => {
                 let ordinal = *next_ordinal;
@@ -528,89 +422,53 @@ impl ReplicationIngress {
                 change_lsn: wal_start,
                 change_ordinal,
                 image_ordinal: *image_ordinal,
-                source_subxid,
                 source_oid: relid,
                 weight: *weight,
                 payload: tuple_to_json(tuple, columns)?,
             });
         }
-        self.ensure_pending(segment)?.events.extend(converted);
+        self.ensure_pending(transaction)?.events.extend(converted);
         Ok(())
-    }
-
-    fn source_subxid(
-        &self,
-        source_xid: Option<u32>,
-        message: &'static str,
-    ) -> Result<u32, IngressError> {
-        let segment = self.require_active_segment(message)?;
-        self.validate_message_xid(segment, source_xid, message)?;
-        Ok(source_xid.unwrap_or_else(|| segment.xid()))
     }
 
     fn validate_message_xid(
         &self,
-        segment: ActiveSegment,
         source_xid: Option<u32>,
         message: &'static str,
     ) -> Result<(), IngressError> {
-        match (segment, source_xid) {
-            (ActiveSegment::Ordinary { .. }, None) | (ActiveSegment::Streaming { .. }, Some(_)) => {
-                Ok(())
-            }
-            (ActiveSegment::Ordinary { .. }, Some(_)) => Err(IngressError::State(format!(
-                "{message} used a streamed xid inside an ordinary transaction"
-            ))),
-            (ActiveSegment::Streaming { .. }, None) => Err(IngressError::State(format!(
-                "{message} omitted its xid inside a streamed transaction"
-            ))),
+        self.require_active_transaction(message)?;
+        if source_xid.is_none() {
+            Ok(())
+        } else {
+            Err(IngressError::State(format!(
+                "{message} carried a streamed xid while pgoutput streaming is disabled"
+            )))
         }
     }
 
     fn ensure_pending(
         &mut self,
-        segment: ActiveSegment,
+        transaction: ActiveTransaction,
     ) -> Result<&mut PendingBatch, IngressError> {
         if let Some(pending) = self.pending.as_ref() {
-            if pending.source_xid != segment.xid() || pending.identity_lsn != segment.first_lsn() {
+            if pending.source_xid != transaction.xid || pending.final_lsn != transaction.final_lsn {
                 return Err(IngressError::State(
                     "one ingress batch crossed source transactions".into(),
                 ));
             }
         } else {
-            self.pending = Some(PendingBatch::new(segment));
+            self.pending = Some(PendingBatch::new(transaction));
         }
         Ok(self.pending.as_mut().expect("pending batch initialized"))
     }
 
-    fn require_active_segment(&self, message: &'static str) -> Result<ActiveSegment, IngressError> {
-        self.active_segment.ok_or_else(|| {
+    fn require_active_transaction(
+        &self,
+        message: &'static str,
+    ) -> Result<ActiveTransaction, IngressError> {
+        self.active_transaction.ok_or_else(|| {
             IngressError::State(format!("{message} arrived outside a source transaction"))
         })
-    }
-
-    fn require_streaming_segment(
-        &self,
-        message: &'static str,
-    ) -> Result<ActiveSegment, IngressError> {
-        match self.require_active_segment(message)? {
-            segment @ ActiveSegment::Streaming { .. } => Ok(segment),
-            ActiveSegment::Ordinary { .. } => Err(IngressError::State(format!(
-                "{message} arrived inside an ordinary transaction"
-            ))),
-        }
-    }
-
-    fn require_ordinary_segment(
-        &self,
-        message: &'static str,
-    ) -> Result<ActiveSegment, IngressError> {
-        match self.require_active_segment(message)? {
-            segment @ ActiveSegment::Ordinary { .. } => Ok(segment),
-            ActiveSegment::Streaming { .. } => Err(IngressError::State(format!(
-                "{message} arrived inside a streamed segment"
-            ))),
-        }
     }
 }
 
@@ -653,20 +511,20 @@ mod tests {
 
     #[test]
     fn pending_batch_digest_includes_wal_position_and_frame_boundary() {
-        let segment = ActiveSegment::Streaming {
+        let transaction = ActiveTransaction {
             xid: 7,
-            first_lsn: 10,
+            final_lsn: 10,
         };
-        let mut first = PendingBatch::new(segment);
+        let mut first = PendingBatch::new(transaction);
         first.observe_frame(10, b"ab").unwrap();
-        let mut second = PendingBatch::new(segment);
+        let mut second = PendingBatch::new(transaction);
         second.observe_frame(11, b"ab").unwrap();
-        let mut third = PendingBatch::new(segment);
+        let mut third = PendingBatch::new(transaction);
         third.observe_frame(10, b"a").unwrap();
         third.observe_frame(10, b"b").unwrap();
         assert_ne!(first.finish().digest, second.finish().digest);
         assert_ne!(
-            PendingBatch::new(segment).finish().digest,
+            PendingBatch::new(transaction).finish().digest,
             third.finish().digest
         );
     }
