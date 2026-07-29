@@ -12,16 +12,45 @@ from committed WAL changes—no refresh and no source-table rescan.
 > supports a validated SQL subset. It is not yet a general-purpose streaming
 > platform or a distributed execution engine.
 
-## The whole idea
+## How it works
+
+When you declare a Shiba result table, Shiba validates the query, computes the
+initial rows, and saves a plan for maintaining them. That happens once.
+
+After that, follow one ordinary source-table commit:
 
 ```text
-SQL declaration -> logical plan -> committed WAL -> row deltas -> result table
+INSERT / UPDATE / DELETE
+          │ COMMIT
+          ▼
+    PostgreSQL WAL
+          │
+          ▼
+  shared change_log
+          │
+          ▼
+ per-result inbox task
+          │
+          ▼
+ saved plan + SQL kernels
+          │
+          ▼
+      result table
 ```
 
-There is one background Runtime per database. It reads one durable change log,
-schedules every result in turn, and commits result changes with its progress
-checkpoint. That is the architecture; the rest of the project makes those
-boundaries safe.
+Each database has one Shiba background process called the Runtime. PostgreSQL
+logical decoding has its own walsender; Shiba adds no Router or worker pool.
+The Runtime reads committed WAL, saves each source transaction once in the
+change log, and gives every affected result table a small inbox task. It then
+processes those tasks in turn.
+
+For one task, the Runtime updates operator state, result rows, and progress,
+then removes the inbox task—all in one PostgreSQL transaction. If it crashes,
+WAL is replayed, the inbox task remains, or the whole update rolls back. It can
+therefore retry without rescanning the source table.
+
+The [architecture walkthrough](docs/ARCHITECTURE.md) follows this exact path
+step by step and then explains registration, recovery, and limits.
 
 New to Rust? Follow the [guided Rust code tour](docs/LEARNING_RUST.md). It starts
 with small round-trip helpers and builds up to binary protocols, state
@@ -34,13 +63,9 @@ source data. Shiba turns a PostgreSQL result table into an incrementally
 maintained projection:
 
 - source writes remain fast because maintenance is asynchronous;
-- only committed changes are consumed from PostgreSQL logical decoding;
-- result state, output rows, progress, and inbox acknowledgement commit
-  atomically per source transaction;
-- crash recovery is based on durable commit-LSN checkpoints and idempotent
-  replay;
-- the implementation is intentionally one process and one visible data path,
-  so its correctness story can be inspected rather than assumed.
+- result updates consume committed deltas instead of rescanning source tables;
+- one Shiba worker and one visible queue path make the implementation readable
+  end to end.
 
 ## Quick start
 
@@ -102,43 +127,6 @@ semi/anti joins from `EXISTS` and `IN`, grouped `COUNT`/`SUM`,
 partitioned windows. The exact contract and rejected SQL shapes are documented
 in [docs/MVP.md](docs/MVP.md).
 
-## Read the architecture
-
-```text
-Analyzed PostgreSQL Query
-  -> validated logical plan
-  -> CTAS backfill and registration
-  -> persisted versioned PhysicalDagPlan
-  -> pgoutput logical replication
-  -> one database-scoped shiba runtime
-       -> bounded WAL routing
-       -> shared durable change_log
-       -> lightweight per-DAG inbox references
-       -> round-robin DagRuntime scheduling
-       -> set-oriented physical Stages
-       -> bounded change-log garbage collection
-  -> operator state and result table
-```
-
-Three invariants organize the implementation:
-
-1. Rust owns PostgreSQL hooks, WAL decoding, plan validation, and the one
-   database-scoped Runtime; SQL owns catalogs and set-oriented operator kernels.
-2. A row delta is stored once in `change_log`; each result receives only an
-   inbox reference to the source transaction.
-3. Result state, progress, and inbox acknowledgement commit atomically. Failed
-   results keep their replay input and are quarantined independently.
-
-Inspect the persisted physical plan with:
-
-```sql
-SELECT shiba.explain_physical('shiba.order_stats');
-```
-
-See the [guided code tour](docs/LEARNING_RUST.md) for the reading order and
-[detailed architecture](docs/ARCHITECTURE.md) for execution and recovery
-invariants.
-
 ## Development and testing
 
 ```bash
@@ -147,12 +135,7 @@ cargo clippy --all-targets -- -D warnings
 ./scripts/test-all.sh
 ```
 
-The full correctness gate covers unit tests, real PostgreSQL 17 end-to-end
-tests, differential checks, join behavior, concurrency, transaction recovery,
-failpoint recovery, physical-Stage lifecycle, and the single-Runtime
-architecture. Performance acceptance uses the complete unfiltered,
-three-repetition matrix and a matched retained baseline; smoke or filtered
-runs are diagnostic only. See
+The complete correctness and performance gates are documented in
 [docs/TESTING.md](docs/TESTING.md).
 
 ## Releases
