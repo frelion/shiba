@@ -1,0 +1,1918 @@
+//! Scalar control flow for a durable Distinct.
+//!
+//! PostgreSQL owns typed keys, representative rows, multiplicities, and the
+//! set transition. Rust owns only the immutable input position, bounded
+//! counters, and whether the pinned chunk is data or a frontier.
+
+use pgrx::datum::DatumWithOid;
+use pgrx::prelude::*;
+use pgrx::spi::{SpiClient, SpiTupleTable};
+
+use crate::kernel::{InputPosition, OutputFacts, PrimitiveFacts};
+use crate::logical::model::{DataflowPlan, DataflowStage, OperatorSpec};
+use crate::logical::StepOutcome;
+use crate::logical::WorkBudget;
+use crate::postgres::{format_lsn, quote_identifier};
+use crate::scalar_sql::compile_scalar_expression;
+
+use super::btree::{
+    resolve_client as resolve_btree_client, resolve_step as resolve_btree_step, BtreeOrder,
+};
+use super::register::{
+    catalog_continuation, catalog_state, column_sql, qualified_internal, resolve_relation_oid,
+};
+use super::{
+    advance_input, append_frontier, attribute_matches_slot, canonical_row_key_sql,
+    compile_named_outputs, compile_stage_bindings, next_chunk, payload_facts,
+    validate_output_attributes, BindingInput, ChunkKind, ChunkMeta, ProducerKind, RelationRef,
+    StepTxn, TypeRef, WorkUsage,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DistinctPhase {
+    Apply,
+    Drain,
+    Frontier,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DistinctContinuation {
+    pub(crate) input: InputPosition,
+    pub(crate) phase: DistinctPhase,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct OccupancyDiff {
+    /// Typed keys whose signed occupancy changed in the admitted prefix.
+    pub(crate) touched_keys: u64,
+    /// Durable external effects produced or queued by the primitive.
+    pub(crate) external_effects: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DistinctAction {
+    ApplyPrefix { input: InputPosition },
+    DrainEffects { input: InputPosition },
+    ForwardFrontier { input: InputPosition },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AppliedPrefix {
+    pub(crate) facts: PrimitiveFacts,
+    pub(crate) occupancy: OccupancyDiff,
+    /// `Some` resumes the same immutable chunk. `None` means the primitive
+    /// atomically advanced the input consumer past the completed chunk.
+    pub(crate) next: Option<DistinctContinuation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DistinctActionResult {
+    Applied(AppliedPrefix),
+    Drained(AppliedPrefix),
+    FrontierForwarded(PrimitiveFacts),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DistinctTransition {
+    Committed {
+        continuation: Option<DistinctContinuation>,
+        facts: PrimitiveFacts,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DistinctMachine;
+
+impl DistinctMachine {
+    pub(crate) fn action(
+        self,
+        continuation: DistinctContinuation,
+    ) -> Result<DistinctAction, String> {
+        validate_input(continuation.input)?;
+        if continuation.phase == DistinctPhase::Frontier && continuation.input.row_ordinal != 0 {
+            return Err("Distinct frontier has a data-row position".into());
+        }
+        Ok(match continuation.phase {
+            DistinctPhase::Apply => DistinctAction::ApplyPrefix {
+                input: continuation.input,
+            },
+            DistinctPhase::Drain => DistinctAction::DrainEffects {
+                input: continuation.input,
+            },
+            DistinctPhase::Frontier => DistinctAction::ForwardFrontier {
+                input: continuation.input,
+            },
+        })
+    }
+
+    /// Facts are applied only after their database transaction commits. A
+    /// crash before commit leaves `continuation` authoritative and therefore
+    /// proposes precisely the same action on restart.
+    pub(crate) fn apply(
+        self,
+        continuation: DistinctContinuation,
+        result: DistinctActionResult,
+        budget: WorkBudget,
+    ) -> Result<DistinctTransition, String> {
+        let expected = self.action(continuation)?;
+        match (expected, result) {
+            (DistinctAction::ApplyPrefix { input }, DistinctActionResult::Applied(page)) => {
+                self.apply_prefix(input, page, budget, true)
+            }
+            (DistinctAction::DrainEffects { input }, DistinctActionResult::Drained(page)) => {
+                self.apply_prefix(input, page, budget, false)
+            }
+            (
+                DistinctAction::ForwardFrontier { .. },
+                DistinctActionResult::FrontierForwarded(facts),
+            ) => self.apply_frontier(facts, budget),
+            _ => Err("database returned facts for another Distinct phase".into()),
+        }
+    }
+
+    fn apply_prefix(
+        self,
+        input: InputPosition,
+        page: AppliedPrefix,
+        budget: WorkBudget,
+        consumes_input: bool,
+    ) -> Result<DistinctTransition, String> {
+        page.facts.validate(budget)?;
+        if consumes_input && page.facts.usage.input_rows == 0 {
+            return Err("Distinct prefix made no bounded input progress".into());
+        }
+        if !consumes_input
+            && (page.facts.usage.input_rows != 0 || page.facts.usage.input_bytes != 0)
+        {
+            return Err("Distinct drain consumed input".into());
+        }
+        if consumes_input && page.occupancy.touched_keys > page.facts.usage.input_rows {
+            return Err("Distinct typed occupancy summary is inconsistent".into());
+        }
+        if consumes_input
+            && (page.facts.usage.output_rows != 0
+                || !matches!(page.facts.output, OutputFacts::None)
+                || (page.occupancy.external_effects > 0
+                    && !matches!(
+                        page.next,
+                        Some(DistinctContinuation {
+                            phase: DistinctPhase::Drain,
+                            ..
+                        })
+                    ))
+                || (page.occupancy.external_effects == 0
+                    && matches!(
+                        page.next,
+                        Some(DistinctContinuation {
+                            phase: DistinctPhase::Drain,
+                            ..
+                        })
+                    )))
+        {
+            return Err("Distinct Apply/Drain handoff is inconsistent".into());
+        }
+        if !consumes_input && page.occupancy.external_effects != page.facts.usage.output_rows {
+            return Err("Distinct drain effect summary is inconsistent".into());
+        }
+        match page.facts.output {
+            OutputFacts::None if page.facts.usage.output_rows == 0 => {}
+            OutputFacts::Data { .. } if page.facts.usage.output_rows > 0 => {}
+            _ => return Err("Distinct output chunk disagrees with its occupancy diff".into()),
+        }
+        if matches!(page.facts.output, OutputFacts::Frontier { .. }) {
+            return Err("Distinct input prefix emitted a frontier".into());
+        }
+
+        let continuation = match page.next {
+            Some(next) => {
+                validate_input(next.input)?;
+                if next.input.stream_id != input.stream_id
+                    || next.input.chunk_seq != input.chunk_seq
+                    || (consumes_input && next.input.row_ordinal <= input.row_ordinal)
+                    || (!consumes_input && next.input.row_ordinal != input.row_ordinal)
+                    || next.phase == DistinctPhase::Frontier
+                {
+                    return Err("Distinct continuation did not advance its input".into());
+                }
+                Some(next)
+            }
+            None => None,
+        };
+        if page.facts.continuation_rows != u64::from(continuation.is_some()) {
+            return Err("Distinct checkpoint disagrees with its continuation row".into());
+        }
+        Ok(DistinctTransition::Committed {
+            continuation,
+            facts: page.facts,
+        })
+    }
+
+    fn apply_frontier(
+        self,
+        facts: PrimitiveFacts,
+        budget: WorkBudget,
+    ) -> Result<DistinctTransition, String> {
+        facts.validate(budget)?;
+        if !matches!(facts.output, OutputFacts::Frontier { .. })
+            || facts.usage.input_rows != 0
+            || facts.usage.input_bytes != 0
+            || facts.state_rows != 0
+            || facts.continuation_rows != 0
+        {
+            return Err("Distinct frontier commit is inconsistent".into());
+        }
+        Ok(DistinctTransition::Committed {
+            continuation: None,
+            facts,
+        })
+    }
+}
+
+fn validate_input(input: InputPosition) -> Result<(), String> {
+    if input.stream_id <= 0 || input.chunk_seq <= 0 || input.row_ordinal < 0 {
+        return Err("Distinct input position is invalid".into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StoredContinuation {
+    value: DistinctContinuation,
+    persisted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrefixFacts {
+    usage: WorkUsage,
+    next_row: i64,
+    touched_keys: u64,
+    queued_effects: u64,
+    state_rows: u64,
+}
+
+struct PrefixSql<'a> {
+    input: &'a RelationRef,
+    output_type: &'a TypeRef,
+    state: &'a RelationRef,
+    bag: &'a RelationRef,
+    queue: &'a RelationRef,
+    touched: &'a RelationRef,
+    keys: &'a [String],
+    key_orders: &'a [BtreeOrder],
+    expressions: &'a [String],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DrainFacts {
+    facts: PrimitiveFacts,
+    remaining_effects: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReconcileFacts {
+    queued_effects: u64,
+    state_rows: u64,
+}
+
+/// Create the exact-key state, physical representative bag, pending effect
+/// queue, and phaseful continuation used by one Distinct stage.
+pub(crate) fn provision(
+    client: &mut SpiClient<'_>,
+    result_oid: pg_sys::Oid,
+    stage_id: i32,
+    stage: &DataflowStage,
+    input_streams: &[i64],
+    output_stream: i64,
+) -> Result<(), String> {
+    let OperatorSpec::Distinct(spec) = &stage.spec else {
+        return Err("Distinct provisioner received another operator".into());
+    };
+    if result_oid == pg_sys::InvalidOid
+        || stage_id < 0
+        || input_streams.len() != 1
+        || input_streams[0] <= 0
+        || output_stream <= 0
+        || spec.keys.is_empty()
+        || spec.outputs.is_empty()
+    {
+        return Err(format!(
+            "Distinct stage {stage_id} has an invalid storage contract"
+        ));
+    }
+    let output = super::storage::payload(client, output_stream)?;
+    let output_attributes = super::storage::composite_attributes(client, &output.row_type)?;
+    if output_attributes.len() != stage.schema.outputs.len() {
+        return Err("Distinct output payload does not match its plan schema".into());
+    }
+
+    let result_number = result_oid.to_u32();
+    let key_columns = (1..=spec.keys.len())
+        .map(|index| format!("key_{index}"))
+        .collect::<Vec<_>>();
+    let key_definitions = key_columns
+        .iter()
+        .zip(&spec.keys)
+        .map(|(column, key)| {
+            Ok(format!(
+                "{} {}",
+                quote_identifier(column),
+                column_sql(client, &key.type_)?
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let key_index = key_columns
+        .iter()
+        .zip(&spec.keys)
+        .map(|(column, key)| {
+            resolve_btree_client(client, key, "Distinct").map(|order| order.index_column(column))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let state = create_distinct_state(
+        client,
+        result_oid,
+        stage_id,
+        0,
+        &format!("distinct_groups_r{result_number}_s{stage_id}"),
+        &format!(
+            "group_state_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+             {},
+             output_key bytea,
+             output_row {},
+             multiplicity bigint NOT NULL DEFAULT 0 CHECK(multiplicity >= 0),
+             CHECK((multiplicity=0)=(output_key IS NULL)),
+             CHECK((multiplicity=0)=((output_row)::text IS NULL))",
+            key_definitions.join(","),
+            output.row_type.sql(),
+        ),
+    )?;
+    let state_index =
+        quote_identifier(&format!("distinct_groups_key_r{result_number}_s{stage_id}"));
+    client
+        .update(
+            &format!(
+                "CREATE UNIQUE INDEX {state_index} ON {state}({})
+                 NULLS NOT DISTINCT",
+                key_index.join(",")
+            ),
+            None,
+            &[],
+        )
+        .map_err(|error| {
+            format!("Distinct stage {stage_id} keys lack exact B-tree semantics: {error}")
+        })?;
+    create_distinct_state(
+        client,
+        result_oid,
+        stage_id,
+        1,
+        &format!("distinct_bag_r{result_number}_s{stage_id}"),
+        &format!(
+            "bag_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+             group_state_id bigint NOT NULL REFERENCES {state}(group_state_id)
+               ON DELETE RESTRICT,
+             output_key bytea NOT NULL,
+             output_row {} NOT NULL,
+             multiplicity bigint NOT NULL CHECK(multiplicity > 0),
+             UNIQUE(group_state_id,output_key)",
+            output.row_type.sql(),
+        ),
+    )?;
+    create_distinct_state(
+        client,
+        result_oid,
+        stage_id,
+        2,
+        &format!("distinct_effect_queue_r{result_number}_s{stage_id}"),
+        &format!(
+            "queue_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+             output_key bytea NOT NULL,
+             weight bigint NOT NULL CHECK(weight IN (-1,1)),
+             output_row {} NOT NULL,
+             row_bytes bigint NOT NULL CHECK(row_bytes > 0),
+             causal_lsn pg_lsn NOT NULL",
+            output.row_type.sql(),
+        ),
+    )?;
+    create_distinct_state(
+        client,
+        result_oid,
+        stage_id,
+        3,
+        &format!("distinct_touched_r{result_number}_s{stage_id}"),
+        "group_state_id bigint PRIMARY KEY,
+         net_weight numeric NOT NULL",
+    )?;
+
+    let continuation_name = format!("continuation_r{result_number}_s{stage_id}");
+    let continuation = qualified_internal(&continuation_name);
+    client
+        .update(
+            &format!(
+                "CREATE TABLE {continuation}(
+                   singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+                   phase smallint NOT NULL CHECK(phase IN (1,2)),
+                   input_stream_id bigint NOT NULL,
+                   input_chunk_seq bigint NOT NULL CHECK(input_chunk_seq > 0),
+                   next_row_ordinal bigint NOT NULL CHECK(next_row_ordinal >= 0),
+                   FOREIGN KEY(input_stream_id,input_chunk_seq)
+                     REFERENCES shiba_internal.effect_stream_chunks(
+                       stream_id,chunk_seq
+                     ) ON DELETE RESTRICT
+                 )"
+            ),
+            None,
+            &[],
+        )
+        .map_err(|error| format!("could not create Distinct continuation: {error}"))?;
+    revoke_distinct_relation(client, &continuation, "continuation")?;
+    let continuation_oid = resolve_relation_oid(client, &continuation)?;
+    catalog_continuation(client, result_oid, stage_id, continuation_oid)
+}
+
+fn create_distinct_state(
+    client: &mut SpiClient<'_>,
+    result_oid: pg_sys::Oid,
+    stage_id: i32,
+    slot: i32,
+    name: &str,
+    body: &str,
+) -> Result<String, String> {
+    let relation = qualified_internal(name);
+    client
+        .update(&format!("CREATE TABLE {relation}({body})"), None, &[])
+        .map_err(|error| {
+            format!("could not create Distinct stage {stage_id} state slot {slot}: {error}")
+        })?;
+    revoke_distinct_relation(client, &relation, "state")?;
+    let relation_oid = resolve_relation_oid(client, &relation)?;
+    catalog_state(client, result_oid, stage_id, slot, relation_oid)?;
+    Ok(relation)
+}
+
+fn revoke_distinct_relation(
+    client: &mut SpiClient<'_>,
+    relation: &str,
+    label: &str,
+) -> Result<(), String> {
+    client
+        .update(
+            &format!("REVOKE ALL ON TABLE {relation} FROM PUBLIC"),
+            None,
+            &[],
+        )
+        .map_err(|error| format!("could not protect Distinct {label}: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn execute(
+    mut transaction: StepTxn<'_, '_>,
+    plan: &DataflowPlan,
+    stage_id: u32,
+) -> Result<StepOutcome, String> {
+    let stage = plan
+        .stages
+        .get(usize::try_from(stage_id).map_err(|_| "Distinct stage ID exceeds usize")?)
+        .ok_or_else(|| format!("dataflow has no Distinct stage {stage_id}"))?;
+    let OperatorSpec::Distinct(spec) = &stage.spec else {
+        return Err("Distinct executor received another operator".into());
+    };
+    if transaction.inputs().len() != 1
+        || transaction.input(0)?.producer != ProducerKind::Operator
+        || stage.inputs.len() != 1
+    {
+        return Err("Distinct must have one operator input".into());
+    }
+    let input = transaction.input(0)?.clone();
+    let continuation_relation = transaction.continuation_storage()?;
+    validate_continuation_abi(&mut transaction, &continuation_relation)?;
+    let mut stored = load_continuation(
+        &mut transaction,
+        &continuation_relation,
+        input.stream_id,
+        input.next_chunk_seq,
+    )?;
+    if stored.persisted != transaction.checkpoint_had_continuation() {
+        return Err("Distinct checkpoint disagrees with its continuation".into());
+    }
+    let chunk = next_chunk(&mut transaction, 0)?
+        .ok_or_else(|| "runnable Distinct has no input chunk".to_string())?;
+    if stored.persisted {
+        if chunk.kind != ChunkKind::Data || stored.value.phase == DistinctPhase::Frontier {
+            return Err("Distinct continuation is not pinned to a data chunk".into());
+        }
+    } else {
+        stored.value.phase = match chunk.kind {
+            ChunkKind::Data => DistinctPhase::Apply,
+            ChunkKind::Frontier => DistinctPhase::Frontier,
+        };
+    }
+    let queue = transaction.state_storage(2)?;
+    let touched = transaction.state_storage(3)?;
+    require_empty_touched(&mut transaction, &touched)?;
+
+    if stored.value.phase == DistinctPhase::Frontier {
+        if stored.value.input.row_ordinal != 0 {
+            return Err("Distinct frontier has a row continuation".into());
+        }
+        require_empty_queue(&mut transaction, &queue)?;
+        let output = append_frontier(&mut transaction, chunk.lsn)?;
+        advance_input(
+            &mut transaction,
+            0,
+            chunk.sequence + 1,
+            chunk.lsn,
+            WorkUsage::default(),
+        )?;
+        replace_continuation(&mut transaction, &continuation_relation, stored, None)?;
+        DistinctMachine.apply(
+            stored.value,
+            DistinctActionResult::FrontierForwarded(PrimitiveFacts {
+                output,
+                ..PrimitiveFacts::default()
+            }),
+            transaction.budget(),
+        )?;
+        return transaction.finish(false);
+    }
+
+    let input_storage = transaction.payload_storage(input.stream_id)?;
+    if stored.value.phase == DistinctPhase::Apply && stored.value.input.row_ordinal == 0 {
+        payload_facts(&mut transaction, &input_storage.relation, &chunk)?;
+    }
+    let output = transaction.output()?.clone();
+    let output_storage = transaction.payload_storage(output.stream_id)?;
+    let state = transaction.state_storage(0)?;
+    let bag = transaction.state_storage(1)?;
+    validate_state_abi(
+        &mut transaction,
+        &state,
+        spec.keys.len(),
+        output_storage.row_type.oid(),
+        spec,
+    )?;
+    validate_bag_abi(&mut transaction, &bag, output_storage.row_type.oid())?;
+    validate_queue_abi(&mut transaction, &queue, output_storage.row_type.oid())?;
+    validate_touched_abi(&mut transaction, &touched)?;
+
+    if stored.value.phase == DistinctPhase::Drain {
+        let drained = drain_queue(
+            &mut transaction,
+            &output_storage.relation,
+            &output_storage.row_type,
+            &queue,
+        )?;
+        let next = if drained.remaining_effects > 0 {
+            Some(stored.value)
+        } else {
+            finish_input_position(
+                &mut transaction,
+                &input,
+                &chunk,
+                stored.value.input.row_ordinal,
+            )?
+        };
+        let facts = PrimitiveFacts {
+            continuation_rows: u64::from(next.is_some()),
+            ..drained.facts
+        };
+        let transition = DistinctMachine.apply(
+            stored.value,
+            DistinctActionResult::Drained(AppliedPrefix {
+                facts,
+                occupancy: OccupancyDiff {
+                    touched_keys: 0,
+                    external_effects: facts.usage.output_rows,
+                },
+                next,
+            }),
+            transaction.budget(),
+        )?;
+        let DistinctTransition::Committed { continuation, .. } = transition;
+        replace_continuation(
+            &mut transaction,
+            &continuation_relation,
+            stored,
+            continuation,
+        )?;
+        return transaction.finish(continuation.is_some());
+    }
+
+    require_empty_queue(&mut transaction, &queue)?;
+    let bindings = compile_stage_bindings(
+        &mut transaction,
+        plan,
+        stage,
+        &[BindingInput {
+            row_type: &input_storage.row_type,
+            alias: "input_row",
+        }],
+    )?;
+    let keys = spec
+        .keys
+        .iter()
+        .map(|key| compile_scalar_expression(&key.expr, &bindings))
+        .collect::<Result<Vec<_>, _>>()?;
+    let key_orders = spec
+        .keys
+        .iter()
+        .map(|key| resolve_btree_step(&mut transaction, key, "Distinct"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let output_attributes = transaction.composite_attributes(&output_storage.row_type)?;
+    validate_output_attributes(&output_attributes, &stage.schema.outputs)?;
+    let expressions =
+        compile_named_outputs(&stage.schema.outputs, &spec.outputs, &bindings, "Distinct")?;
+    let facts = run_prefix(
+        &mut transaction,
+        &chunk,
+        stored.value.input.row_ordinal,
+        &PrefixSql {
+            input: &input_storage.relation,
+            output_type: &output_storage.row_type,
+            state: &state,
+            bag: &bag,
+            queue: &queue,
+            touched: &touched,
+            keys: &keys,
+            key_orders: &key_orders,
+            expressions: &expressions,
+        },
+    )?;
+    let next = if facts.queued_effects > 0 {
+        Some(DistinctContinuation {
+            input: InputPosition::new(input.stream_id, chunk.sequence, facts.next_row)?,
+            phase: DistinctPhase::Drain,
+        })
+    } else {
+        finish_input_position(&mut transaction, &input, &chunk, facts.next_row)?
+    };
+    let primitive = PrimitiveFacts {
+        usage: facts.usage,
+        state_rows: facts.state_rows,
+        continuation_rows: u64::from(next.is_some()),
+        output: OutputFacts::None,
+    };
+    let result = DistinctActionResult::Applied(AppliedPrefix {
+        facts: primitive,
+        occupancy: OccupancyDiff {
+            touched_keys: facts.touched_keys,
+            external_effects: facts.queued_effects,
+        },
+        next,
+    });
+    let transition = DistinctMachine.apply(stored.value, result, transaction.budget())?;
+    let DistinctTransition::Committed { continuation, .. } = transition;
+    replace_continuation(
+        &mut transaction,
+        &continuation_relation,
+        stored,
+        continuation,
+    )?;
+    transaction.finish(continuation.is_some())
+}
+
+fn finish_input_position(
+    transaction: &mut StepTxn<'_, '_>,
+    input: &super::InputState,
+    chunk: &ChunkMeta,
+    next_row: i64,
+) -> Result<Option<DistinctContinuation>, String> {
+    let chunk_rows = i64::try_from(chunk.rows).map_err(|_| "Distinct chunk rows exceed bigint")?;
+    if next_row < chunk_rows {
+        return Ok(Some(DistinctContinuation {
+            input: InputPosition::new(input.stream_id, chunk.sequence, next_row)?,
+            phase: DistinctPhase::Apply,
+        }));
+    }
+    if next_row != chunk_rows {
+        return Err("Distinct prefix advanced beyond its input chunk".into());
+    }
+    advance_input(
+        transaction,
+        0,
+        chunk.sequence + 1,
+        input.consumed_frontier_lsn,
+        WorkUsage {
+            input_rows: chunk.rows,
+            input_bytes: chunk.bytes,
+            ..WorkUsage::default()
+        },
+    )?;
+    Ok(None)
+}
+
+fn run_prefix(
+    transaction: &mut StepTxn<'_, '_>,
+    chunk: &ChunkMeta,
+    first_row: i64,
+    sql: &PrefixSql<'_>,
+) -> Result<PrefixFacts, String> {
+    let PrefixSql {
+        input,
+        output_type,
+        state,
+        bag,
+        queue,
+        touched,
+        keys,
+        key_orders,
+        expressions,
+    } = sql;
+    if keys.is_empty() || keys.len() != key_orders.len() || expressions.is_empty() {
+        return Err("Distinct has no exact key or output expression".into());
+    }
+    let budget = transaction.budget();
+    let key_columns = (1..=keys.len())
+        .map(|index| format!("key_{index}"))
+        .collect::<Vec<_>>();
+    let key_column_list = key_columns.join(",");
+    let qualified_key_column_list = key_columns
+        .iter()
+        .map(|column| format!("evaluated_base.{}", quote_identifier(column)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let key_select = keys
+        .iter()
+        .enumerate()
+        .map(|(index, expression)| format!("{expression} AS key_{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let key_order = key_orders
+        .iter()
+        .enumerate()
+        .map(|(index, order)| {
+            format!(
+                "evaluated_base.key_{} USING {} NULLS {}",
+                index + 1,
+                order.sort_operator,
+                if order.nulls_first { "FIRST" } else { "LAST" }
+            )
+        })
+        .chain(std::iter::once("evaluated_base.row_ordinal".into()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let conflict_keys = key_columns
+        .iter()
+        .zip(key_orders.iter())
+        .map(|(column, order)| format!("{} {}", quote_identifier(column), order.opclass))
+        .collect::<Vec<_>>()
+        .join(",");
+    let group_match = key_orders
+        .iter()
+        .enumerate()
+        .map(|(index, order)| {
+            distinct_null_safe_equality(
+                &format!("resolved_groups.key_{}", index + 1),
+                &format!("evaluated_base.key_{}", index + 1),
+                &order.equality_operator,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let output_key = canonical_row_key_sql("incoming.output_row", output_type);
+    let lsn = format_lsn(chunk.lsn);
+    let query = format!(
+        r#"
+        WITH candidates AS MATERIALIZED (
+          SELECT input_row.row_ordinal,input_row.weight,
+                 shiba_internal.effect_row_bytes(input_row.row_value) AS input_bytes,
+                 ROW({expressions})::{output_type} AS output_row,
+                 {key_select}
+          FROM {input} AS input_row
+          WHERE input_row.stream_id=$1 AND input_row.chunk_seq=$2
+            AND input_row.row_ordinal >= $3
+          ORDER BY input_row.row_ordinal
+          LIMIT $4
+        ),
+        measured AS (
+          SELECT candidates.*,
+                 row_number() OVER (ORDER BY row_ordinal) AS page_ordinal,
+                 sum(input_bytes) OVER (ORDER BY row_ordinal) AS running_input_bytes
+          FROM candidates
+        ),
+        incoming AS MATERIALIZED (
+          SELECT * FROM measured
+          WHERE page_ordinal=1 OR running_input_bytes <= $5
+        ),
+        evaluated_base AS MATERIALIZED (
+          SELECT incoming.*,{output_key} AS output_key
+          FROM incoming
+        ),
+        collapsed AS MATERIALIZED (
+          SELECT DISTINCT ON ({qualified_key_column_list})
+                 {qualified_key_column_list}
+          FROM evaluated_base
+          ORDER BY {key_order}
+        ),
+        resolved_groups AS MATERIALIZED (
+          INSERT INTO {state} AS groups({key_column_list})
+          SELECT {key_column_list} FROM collapsed
+          ON CONFLICT({conflict_keys}) DO UPDATE
+          SET multiplicity=groups.multiplicity
+          RETURNING group_state_id,{key_column_list},multiplicity
+        ),
+        evaluated AS MATERIALIZED (
+          SELECT evaluated_base.*,resolved_groups.group_state_id
+          FROM evaluated_base
+          JOIN resolved_groups ON {group_match}
+        ),
+        key_prefixes AS (
+          SELECT evaluated.*,
+                 sum(weight::numeric) OVER (
+                   PARTITION BY group_state_id ORDER BY row_ordinal
+                   ROWS UNBOUNDED PRECEDING
+                 ) AS key_prefix
+          FROM evaluated
+        ),
+        physical_prefixes AS (
+          SELECT key_prefixes.*,
+                 sum(weight::numeric) OVER (
+                   PARTITION BY group_state_id,output_key ORDER BY row_ordinal
+                   ROWS UNBOUNDED PRECEDING
+                 ) AS physical_prefix
+          FROM key_prefixes
+        ),
+        key_collapsed AS MATERIALIZED (
+          SELECT group_state_id,sum(weight::numeric) AS net_weight,
+                 min(key_prefix) AS min_prefix,max(key_prefix) AS max_prefix
+          FROM key_prefixes GROUP BY group_state_id
+        ),
+        physical_collapsed AS MATERIALIZED (
+          SELECT group_state_id,output_key,
+                 (array_agg(output_row ORDER BY row_ordinal))[1] AS incoming_output_row,
+                 sum(weight::numeric) AS net_weight,
+                 min(physical_prefix) AS min_prefix,
+                 max(physical_prefix) AS max_prefix
+          FROM physical_prefixes
+          GROUP BY group_state_id,output_key
+        ),
+        locked_bag AS MATERIALIZED (
+          SELECT locked.*
+          FROM physical_collapsed
+          JOIN LATERAL (
+            SELECT bag.*
+            FROM {bag} AS bag
+            WHERE bag.group_state_id=physical_collapsed.group_state_id
+              AND bag.output_key=physical_collapsed.output_key
+            LIMIT 1
+            FOR UPDATE
+          ) AS locked ON true
+        ),
+        key_decision AS MATERIALIZED (
+          SELECT key_collapsed.group_state_id,
+                 resolved_groups.multiplicity::numeric AS old_multiplicity,
+                 resolved_groups.multiplicity::numeric+key_collapsed.net_weight
+                   AS new_multiplicity,
+                 resolved_groups.multiplicity::numeric+key_collapsed.min_prefix
+                   AS minimum_multiplicity,
+                 resolved_groups.multiplicity::numeric+key_collapsed.max_prefix
+                   AS maximum_multiplicity
+          FROM key_collapsed
+          JOIN resolved_groups USING(group_state_id)
+        ),
+        physical_decision AS MATERIALIZED (
+          SELECT physical_collapsed.*,locked_bag.bag_id,
+                 locked_bag.output_row AS stored_output_row,
+                 coalesce(locked_bag.multiplicity,0)::numeric AS old_multiplicity,
+                 coalesce(locked_bag.multiplicity,0)::numeric
+                   +physical_collapsed.net_weight AS new_multiplicity,
+                 coalesce(locked_bag.multiplicity,0)::numeric
+                   +physical_collapsed.min_prefix AS minimum_multiplicity,
+                 coalesce(locked_bag.multiplicity,0)::numeric
+                   +physical_collapsed.max_prefix AS maximum_multiplicity
+          FROM physical_collapsed
+          LEFT JOIN locked_bag
+            ON locked_bag.group_state_id=physical_collapsed.group_state_id
+           AND locked_bag.output_key=physical_collapsed.output_key
+        ),
+        validation AS MATERIALIZED (
+          SELECT CASE
+            WHEN (SELECT count(*) FROM evaluated)<>
+                 (SELECT count(*) FROM incoming)
+              OR (SELECT count(*) FROM resolved_groups)<>
+                 (SELECT count(*) FROM collapsed)
+              OR (SELECT count(*) FROM key_decision)<>
+                 (SELECT count(*) FROM key_collapsed) THEN 'corrupt'
+            WHEN EXISTS (
+              SELECT 1 FROM key_decision WHERE minimum_multiplicity<0
+            ) OR EXISTS (
+              SELECT 1 FROM physical_decision WHERE minimum_multiplicity<0
+            ) THEN 'negative'
+            WHEN EXISTS (
+              SELECT 1 FROM key_decision
+              WHERE maximum_multiplicity>9223372036854775807
+            ) OR EXISTS (
+              SELECT 1 FROM physical_decision
+              WHERE maximum_multiplicity>9223372036854775807
+            ) THEN 'overflow'
+            ELSE 'ok' END AS status
+        ),
+        bag_removed AS (
+          DELETE FROM {bag} AS bag USING physical_decision,validation
+          WHERE validation.status='ok'
+            AND bag.bag_id=physical_decision.bag_id
+            AND physical_decision.new_multiplicity=0
+          RETURNING 1
+        ),
+        bag_changed AS (
+          UPDATE {bag} AS bag
+          SET multiplicity=physical_decision.new_multiplicity::bigint
+          FROM physical_decision,validation
+          WHERE validation.status='ok'
+            AND bag.bag_id=physical_decision.bag_id
+            AND physical_decision.new_multiplicity>0
+          RETURNING 1
+        ),
+        bag_created AS (
+          INSERT INTO {bag}(group_state_id,output_key,output_row,multiplicity)
+          SELECT physical_decision.group_state_id,physical_decision.output_key,
+                 physical_decision.incoming_output_row,
+                 physical_decision.new_multiplicity::bigint
+          FROM physical_decision,validation
+          WHERE validation.status='ok'
+            AND physical_decision.bag_id IS NULL
+            AND physical_decision.new_multiplicity>0
+          RETURNING 1
+        ),
+        touched_written AS (
+          INSERT INTO {touched}(group_state_id,net_weight)
+          SELECT key_collapsed.group_state_id,key_collapsed.net_weight
+          FROM key_collapsed,validation
+          WHERE validation.status='ok'
+          RETURNING 1
+        )
+        SELECT validation.status,
+               (SELECT count(*)::bigint FROM key_decision),
+               (SELECT count(*)::bigint FROM physical_decision),
+               (SELECT max(row_ordinal)+1 FROM incoming),
+               (SELECT count(*)::bigint FROM incoming),
+               (SELECT coalesce(sum(input_bytes),0)::bigint FROM incoming),
+               (SELECT count(*)::bigint FROM bag_removed)
+                 +(SELECT count(*)::bigint FROM bag_changed)
+                 +(SELECT count(*)::bigint FROM bag_created)
+                 +(SELECT count(*)::bigint FROM resolved_groups)
+                 +(SELECT count(*)::bigint FROM touched_written)
+        FROM validation
+        "#,
+        expressions = expressions.join(","),
+        output_type = output_type.sql(),
+        key_select = key_select,
+        key_column_list = key_column_list,
+        qualified_key_column_list = qualified_key_column_list,
+        key_order = key_order,
+        conflict_keys = conflict_keys,
+        input = input.sql(),
+        output_key = output_key,
+        state = state.sql(),
+        group_match = group_match,
+        bag = bag.sql(),
+        touched = touched.sql(),
+    );
+    let rows = transaction.write(&query, &unsafe {
+        [
+            DatumWithOid::new(chunk.stream_id, pg_sys::INT8OID),
+            DatumWithOid::new(chunk.sequence, pg_sys::INT8OID),
+            DatumWithOid::new(first_row, pg_sys::INT8OID),
+            DatumWithOid::new(i64_from_usize(budget.max_input_rows)?, pg_sys::INT8OID),
+            DatumWithOid::new(i64_from_usize(budget.max_input_bytes)?, pg_sys::INT8OID),
+        ]
+    })?;
+    if rows.len() != 1 {
+        return Err("Distinct Apply returned no summary".into());
+    }
+    let row = rows.first();
+    let status = required::<String>(&row, 1, "Distinct Apply status")?;
+    if status != "ok" {
+        return Err(format!(
+            "Distinct multiplicity transition returned {status}"
+        ));
+    }
+    let touched_keys = nonnegative(required::<i64>(&row, 2, "Distinct touched keys")?)?;
+    let touched_physical =
+        nonnegative(required::<i64>(&row, 3, "Distinct touched physical rows")?)?;
+    let next_row = required::<i64>(&row, 4, "Distinct next row")?;
+    let input_rows = nonnegative(required::<i64>(&row, 5, "Distinct input rows")?)?;
+    let input_bytes = nonnegative(required::<i64>(&row, 6, "Distinct input bytes")?)?;
+    let mutations = nonnegative(required::<i64>(&row, 7, "Distinct mutations")?)?;
+    if touched_keys > input_rows || touched_physical > input_rows {
+        return Err("Distinct Apply exceeded its per-input state bound".into());
+    }
+
+    // A new SPI statement observes the bag mutations. It performs one
+    // `(group_state_id,output_key) LIMIT 1` probe per touched SQL group, so a
+    // group with many SQL-equal physical representations remains bounded.
+    let reconciled =
+        reconcile_representatives(transaction, state, bag, queue, touched, output_type, &lsn)?;
+    if reconciled.queued_effects > input_rows.saturating_mul(2) {
+        return Err("Distinct queued more than two effects per admitted row".into());
+    }
+    Ok(PrefixFacts {
+        usage: WorkUsage {
+            input_rows,
+            input_bytes,
+            ..WorkUsage::default()
+        },
+        next_row,
+        touched_keys,
+        queued_effects: reconciled.queued_effects,
+        state_rows: mutations
+            .checked_add(reconciled.state_rows)
+            .ok_or_else(|| "Distinct state count overflowed".to_string())?,
+    })
+}
+
+fn reconcile_representatives(
+    transaction: &mut StepTxn<'_, '_>,
+    state: &RelationRef,
+    bag: &RelationRef,
+    queue: &RelationRef,
+    touched: &RelationRef,
+    output_type: &TypeRef,
+    lsn: &str,
+) -> Result<ReconcileFacts, String> {
+    let budget = transaction.budget();
+    let canonical_key = canonical_row_key_sql("desired.output_row", output_type);
+    let rows = transaction.write(
+        &format!(
+            r#"
+            WITH touched_page AS MATERIALIZED (
+              DELETE FROM {touched}
+              RETURNING group_state_id,net_weight
+            ),
+            locked AS MATERIALIZED (
+              SELECT locked_group.*
+              FROM touched_page
+              JOIN LATERAL (
+                SELECT groups.*
+                FROM {state} AS groups
+                WHERE groups.group_state_id=touched_page.group_state_id
+                LIMIT 1
+                FOR UPDATE
+              ) AS locked_group ON true
+            ),
+            desired AS MATERIALIZED (
+              SELECT locked.group_state_id,locked.output_key AS old_output_key,
+                     locked.output_row AS old_output_row,
+                     locked.multiplicity::numeric AS old_multiplicity,
+                     locked.multiplicity::numeric+touched_page.net_weight
+                       AS new_multiplicity,
+                     representative.output_key,representative.output_row
+              FROM locked
+              JOIN touched_page USING(group_state_id)
+              LEFT JOIN LATERAL (
+                SELECT bag.output_key,bag.output_row
+                FROM {bag} AS bag
+                WHERE bag.group_state_id=locked.group_state_id
+                ORDER BY bag.output_key
+                LIMIT 1
+              ) AS representative ON true
+            ),
+            validation AS MATERIALIZED (
+              SELECT CASE WHEN EXISTS (
+                SELECT 1
+                WHERE (SELECT count(*) FROM desired)<>
+                      (SELECT count(*) FROM touched_page)
+              ) OR EXISTS (
+                SELECT 1 FROM desired
+                WHERE desired.new_multiplicity<0
+                   OR desired.new_multiplicity>9223372036854775807
+                   OR (desired.old_multiplicity>0)<>
+                      (desired.old_output_key IS NOT NULL)
+                   OR (desired.new_multiplicity>0)<>
+                      (desired.output_key IS NOT NULL)
+                   OR (
+                     desired.output_key IS NOT NULL
+                     AND desired.output_key<>{canonical_key}
+                   )
+              ) THEN 'corrupt' ELSE 'ok' END AS status
+            ),
+            effects AS MATERIALIZED (
+              SELECT desired.group_state_id,1 AS leg,
+                     desired.old_output_key AS output_key,
+                     -1::bigint AS weight,desired.old_output_row AS output_row
+              FROM desired
+              WHERE desired.old_output_key IS NOT NULL
+                AND (
+                  desired.output_key IS NULL
+                  OR desired.old_output_key<>desired.output_key
+                )
+              UNION ALL
+              SELECT desired.group_state_id,
+                     CASE WHEN desired.old_output_key IS NULL THEN 1 ELSE 2 END,
+                     desired.output_key,1::bigint,desired.output_row
+              FROM desired
+              WHERE desired.output_key IS NOT NULL
+                AND (
+                  desired.old_output_key IS NULL
+                  OR desired.old_output_key<>desired.output_key
+                )
+            ),
+            state_changed AS (
+              UPDATE {state} AS groups
+              SET output_key=desired.output_key,output_row=desired.output_row,
+                  multiplicity=desired.new_multiplicity::bigint
+              FROM desired,validation
+              WHERE validation.status='ok'
+                AND groups.group_state_id=desired.group_state_id
+                AND desired.new_multiplicity>0
+              RETURNING 1
+            ),
+            state_removed AS (
+              DELETE FROM {state} AS groups
+              USING desired,validation
+              WHERE validation.status='ok'
+                AND groups.group_state_id=desired.group_state_id
+                AND desired.new_multiplicity=0
+              RETURNING 1
+            ),
+            queued AS (
+              INSERT INTO {queue}(
+                output_key,weight,output_row,row_bytes,causal_lsn
+              )
+              SELECT effects.output_key,effects.weight,effects.output_row,
+                     shiba_internal.effect_row_bytes(effects.output_row),$1::pg_lsn
+              FROM effects,validation
+              WHERE validation.status='ok'
+              ORDER BY effects.group_state_id,effects.leg
+              RETURNING 1
+            )
+            SELECT validation.status,
+                   (SELECT count(*)::bigint FROM desired),
+                   (SELECT count(*)::bigint FROM queued),
+                   (SELECT count(*)::bigint FROM state_changed)
+                     +(SELECT count(*)::bigint FROM state_removed)
+                     +(SELECT count(*)::bigint FROM queued)
+                     +(SELECT count(*)::bigint FROM touched_page)
+            FROM validation
+            "#,
+            state = state.sql(),
+            bag = bag.sql(),
+            queue = queue.sql(),
+            touched = touched.sql(),
+            canonical_key = canonical_key,
+        ),
+        &unsafe { [DatumWithOid::new(lsn, pg_sys::TEXTOID)] },
+    )?;
+    if rows.len() != 1 {
+        return Err("Distinct representative reconciliation returned no summary".into());
+    }
+    let row = rows.first();
+    let status = required::<String>(&row, 1, "Distinct reconciliation status")?;
+    if status != "ok" {
+        return Err(format!(
+            "Distinct representative reconciliation returned {status}"
+        ));
+    }
+    let touched = nonnegative(required::<i64>(&row, 2, "Distinct reconciled groups")?)?;
+    let queued_effects = nonnegative(required::<i64>(&row, 3, "Distinct reconciled effects")?)?;
+    let state_rows = nonnegative(required::<i64>(
+        &row,
+        4,
+        "Distinct reconciliation mutations",
+    )?)?;
+    if touched
+        > u64::try_from(budget.max_input_rows)
+            .map_err(|_| "Distinct input row budget exceeds u64")?
+    {
+        return Err("Distinct reconciliation exceeded its touched-group bound".into());
+    }
+    Ok(ReconcileFacts {
+        queued_effects,
+        state_rows,
+    })
+}
+
+fn distinct_null_safe_equality(left: &str, right: &str, equality: &str) -> String {
+    format!(
+        "(
+           ({left} IS NULL AND {right} IS NULL)
+           OR
+           ({left} IS NOT NULL AND {right} IS NOT NULL
+            AND ({left} {equality} {right}) IS TRUE)
+         )"
+    )
+}
+
+fn require_empty_queue(
+    transaction: &mut StepTxn<'_, '_>,
+    queue: &RelationRef,
+) -> Result<(), String> {
+    let rows = transaction.read(
+        &format!(
+            "SELECT queue_id FROM {} ORDER BY queue_id LIMIT 1",
+            queue.sql()
+        ),
+        &[],
+    )?;
+    if !rows.is_empty() {
+        return Err("Distinct Apply/frontier found undrained effects".into());
+    }
+    Ok(())
+}
+
+fn require_empty_touched(
+    transaction: &mut StepTxn<'_, '_>,
+    touched: &RelationRef,
+) -> Result<(), String> {
+    let rows = transaction.read(
+        &format!(
+            "SELECT group_state_id FROM {} ORDER BY group_state_id LIMIT 1",
+            touched.sql()
+        ),
+        &[],
+    )?;
+    if !rows.is_empty() {
+        return Err("Distinct found committed touched-key scratch state".into());
+    }
+    Ok(())
+}
+
+fn drain_queue(
+    transaction: &mut StepTxn<'_, '_>,
+    output_payload: &RelationRef,
+    output_type: &TypeRef,
+    queue: &RelationRef,
+) -> Result<DrainFacts, String> {
+    let output = transaction.output()?.clone();
+    let budget = transaction.budget();
+    let max_rows = i64::min(i64_from_usize(budget.max_output_rows)?, output.target_rows);
+    let max_bytes = i64::min(
+        i64_from_usize(budget.max_output_bytes)?,
+        output.target_bytes,
+    );
+    let canonical_key = canonical_row_key_sql("selected.output_row", output_type);
+    let rows = transaction.write(
+        &format!(
+            r#"
+            WITH candidates AS MATERIALIZED (
+              SELECT queue_id,output_key,weight,output_row,row_bytes,causal_lsn
+              FROM {queue}
+              ORDER BY queue_id
+              LIMIT $3
+            ),
+            measured AS (
+              SELECT candidates.*,
+                     row_number() OVER (ORDER BY queue_id) AS page_ordinal,
+                     sum(row_bytes) OVER (ORDER BY queue_id) AS running_bytes
+              FROM candidates
+            ),
+            selected AS MATERIALIZED (
+              SELECT * FROM measured
+              WHERE page_ordinal=1 OR running_bytes <= $4
+            ),
+            summary AS MATERIALIZED (
+              SELECT count(*)::bigint AS emitted,
+                     coalesce(sum(row_bytes),0)::bigint AS emitted_bytes,
+                     min(causal_lsn) AS causal_lsn,
+                     min(causal_lsn)=max(causal_lsn) AS one_causal_lsn,
+                     bool_and(output_key={canonical_key}) AS canonical_keys
+              FROM selected
+            ),
+            appended AS MATERIALIZED (
+              SELECT append.outcome,append.appended_chunk_seq
+              FROM summary
+              CROSS JOIN LATERAL shiba_internal.append_effect_stream_chunk(
+                $1,$2,'data',summary.emitted,summary.emitted_bytes,
+                summary.causal_lsn
+              ) AS append
+              WHERE summary.emitted>0 AND summary.one_causal_lsn
+                AND summary.canonical_keys
+            ),
+            payload_insert AS (
+              INSERT INTO {output_payload}(
+                stream_id,chunk_seq,row_ordinal,weight,row_value
+              )
+              SELECT $1,appended.appended_chunk_seq,
+                     row_number() OVER (ORDER BY selected.queue_id)-1,
+                     selected.weight,selected.output_row
+              FROM selected,appended
+              WHERE appended.outcome='appended'
+              RETURNING 1
+            ),
+            removed AS (
+              DELETE FROM {queue} AS queue
+              USING selected,appended
+              WHERE appended.outcome='appended'
+                AND queue.queue_id=selected.queue_id
+              RETURNING 1
+            )
+            SELECT summary.emitted,summary.emitted_bytes,
+                   summary.one_causal_lsn,summary.canonical_keys,
+                   appended.outcome,appended.appended_chunk_seq,
+                   (SELECT count(*)::bigint FROM payload_insert),
+                   (SELECT count(*)::bigint FROM removed),
+                   (SELECT count(*)::bigint
+                    FROM {queue} AS pending
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM selected
+                      WHERE selected.queue_id=pending.queue_id
+                    ))
+            FROM summary LEFT JOIN appended ON true
+            "#,
+            queue = queue.sql(),
+            output_payload = output_payload.sql(),
+            canonical_key = canonical_key,
+        ),
+        &unsafe {
+            [
+                DatumWithOid::new(output.stream_id, pg_sys::INT8OID),
+                DatumWithOid::new(output.next_chunk_seq, pg_sys::INT8OID),
+                DatumWithOid::new(max_rows, pg_sys::INT8OID),
+                DatumWithOid::new(max_bytes, pg_sys::INT8OID),
+            ]
+        },
+    )?;
+    if rows.len() != 1 {
+        return Err("Distinct Drain returned no summary".into());
+    }
+    let row = rows.first();
+    let emitted = nonnegative(required::<i64>(&row, 1, "Distinct emitted effects")?)?;
+    let emitted_bytes = nonnegative(required::<i64>(&row, 2, "Distinct emitted bytes")?)?;
+    let one_causal_lsn = required::<bool>(&row, 3, "Distinct causal LSN summary")?;
+    let canonical_keys = required::<bool>(&row, 4, "Distinct canonical effect keys")?;
+    let outcome = row.get::<String>(5).map_err(|error| error.to_string())?;
+    let sequence = row.get::<i64>(6).map_err(|error| error.to_string())?;
+    let inserted = nonnegative(required::<i64>(&row, 7, "Distinct payload inserts")?)?;
+    let removed = nonnegative(required::<i64>(&row, 8, "Distinct queue deletes")?)?;
+    let remaining = nonnegative(required::<i64>(&row, 9, "Distinct remaining effects")?)?;
+    if emitted == 0
+        || emitted_bytes == 0
+        || !one_causal_lsn
+        || !canonical_keys
+        || outcome.as_deref() != Some("appended")
+        || sequence != Some(output.next_chunk_seq)
+        || inserted != emitted
+        || removed != emitted
+    {
+        return Err("Distinct bounded effect Drain is inconsistent".into());
+    }
+    Ok(DrainFacts {
+        facts: PrimitiveFacts {
+            usage: WorkUsage {
+                output_rows: emitted,
+                output_bytes: emitted_bytes,
+                ..WorkUsage::default()
+            },
+            state_rows: removed,
+            continuation_rows: 0,
+            output: OutputFacts::Data {
+                chunk_seq: output.next_chunk_seq,
+            },
+        },
+        remaining_effects: remaining,
+    })
+}
+
+fn validate_state_abi(
+    transaction: &mut StepTxn<'_, '_>,
+    state: &RelationRef,
+    key_count: usize,
+    output_type_oid: pg_sys::Oid,
+    spec: &crate::logical::model::DistinctSpec,
+) -> Result<(), String> {
+    let attributes = transaction.relation_attributes(state.oid())?;
+    if attributes.len() != key_count + 4
+        || attributes[0].name != "group_state_id"
+        || attributes[0].type_oid != pg_sys::INT8OID
+        || attributes[key_count + 1].name != "output_key"
+        || attributes[key_count + 1].type_oid != pg_sys::BYTEAOID
+        || attributes[key_count + 2].name != "output_row"
+        || attributes[key_count + 2].type_oid != output_type_oid
+        || attributes[key_count + 3].name != "multiplicity"
+        || attributes[key_count + 3].type_oid != pg_sys::INT8OID
+    {
+        return Err("Distinct typed state relation has an invalid ABI".into());
+    }
+    for (index, key) in spec.keys.iter().enumerate() {
+        let attribute = &attributes[index + 1];
+        if attribute.name != format!("key_{}", index + 1)
+            || !attribute_matches_slot(attribute, &key.type_)
+        {
+            return Err("Distinct typed key state changed ABI".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_bag_abi(
+    transaction: &mut StepTxn<'_, '_>,
+    bag: &RelationRef,
+    output_type_oid: pg_sys::Oid,
+) -> Result<(), String> {
+    let attributes = transaction.relation_attributes(bag.oid())?;
+    let expected = [
+        ("bag_id", pg_sys::INT8OID),
+        ("group_state_id", pg_sys::INT8OID),
+        ("output_key", pg_sys::BYTEAOID),
+        ("output_row", output_type_oid),
+        ("multiplicity", pg_sys::INT8OID),
+    ];
+    if attributes.len() != expected.len()
+        || attributes
+            .iter()
+            .zip(expected)
+            .any(|(actual, (name, type_oid))| {
+                actual.name != name || actual.type_oid != type_oid || !actual.not_null
+            })
+    {
+        return Err("Distinct physical representative bag has an invalid ABI".into());
+    }
+    Ok(())
+}
+
+fn validate_queue_abi(
+    transaction: &mut StepTxn<'_, '_>,
+    queue: &RelationRef,
+    output_type_oid: pg_sys::Oid,
+) -> Result<(), String> {
+    let attributes = transaction.relation_attributes(queue.oid())?;
+    let expected = [
+        ("queue_id", pg_sys::INT8OID),
+        ("output_key", pg_sys::BYTEAOID),
+        ("weight", pg_sys::INT8OID),
+        ("output_row", output_type_oid),
+        ("row_bytes", pg_sys::INT8OID),
+        ("causal_lsn", pg_sys::PG_LSNOID),
+    ];
+    if attributes.len() != expected.len()
+        || attributes
+            .iter()
+            .zip(expected)
+            .any(|(actual, (name, type_oid))| {
+                actual.name != name || actual.type_oid != type_oid || !actual.not_null
+            })
+    {
+        return Err("Distinct pending effect queue has an invalid ABI".into());
+    }
+    Ok(())
+}
+
+fn validate_touched_abi(
+    transaction: &mut StepTxn<'_, '_>,
+    touched: &RelationRef,
+) -> Result<(), String> {
+    let attributes = transaction.relation_attributes(touched.oid())?;
+    let expected = [
+        ("group_state_id", pg_sys::INT8OID),
+        ("net_weight", pg_sys::NUMERICOID),
+    ];
+    if attributes.len() != expected.len()
+        || attributes
+            .iter()
+            .zip(expected)
+            .any(|(actual, (name, type_oid))| {
+                actual.name != name || actual.type_oid != type_oid || !actual.not_null
+            })
+    {
+        return Err("Distinct touched-key scratch relation has an invalid ABI".into());
+    }
+    Ok(())
+}
+
+fn validate_continuation_abi(
+    transaction: &mut StepTxn<'_, '_>,
+    relation: &RelationRef,
+) -> Result<(), String> {
+    let attributes = transaction.relation_attributes(relation.oid())?;
+    let expected = [
+        ("singleton", pg_sys::BOOLOID),
+        ("phase", pg_sys::INT2OID),
+        ("input_stream_id", pg_sys::INT8OID),
+        ("input_chunk_seq", pg_sys::INT8OID),
+        ("next_row_ordinal", pg_sys::INT8OID),
+    ];
+    if attributes.len() != expected.len()
+        || attributes
+            .iter()
+            .zip(expected)
+            .any(|(actual, (name, type_oid))| {
+                actual.name != name || actual.type_oid != type_oid || !actual.not_null
+            })
+    {
+        return Err("Distinct continuation relation has an invalid ABI".into());
+    }
+    Ok(())
+}
+
+fn load_continuation(
+    transaction: &mut StepTxn<'_, '_>,
+    relation: &RelationRef,
+    stream_id: i64,
+    chunk_seq: i64,
+) -> Result<StoredContinuation, String> {
+    let query = format!(
+        "SELECT phase,input_stream_id,input_chunk_seq,next_row_ordinal
+         FROM {} WHERE singleton FOR UPDATE",
+        relation.sql()
+    );
+    let rows = transaction.lock(&query, &[])?;
+    match rows.len() {
+        0 => Ok(StoredContinuation {
+            value: DistinctContinuation {
+                input: InputPosition::new(stream_id, chunk_seq, 0)?,
+                phase: DistinctPhase::Apply,
+            },
+            persisted: false,
+        }),
+        1 => {
+            let row = rows.first();
+            let phase = match required::<i16>(&row, 1, "Distinct continuation phase")? {
+                1 => DistinctPhase::Apply,
+                2 => DistinctPhase::Drain,
+                _ => return Err("Distinct continuation has an invalid phase".into()),
+            };
+            let position = InputPosition::new(
+                required::<i64>(&row, 2, "Distinct continuation stream")?,
+                required::<i64>(&row, 3, "Distinct continuation chunk")?,
+                required::<i64>(&row, 4, "Distinct continuation row")?,
+            )?;
+            if position.stream_id != stream_id || position.chunk_seq != chunk_seq {
+                return Err("Distinct continuation is not at its input cursor".into());
+            }
+            Ok(StoredContinuation {
+                value: DistinctContinuation {
+                    input: position,
+                    phase,
+                },
+                persisted: true,
+            })
+        }
+        _ => Err("Distinct continuation relation has multiple rows".into()),
+    }
+}
+
+fn replace_continuation(
+    transaction: &mut StepTxn<'_, '_>,
+    relation: &RelationRef,
+    old: StoredContinuation,
+    next: Option<DistinctContinuation>,
+) -> Result<(), String> {
+    let query = match (old.persisted, next) {
+        (false, Some(next)) => format!(
+            "INSERT INTO {} VALUES(true,{},{},{},{}) RETURNING singleton",
+            relation.sql(),
+            phase_code(next.phase)?,
+            next.input.stream_id,
+            next.input.chunk_seq,
+            next.input.row_ordinal
+        ),
+        (true, Some(next)) => format!(
+            "UPDATE {} SET phase={},input_stream_id={},input_chunk_seq={},next_row_ordinal={}
+             WHERE singleton AND phase={} AND input_stream_id={} AND input_chunk_seq={}
+               AND next_row_ordinal={} RETURNING singleton",
+            relation.sql(),
+            phase_code(next.phase)?,
+            next.input.stream_id,
+            next.input.chunk_seq,
+            next.input.row_ordinal,
+            phase_code(old.value.phase)?,
+            old.value.input.stream_id,
+            old.value.input.chunk_seq,
+            old.value.input.row_ordinal
+        ),
+        (true, None) => format!(
+            "DELETE FROM {} WHERE singleton AND phase={} AND input_stream_id={}
+               AND input_chunk_seq={} AND next_row_ordinal={} RETURNING singleton",
+            relation.sql(),
+            phase_code(old.value.phase)?,
+            old.value.input.stream_id,
+            old.value.input.chunk_seq,
+            old.value.input.row_ordinal
+        ),
+        (false, None) => return Ok(()),
+    };
+    if transaction.write(&query, &[])?.len() != 1 {
+        return Err("Distinct continuation compare-and-set failed".into());
+    }
+    Ok(())
+}
+
+fn phase_code(phase: DistinctPhase) -> Result<i16, String> {
+    match phase {
+        DistinctPhase::Apply => Ok(1),
+        DistinctPhase::Drain => Ok(2),
+        DistinctPhase::Frontier => Err("Distinct frontier cannot be persisted".into()),
+    }
+}
+
+fn required<T: FromDatum + IntoDatum>(
+    table: &SpiTupleTable<'_>,
+    ordinal: usize,
+    name: &str,
+) -> Result<T, String> {
+    table
+        .get::<T>(ordinal)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("database returned NULL {name}"))
+}
+
+fn nonnegative(value: i64) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| "database returned a negative resource count".into())
+}
+
+fn i64_from_usize(value: usize) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| "Distinct budget exceeds bigint".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::WorkUsage;
+
+    fn budget() -> WorkBudget {
+        WorkBudget::new(3, 30, 1, 10)
+    }
+
+    fn position(row: i64) -> InputPosition {
+        InputPosition::new(5, 9, row).unwrap()
+    }
+
+    fn input_continuation(row: i64) -> DistinctContinuation {
+        DistinctContinuation {
+            input: position(row),
+            phase: DistinctPhase::Apply,
+        }
+    }
+
+    fn drain_continuation(row: i64) -> DistinctContinuation {
+        DistinctContinuation {
+            input: position(row),
+            phase: DistinctPhase::Drain,
+        }
+    }
+
+    #[test]
+    fn crash_before_commit_replays_the_same_prefix() {
+        let machine = DistinctMachine;
+        let durable = input_continuation(1);
+        let action = machine.action(durable).unwrap();
+        assert_eq!(action, machine.action(durable).unwrap());
+
+        let committed = machine
+            .apply(
+                durable,
+                DistinctActionResult::Applied(AppliedPrefix {
+                    facts: PrimitiveFacts {
+                        usage: WorkUsage {
+                            input_rows: 2,
+                            input_bytes: 12,
+                            ..WorkUsage::default()
+                        },
+                        state_rows: 2,
+                        continuation_rows: 1,
+                        output: OutputFacts::None,
+                    },
+                    occupancy: OccupancyDiff {
+                        touched_keys: 2,
+                        external_effects: 1,
+                    },
+                    next: Some(DistinctContinuation {
+                        input: position(3),
+                        phase: DistinctPhase::Drain,
+                    }),
+                }),
+                budget(),
+            )
+            .unwrap();
+        let DistinctTransition::Committed {
+            continuation: Some(after_commit),
+            ..
+        } = committed
+        else {
+            panic!("partial Distinct prefix must resume");
+        };
+        assert_eq!(
+            machine.action(after_commit).unwrap(),
+            DistinctAction::DrainEffects { input: position(3) }
+        );
+    }
+
+    #[test]
+    fn occupancy_can_change_without_an_external_diff() {
+        let committed = DistinctMachine
+            .apply(
+                input_continuation(1),
+                DistinctActionResult::Applied(AppliedPrefix {
+                    facts: PrimitiveFacts {
+                        usage: WorkUsage {
+                            input_rows: 2,
+                            input_bytes: 8,
+                            ..WorkUsage::default()
+                        },
+                        state_rows: 1,
+                        continuation_rows: 0,
+                        output: OutputFacts::None,
+                    },
+                    occupancy: OccupancyDiff {
+                        touched_keys: 1,
+                        external_effects: 0,
+                    },
+                    next: None,
+                }),
+                budget(),
+            )
+            .unwrap();
+        assert!(matches!(
+            committed,
+            DistinctTransition::Committed {
+                continuation: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn one_oversized_typed_effect_row_is_valid() {
+        DistinctMachine
+            .apply(
+                drain_continuation(1),
+                DistinctActionResult::Drained(AppliedPrefix {
+                    facts: PrimitiveFacts {
+                        usage: WorkUsage {
+                            output_rows: 1,
+                            output_bytes: 11,
+                            ..WorkUsage::default()
+                        },
+                        state_rows: 1,
+                        continuation_rows: 0,
+                        output: OutputFacts::Data { chunk_seq: 18 },
+                    },
+                    occupancy: OccupancyDiff {
+                        touched_keys: 0,
+                        external_effects: 1,
+                    },
+                    next: None,
+                }),
+                budget(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn committed_frontier_has_no_continuation() {
+        let durable = DistinctContinuation {
+            input: position(0),
+            phase: DistinctPhase::Frontier,
+        };
+        let committed = DistinctMachine
+            .apply(
+                durable,
+                DistinctActionResult::FrontierForwarded(PrimitiveFacts {
+                    output: OutputFacts::Frontier { chunk_seq: 19 },
+                    ..PrimitiveFacts::default()
+                }),
+                budget(),
+            )
+            .unwrap();
+        assert!(matches!(
+            committed,
+            DistinctTransition::Committed {
+                continuation: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn drain_output_count_must_equal_the_effect_summary() {
+        let error = DistinctMachine
+            .apply(
+                drain_continuation(1),
+                DistinctActionResult::Drained(AppliedPrefix {
+                    facts: PrimitiveFacts {
+                        usage: WorkUsage {
+                            output_rows: 1,
+                            output_bytes: 4,
+                            ..WorkUsage::default()
+                        },
+                        continuation_rows: 0,
+                        output: OutputFacts::Data { chunk_seq: 20 },
+                        ..PrimitiveFacts::default()
+                    },
+                    occupancy: OccupancyDiff {
+                        touched_keys: 0,
+                        external_effects: 0,
+                    },
+                    next: None,
+                }),
+                budget(),
+            )
+            .unwrap_err();
+        assert!(error.contains("effect"));
+    }
+
+    #[test]
+    fn replacement_queues_two_legs_under_a_one_row_output_budget() {
+        let applied = DistinctMachine
+            .apply(
+                input_continuation(4),
+                DistinctActionResult::Applied(AppliedPrefix {
+                    facts: PrimitiveFacts {
+                        usage: WorkUsage {
+                            input_rows: 1,
+                            input_bytes: 8,
+                            ..WorkUsage::default()
+                        },
+                        state_rows: 3,
+                        continuation_rows: 1,
+                        output: OutputFacts::None,
+                    },
+                    occupancy: OccupancyDiff {
+                        touched_keys: 1,
+                        external_effects: 2,
+                    },
+                    next: Some(drain_continuation(5)),
+                }),
+                budget(),
+            )
+            .unwrap();
+        let DistinctTransition::Committed {
+            continuation: Some(first_drain),
+            ..
+        } = applied
+        else {
+            panic!("replacement must persist its Drain phase");
+        };
+
+        let first_leg = DistinctMachine
+            .apply(
+                first_drain,
+                DistinctActionResult::Drained(AppliedPrefix {
+                    facts: PrimitiveFacts {
+                        usage: WorkUsage {
+                            output_rows: 1,
+                            output_bytes: 6,
+                            ..WorkUsage::default()
+                        },
+                        state_rows: 1,
+                        continuation_rows: 1,
+                        output: OutputFacts::Data { chunk_seq: 21 },
+                    },
+                    occupancy: OccupancyDiff {
+                        touched_keys: 0,
+                        external_effects: 1,
+                    },
+                    next: Some(first_drain),
+                }),
+                budget(),
+            )
+            .unwrap();
+        assert!(matches!(
+            first_leg,
+            DistinctTransition::Committed {
+                continuation: Some(DistinctContinuation {
+                    phase: DistinctPhase::Drain,
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sql_contract_checks_both_negative_prefixes_and_bounds_representative_lookup() {
+        let source = include_str!("distinct.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("Distinct module must keep tests after production code")
+            .0;
+        let reconcile = production
+            .split_once("fn reconcile_representatives(")
+            .expect("Distinct must reconcile representatives")
+            .1
+            .split_once("fn distinct_null_safe_equality(")
+            .expect("representative reconciliation must remain a bounded helper")
+            .0;
+
+        assert!(production.contains("min(key_prefix) AS min_prefix"));
+        assert!(production.contains("min(physical_prefix) AS min_prefix"));
+        assert!(production.contains("minimum_multiplicity<0"));
+        assert!(production.contains("UNIQUE(group_state_id,output_key)"));
+        assert!(production.contains("CHECK((multiplicity=0)=((output_row)::text IS NULL))"));
+        assert!(production.contains("SELECT DISTINCT ON ({qualified_key_column_list})"));
+        assert!(production.contains("ON CONFLICT({conflict_keys}) DO UPDATE"));
+        assert!(production.contains("JOIN resolved_groups ON {group_match}"));
+        assert!(!production.contains("distinct_bag_order"));
+        assert!(production.contains(
+            "WHERE bag.group_state_id=physical_collapsed.group_state_id
+              AND bag.output_key=physical_collapsed.output_key
+            LIMIT 1
+            FOR UPDATE"
+        ));
+        assert!(reconcile.contains(
+            "WITH touched_page AS MATERIALIZED (
+              DELETE FROM {touched}
+              RETURNING group_state_id,net_weight"
+        ));
+        assert!(reconcile.contains(
+            "WHERE groups.group_state_id=touched_page.group_state_id
+                LIMIT 1
+                FOR UPDATE"
+        ));
+        assert!(reconcile.contains(
+            "WHERE bag.group_state_id=locked.group_state_id
+                ORDER BY bag.output_key
+                LIMIT 1"
+        ));
+    }
+}

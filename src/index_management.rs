@@ -1,4 +1,4 @@
-//! Backend identity and transaction guards for user-managed result indexes.
+//! Backend identity and transaction guards for privileged user entry points.
 //!
 //! SQL `SECURITY DEFINER` functions cannot observe the effective invoker
 //! through `current_user`, and DDL executed from them keeps relation locks
@@ -9,7 +9,7 @@
 use pgrx::prelude::*;
 
 #[pg_extern]
-pub fn index_ddl_invoker() -> pg_sys::Oid {
+pub fn invoker_oid() -> pg_sys::Oid {
     unsafe { pg_sys::GetOuterUserId() }
 }
 

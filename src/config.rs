@@ -11,17 +11,25 @@ const DEFAULT_RUNTIME_TEMP_FILE_LIMIT_KB: i32 = 1024 * 1024;
 const MIN_RUNTIME_TEMP_FILE_LIMIT_KB: i32 = 0;
 const MAX_RUNTIME_TEMP_FILE_LIMIT_KB: i32 = i32::MAX;
 
-const DEFAULT_MAX_CACHED_DAGS: i32 = 128;
-const MIN_MAX_CACHED_DAGS: i32 = 1;
-const MAX_MAX_CACHED_DAGS: i32 = 4_096;
+const DEFAULT_MAX_CACHED_DATAFLOWS: i32 = 128;
+const MIN_MAX_CACHED_DATAFLOWS: i32 = 1;
+const MAX_MAX_CACHED_DATAFLOWS: i32 = 4_096;
 
 const DEFAULT_STAGE_CHUNK_ROWS: i32 = 2_048;
 const MIN_STAGE_CHUNK_ROWS: i32 = 1;
 const MAX_STAGE_CHUNK_ROWS: i32 = 1_000_000;
 
-const DEFAULT_MAX_STAGE_ROWS: i32 = 1_000_000;
-const MIN_MAX_STAGE_ROWS: i32 = 1;
-const MAX_MAX_STAGE_ROWS: i32 = i32::MAX;
+const DEFAULT_STAGE_CHUNK_BYTES: i32 = 16 * 1024 * 1024;
+const MIN_STAGE_CHUNK_BYTES: i32 = 1;
+const MAX_STAGE_CHUNK_BYTES: i32 = i32::MAX;
+
+const DEFAULT_STAGE_ADMISSION_ROWS: i32 = 16 * 1024;
+const MIN_STAGE_ADMISSION_ROWS: i32 = 1;
+const MAX_STAGE_ADMISSION_ROWS: i32 = 1_000_000;
+
+const DEFAULT_STAGE_ADMISSION_BYTES: i32 = 128 * 1024 * 1024;
+const MIN_STAGE_ADMISSION_BYTES: i32 = 1;
+const MAX_STAGE_ADMISSION_BYTES: i32 = i32::MAX;
 
 const DEFAULT_INGRESS_BATCH_ROWS: i32 = 2_048;
 const MIN_INGRESS_BATCH_ROWS: i32 = 1;
@@ -42,9 +50,12 @@ const MAX_INGRESS_RETENTION_MS: i32 = i32::MAX;
 static RUNTIME_WORK_MEM_KB: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_RUNTIME_WORK_MEM_KB);
 static RUNTIME_TEMP_FILE_LIMIT_KB: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_RUNTIME_TEMP_FILE_LIMIT_KB);
-static MAX_CACHED_DAGS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_CACHED_DAGS);
+static MAX_CACHED_DATAFLOWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_CACHED_DATAFLOWS);
 static STAGE_CHUNK_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_STAGE_CHUNK_ROWS);
-static MAX_STAGE_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_STAGE_ROWS);
+static STAGE_CHUNK_BYTES: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_STAGE_CHUNK_BYTES);
+static STAGE_ADMISSION_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_STAGE_ADMISSION_ROWS);
+static STAGE_ADMISSION_BYTES: GucSetting<i32> =
+    GucSetting::<i32>::new(DEFAULT_STAGE_ADMISSION_BYTES);
 static INGRESS_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_BATCH_ROWS);
 static INGRESS_BATCH_BYTES: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_BATCH_BYTES);
 static MAX_CACHED_RELATIONS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_CACHED_RELATIONS);
@@ -73,19 +84,19 @@ pub fn init() {
         GucFlags::UNIT_KB,
     );
     GucRegistry::define_int_guc(
-        c"shiba.max_cached_dags",
-        c"Maximum number of DAG runtimes cached by one Shiba Runtime.",
-        c"Older DAG runtimes are deterministically evicted and their prepared programs released.",
-        &MAX_CACHED_DAGS,
-        MIN_MAX_CACHED_DAGS,
-        MAX_MAX_CACHED_DAGS,
+        c"shiba.max_cached_dataflows",
+        c"Maximum number of loaded dataflows cached by the Shiba Runtime.",
+        c"Older loaded dataflows are deterministically evicted and rebuilt from durable state when needed.",
+        &MAX_CACHED_DATAFLOWS,
+        MIN_MAX_CACHED_DATAFLOWS,
+        MAX_MAX_CACHED_DATAFLOWS,
         GucContext::Sighup,
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
         c"shiba.stage_chunk_rows",
-        c"Target number of Stage rows processed by one SQL chunk.",
-        c"SQL operators can read this value with current_setting to bound statement work.",
+        c"Target number of input and output rows processed by one operator step.",
+        c"A single indivisible row may exceed this target and occupy one step.",
         &STAGE_CHUNK_ROWS,
         MIN_STAGE_CHUNK_ROWS,
         MAX_STAGE_CHUNK_ROWS,
@@ -93,14 +104,34 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
-        c"shiba.max_stage_rows",
-        c"Maximum allowed rows in one operator work set.",
-        c"SQL operators can read this value with current_setting to enforce Stage row quotas.",
-        &MAX_STAGE_ROWS,
-        MIN_MAX_STAGE_ROWS,
-        MAX_MAX_STAGE_ROWS,
+        c"shiba.stage_chunk_bytes",
+        c"Target input and output bytes processed by one operator step.",
+        c"A single indivisible row may exceed this target and occupy one step.",
+        &STAGE_CHUNK_BYTES,
+        MIN_STAGE_CHUNK_BYTES,
+        MAX_STAGE_CHUNK_BYTES,
+        GucContext::Sighup,
+        GucFlags::UNIT_BYTE,
+    );
+    GucRegistry::define_int_guc(
+        c"shiba.stage_admission_rows",
+        c"Initial cumulative-row threshold for Aggregate, Window, and TopN Drain.",
+        c"Threshold intervals grow geometrically to a fixed cap; each Apply step remains bounded by shiba.stage_chunk_rows.",
+        &STAGE_ADMISSION_ROWS,
+        MIN_STAGE_ADMISSION_ROWS,
+        MAX_STAGE_ADMISSION_ROWS,
         GucContext::Sighup,
         GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"shiba.stage_admission_bytes",
+        c"Initial cumulative-byte threshold for Aggregate, Window, and TopN Drain.",
+        c"Threshold intervals grow geometrically to a fixed cap; each Apply step remains bounded by shiba.stage_chunk_bytes.",
+        &STAGE_ADMISSION_BYTES,
+        MIN_STAGE_ADMISSION_BYTES,
+        MAX_STAGE_ADMISSION_BYTES,
+        GucContext::Sighup,
+        GucFlags::UNIT_BYTE,
     );
     GucRegistry::define_int_guc(
         c"shiba.ingress_batch_rows",
@@ -114,7 +145,7 @@ pub fn init() {
     );
     GucRegistry::define_int_guc(
         c"shiba.ingress_batch_bytes",
-        c"Target maximum pgoutput payload bytes in one ingress transaction.",
+        c"Target maximum pgoutput payload bytes in one persisted ingress batch.",
         c"One individual replication message or tuple may exceed this target.",
         &INGRESS_BATCH_BYTES,
         MIN_INGRESS_BATCH_BYTES,
@@ -144,7 +175,7 @@ pub fn init() {
     );
     GucRegistry::define_string_guc(
         c"shiba.replication_conninfo",
-        c"libpq connection parameters for the v2 logical replication connection.",
+        c"libpq connection parameters for the logical replication connection.",
         c"Use passfile, certificate, or peer authentication; do not place an inline password here.",
         &REPLICATION_CONNINFO,
         GucContext::Sighup,
@@ -160,9 +191,37 @@ pub fn runtime_temp_file_limit_kb() -> i32 {
     RUNTIME_TEMP_FILE_LIMIT_KB.get()
 }
 
-pub fn max_cached_dags() -> usize {
-    usize::try_from(MAX_CACHED_DAGS.get())
-        .expect("shiba.max_cached_dags passed PostgreSQL range validation")
+pub fn max_cached_dataflows() -> usize {
+    usize::try_from(MAX_CACHED_DATAFLOWS.get())
+        .expect("shiba.max_cached_dataflows passed PostgreSQL range validation")
+}
+
+pub fn stage_chunk_rows() -> usize {
+    usize::try_from(STAGE_CHUNK_ROWS.get())
+        .expect("shiba.stage_chunk_rows passed PostgreSQL range validation")
+}
+
+pub fn stage_chunk_bytes() -> usize {
+    usize::try_from(STAGE_CHUNK_BYTES.get())
+        .expect("shiba.stage_chunk_bytes passed PostgreSQL range validation")
+}
+
+pub fn stage_admission_rows() -> usize {
+    usize::try_from(STAGE_ADMISSION_ROWS.get())
+        .expect("shiba.stage_admission_rows passed PostgreSQL range validation")
+}
+
+pub fn stage_admission_bytes() -> usize {
+    usize::try_from(STAGE_ADMISSION_BYTES.get())
+        .expect("shiba.stage_admission_bytes passed PostgreSQL range validation")
+}
+
+pub(crate) fn stage_admission_row_interval_cap() -> usize {
+    usize::try_from(MAX_STAGE_ADMISSION_ROWS).expect("stage admission row cap is positive")
+}
+
+pub(crate) fn stage_admission_byte_interval_cap() -> usize {
+    usize::try_from(MAX_STAGE_ADMISSION_BYTES).expect("stage admission byte cap is positive")
 }
 
 pub fn ingress_batch_rows() -> usize {
@@ -208,9 +267,16 @@ mod tests {
             (MIN_RUNTIME_TEMP_FILE_LIMIT_KB..=MAX_RUNTIME_TEMP_FILE_LIMIT_KB)
                 .contains(&DEFAULT_RUNTIME_TEMP_FILE_LIMIT_KB)
         );
-        assert!((MIN_MAX_CACHED_DAGS..=MAX_MAX_CACHED_DAGS).contains(&DEFAULT_MAX_CACHED_DAGS));
+        assert!((MIN_MAX_CACHED_DATAFLOWS..=MAX_MAX_CACHED_DATAFLOWS)
+            .contains(&DEFAULT_MAX_CACHED_DATAFLOWS));
         assert!((MIN_STAGE_CHUNK_ROWS..=MAX_STAGE_CHUNK_ROWS).contains(&DEFAULT_STAGE_CHUNK_ROWS));
-        assert!((MIN_MAX_STAGE_ROWS..=MAX_MAX_STAGE_ROWS).contains(&DEFAULT_MAX_STAGE_ROWS));
+        assert!(
+            (MIN_STAGE_CHUNK_BYTES..=MAX_STAGE_CHUNK_BYTES).contains(&DEFAULT_STAGE_CHUNK_BYTES)
+        );
+        assert!((MIN_STAGE_ADMISSION_ROWS..=MAX_STAGE_ADMISSION_ROWS)
+            .contains(&DEFAULT_STAGE_ADMISSION_ROWS));
+        assert!((MIN_STAGE_ADMISSION_BYTES..=MAX_STAGE_ADMISSION_BYTES)
+            .contains(&DEFAULT_STAGE_ADMISSION_BYTES));
         assert!(
             (MIN_INGRESS_BATCH_ROWS..=MAX_INGRESS_BATCH_ROWS).contains(&DEFAULT_INGRESS_BATCH_ROWS)
         );

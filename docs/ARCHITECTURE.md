@@ -1,92 +1,84 @@
-# Shiba 怎么运作
+# Shiba 是怎么运行的
 
-Shiba 从 PostgreSQL 的逻辑复制流读取已经提交的行变化，再把变化增量地写进结果表。
-源表有新写入时，它不会重新扫描源表，也不会重新执行整条查询。
+Shiba 把一条 `SELECT` 注册成持续运行的 DAG。源表变化从 PostgreSQL WAL 进入
+DAG，最后由 Sink 修改结果表。读取结果表时不会重新执行原查询。
 
-先看一笔大事务。假设应用一次插入 1000 万行：
+## 完整数据路径
 
 ```mermaid
 flowchart LR
-    APP["应用事务<br/>1000 万行"]
-    WAL["WAL / pgoutput"]
-    LOG[("change_log<br/>共享的行变化")]
-    RANGES[("稳定输入范围")]
-    INBOX[("dag_inbox<br/>每个结果各有一个游标")]
-    APPLY["读取一个范围<br/>执行保存的 operator plan"]
-    STATE[("operator state")]
-    RESULT[("result table")]
+    A["已经提交的<br/>source DML"] --> B["pgoutput"]
+    B --> C["Rust ingress<br/>读一个有界 batch"]
+    C --> D[("change_log")]
+    D --> E["source publisher<br/>发布一个有界前缀"]
+    E --> F[("source EffectStream")]
+    F --> G["Scan"]
+    G --> H[("operator EffectStream")]
+    H --> I["DAG stages"]
+    I --> J[("operator EffectStream")]
+    J --> K["Sink"]
+    K --> L[("结果表")]
 
-    APP -->|"COMMIT"| WAL
-    WAL -->|"边接收边持久化"| LOG
-    LOG --> RANGES
-    RANGES -->|"每形成一个范围就路由"| INBOX
-    INBOX --> APPLY
-    APPLY -->|"同一 PostgreSQL 事务"| STATE
-    APPLY -->|"同一 PostgreSQL 事务"| RESULT
-    APPLY -->|"成功后游标 +1"| INBOX
+    C -. "读到 Commit" .-> P[("source frontier")]
+    E -. "此前前缀全部发布" .-> P
+    P -. "推进完整进度" .-> G
+
+    I <--> S[("operator state")]
+    T[("continuation")] <--> G
+    T <--> I
+    T <--> K
+    U[("checkpoint")] <--> G
+    U <--> I
+    U <--> K
 ```
 
-这张图里最重要的是两件事：
+图中的名词只表示下面这些东西：
 
-1. 当前关闭 pgoutput transaction streaming，所以回滚的源事务不会进入 Shiba
-   ingress。walsender 发出 `Begin` 和行变化时，源事务其实已经提交；末尾的
-   pgoutput `Commit` 只是 Shiba 尚未读到的结束记录，不是源事务仍未提交。
-2. Runtime 每持久化一个稳定范围，就可以路由并运行这个范围，不等末尾
-   `Commit`。operator state、结果表和 batch 游标在同一个 PostgreSQL 事务里提交。
-   `Commit` 只把 batch 列表标为完整；此后确认游标已经越过最后一个范围，才推进
-   progress、删除 inbox 并允许复制 feedback 前进。
+| 名词 | 含义 |
+| --- | --- |
+| weighted row | 一条完整行及其权重；插入是 `+1`，删除是 `-1` |
+| EffectStream | producer 按顺序追加的持久 typed chunks；下游从自己的位置读取 |
+| input cursor | 某个 stage 的某个 input port 下一次从哪个 chunk、哪一行开始 |
+| frontier | “这个 source LSN 及以前不会再有新数据”的完整进度，不是数据 batch |
+| continuation | 当前 phase，以及下一行或下一页从哪里继续 |
+| admission | 有状态算子自上次 output frontier 起已吸收的输入 row/byte 数 |
+| checkpoint | step revision、是否有 continuation，以及 admission 计数 |
+| operator state | Join arrangement、Aggregate group、Window partition 等持久计算状态 |
 
-因此，对同一个结果表，源事务不再是原子可见边界。一笔 1000 万行的源事务会逐批
-出现在结果里。处理到一半时，用户可能看到前 500 万行产生的结果；这个中间结果
-不一定对应源表的任何一个事务快照。
+这些状态都在 PostgreSQL relation 中。Rust 内存里的 plan cache 和 ready queue
+可以丢弃；它们不是恢复依据。
 
-## 数据按什么顺序流动
+还需要区分三种语义：
 
-```mermaid
-sequenceDiagram
-    participant App as application
-    participant PG as PostgreSQL
-    participant WAL as logical decoding / walsender
-    participant RT as Shiba Runtime
-    participant Input as change_log + stable ranges
-    participant Q as dag_inbox
-    participant Out as operator state + result
+| 边界 | Shiba 保证什么 |
+| --- | --- |
+| source transaction | pgoutput 只发送已经提交的数据，但这笔事务不会作为结果表的原子可见单位 |
+| operator step | state、cursor、continuation、output 和 checkpoint 中本 step 改动的部分在一个 PostgreSQL transaction 中提交；这是内部恢复单位 |
+| Sink step | 一个有界结果前缀的 DML 与对应 input cursor、continuation、checkpoint 同时提交；这是用户可见的 exactly-once 边界 |
 
-    App->>PG: DML + COMMIT succeeds
-    PG->>WAL: committed WAL transaction
-    loop pgoutput row changes
-        WAL-->>RT: INSERT / UPDATE / DELETE
-        RT->>Input: append weighted rows
-        RT->>Input: close a stable range when batch target is reached
-        RT->>Q: route this stable range
-        RT->>Q: claim next_batch_ordinal
-        RT->>Input: read this range only
-        RT->>Out: update state and result
-        RT->>Q: advance next_batch_ordinal
-        Note over RT,Out: state + result + cursor commit together
-    end
-    WAL-->>RT: Commit record
-    RT->>Input: mark ingress transaction committed
-    RT->>Q: if cursor is past the final range, advance progress and remove inbox
+所以，一笔 1000 万行的 source transaction 会分批进入结果表。用户可能先看到它
+已经提交到 Sink 的前缀，不会等到 1000 万行全部完成后一次出现。
+
+## 一次 INSERT 如何到达结果表
+
+假设应用执行：
+
+```sql
+INSERT INTO public.orders
+SELECT ...
+FROM generate_series(1, 10000000);
+COMMIT;
 ```
 
-`ingress_batch_rows` 和 `ingress_batch_bytes` 是 ingress 的软目标。完整的 CopyData
-message 或单个 tuple 不会被切开，所以实际范围不保证正好等于配置值。范围一旦
-写入 `ingress_apply_batches` 就不再变化，所有结果 DAG 都用同一组范围，但各自
-保存自己的消费游标。
+Shiba 使用 `pgoutput`，并设置 `streaming 'off'`。walsender 开始发送这笔事务的
+`Begin` 和行变化时，应用事务已经提交。应用提交和 Shiba 稍后从复制连接读到
+pgoutput `Commit` 是两个不同的时刻。
 
-Shiba 当前使用非 streaming pgoutput。应用事务提交后，walsender 才输出它的
-`Begin`、行变化和 `Commit`。因此 Runtime 收到 `Begin` 时已经知道稳定的
-`final_lsn`，可以把随后形成的每个范围直接交给 DAG。若 DAG 已消费当前全部范围、
-但 Runtime 还没读到 `Commit`，inbox 保留在原处等待；它不会推进 progress，也
-不会被删除。这里没有未提交的源数据进入结果。
+### 1. ingress 保存一个 batch
 
-一个 ingress batch 形成一个共享稳定范围；某个结果消费这个范围称为一个 DAG
-batch；提交这个 DAG batch 的 PostgreSQL 事务称为 apply 事务。
-
-## 一批数据如何变成结果
-
-逻辑复制的 DML 先被规范成有顺序的 weighted rows：
+[`src/ingress.rs`](../src/ingress.rs) 按
+`shiba.ingress_batch_rows` 和 `shiba.ingress_batch_bytes` 读取一个 batch，并把
+DML 转成 weighted rows：
 
 ```text
 INSERT row       => (+1, row)
@@ -94,206 +86,394 @@ DELETE old       => (-1, old)
 UPDATE old → new => (-1, old), (+1, new)
 ```
 
-`input_seq` 保存源事务内的顺序。每个 DAG batch 对应一个固定的 `input_seq`
-范围。Runtime 加载注册时生成的 `PhysicalDagPlan`，只读取这个范围中与该 DAG
-有关的变化。
+[`persist_ingress_batch`](../src/worker.rs) 用一个短 PostgreSQL transaction 写入
+source transaction header、`change_log`、publication cursor 和 batch 计数。这个
+transaction 失败时全部回滚，logical replication slot 会保留尚未确认的 WAL。
 
-```text
-一个 DAG batch 的 PostgreSQL transaction
+如果 1000 万行超过 batch 目标，`ReplicationIngress::poll_batch` 会在仍未读到
+pgoutput `Commit` 时返回。下一批以后再读；不需要把整笔 source transaction 放进
+一个 Rust 对象或一个 PostgreSQL transaction。
 
-read input_seq [first, last]
-  → fold this batch
-  → verify that row counts cannot become negative
-  → update authoritative operator state
-  → update result table
-  → advance dag_inbox.next_batch_ordinal
+### 2. publisher 追加一个 source chunk
+
+Runtime 总是先处理已经持久化的 publication work。
+[`publish_source_batch`](../sql/11_ingress.sql) 从 `change_log` 读取一个受
+row/byte 限制的前缀，写入 source stream 的 typed payload relation，再追加对应的
+chunk metadata。payload、metadata 和 publication cursor 在同一个 transaction
+提交。
+
+source chunk 一旦提交，Scan 就可以读取它，不需要等 pgoutput `Commit`。`Commit`
+只封口这笔 source transaction：它记录 commit/end LSN，并允许 durable ingress
+LSN 在安全时前进。
+
+source frontier 的条件更严格。只有协议 `Commit` 已持久化、这笔事务的所有
+publication work 已完成，并且前面没有更早的 open/pending transaction 时，
+generation-wide source frontier 才能推进。数据可以提前流动，完整进度不能提前
+声明。
+
+### 3. DAG 一次运行一个 stage step
+
+source chunk 提交后，订阅它的 Scan 变为 runnable。Runtime 不会从 Scan 递归调用
+整条 DAG；它从持久 cursor、continuation 和 stream capacity 判断哪些 stage
+可运行，一次选择一个 stage。
+
+每个 step 都遵循同一套提交过程：
+
+```mermaid
+flowchart TD
+    A["按 stream_id 锁 input/output stream"] --> B["锁 input cursor 和 checkpoint"]
+    B --> C["读取 continuation"]
+    C --> D["执行一个受 row/byte 限制的 SQL primitive"]
+    D --> E["更新 state，并按需追加 output chunk"]
+    E --> F["推进 input cursor，替换或删除 continuation"]
+    F --> G["条件更新 checkpoint revision"]
+    G --> H["COMMIT"]
 ```
 
-折叠使用共享的 UNLOGGED scratch 表。apply 协议要求其中的 rows 只属于当前
-batch，并在 batch 之间保持为空；PostgreSQL 不会自动清空这些表。它们只帮助同一
-个 batch 里的多条 SQL 交换中间数据。崩溃恢复不依赖 scratch；恢复依赖持久化的
-`change_log`、稳定输入范围、正式 operator state、结果表和 inbox 游标。失败的
-batch 会根据游标重新读取同一个输入范围。
+[`StepTxn`](../src/kernel/step.rs) 实现公共的锁、cursor 和 checkpoint 协议。
+Rust kernel 决定 phase、预算和恢复位置；PostgreSQL 执行 typed 集合运算并提交
+transaction。
 
-当前注册计划只会生成五类 pipeline：
+一个 stage 追加 output chunk 后，它的下游会在本轮或后续 Runtime 轮次变为
+runnable。一个 step 没完成当前页时会保存 continuation；重启后读取同一条
+continuation 继续。普通 Scan、Filter、Project 只读取当前 chunk 的有界前缀；
+有状态算子还会读取自己的持久 state，但不会重新扫描 source table。
 
-| Pipeline | 每个 ingress batch 的工作 |
-| --- | --- |
-| Aggregate | 按 group 折叠 delta，更新 aggregate state 和可见 group；`COUNT(DISTINCT)` 还会维护 `(group, value)` multiplicity |
-| top-level Distinct | 更新输出 row 的 multiplicity，只在 `0 ↔ 正数` 时插入或删除结果 |
-| TopN | 更新 retained row bag，再从当前 state 计算结果 |
-| Window | 更新 row bag，再计算这个 batch 影响的 partition |
-| Join → Aggregate | 用当前左右 arrangement 计算本 batch 的 join delta，再更新 arrangement 和 aggregate |
+### 4. Sink 提交结果前缀
 
-### Join 为什么可以逐批
+Sink 消费最后一条 EffectStream 的 weighted rows，并把一个受预算限制的前缀
+应用到结果表。结果 DML、Sink input cursor、continuation 和 checkpoint 在同一个
+PostgreSQL transaction 中提交。
 
-设当前 batch 的左右变化是 `ΔL` 和 `ΔR`，batch 开始前的正式 arrangement 是
-`L` 和 `R`。inner join 的匹配部分是：
+如果 Runtime 在提交前退出，这些改动一起回滚；如果在提交后退出，cursor 已经
+越过对应结果 effect，恢复时不会重复应用。这是 Shiba 对用户可见结果的
+exactly-once 单位，不是整笔 source transaction。
 
-```text
-ΔL × R + L × ΔR + ΔL × ΔR
-```
+## 复杂 SQL 如何变成 DAG
 
-outer、semi、anti 和 null-aware anti 还会根据匹配数的 `0 ↔ 正数` 变化补上
-NULL-extension 或存在性边界。代码把匹配部分和这些边界一起写成这一批精确的
-`F(new) - F(old)`。
-
-这一批提交后，正式 arrangement 变成 `L + ΔL` 和 `R + ΔR`。下一批用这个新
-状态继续计算。因此跨 batch 的组合不会丢失：早一批的变化已经进入 arrangement，
-晚一批到来时会与它匹配。所有批次相加就是整笔源事务的最终变化。
-
-这和旧的“攒完整笔 source transaction，最后统一发布”不同。现在每批的 Join
-变化会直接进入结果。
-
-## 1000 万行到底会读多少
-
-如果一笔 source transaction 插入 1000 万行：
-
-| 位置 | 实际工作 |
-| --- | --- |
-| 源表 | 增量维护阶段不扫描 |
-| pgoutput / Rust | 1000 万条变化都会经过；Rust 只保留当前 ingress batch |
-| `change_log` | 一份共享输入，共保存 1000 万条 row image |
-| 每个受影响的 DAG | 最终仍要处理与自己相关的全部变化，但一次 transaction 只读一个稳定范围 |
-| 用户可见结果 | 每个成功 batch 都会推进，不等待第 1000 万行处理完成 |
-
-默认按 `ingress_batch_rows = 2048` 粗略估算，1000 万行约有 4883 个范围。十个
-结果依赖同一张源表时，输入 payload 仍只保存一份；十个 DAG 会独立读取相关范围
-并维护自己的 state、result 和 cursor。
-
-batch 解决的是“大 source commit 导致一个巨大 apply transaction”的问题。它
-不能减少查询本身必须完成的总工作，也没有解决单个输入产生海量输出的问题：
-
-- 一个 Join row 匹配一百万行，结果就至少有一百万份工作；
-- 一个 Window batch 命中超大 partition，当前实现仍可能重算整个 partition；
-- TopN retained state 或 DISTINCT key 数很大时，单条 operator SQL 仍可能很重。
-
-## Runtime 和调度
-
-每个 active database 只有一个名为 `shiba runtime` 的 PostgreSQL background
-worker。logical walsender 是 PostgreSQL 自己的另一个 backend。Shiba 没有
-Router 进程、Executor pool、每 DAG worker 或 Rust 线程池。
-
-Runtime 主循环是：
-
-```text
-ingress one batch → routing one page → round-robin apply → GC
-```
-
-一次 apply 只处理一个 DAG 的一个 ingress batch。有后续 batch 的 DAG 会回到
-队尾，因此其他 ready DAG 可以先执行。每轮的事务数和时间预算只在 PostgreSQL
-transaction 之间检查；已经运行的 SQL statement 不会被中断。
-
-`DagRuntime` 是内存中已加载的执行计划，不是线程。cache 是有界 LRU；被淘汰或
-Runtime 重启后，会从持久化的 physical plan 重新加载。
-
-同一 DAG 严格按 source commit 和 batch ordinal 顺序推进。不同 DAG 独立调度，
-所以同一 source transaction 对结果 A 的前几批可能已经可见，而结果 B 尚未开始。
-
-## 哪些状态决定恢复位置
-
-| 数据 | 作用 |
-| --- | --- |
-| logical replication slot | 决定 PostgreSQL 还要保留哪些 WAL |
-| `ingress_transactions`、`change_log` | 已持久化的 source transaction 和 ordered row delta |
-| `ingress_apply_batches` | 不再变化的 `input_seq` 范围 |
-| 每批 routing cursor | 这个稳定范围的结果订阅者路由到哪里 |
-| `dag_inbox.next_batch_ordinal` | 该结果下一批应该读哪个范围 |
-| operator state | 下一批计算使用的正式状态 |
-| result table | 用户当前看到的结果，包括已提交的部分 source transaction |
-| `view_progress.applied_lsn` | 最后一笔已经全部消费完成的相关 source commit |
-| `PhysicalDagPlan` | Runtime 要运行的 pipeline |
-
-`dag_inbox.next_batch_ordinal` 是处理大 source commit 时的精确恢复位置。
-`view_progress.applied_lsn` 只在 pgoutput `Commit` 已持久化、batch 列表完整且
-游标越过最后一个 batch 时推进。因此，当一笔 source transaction 处理到一半时，
-结果表已经变化，`view_progress` 仍指向上一笔完整处理完的 source commit。它不是
-“当前结果精确对应哪个源快照”的证明。
-
-Replication feedback 只确认输入已经持久化，也不表示所有结果已经追上。
-
-## 崩溃和重试
-
-每个 batch 都遵守同一条规则：正式 state、result mutation 和 batch cursor 必须
-在同一个 PostgreSQL transaction 中提交。
-
-- batch 提交前 Runtime 退出：本批 state、result 和 cursor 一起回滚，重启后重做；
-- batch 提交后 Runtime 退出：本批结果保持可见，重启后从下一 ordinal 继续；
-- `Commit` 到达前退出：已提交的批次保留，当前批次按事务回滚或提交；重放靠稳定
-  event identity 和 batch ordinal 去重，不会重复应用；
-- 最后一批失败：最后一批 state、result、`view_progress` 和 inbox 删除一起回滚；
-- ingress 落盘后、replication feedback 前退出：稳定 event identity 去重；
-- routing page 中途失败：本页 inbox 写入和 routing cursor 一起回滚。
-
-所以 crash replay 不会把一个已经提交的 batch 重算两次。但放弃 source-commit
-原子可见后，如果后续 batch 持续失败，用户会长期看到这笔 source transaction
-已经成功处理的前缀。短暂锁冲突和 serialization error 会重试；确定性错误会暂停
-或 quarantine 当前 DAG，其他 DAG 继续工作。
-
-## 资源上限
-
-| 配置或资源 | 当前限制的对象 |
-| --- | --- |
-| `ingress_batch_rows` / `ingress_batch_bytes` | ingress batch 的软目标 |
-| `max_stage_rows` | Aggregate/Distinct 的本批 scratch；Join candidates；TopN retained state；Window 受影响的完整 partition |
-| `stage_chunk_rows` | Aggregate/Distinct 在一个 apply 事务内，一条 state/sink SQL 处理的 folded keys |
-| relation descriptor cache | 到达上限后 fail closed |
-| DagRuntime cache | 有界 LRU |
-| `work_mem` | 每个 PostgreSQL plan node 的内存预算 |
-| `temp_file_limit` | Runtime session 的临时文件上限 |
-
-当前源事务不再需要一次性通过一个 transaction-size admission gate。但
-`max_stage_rows` 仍是硬上限。更小的 ingress batch 能减少本批输入和 scratch，
-但不能缩小已有 TopN state、受影响的完整 Window partition，或一行变化产生的
-Join fanout。超过上限时 DAG 仍会暂停。
-
-积压有两处：
-
-- slot 尚未被持久化的 WAL lag；
-- 已经持久化、但某个 DAG 尚未处理完的 `dag_inbox` backlog。
-
-`shiba.progress().pending_wal_bytes` 表示前者，不是某个结果的 inbox backlog。
-暂停或 quarantined 的结果会保留 inbox 和共享 changelog 引用。
-
-## 查询注册
-
-`CREATE TABLE shiba... AS SELECT...` 在一个注册事务中完成：
-
-```text
-PostgreSQL analyzed Query
-  → 支持范围校验
-  → 锁定源表
-  → CTAS 初始快照
-  → 初始化 operator state
-  → 保存 LogicalPlan + PhysicalDagPlan
-  → 加入 publication 并安装唤醒 trigger
-```
-
-源表锁覆盖初始快照和 activation LSN 的建立，所以快照与随后消费的 WAL 之间没有
-写入缺口。Runtime 为每笔 source transaction 运行已保存的 physical plan，不会
-重新规划查询。
-
-## 代码入口
-
-| 主题 | 文件 |
-| --- | --- |
-| Runtime 主循环和 round-robin scheduler | `src/worker.rs` |
-| replication transport | `src/replication.rs` |
-| pgoutput decoder | `src/pgoutput.rs` |
-| transaction-aware ingress batching | `src/ingress.rs` |
-| ingress 持久化、稳定 batch range | `sql/11_ingress.sql` |
-| catalog 和 scratch/state tables | `sql/00_catalog.sql` |
-| Aggregate | `sql/21_operator_aggregate.sql` |
-| Distinct、TopN、Window | `sql/22_operator_unary_batches.sql` |
-| Join | `sql/23_operator_join_batch.sql` |
-| claim、batch cursor、progress/ack | `sql/24_operator_dispatch.sql` |
-| registration | `sql/30_registration.sql` |
-
-查看某个结果保存的 physical plan：
+PostgreSQL 完成语法分析和名称解析后，
+[`src/query_lowering.rs`](../src/query_lowering.rs) 把 `Query` 转成唯一的
+`DataflowPlan`。例如下面这条查询包含三个 source、两个 Join、Aggregate、Window
+和 TopN：
 
 ```sql
-SELECT shiba.explain_physical('shiba.sales_by_product');
+CREATE TABLE shiba.chain_ranked AS
+SELECT first_key,
+       joined_rows,
+       row_number() OVER (
+         ORDER BY joined_rows DESC, first_key
+       ) AS rank
+FROM (
+  SELECT fact.first_key,
+         count(*) AS joined_rows
+  FROM public.chain_fact AS fact
+  JOIN public.chain_first AS first_side
+    ON first_side.first_key = fact.first_key
+  JOIN public.chain_second AS second_side
+    ON second_side.second_key = first_side.second_key
+  GROUP BY fact.first_key
+) AS grouped
+ORDER BY joined_rows DESC, first_key
+LIMIT 100;
 ```
 
-产品支持范围见 [`MVP.md`](MVP.md)，测试入口见 [`TESTING.md`](TESTING.md)，
-Rust 代码导读见 [`LEARNING_RUST.md`](LEARNING_RUST.md)。
+它的主要 stage 和 stream 如下。Project 也画出来，因为它们是实际 stage，不是
+图中的省略步骤。
+
+```mermaid
+flowchart TB
+    SF[("source stream<br/>chain_fact")] -->|"cursor + frontier"| F["Scan fact"]
+    S1[("source stream<br/>chain_first")] -->|"cursor + frontier"| D1["Scan first"]
+    F --> QF[("stream")]
+    D1 --> Q1[("stream")]
+    QF -->|"port 0 cursor + frontier"| J1["Join 1<br/>bounded match pages"]
+    Q1 -->|"port 1 cursor + frontier"| J1
+    J1 <--> JS1[("Join 1 state")]
+    J1 --> QJ1[("stream")]
+
+    S2[("source stream<br/>chain_second")] -->|"cursor + frontier"| D2["Scan second"]
+    D2 --> Q2[("stream")]
+    QJ1 -->|"port 0 cursor + frontier"| J2["Join 2<br/>bounded match pages"]
+    Q2 -->|"port 1 cursor + frontier"| J2
+    J2 <--> JS2[("Join 2 state")]
+    J2 --> QJ2[("stream")]
+
+    QJ2 -->|"cursor + frontier"| A["Aggregate"]
+    A <--> AS[("group state")]
+    A --> QA[("stream")]
+    QA -->|"cursor + frontier"| P1["Project"]
+    P1 --> QP1[("stream")]
+    QP1 -->|"cursor + frontier"| W["Window"]
+    W <--> WS[("partition state")]
+    W --> QW[("stream")]
+    QW -->|"cursor + frontier"| P2["Project"]
+    P2 --> QP2[("stream")]
+    QP2 -->|"cursor + frontier"| T["TopN"]
+    T <--> TS[("ordered state")]
+    T --> QT[("stream")]
+    QT -->|"cursor + frontier"| K["Sink"]
+    K --> R[("chain_ranked")]
+```
+
+两个 Join 都是 fan-in：每个 input port 有独立 cursor，不要求两边凑成同一个
+batch。任一输入有数据时 Join 都可以工作；只有所有输入都证明某个 LSN 已经完整，
+它才能向下游推进该 frontier。
+
+两个 Join 也可能产生 row fanout。一条输入匹配很多 arrangement rows 时，Join
+只扫描一个有界 keyset page、追加一个 output chunk，并在 continuation 中保存
+当前 input row、input port 和 opposite-side cursor。第二个 Join 可以在第一个
+Join 仍继续分页时消费已经提交的 chunks。
+
+`DataflowPlan` 只保存通用 operator 及其 typed schema、input bindings 和配置：
+
+```text
+Scan Filter Project Join Distinct Aggregate Window TopN Sink
+```
+
+复杂查询靠这些 operator 组合，不会选择某个固定 query family，也没有第二套
+physical plan 或 PL/pgSQL fallback。完整 SQL 支持范围见
+[`SQL.md`](SQL.md)。
+
+## EffectStream、fanout 和背压
+
+除 Sink 外，每个 stage 只有一条 output EffectStream。每个下游 input port 在
+`effect_stream_consumers` 中保存自己的 cursor；多个 consumer 共享 payload：
+
+```mermaid
+flowchart LR
+    P["producer"] --> Q[("one EffectStream")]
+    Q -->|"consumer A<br/>cursor + frontier"| A["downstream A"]
+    Q -->|"consumer B<br/>cursor + frontier"| B["downstream B"]
+```
+
+这就是 stream fanout。增加下游只增加 consumer cursor，不复制已经存储的
+payload。GC 只能删除所有 consumer 都越过的 chunk。
+
+EffectStream 的持久数据分为：
+
+```text
+effect_streams
+  next sequence、retained rows/bytes/chunks、frontier、backpressure
+
+effect_stream_chunks
+  data/frontier chunk metadata
+
+generated payload relation
+  (stream_id, chunk_seq, row_ordinal, weight, row_value)
+
+effect_stream_consumers
+  每个 input port 的 next_chunk_seq、activation_lsn、consumed_frontier_lsn
+```
+
+operator stream 中，data chunk 保存 weighted rows，frontier chunk 不保存行。
+source stream 只保存 data chunks；它的 generation-wide frontier 来自
+`ingress_replay_state.published_lsn`，由 Scan 转成下游的 frontier chunk。
+chunk sequence 回答“读到 stream 的哪里”，frontier 回答“处理完整到哪个 source
+LSN”，两者不能替代。
+
+stream 同时统计 retained chunk、row 和 byte。达到任一 high watermark 后，
+producer 在写入前返回 blocked；所有 consumer 推进、GC 降到 low watermark 后才
+解除。下游慢时，背压会从最后一条 stream 逐级阻止上游继续产生数据。Runtime
+仍会调度可以消费现有 chunks 的下游 stage，让 GC 有机会释放容量。
+
+如果 source publication 被背压，Runtime 暂停读取新 WAL，只保留当前有界 ingress
+staging。复制连接仍定期发送 standby status，并且只确认已经持久化的 ingress
+LSN；重复 heartbeat 不会重写同一个 replay-state row。
+
+## 大数据量如何保持可恢复
+
+如果 1000 万行都影响查询，总工作量不能消失：相关 Scan 最终都要处理这些变化。
+区别是每层都有自己的持久切分点：
+
+| 层 | 配置 |
+| --- | --- |
+| ingress 读取 batch | `shiba.ingress_batch_rows`, `shiba.ingress_batch_bytes` |
+| source publication chunk | 复用 ingress row/byte 目标，但按 source stream 独立切分 |
+| operator input/output step | `shiba.stage_chunk_rows`, `shiba.stage_chunk_bytes` |
+| Aggregate/Window/TopN Drain 调度 | `shiba.stage_admission_rows`, `shiba.stage_admission_bytes` |
+
+一个 ingress batch 不对应一个 source chunk，也不对应一个 operator transaction。
+每层按自己的预算提交和恢复。ingress 在完整 pgoutput message 之后检查目标，因此
+一条 message（包括 UPDATE 的 `-old,+new`）可以越过 ingress row/byte target；
+operator step 的 row target 则是硬边界。
+
+普通 Scan、Filter、Project 读取当前 chunk 的有界前缀。Join 记录当前 input row 和
+匹配页 cursor。Aggregate 记录 dirty group 和 rebuild cursor；Window 记录
+partition、frame、function phase 和 cursor；TopN 记录重建和 output diff cursor。
+它们都从持久位置继续，不会为一次增量重读完整 source table。
+
+单个不可再拆的 typed work item，例如一条 input row 或一次 Window finalization，
+可以超过 byte target 并单独占一个 step；其余工作必须在达到 row/byte target 时
+保存 continuation。Runtime 还为 PostgreSQL statement 设置 `work_mem` 和
+`temp_file_limit`，但正在执行的 SQL statement 不会被 wall-clock timer 中断，
+所以 kernel 自己的分页条件才是 transaction 边界。
+
+### Aggregate、Window、TopN 的 Apply 和 Drain
+
+如果高 fanout Join 连续产生很多小 chunks，Aggregate、Window 或 TopN 每收到一个
+chunk 就完整重建输出，会反复扫描相同 state。它们把输入吸收和输出重建分开：
+
+```mermaid
+flowchart LR
+    A[("input stream")] --> B["Apply<br/>吸收有界前缀"]
+    B --> C[("authoritative state")]
+    B --> D[("dirty work + causal LSN")]
+    B --> E["推进已完整消费的 input chunk"]
+    B --> F[("admitted rows / bytes")]
+    F --> G{"到达 Drain 阈值<br/>或收到 frontier？"}
+    G -- "否" --> A
+    G -- "是" --> H["Drain<br/>暂停读取新 input"]
+    C --> H
+    D --> H
+    H --> I["按 phase 分页重建、比较、输出"]
+    I --> J[("output stream")]
+    H --> K{"pending work 完成？"}
+    K -- "否" --> H
+    K -- "是，普通 Drain" --> A
+    K -- "是，frontier Drain" --> L["追加 output frontier<br/>清零 admission"]
+    L --> A
+```
+
+Apply 每次仍受 stage row/byte budget 限制。完整 input chunk 被吸收后可以立即推进
+cursor；后续 Drain 依赖 operator state 和 pending work，不再固定已经消费的
+chunk。若预算在 chunk 中间耗尽，partial input cursor 保存在 continuation。
+
+admission 阈值从配置值 `Q` 开始，按 `Q, 2Q, 4Q, ...` 增长，到固定间隔上限后
+继续按该间隔触发。普通 Drain 完成后保留累计计数；只有 output frontier 与计数
+清零在同一个 transaction 中提交。这样不会因每个小 fanout chunk 都重建 hot
+group，同时两轮 Drain 之间的新输入仍有上限。
+
+Drain 自身也按 phase 和 cursor 分页。Aggregate 分页处理 dirty groups 和 aggregate
+state；Window 分页处理 partition、frame、function 和 output difference；TopN
+分页处理 ordered state 和 result difference。每次提交都留下准确的下一恢复位置。
+
+Window aggregate Fold 可以在一个 step 内连续处理多个 output ordinals。预算累计
+frame input 的 rows/bytes；每次 finalization 另计一个 row，并计入 materialized
+function/candidate 的 bytes。accumulator 已完成、但 finalization 放不进剩余预算时，
+continuation 持久保存 `ready_to_finalize`，下一 step 再执行。frame relation 缺行是
+持久状态错误，不会被当成空 frame；即使所有 frame 确实为空，一个 step 也最多访问
+64 个 ordinals。
+
+Distinct 不使用这套 admission 调度。它更新 SQL-equal group 的 multiplicity；
+如果当前代表行改变，就先把 `-old` retraction、再把 `+new` insertion 写入持久
+effect queue。Drain 在读取后续 input 或转发 frontier 前按 output budget 清空这条
+queue。
+
+## 初始数据如何进入 DAG
+
+注册 CTAS 时，Shiba 必须覆盖 source snapshot 和注册后 WAL 之间的边界：
+
+```mermaid
+sequenceDiagram
+    participant D as CTAS hook
+    participant S as source tables
+    participant B as Scan bootstrap relation
+    participant C as catalog
+    participant R as Runtime
+
+    D->>D: Query → DataflowPlan
+    D->>S: 按 OID 顺序取得写锁
+    D->>D: 记录 activation_lsn
+    D->>C: 保存 plan，并创建 stream/state/continuation/checkpoint
+    D->>B: 复制 typed source snapshot
+    D->>D: COMMIT
+    R->>B: 分步排空 bootstrap
+    R->>C: 发布 activation_lsn SnapshotFrontier
+    R->>C: 消费 activation_lsn 之后的 live chunks
+```
+
+source lock 覆盖 snapshot 和 activation LSN 的建立，因此不会漏掉中间写入。
+bootstrap rows 通过正常的 Scan → DAG → Sink 路径处理。Scan 排空 snapshot 后
+先发布恰好位于 `activation_lsn` 的 SnapshotFrontier，再进入 live phase。
+
+当前限制是 source snapshot 仍在注册 transaction 中复制进 bootstrap relation。
+后续处理有界，但在已有超大 source table 上注册 CTAS 仍可能产生长 transaction。
+
+## Runtime 和崩溃恢复
+
+每个 active database 有一个 Shiba background worker。logical walsender 是
+PostgreSQL 的另一个 backend，不是第二个 Shiba Runtime。
+
+[`shiba_runtime_main`](../src/worker.rs) 的循环是：
+
+```text
+发布一个 pending source prefix
+如果没有 pending publication，读取一个 ingress batch
+运行一轮有界的 ready operator steps
+定期 GC change_log 和 EffectStream
+```
+
+一轮可以运行多个 stage steps，但每次只提交一个 stage。ready queue 只缓存
+operator ID；每轮 runnable 状态来自 PostgreSQL 中的 checkpoint、consumer cursor、
+continuation 和 stream capacity。cache 淘汰或 Runtime 重启后会重新读取这些状态。
+
+恢复位置按职责分布：
+
+| 内容 | 权威位置 |
+| --- | --- |
+| 尚未确认的 WAL | logical replication slot |
+| ingress LSN、source transaction、ordered effects、publication cursor | `ingress_replay_state`, `ingress_transactions`, `change_log`, `source_publications` |
+| 查询计划 | `dataflows.plan` |
+| stream chunks、payload、每个 input cursor | EffectStream catalog 和 generated payload relation |
+| step revision、admission、phase、下一页 cursor | checkpoint 和 generated continuation relation |
+| Join/Aggregate/Window/TopN 等计算状态 | generated typed state relations |
+| 用户当前可见结果 | Shiba-managed result table |
+
+恢复规则只取决于 transaction 是否提交：
+
+- ingress 提交前失败：当前 batch 没有 durable row，slot 重放；
+- 已发布部分 source chunks、但尚未读到 pgoutput `Commit` 时失败：slot 重放这笔
+  source transaction，稳定 transaction/event identity 和 publication cursor
+  避免重复发布已经提交的 chunks；
+- source publication 提交前失败：payload、metadata 和 cursor 一起回滚；
+- source publication 提交后失败：cursor 已前进，从下一个前缀继续；
+- operator step 提交前失败：state、output、cursor、continuation 和 checkpoint
+  一起回滚；
+- operator step 提交后失败：这些持久状态已经记录下一恢复点；
+- Sink step 同样遵守这条规则，并额外把结果 DML 包含在同一个 transaction 中，
+  因此已提交的结果 effect 不会在恢复后再次应用。
+
+确定性错误不会被跳过，也不会推进 cursor。PostgreSQL 重启 Runtime 后会再次执行
+同一个 durable step。
+
+## Rust 与 SQL 的实现边界
+
+Rust 负责 pgoutput 解析、Query lowering、operator phase、continuation、预算、
+恢复判断和调度。SQL 只负责 catalog、typed relation、必要的集合运算和事务性
+读写。所有 operator 都从
+[`src/kernel/dispatcher.rs`](../src/kernel/dispatcher.rs) 进入；不存在 PL/pgSQL
+kernel、wrapper 或 fallback。
+
+plan 保存 PostgreSQL 已解析的 function、operator、type、collation 和 sort
+operator OID。注册与执行都会校验 OID 和 generated relation ABI。`change_log`
+保留 pgoutput 的 per-column text，publisher 再构造 typed row；需要稳定 row
+identity 的 kernel 使用统一的 named-composite text roundtrip 和 binary encoding。
+这些细节不改变前面的 stream、cursor 和 transaction 边界。
+
+主要代码入口：
+
+| 内容 | 文件 |
+| --- | --- |
+| Runtime 主循环和 ingress transaction | `src/worker.rs` |
+| pgoutput transport/parser | `src/replication.rs`, `src/pgoutput.rs` |
+| ingress Rust state machine | `src/ingress.rs` |
+| Query → `DataflowPlan` | `src/query_lowering.rs` |
+| plan model和校验 | `src/logical/model.rs`, `src/logical/validate.rs` |
+| ready queue和持久状态读取 | `src/logical/dataflow.rs`, `src/logical/runtime.rs` |
+| step 公共 transaction 协议 | `src/kernel/step.rs` |
+| typed storage/OID 校验 | `src/kernel/storage.rs`, `src/kernel/register.rs` |
+| EffectStream 公共操作 | `src/kernel/stream.rs`, `sql/12_effect_stream.sql` |
+| operator dispatcher | `src/kernel/dispatcher.rs` |
+| operator kernels | `src/kernel/linear.rs`, `join.rs`, `distinct.rs`, `aggregate.rs`, `window.rs`, `topn.rs`, `sink.rs` |
+| catalog | `sql/00_catalog.sql` |
+| ingress persistence/publication | `sql/11_ingress.sql` |
+| introspection和生命周期 | `sql/25_introspection.sql`, `sql/40_lifecycle.sql` |
+
+查看已注册 dataflow 的 plan、stream cursor 和 checkpoint：
+
+```sql
+SELECT shiba.explain_dataflow('shiba.chain_ranked');
+```
+
+SQL 支持范围见 [`SQL.md`](SQL.md)，测试入口见 [`TESTING.md`](TESTING.md)，Rust
+阅读顺序见 [`LEARNING_RUST.md`](LEARNING_RUST.md)。

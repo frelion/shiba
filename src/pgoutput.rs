@@ -75,6 +75,13 @@ pub enum Message {
 
 pub type Tuple = Vec<Option<String>>;
 
+#[derive(Debug, PartialEq)]
+enum ParsedTupleValue {
+    Null,
+    Text(String),
+    UnchangedToast,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParseContext {
     NonStreaming,
@@ -282,7 +289,7 @@ fn parse_insert(
     Ok(Message::Insert {
         source_xid,
         relid,
-        row,
+        row: complete_tuple(row)?,
     })
 }
 
@@ -302,13 +309,14 @@ fn parse_update(
     if input.get(offset) != Some(&b'N') {
         return Err("UPDATE lacks a new tuple");
     }
+    let old = complete_tuple(old)?;
     let (new, tuple_end) = parse_tuple(input, offset)?;
     require_exact_len(input, tuple_end, "invalid update message length")?;
     Ok(Message::Update {
         source_xid,
         relid,
+        new: resolve_unchanged_toast(&old, new)?,
         old,
-        new,
     })
 }
 
@@ -327,7 +335,7 @@ fn parse_delete(
     Ok(Message::Delete {
         source_xid,
         relid,
-        old,
+        old: complete_tuple(old)?,
     })
 }
 
@@ -362,7 +370,10 @@ fn parse_truncate(
     })
 }
 
-fn parse_tuple(input: &[u8], offset: usize) -> Result<(Tuple, usize), &'static str> {
+fn parse_tuple(
+    input: &[u8],
+    offset: usize,
+) -> Result<(Vec<ParsedTupleValue>, usize), &'static str> {
     match input.get(offset) {
         Some(b'N') | Some(b'K') | Some(b'O') => {}
         _ => return Err("invalid tuple tag"),
@@ -373,7 +384,7 @@ fn parse_tuple(input: &[u8], offset: usize) -> Result<(Tuple, usize), &'static s
     for _ in 0..count {
         match *input.get(cursor).ok_or("truncated tuple")? {
             b'n' => {
-                values.push(None);
+                values.push(ParsedTupleValue::Null);
                 cursor += 1;
             }
             b't' => {
@@ -382,14 +393,44 @@ fn parse_tuple(input: &[u8], offset: usize) -> Result<(Tuple, usize), &'static s
                 let end = start.checked_add(length).ok_or("truncated tuple")?;
                 let value = std::str::from_utf8(input.get(start..end).ok_or("truncated tuple")?)
                     .map_err(|_| "tuple value is not UTF-8")?;
-                values.push(Some(value.to_owned()));
+                values.push(ParsedTupleValue::Text(value.to_owned()));
                 cursor = end;
             }
-            b'u' => return Err("unchanged TOAST value is unsupported by the Shiba MVP"),
+            b'u' => {
+                values.push(ParsedTupleValue::UnchangedToast);
+                cursor += 1;
+            }
             _ => return Err("invalid tuple column tag"),
         }
     }
     Ok((values, cursor))
+}
+
+fn complete_tuple(values: Vec<ParsedTupleValue>) -> Result<Tuple, &'static str> {
+    values
+        .into_iter()
+        .map(|value| match value {
+            ParsedTupleValue::Null => Ok(None),
+            ParsedTupleValue::Text(value) => Ok(Some(value)),
+            ParsedTupleValue::UnchangedToast => {
+                Err("unchanged TOAST value requires an UPDATE old tuple")
+            }
+        })
+        .collect()
+}
+
+fn resolve_unchanged_toast(old: &Tuple, new: Vec<ParsedTupleValue>) -> Result<Tuple, &'static str> {
+    new.into_iter()
+        .enumerate()
+        .map(|(index, value)| match value {
+            ParsedTupleValue::Null => Ok(None),
+            ParsedTupleValue::Text(value) => Ok(Some(value)),
+            ParsedTupleValue::UnchangedToast => old
+                .get(index)
+                .cloned()
+                .ok_or("unchanged TOAST column is absent from the UPDATE old tuple"),
+        })
+        .collect()
 }
 
 fn read_cstr(input: &[u8], offset: usize) -> Result<(&str, usize), &'static str> {
@@ -1158,19 +1199,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_tuple_column_tags_and_unchanged_toast() {
-        for (column_tag, error) in [
-            (
-                b'u',
-                "unchanged TOAST value is unsupported by the Shiba MVP",
-            ),
-            (b'?', "invalid tuple column tag"),
-        ] {
-            let mut raw_tuple = tuple(b'N', &[]);
-            raw_tuple[1..3].copy_from_slice(&1u16.to_be_bytes());
-            raw_tuple.push(column_tag);
-            assert_eq!(parse(&dml(b'I', 1, &[raw_tuple])), Err(error));
-        }
+    fn resolves_unchanged_toast_from_the_update_old_tuple() {
+        let mut new = tuple(b'N', &[Some(b"new")]);
+        new[1..3].copy_from_slice(&2u16.to_be_bytes());
+        new.push(b'u');
+        assert_eq!(
+            parse(&dml(
+                b'U',
+                1,
+                &[tuple(b'O', &[Some(b"old"), Some(b"wide")]), new]
+            )),
+            Ok(Message::Update {
+                source_xid: None,
+                relid: 1,
+                old: vec![Some("old".into()), Some("wide".into())],
+                new: vec![Some("new".into()), Some("wide".into())],
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unchanged_toast_without_an_old_value_and_invalid_tags() {
+        let mut unchanged = tuple(b'N', &[]);
+        unchanged[1..3].copy_from_slice(&1u16.to_be_bytes());
+        unchanged.push(b'u');
+        assert_eq!(
+            parse(&dml(b'I', 1, &[unchanged])),
+            Err("unchanged TOAST value requires an UPDATE old tuple")
+        );
+
+        let mut invalid = tuple(b'N', &[]);
+        invalid[1..3].copy_from_slice(&1u16.to_be_bytes());
+        invalid.push(b'?');
+        assert_eq!(
+            parse(&dml(b'I', 1, &[invalid])),
+            Err("invalid tuple column tag")
+        );
     }
 
     #[test]

@@ -3,12 +3,13 @@
 -- CALLING TRANSACTION BOUNDARIES
 -- --------------------------------
 -- These functions never commit and never perform replication I/O.  The
--- Runtime must call claim/create, event insertion(s), record_batch, and any
--- Commit finalization for that batch inside one bounded SPI transaction, then
--- commit before reading or waiting on the replication socket. Every durable
--- apply batch creates its own routing work and may execute while the ingress
--- transaction is open. Prefix batches do not advance durable replication
--- progress; commit_ingress_transaction only seals the header and advances it.
+-- Runtime calls claim/create, bounded event admission, and an optional Commit
+-- finalization inside one bounded SPI transaction, then commits before reading
+-- or waiting on the replication socket. Every durable apply batch creates one
+-- publication task per source and may be appended to the shared source stream
+-- while the ingress transaction is still open. Prefix batches do not advance
+-- durable replication progress; commit_ingress_transaction seals the header
+-- and advances persisted_lsn in constant work.
 -- Read feedback_upper_bound in a short SPI transaction, end that transaction,
 -- and only then send Standby Status Update.  After a
 -- successful send, record the confirmation intent in another short SPI
@@ -19,8 +20,9 @@
 -- 0. ingress_replay_state table lock (generation creation only)
 -- 1. ingress_replay_state rows (ascending slot_generation)
 -- 2. ingress_transactions rows (ascending ingress_txn_id)
--- 3. change_log stable identity / ingress_decode_batches
--- 4. ingress_apply_batches / routing_tasks
+-- 3. change_log stable identity
+-- 4. ingress_apply_batches / source_publications
+-- 5. effect_streams / effect_stream_chunks / typed payload relation
 --
 -- Every mutating function below follows the applicable prefix of this order.
 -- PostgreSQL retains the row locks until the caller commits or rolls back the
@@ -219,7 +221,6 @@ CREATE FUNCTION shiba_internal.claim_ingress_transaction(
 RETURNS TABLE (
     ingress_txn_id bigint,
     txn_status text,
-    next_input_seq bigint,
     event_count bigint,
     payload_bytes bigint,
     created boolean
@@ -291,7 +292,6 @@ BEGIN
     RETURN QUERY
     SELECT txn.ingress_txn_id,
            txn.status,
-           txn.next_input_seq,
            txn.event_count,
            txn.payload_bytes,
            v_created
@@ -300,173 +300,16 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION shiba_internal.insert_ingress_event(
-    p_ingress_txn_id bigint,
-    p_change_lsn pg_lsn,
-    p_change_ordinal bigint,
-    p_image_ordinal integer,
-    p_source_oid oid,
-    p_weight bigint,
-    p_typed_payload jsonb
-)
-RETURNS TABLE (
-    input_seq bigint,
-    inserted boolean
-)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-    v_slot_generation bigint;
-    v_status text;
-    v_next_input_seq bigint;
-    v_existing_source_oid oid;
-    v_existing_weight bigint;
-    v_existing_payload jsonb;
-    v_payload_bytes bigint;
-BEGIN
-    IF p_ingress_txn_id IS NULL
-       OR p_change_lsn IS NULL
-       OR p_change_ordinal IS NULL
-       OR p_image_ordinal IS NULL
-       OR p_source_oid IS NULL
-       OR p_weight IS NULL
-       OR p_typed_payload IS NULL THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '22004',
-            MESSAGE = 'ingress event fields must not contain NULL';
-    END IF;
-
-    SELECT txn.slot_generation
-      INTO STRICT v_slot_generation
-      FROM shiba_internal.ingress_transactions AS txn
-     WHERE txn.ingress_txn_id = p_ingress_txn_id;
-
-    -- Lock-order level 1.
-    PERFORM 1
-      FROM shiba_internal.ingress_replay_state AS replay
-     WHERE replay.slot_generation = v_slot_generation
-       AND replay.state = 'active'
-     FOR UPDATE;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55000',
-            MESSAGE = format(
-                'ingress slot generation %s is not active',
-                v_slot_generation
-            );
-    END IF;
-
-    -- Lock-order level 2.  This serializes input_seq allocation for one source
-    -- transaction and makes replay retain the first allocation.
-    SELECT txn.status,
-           txn.next_input_seq
-      INTO STRICT v_status,
-                  v_next_input_seq
-      FROM shiba_internal.ingress_transactions AS txn
-     WHERE txn.ingress_txn_id = p_ingress_txn_id
-     FOR UPDATE;
-
-    IF v_status <> 'open' THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55000',
-            MESSAGE = format(
-                'cannot append to ingress transaction %s in state %s',
-                p_ingress_txn_id,
-                v_status
-            );
-    END IF;
-
-    SELECT event.input_seq,
-           event.source_oid,
-           event.weight,
-           event.typed_payload
-      INTO input_seq,
-           v_existing_source_oid,
-           v_existing_weight,
-           v_existing_payload
-      FROM shiba_internal.change_log AS event
-     WHERE event.ingress_txn_id = p_ingress_txn_id
-       AND event.change_lsn = p_change_lsn
-       AND event.change_ordinal = p_change_ordinal
-       AND event.image_ordinal = p_image_ordinal;
-
-    IF FOUND THEN
-        IF v_existing_source_oid IS DISTINCT FROM p_source_oid
-           OR v_existing_weight IS DISTINCT FROM p_weight
-           OR v_existing_payload IS DISTINCT FROM p_typed_payload THEN
-            RAISE EXCEPTION USING
-                ERRCODE = 'XX001',
-                MESSAGE = format(
-                    'ingress event identity conflict for transaction %s at (%s,%s,%s)',
-                    p_ingress_txn_id,
-                    p_change_lsn,
-                    p_change_ordinal,
-                    p_image_ordinal
-                );
-        END IF;
-
-        inserted := false;
-        RETURN NEXT;
-        RETURN;
-    END IF;
-
-    v_payload_bytes :=
-        pg_catalog.octet_length(pg_catalog.jsonb_send(p_typed_payload))::bigint;
-    input_seq := v_next_input_seq;
-
-    -- Lock-order level 3: stable event identity.
-    INSERT INTO shiba_internal.change_log (
-        ingress_txn_id,
-        change_lsn,
-        change_ordinal,
-        image_ordinal,
-        input_seq,
-        source_oid,
-        weight,
-        typed_payload,
-        payload_bytes
-    )
-    VALUES (
-        p_ingress_txn_id,
-        p_change_lsn,
-        p_change_ordinal,
-        p_image_ordinal,
-        input_seq,
-        p_source_oid,
-        p_weight,
-        p_typed_payload,
-        v_payload_bytes
-    );
-
-    UPDATE shiba_internal.ingress_transactions AS txn
-       SET next_input_seq = txn.next_input_seq + 1,
-           event_count = txn.event_count + 1,
-           payload_bytes = txn.payload_bytes + v_payload_bytes
-     WHERE txn.ingress_txn_id = p_ingress_txn_id;
-
-    inserted := true;
-    RETURN NEXT;
-END;
-$$;
-
--- One Runtime/SPI call inserts a bounded array in wire order.  Each element
--- has this fixed JSONB shape:
+-- One Runtime/SPI call admits a bounded array in wire order. Each element has
+-- this exact JSONB shape:
 -- {
 --   "change_lsn": "0/16B6A20",
 --   "change_ordinal": 0,
 --   "image_ordinal": 0,
 --   "source_oid": 16384,
 --   "weight": 1,
---   "typed_payload": {...}
+--   "payload": {...}
 -- }
---
--- The first implementation deliberately delegates each element to the single
--- event function so identity-conflict semantics have one implementation.
--- This removes per-row SPI round trips; a later set-oriented SQL body may
--- replace the loop without changing the API.
 CREATE FUNCTION shiba_internal.insert_ingress_events(
     p_ingress_txn_id bigint,
     p_events jsonb
@@ -482,15 +325,23 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-    v_event jsonb;
-    v_array_ordinal bigint;
-    v_input_seq bigint;
-    v_inserted boolean;
+    v_slot_generation bigint;
+    v_status text;
+    v_existing_event_count bigint;
+    v_existing_payload_bytes bigint;
+    v_existing_batch_count bigint;
+    v_existing_pending_publications bigint;
+    v_batch_payload_bytes bigint;
+    v_task_count bigint;
+    v_total_count bigint;
+    v_source_count bigint;
+    v_last_replayed_ordinal bigint;
+    v_first_new_ordinal bigint;
+    v_identity_conflict boolean;
     v_first_inserted_input_seq bigint;
     v_last_inserted_input_seq bigint;
     v_batch_ordinal bigint;
-    v_previous_last_input_seq bigint;
-    v_source record;
+    v_source_oid oid;
     v_source_name text;
 BEGIN
     IF p_ingress_txn_id IS NULL OR p_events IS NULL THEN
@@ -505,109 +356,338 @@ BEGIN
             MESSAGE = 'ingress event batch must be a JSONB array';
     END IF;
 
-    inserted_count := 0;
-    replayed_count := 0;
-
-    FOR v_event, v_array_ordinal IN
-        SELECT item.value, item.ordinality
+    IF EXISTS (
+        SELECT 1
           FROM pg_catalog.jsonb_array_elements(p_events)
                WITH ORDINALITY AS item(value, ordinality)
-         ORDER BY item.ordinality
-    LOOP
-        IF pg_catalog.jsonb_typeof(v_event) <> 'object'
-           OR NOT (
-               v_event ? 'change_lsn'
-               AND v_event ? 'change_ordinal'
-               AND v_event ? 'image_ordinal'
-               AND v_event ? 'source_oid'
-               AND v_event ? 'weight'
-               AND v_event ? 'typed_payload'
-           ) THEN
-            RAISE EXCEPTION USING
-                ERRCODE = '22023',
-                MESSAGE = format(
-                    'ingress event batch element %s has invalid shape',
-                    v_array_ordinal
-                );
-        END IF;
-
-        SELECT event_result.input_seq,
-               event_result.inserted
-          INTO STRICT v_input_seq,
-                      v_inserted
-          FROM shiba_internal.insert_ingress_event(
-                   p_ingress_txn_id,
-                   (v_event ->> 'change_lsn')::pg_lsn,
-                   (v_event ->> 'change_ordinal')::bigint,
-                   (v_event ->> 'image_ordinal')::integer,
-                   (v_event ->> 'source_oid')::oid,
-                   (v_event ->> 'weight')::bigint,
-                   v_event -> 'typed_payload'
-               ) AS event_result;
-
-        IF first_input_seq IS NULL THEN
-            first_input_seq := v_input_seq;
-        END IF;
-        last_input_seq := v_input_seq;
-
-        IF v_inserted THEN
-            inserted_count := inserted_count + 1;
-            IF v_first_inserted_input_seq IS NULL THEN
-                v_first_inserted_input_seq := v_input_seq;
-            END IF;
-            v_last_inserted_input_seq := v_input_seq;
-        ELSE
-            replayed_count := replayed_count + 1;
-        END IF;
-    END LOOP;
-
-    -- Normalize only the bounded input_seq interval touched by this call.
-    -- typed_payload stays immutable so replay compares the original wire
-    -- image; canonical_payload is what DAG operators read.
-    IF first_input_seq IS NOT NULL THEN
-        FOR v_source IN
-            SELECT DISTINCT event.source_oid
-              FROM shiba_internal.change_log AS event
-             WHERE event.ingress_txn_id = p_ingress_txn_id
-               AND event.input_seq BETWEEN first_input_seq AND last_input_seq
-        LOOP
-            SELECT pg_catalog.format(
-                       '%I.%I',
-                       namespace_catalog.nspname,
-                       relation_catalog.relname
-                   )
-              INTO STRICT v_source_name
-              FROM pg_catalog.pg_class AS relation_catalog
-              JOIN pg_catalog.pg_namespace AS namespace_catalog
-                ON namespace_catalog.oid = relation_catalog.relnamespace
-             WHERE relation_catalog.oid = v_source.source_oid
-               AND relation_catalog.relkind IN ('r', 'p');
-
-            EXECUTE pg_catalog.format(
-                'UPDATE shiba_internal.change_log AS event
-                    SET canonical_payload = pg_catalog.to_jsonb(
-                        pg_catalog.jsonb_populate_record(
-                            NULL::%s,
-                            event.typed_payload
-                        )
-                    )
-                  WHERE event.ingress_txn_id = $1
-                    AND event.input_seq BETWEEN $2 AND $3
-                    AND event.source_oid = $4
-                    AND event.canonical_payload IS NULL',
-                v_source_name
-            )
-            USING p_ingress_txn_id,
-                  first_input_seq,
-                  last_input_seq,
-                  v_source.source_oid;
-        END LOOP;
+         WHERE CASE
+             WHEN pg_catalog.jsonb_typeof(item.value) <> 'object' THEN true
+             ELSE NOT (
+                 item.value ?& ARRAY[
+                     'change_lsn',
+                     'change_ordinal',
+                     'image_ordinal',
+                     'source_oid',
+                     'weight',
+                     'payload'
+                 ]
+             )
+             OR EXISTS (
+                 SELECT 1
+                   FROM pg_catalog.jsonb_object_keys(item.value) AS member(key)
+                  WHERE member.key <> ALL (ARRAY[
+                      'change_lsn',
+                      'change_ordinal',
+                      'image_ordinal',
+                      'source_oid',
+                      'weight',
+                      'payload'
+                  ])
+             )
+         END
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023',
+            MESSAGE = 'ingress event batch has an invalid element shape';
     END IF;
 
-    -- The ingress transaction header remains locked by insert_ingress_event
-    -- until the caller commits, so batch ordinal allocation is serialized
-    -- with input_seq allocation.  Replayed events create no second apply
-    -- batch even when the replication transport groups frames differently.
+    BEGIN
+        IF EXISTS (
+            SELECT 1
+              FROM pg_catalog.jsonb_array_elements(p_events)
+                   WITH ORDINALITY AS item(value, ordinality)
+             WHERE pg_catalog.jsonb_typeof(item.value -> 'change_lsn')
+                       <> 'string'
+                OR pg_catalog.jsonb_typeof(item.value -> 'change_ordinal')
+                       <> 'number'
+                OR pg_catalog.jsonb_typeof(item.value -> 'image_ordinal')
+                       <> 'number'
+                OR pg_catalog.jsonb_typeof(item.value -> 'source_oid')
+                       <> 'number'
+                OR pg_catalog.jsonb_typeof(item.value -> 'weight')
+                       <> 'number'
+                OR pg_catalog.jsonb_typeof(item.value -> 'payload')
+                       <> 'object'
+                OR (item.value ->> 'change_ordinal')::bigint < 0
+                OR (item.value ->> 'image_ordinal')::integer < 0
+                OR (item.value ->> 'source_oid')::oid = 0::oid
+                OR (item.value ->> 'weight')::bigint NOT IN (-1, 1)
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22023',
+                MESSAGE = 'ingress event batch contains an invalid value';
+        END IF;
+
+        IF EXISTS (
+            SELECT 1
+              FROM pg_catalog.jsonb_array_elements(p_events) AS item(value)
+             GROUP BY (item.value ->> 'change_lsn')::pg_lsn,
+                      (item.value ->> 'change_ordinal')::bigint,
+                      (item.value ->> 'image_ordinal')::integer
+            HAVING count(*) > 1
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22023',
+                MESSAGE = 'ingress event batch repeats a stable event identity';
+        END IF;
+    EXCEPTION
+        WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22023',
+                MESSAGE = 'ingress event batch contains an invalid typed value';
+    END;
+
+    SELECT txn.slot_generation
+      INTO STRICT v_slot_generation
+      FROM shiba_internal.ingress_transactions AS txn
+     WHERE txn.ingress_txn_id = p_ingress_txn_id;
+
+    -- Lock once per bounded batch: generation, then transaction header.
+    PERFORM 1
+      FROM shiba_internal.ingress_replay_state AS replay
+     WHERE replay.slot_generation = v_slot_generation
+       AND replay.state = 'active'
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = format(
+                'ingress slot generation %s is not active',
+                v_slot_generation
+            );
+    END IF;
+
+    SELECT txn.status,
+           txn.event_count,
+           txn.payload_bytes,
+           txn.batch_count,
+           txn.pending_publications
+      INTO STRICT v_status,
+                  v_existing_event_count,
+                  v_existing_payload_bytes,
+                  v_existing_batch_count,
+                  v_existing_pending_publications
+      FROM shiba_internal.ingress_transactions AS txn
+     WHERE txn.ingress_txn_id = p_ingress_txn_id
+     FOR UPDATE;
+    IF v_status <> 'open' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = format(
+                'cannot append to ingress transaction %s in state %s',
+                p_ingress_txn_id,
+                v_status
+            );
+    END IF;
+
+    -- Validate one source at a time. jsonb_populate_record makes PostgreSQL
+    -- cast every pgoutput text field to the source row type, but change_log
+    -- retains the original per-column text JSON. A later publisher therefore
+    -- reconstructs exactly the same typed values, including array dimensions.
+    v_total_count := 0;
+    FOR v_source_oid IN
+        SELECT DISTINCT (item.value ->> 'source_oid')::oid
+          FROM pg_catalog.jsonb_array_elements(p_events) AS item(value)
+         ORDER BY 1
+    LOOP
+        SELECT pg_catalog.format(
+                   '%I.%I',
+                   namespace_catalog.nspname,
+                   relation_catalog.relname
+               )
+          INTO STRICT v_source_name
+          FROM pg_catalog.pg_class AS relation_catalog
+          JOIN pg_catalog.pg_namespace AS namespace_catalog
+            ON namespace_catalog.oid = relation_catalog.relnamespace
+         WHERE relation_catalog.oid = v_source_oid
+           AND relation_catalog.relkind IN ('r', 'p')
+           AND relation_catalog.relpersistence = 'p';
+
+        EXECUTE pg_catalog.format(
+            'SELECT count(
+                      pg_catalog.jsonb_populate_record(
+                        NULL::%s,
+                        item.value -> ''payload''
+                      )
+                    )
+               FROM pg_catalog.jsonb_array_elements($1)
+                    AS item(value)
+              WHERE (item.value ->> ''source_oid'')::oid = $2',
+            v_source_name
+        )
+        INTO STRICT v_source_count
+        USING p_events, v_source_oid;
+
+        v_total_count := v_total_count + v_source_count;
+    END LOOP;
+
+    IF v_total_count <> pg_catalog.jsonb_array_length(p_events) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'XX001',
+            MESSAGE = 'typed ingress validation lost an event';
+    END IF;
+
+    WITH incoming AS (
+        SELECT item.ordinality::bigint AS ordinal,
+               (item.value ->> 'change_lsn')::pg_lsn AS change_lsn,
+               (item.value ->> 'change_ordinal')::bigint AS change_ordinal,
+               (item.value ->> 'image_ordinal')::integer AS image_ordinal,
+               (item.value ->> 'source_oid')::oid AS source_oid,
+               (item.value ->> 'weight')::bigint AS weight,
+               item.value -> 'payload' AS payload
+          FROM pg_catalog.jsonb_array_elements(p_events)
+               WITH ORDINALITY AS item(value, ordinality)
+    ),
+    matched AS (
+        SELECT incoming.*,
+               existing.input_seq,
+               existing.source_oid AS existing_source_oid,
+               existing.weight AS existing_weight,
+               existing.payload AS existing_payload
+          FROM incoming
+          LEFT JOIN shiba_internal.change_log AS existing
+            ON existing.ingress_txn_id = p_ingress_txn_id
+           AND existing.change_lsn = incoming.change_lsn
+           AND existing.change_ordinal = incoming.change_ordinal
+           AND existing.image_ordinal = incoming.image_ordinal
+    )
+    SELECT count(*) FILTER (WHERE input_seq IS NULL),
+           count(*) FILTER (WHERE input_seq IS NOT NULL),
+           max(ordinal) FILTER (WHERE input_seq IS NOT NULL),
+           min(ordinal) FILTER (WHERE input_seq IS NULL),
+           min(input_seq),
+           max(input_seq),
+           coalesce(
+             bool_or(
+               input_seq IS NOT NULL
+               AND (
+                 existing_source_oid IS DISTINCT FROM source_oid
+                 OR existing_weight IS DISTINCT FROM weight
+                 OR existing_payload IS DISTINCT FROM payload
+               )
+             ),
+             false
+           )
+      INTO inserted_count,
+           replayed_count,
+           v_last_replayed_ordinal,
+           v_first_new_ordinal,
+           first_input_seq,
+           last_input_seq,
+           v_identity_conflict
+      FROM matched;
+
+    IF v_identity_conflict THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'XX001',
+            MESSAGE = format(
+                'ingress event identity conflict for transaction %s',
+                p_ingress_txn_id
+            );
+    END IF;
+
+    IF v_first_new_ordinal IS NOT NULL
+       AND v_last_replayed_ordinal IS NOT NULL
+       AND v_first_new_ordinal < v_last_replayed_ordinal THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'XX001',
+            MESSAGE = format(
+                'ingress replay for transaction %s is not an existing prefix',
+                p_ingress_txn_id
+            );
+    END IF;
+
+    IF inserted_count > 0 THEN
+        IF v_existing_event_count > 9223372036854775807 - inserted_count THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22003',
+                MESSAGE = 'ingress transaction event count exhausted bigint range';
+        END IF;
+
+        WITH incoming AS (
+            SELECT item.ordinality::bigint AS ordinal,
+                   (item.value ->> 'change_lsn')::pg_lsn AS change_lsn,
+                   (item.value ->> 'change_ordinal')::bigint
+                     AS change_ordinal,
+                   (item.value ->> 'image_ordinal')::integer
+                     AS image_ordinal,
+                   (item.value ->> 'source_oid')::oid AS source_oid,
+                   (item.value ->> 'weight')::bigint AS weight,
+                   item.value -> 'payload' AS payload
+              FROM pg_catalog.jsonb_array_elements(p_events)
+                   WITH ORDINALITY AS item(value, ordinality)
+        ),
+        new_events AS (
+            SELECT incoming.*,
+                   v_existing_event_count
+                     + pg_catalog.row_number() OVER (
+                         ORDER BY incoming.ordinal
+                       ) AS input_seq
+              FROM incoming
+              LEFT JOIN shiba_internal.change_log AS existing
+                ON existing.ingress_txn_id = p_ingress_txn_id
+               AND existing.change_lsn = incoming.change_lsn
+               AND existing.change_ordinal = incoming.change_ordinal
+               AND existing.image_ordinal = incoming.image_ordinal
+             WHERE existing.ingress_txn_id IS NULL
+        ),
+        inserted AS (
+            INSERT INTO shiba_internal.change_log (
+                ingress_txn_id,
+                change_lsn,
+                change_ordinal,
+                image_ordinal,
+                input_seq,
+                source_oid,
+                weight,
+                payload
+            )
+            SELECT p_ingress_txn_id,
+                   new_events.change_lsn,
+                   new_events.change_ordinal,
+                   new_events.image_ordinal,
+                   new_events.input_seq,
+                   new_events.source_oid,
+                   new_events.weight,
+                   new_events.payload
+              FROM new_events
+             ORDER BY new_events.ordinal
+            RETURNING input_seq, payload
+        )
+        SELECT min(input_seq),
+               max(input_seq),
+               coalesce(
+                 sum(pg_catalog.octet_length(
+                   pg_catalog.jsonb_send(payload)
+                 )),
+                 0
+               )::bigint
+          INTO STRICT v_first_inserted_input_seq,
+                      v_last_inserted_input_seq,
+                      v_batch_payload_bytes
+          FROM inserted;
+
+        first_input_seq := least(
+            coalesce(first_input_seq, v_first_inserted_input_seq),
+            v_first_inserted_input_seq
+        );
+        last_input_seq := greatest(
+            coalesce(last_input_seq, v_last_inserted_input_seq),
+            v_last_inserted_input_seq
+        );
+
+        IF v_existing_payload_bytes
+             > 9223372036854775807 - v_batch_payload_bytes THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22003',
+                MESSAGE = 'ingress transaction payload summary exhausted bigint range';
+        END IF;
+
+    END IF;
+
+    -- The transaction header lock serializes sequence and batch allocation.
+    -- Replayed events create no second apply batch even when transport frames
+    -- are regrouped after a Runtime restart.
     IF inserted_count > 0 THEN
         IF v_first_inserted_input_seq IS NULL
            OR v_last_inserted_input_seq IS NULL
@@ -621,15 +701,15 @@ BEGIN
                 );
         END IF;
 
-        SELECT coalesce(max(batch.batch_ordinal), 0) + 1,
-               max(batch.last_input_seq)
-          INTO v_batch_ordinal,
-               v_previous_last_input_seq
-          FROM shiba_internal.ingress_apply_batches AS batch
-         WHERE batch.ingress_txn_id = p_ingress_txn_id;
+        IF v_existing_batch_count = 9223372036854775807 THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22003',
+                MESSAGE = 'ingress apply batch count exhausted bigint range';
+        END IF;
+        v_batch_ordinal := v_existing_batch_count + 1;
 
         IF v_first_inserted_input_seq
-             <> coalesce(v_previous_last_input_seq + 1, 1) THEN
+             <> v_existing_event_count + 1 THEN
             RAISE EXCEPTION USING
                 ERRCODE = 'XX001',
                 MESSAGE = format(
@@ -642,126 +722,53 @@ BEGIN
             ingress_txn_id,
             batch_ordinal,
             first_input_seq,
-            last_input_seq,
-            event_count
+            last_input_seq
         )
         VALUES (
             p_ingress_txn_id,
             v_batch_ordinal,
             v_first_inserted_input_seq,
-            v_last_inserted_input_seq,
-            inserted_count
+            v_last_inserted_input_seq
         );
 
-        INSERT INTO shiba_internal.routing_tasks (
+        INSERT INTO shiba_internal.source_publications (
             ingress_txn_id,
             batch_ordinal,
-            commit_lsn
+            source_oid,
+            next_input_seq
         )
-        SELECT txn.ingress_txn_id,
+        SELECT p_ingress_txn_id,
                v_batch_ordinal,
-               txn.final_lsn
-          FROM shiba_internal.ingress_transactions AS txn
+               event.source_oid,
+               min(event.input_seq)
+          FROM shiba_internal.change_log AS event
+         WHERE event.ingress_txn_id = p_ingress_txn_id
+           AND event.input_seq BETWEEN
+               v_first_inserted_input_seq AND v_last_inserted_input_seq
+         GROUP BY event.source_oid;
+
+        GET DIAGNOSTICS v_task_count = ROW_COUNT;
+        IF v_task_count < 1
+           OR v_existing_pending_publications
+                > 9223372036854775807 - v_task_count THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22003',
+                MESSAGE = 'ingress publication task count exhausted bigint range';
+        END IF;
+
+        -- Header summaries are the only transaction-wide authority. The
+        -- bounded rows, batch range, source tasks, and these counters commit
+        -- together; exact replay inserts none of them twice.
+        UPDATE shiba_internal.ingress_transactions AS txn
+           SET event_count = txn.event_count + inserted_count,
+               payload_bytes = txn.payload_bytes + v_batch_payload_bytes,
+               batch_count = txn.batch_count + 1,
+               pending_publications =
+                   txn.pending_publications + v_task_count
          WHERE txn.ingress_txn_id = p_ingress_txn_id;
     END IF;
 
     RETURN NEXT;
-END;
-$$;
-
-CREATE FUNCTION shiba_internal.record_ingress_batch(
-    p_slot_generation bigint,
-    p_decode_end_lsn pg_lsn,
-    p_message_digest bytea,
-    p_event_count bigint,
-    p_payload_bytes bigint
-)
-RETURNS boolean
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-    v_inserted boolean;
-    v_existing_digest bytea;
-    v_existing_event_count bigint;
-    v_existing_payload_bytes bigint;
-BEGIN
-    IF p_slot_generation IS NULL
-       OR p_decode_end_lsn IS NULL
-       OR p_message_digest IS NULL
-       OR p_event_count IS NULL
-       OR p_payload_bytes IS NULL THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '22004',
-            MESSAGE = 'ingress batch fields must not contain NULL';
-    END IF;
-
-    -- Lock-order level 1. This prevents generation retirement while the
-    -- bounded batch is being checkpointed.
-    PERFORM 1
-      FROM shiba_internal.ingress_replay_state AS replay
-     WHERE replay.slot_generation = p_slot_generation
-       AND replay.state = 'active'
-     FOR UPDATE;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '55000',
-            MESSAGE = format(
-                'ingress slot generation %s is not active',
-                p_slot_generation
-            );
-    END IF;
-
-    -- Lock-order level 3: batch identity.  Event rows inserted earlier in this
-    -- same caller transaction become durable atomically with this descriptor.
-    INSERT INTO shiba_internal.ingress_decode_batches (
-        slot_generation,
-        decode_end_lsn,
-        message_digest,
-        event_count,
-        payload_bytes
-    )
-    VALUES (
-        p_slot_generation,
-        p_decode_end_lsn,
-        p_message_digest,
-        p_event_count,
-        p_payload_bytes
-    )
-    ON CONFLICT (slot_generation, decode_end_lsn, message_digest) DO NOTHING;
-
-    v_inserted := FOUND;
-
-    SELECT batch.message_digest,
-           batch.event_count,
-           batch.payload_bytes
-      INTO STRICT v_existing_digest,
-                  v_existing_event_count,
-                  v_existing_payload_bytes
-     FROM shiba_internal.ingress_decode_batches AS batch
-     WHERE batch.slot_generation = p_slot_generation
-       AND batch.decode_end_lsn = p_decode_end_lsn
-       AND batch.message_digest = p_message_digest
-     FOR KEY SHARE;
-
-    IF v_existing_digest IS DISTINCT FROM p_message_digest
-       OR v_existing_event_count IS DISTINCT FROM p_event_count
-       OR v_existing_payload_bytes IS DISTINCT FROM p_payload_bytes THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'XX001',
-            MESSAGE = format(
-                'ingress batch identity conflict for generation %s at %s',
-                p_slot_generation,
-                p_decode_end_lsn
-            );
-    END IF;
-
-    -- Prefix batches are durable and idempotent but never advance the
-    -- replication acknowledgement boundary. Only transaction finalization
-    -- has enough database state to do that safely.
-    RETURN v_inserted;
 END;
 $$;
 
@@ -785,13 +792,6 @@ DECLARE
     v_final_lsn pg_lsn;
     v_existing_commit_lsn pg_lsn;
     v_existing_end_lsn pg_lsn;
-    v_batch_count bigint;
-    v_batch_event_count bigint;
-    v_first_batch_ordinal bigint;
-    v_last_batch_ordinal bigint;
-    v_first_batch_input_seq bigint;
-    v_last_batch_input_seq bigint;
-    v_batches_are_adjacent boolean;
 BEGIN
     IF p_ingress_txn_id IS NULL
        OR p_commit_lsn IS NULL
@@ -862,76 +862,10 @@ BEGIN
         END IF;
         finalized := false;
     ELSE
-        IF EXISTS (
-            SELECT 1
-              FROM shiba_internal.change_log AS event
-             WHERE event.ingress_txn_id = p_ingress_txn_id
-               AND event.canonical_payload IS NULL
-        ) THEN
-            RAISE EXCEPTION USING
-                ERRCODE = 'XX001',
-                MESSAGE = format(
-                    'ingress transaction %s has unnormalized payload',
-                    p_ingress_txn_id
-                );
-        END IF;
-
-        -- The manifest is the downstream execution contract. Validate it at
-        -- the admission boundary so a damaged or incomplete range cannot be
-        -- mistaken for the final batch and published early.
-        WITH ordered_batches AS (
-            SELECT batch.batch_ordinal,
-                   batch.first_input_seq,
-                   batch.last_input_seq,
-                   batch.event_count,
-                   lag(batch.last_input_seq) OVER (
-                       ORDER BY batch.batch_ordinal
-                   ) AS previous_last_input_seq
-              FROM shiba_internal.ingress_apply_batches AS batch
-             WHERE batch.ingress_txn_id = p_ingress_txn_id
-        )
-        SELECT count(*),
-               coalesce(sum(batch.event_count), 0),
-               min(batch.batch_ordinal),
-               max(batch.batch_ordinal),
-               min(batch.first_input_seq)
-                   FILTER (WHERE batch.batch_ordinal = 1),
-               max(batch.last_input_seq),
-               coalesce(bool_and(
-                   batch.first_input_seq
-                     = coalesce(batch.previous_last_input_seq + 1, 1)
-               ), true)
-          INTO v_batch_count,
-               v_batch_event_count,
-               v_first_batch_ordinal,
-               v_last_batch_ordinal,
-               v_first_batch_input_seq,
-               v_last_batch_input_seq,
-               v_batches_are_adjacent
-          FROM ordered_batches AS batch;
-
-        IF (event_count = 0 AND v_batch_count <> 0)
-           OR (
-             event_count > 0
-             AND (
-               v_batch_count = 0
-               OR v_first_batch_ordinal <> 1
-               OR v_last_batch_ordinal <> v_batch_count
-               OR v_first_batch_input_seq <> 1
-               OR v_last_batch_input_seq <> event_count
-               OR v_batch_event_count <> event_count
-               OR NOT v_batches_are_adjacent
-             )
-           ) THEN
-            RAISE EXCEPTION USING
-                ERRCODE = 'XX001',
-                MESSAGE = format(
-                    'ingress transaction %s has an invalid apply-batch manifest',
-                    p_ingress_txn_id
-                );
-        END IF;
-
-        -- Header-only finalization: no change_log row is updated.
+        -- Commit is deliberately header-only. Every bounded admission already
+        -- created its source tasks and incremented pending_publications in the
+        -- same transaction, so sealing a ten-million-row source transaction
+        -- touches exactly these two small authority rows.
         UPDATE shiba_internal.ingress_transactions AS txn
            SET status = 'committed',
                commit_lsn = p_commit_lsn,
@@ -957,143 +891,634 @@ BEGIN
 END;
 $$;
 
--- Fan one durable apply batch out to a bounded page of DAG subscribers.
--- The shared payload remains in change_log and every inbox row points directly
--- to the durable ingress transaction.
-CREATE FUNCTION shiba_internal.route_ingress_page(
-    p_max_subscribers integer
+-- Advance only across a contiguous prefix of sealed transaction headers whose
+-- source tasks all reached a durable terminal state.  This frontier is DAG
+-- visibility, not logical-slot persistence, confirmation, or replay safety.
+CREATE FUNCTION shiba_internal.advance_ingress_publication_frontier(
+    p_slot_generation bigint
+)
+RETURNS pg_lsn
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_current_lsn pg_lsn;
+    v_next_txn_id bigint;
+    v_next_status text;
+    v_next_lsn pg_lsn;
+    v_next_pending_publications bigint;
+BEGIN
+    IF p_slot_generation IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22004',
+            MESSAGE = 'ingress publication generation must not be NULL';
+    END IF;
+
+    SELECT replay.published_lsn
+      INTO STRICT v_current_lsn
+      FROM shiba_internal.ingress_replay_state AS replay
+     WHERE replay.slot_generation = p_slot_generation
+       AND replay.state = 'active'
+     FOR UPDATE;
+
+    -- Advancing one transaction per call keeps recovery work bounded and
+    -- makes "contiguous" literal: no later header is inspected before this
+    -- next causal transaction reaches a terminal publication state.
+    SELECT txn.ingress_txn_id,
+           txn.status,
+           txn.final_lsn,
+           txn.pending_publications
+      INTO v_next_txn_id,
+           v_next_status,
+           v_next_lsn,
+           v_next_pending_publications
+      FROM shiba_internal.ingress_transactions AS txn
+     WHERE txn.slot_generation = p_slot_generation
+       AND (v_current_lsn IS NULL OR txn.final_lsn > v_current_lsn)
+     ORDER BY txn.final_lsn, txn.ingress_txn_id
+     LIMIT 1
+     FOR UPDATE;
+
+    IF v_next_txn_id IS NULL
+       OR v_next_status <> 'committed'
+       OR v_next_pending_publications <> 0 THEN
+        RETURN v_current_lsn;
+    END IF;
+
+    UPDATE shiba_internal.ingress_replay_state AS replay
+       SET published_lsn = v_next_lsn,
+           updated_at = clock_timestamp()
+     WHERE replay.slot_generation = p_slot_generation;
+    v_current_lsn := v_next_lsn;
+
+    RETURN v_current_lsn;
+END;
+$$;
+
+-- Publish one bounded typed prefix of an already-durable, source-local task.
+-- The immutable chunk, typed payload rows, and task cursor commit together.
+-- A retry sees either the old cursor and stream sequence or both new values;
+-- there is no intermediate durable state.
+--
+-- Only the head task for each source is eligible, preserving causal LSN order
+-- within that shared stream.  Backpressured heads are skipped so other sources
+-- can finish, but `has_pending` remains true and tells Runtime not to read more
+-- replication input once no publishable head remains.
+CREATE FUNCTION shiba_internal.publish_source_batch(
+    p_slot_generation bigint
 )
 RETURNS TABLE (
-    worked boolean,
-    completed boolean,
-    subscribers_routed integer
+    outcome text,
+    ingress_txn_id bigint,
+    batch_ordinal bigint,
+    source_oid oid,
+    final_lsn pg_lsn,
+    chunk_seq bigint,
+    has_pending boolean
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-    v_task shiba_internal.routing_tasks%ROWTYPE;
-    v_candidates oid[];
-    v_candidate_count integer;
-    v_page oid[];
+    v_task shiba_internal.source_publications%ROWTYPE;
+    v_candidate_txn_id bigint;
+    v_candidate_batch_ordinal bigint;
+    v_candidate_source_oid oid;
+    v_final_lsn pg_lsn;
+    v_first_input_seq bigint;
+    v_last_input_seq bigint;
+    v_current_input_seq bigint;
+    v_selected_last_input_seq bigint;
+    v_next_source_input_seq bigint;
+    v_stream_id bigint;
+    v_expected_chunk_seq bigint;
+    v_stream_backpressured boolean;
+    v_target_chunk_rows bigint;
+    v_target_chunk_bytes bigint;
+    v_append_outcome text;
+    v_appended_chunk_seq bigint;
+    v_payload_relation text;
+    v_row_type text;
+    v_payload_rows bigint;
+    v_payload_bytes bigint;
+    v_inserted_rows bigint;
+    v_stored_rows bigint;
+    v_stored_bytes bigint;
 BEGIN
-    IF p_max_subscribers IS NULL OR p_max_subscribers < 1 THEN
+    IF p_slot_generation IS NULL THEN
         RAISE EXCEPTION USING
-            ERRCODE = '22023',
-            MESSAGE = 'routing page size must be at least one';
+            ERRCODE = '22004',
+            MESSAGE = 'source publication generation must not be NULL';
     END IF;
 
-    SELECT task.*
-      INTO v_task
-      FROM shiba_internal.routing_tasks AS task
-     WHERE task.status IN ('pending', 'routing')
-     ORDER BY task.commit_lsn, task.ingress_txn_id, task.batch_ordinal
-     LIMIT 1
-     FOR UPDATE SKIP LOCKED;
-
-    IF NOT FOUND THEN
-        RETURN QUERY SELECT false, false, 0;
-        RETURN;
-    END IF;
-
+    -- Lock-order level 1.  Ingress, publication, and frontier advancement for
+    -- one generation are serialized by this small authority row.
     PERFORM 1
-     FROM shiba_internal.ingress_transactions AS txn
-     WHERE txn.ingress_txn_id = v_task.ingress_txn_id
-       AND txn.final_lsn = v_task.commit_lsn
-     FOR KEY SHARE;
+      FROM shiba_internal.ingress_replay_state AS replay
+     WHERE replay.slot_generation = p_slot_generation
+       AND replay.state = 'active'
+     FOR UPDATE;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION USING
-            ERRCODE = 'XX001',
+            ERRCODE = '55000',
             MESSAGE = format(
-                'routing task %s/%s does not reference its ingress transaction',
-                v_task.ingress_txn_id,
-                v_task.batch_ordinal
+                'ingress slot generation %s is not active',
+                p_slot_generation
             );
     END IF;
 
-    WITH batch_sources AS MATERIALIZED (
-        SELECT DISTINCT event.source_oid
-          FROM shiba_internal.ingress_apply_batches AS batch
-          JOIN shiba_internal.change_log AS event
-            ON event.ingress_txn_id = batch.ingress_txn_id
-           AND event.input_seq BETWEEN
-               batch.first_input_seq AND batch.last_input_seq
-         WHERE batch.ingress_txn_id = v_task.ingress_txn_id
-           AND batch.batch_ordinal = v_task.batch_ordinal
-    )
-    SELECT pg_catalog.array_agg(candidate.result_oid ORDER BY candidate.result_oid)
-      INTO v_candidates
-      FROM (
-          SELECT matched.result_oid
-            FROM (
-                SELECT stream_view.result_oid
-                  FROM batch_sources AS source
-                  JOIN shiba_internal.stream_views AS stream_view
-                    ON stream_view.source_oid = source.source_oid
-                  JOIN shiba_internal.view_progress AS progress
-                    ON progress.result_oid = stream_view.result_oid
-                 WHERE stream_view.activation_lsn < v_task.commit_lsn
-                   AND (
-                       progress.applied_lsn IS NULL
-                       OR progress.applied_lsn < v_task.commit_lsn
-                   )
-                UNION
-                SELECT stream_view.result_oid
-                  FROM batch_sources AS source
-                  JOIN shiba_internal.inner_join_views AS join_view
-                    ON join_view.right_source_oid = source.source_oid
-                  JOIN shiba_internal.stream_views AS stream_view
-                    ON stream_view.result_oid = join_view.result_oid
-                  JOIN shiba_internal.view_progress AS progress
-                    ON progress.result_oid = stream_view.result_oid
-                 WHERE stream_view.activation_lsn < v_task.commit_lsn
-                   AND (
-                       progress.applied_lsn IS NULL
-                       OR progress.applied_lsn < v_task.commit_lsn
-                   )
-            ) AS matched
-           WHERE matched.result_oid > v_task.subscriber_cursor
-           ORDER BY matched.result_oid
-           LIMIT p_max_subscribers + 1
-      ) AS candidate;
+    -- Candidate discovery is read-only.  Once selected, authority rows are
+    -- locked explicitly in the global order below and the pending identity is
+    -- revalidated before any stream is touched.
+    SELECT publication.ingress_txn_id,
+           publication.batch_ordinal,
+           publication.source_oid
+      INTO v_candidate_txn_id,
+           v_candidate_batch_ordinal,
+           v_candidate_source_oid
+      FROM shiba_internal.source_publications AS publication
+     JOIN shiba_internal.ingress_transactions AS txn
+        ON txn.ingress_txn_id = publication.ingress_txn_id
+     WHERE txn.slot_generation = p_slot_generation
+       AND publication.next_input_seq IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1
+             FROM shiba_internal.source_publications AS earlier
+             JOIN shiba_internal.ingress_transactions AS earlier_txn
+              ON earlier_txn.ingress_txn_id = earlier.ingress_txn_id
+            WHERE earlier_txn.slot_generation = txn.slot_generation
+              AND earlier.source_oid = publication.source_oid
+              AND earlier.next_input_seq IS NOT NULL
+              AND (
+                  earlier_txn.final_lsn,
+                  earlier.ingress_txn_id,
+                  earlier.batch_ordinal
+              ) < (
+                  txn.final_lsn,
+                  publication.ingress_txn_id,
+                  publication.batch_ordinal
+              )
+       )
+       AND NOT EXISTS (
+           SELECT 1
+             FROM shiba_internal.effect_streams AS stream
+            WHERE stream.producer_kind = 'source'
+              AND stream.slot_generation = txn.slot_generation
+              AND stream.source_oid = publication.source_oid
+              AND stream.backpressured
+              AND EXISTS (
+                  SELECT 1
+                    FROM shiba_internal.effect_stream_consumers AS consumer
+                   WHERE consumer.stream_id = stream.stream_id
+                     AND consumer.activation_lsn < txn.final_lsn
+              )
+       )
+     ORDER BY txn.final_lsn,
+              publication.ingress_txn_id,
+              publication.batch_ordinal,
+              publication.source_oid
+     LIMIT 1;
 
-    v_candidate_count := coalesce(pg_catalog.cardinality(v_candidates), 0);
-    v_page := v_candidates[1:least(v_candidate_count, p_max_subscribers)];
-
-    IF coalesce(pg_catalog.cardinality(v_page), 0) > 0 THEN
-        INSERT INTO shiba_internal.dag_inbox (
-            result_oid,
-            ingress_txn_id,
-            commit_lsn
-        )
-        SELECT subscriber.result_oid,
-               v_task.ingress_txn_id,
-               v_task.commit_lsn
-          FROM pg_catalog.unnest(v_page) AS subscriber(result_oid)
-        ON CONFLICT DO NOTHING;
-        subscribers_routed := pg_catalog.cardinality(v_page);
-    ELSE
-        subscribers_routed := 0;
+    IF v_candidate_txn_id IS NULL THEN
+        outcome := CASE
+            WHEN EXISTS (
+                SELECT 1
+                  FROM shiba_internal.source_publications AS publication
+                 JOIN shiba_internal.ingress_transactions AS txn
+                    ON txn.ingress_txn_id = publication.ingress_txn_id
+                 WHERE txn.slot_generation = p_slot_generation
+                   AND publication.next_input_seq IS NOT NULL
+            )
+            THEN 'blocked'
+            ELSE 'idle'
+        END;
+        has_pending := outcome = 'blocked';
+        RETURN NEXT;
+        RETURN;
     END IF;
 
-    completed := v_candidate_count <= p_max_subscribers;
-    UPDATE shiba_internal.routing_tasks AS task
-       SET subscriber_cursor = CASE
-               WHEN subscribers_routed > 0
-               THEN v_page[subscribers_routed]
-               ELSE task.subscriber_cursor
-           END,
-           status = CASE WHEN completed THEN 'complete' ELSE 'routing' END,
-           attempts = task.attempts + 1,
-           updated_at = clock_timestamp(),
-           completed_at = CASE WHEN completed THEN clock_timestamp() ELSE NULL END,
-           last_error = NULL
-     WHERE task.ingress_txn_id = v_task.ingress_txn_id
-       AND task.batch_ordinal = v_task.batch_ordinal;
+    -- Lock-order levels 2 through 4: transaction, apply batch, publication
+    -- identity.  The generation row above prevents a new earlier task from
+    -- appearing between read-only discovery and this recheck.
+    SELECT txn.final_lsn
+      INTO STRICT v_final_lsn
+      FROM shiba_internal.ingress_transactions AS txn
+     WHERE txn.ingress_txn_id = v_candidate_txn_id
+       AND txn.slot_generation = p_slot_generation
+     FOR UPDATE;
 
-    worked := true;
+    SELECT batch.first_input_seq,
+           batch.last_input_seq
+      INTO STRICT v_first_input_seq,
+                  v_last_input_seq
+      FROM shiba_internal.ingress_apply_batches AS batch
+     WHERE batch.ingress_txn_id = v_candidate_txn_id
+       AND batch.batch_ordinal = v_candidate_batch_ordinal
+     FOR UPDATE;
+
+    SELECT publication.*
+      INTO STRICT v_task
+      FROM shiba_internal.source_publications AS publication
+     WHERE publication.ingress_txn_id = v_candidate_txn_id
+       AND publication.batch_ordinal = v_candidate_batch_ordinal
+       AND publication.source_oid = v_candidate_source_oid
+       AND publication.next_input_seq IS NOT NULL
+     FOR UPDATE;
+
+    v_current_input_seq := v_task.next_input_seq;
+    ingress_txn_id := v_task.ingress_txn_id;
+    batch_ordinal := v_task.batch_ordinal;
+    source_oid := v_task.source_oid;
+    final_lsn := v_final_lsn;
+
+    -- A source stream is shared by every DAG in this generation.  If no
+    -- eligible consumer existed at this causal LSN, the effect is explicitly
+    -- discarded: a later registration starts after this LSN and must not see
+    -- historical change-log rows.
+    SELECT stream.stream_id,
+           stream.next_chunk_seq,
+           stream.backpressured,
+           stream.target_chunk_rows,
+           stream.target_chunk_bytes
+      INTO v_stream_id,
+           v_expected_chunk_seq,
+           v_stream_backpressured,
+           v_target_chunk_rows,
+           v_target_chunk_bytes
+      FROM shiba_internal.effect_streams AS stream
+     WHERE stream.producer_kind = 'source'
+       AND stream.slot_generation = p_slot_generation
+       AND stream.source_oid = v_task.source_oid
+     FOR UPDATE;
+
+    IF NOT FOUND
+       OR NOT EXISTS (
+           SELECT 1
+             FROM shiba_internal.effect_stream_consumers AS consumer
+            WHERE consumer.stream_id = v_stream_id
+              AND consumer.activation_lsn < v_final_lsn
+       ) THEN
+        outcome := 'discarded';
+    ELSIF v_stream_backpressured THEN
+        outcome := 'blocked';
+    ELSE
+        -- Resolve both relation and generated row type from authoritative OID
+        -- metadata, then validate the complete fixed payload ABI.
+        SELECT pg_catalog.format(
+                   '%I.%I',
+                   relation_namespace.nspname,
+                   relation_catalog.relname
+               ),
+               pg_catalog.format(
+                   '%I.%I',
+                   type_namespace.nspname,
+                   row_type.typname
+               )
+          INTO STRICT v_payload_relation,
+                      v_row_type
+          FROM shiba_internal.effect_stream_payloads AS payload
+          JOIN pg_catalog.pg_class AS relation_catalog
+            ON relation_catalog.oid = payload.relation_oid
+           AND relation_catalog.relkind = 'r'
+           AND relation_catalog.relpersistence = 'p'
+          JOIN pg_catalog.pg_namespace AS relation_namespace
+            ON relation_namespace.oid = relation_catalog.relnamespace
+           AND relation_namespace.nspname = 'shiba_internal'
+          JOIN pg_catalog.pg_type AS payload_record_type
+            ON payload_record_type.oid = relation_catalog.reltype
+           AND payload_record_type.typrelid = relation_catalog.oid
+           AND payload_record_type.typnamespace =
+                 relation_catalog.relnamespace
+          JOIN pg_catalog.pg_type AS row_type
+            ON row_type.oid = payload.row_type_oid
+           AND row_type.typtype = 'c'
+          JOIN pg_catalog.pg_namespace AS type_namespace
+            ON type_namespace.oid = row_type.typnamespace
+           AND type_namespace.nspname = 'shiba_internal'
+          JOIN pg_catalog.pg_class AS row_type_relation
+            ON row_type_relation.oid = row_type.typrelid
+           AND row_type_relation.relkind = 'c'
+           AND row_type_relation.relnamespace = type_namespace.oid
+          JOIN pg_catalog.pg_attribute AS stream_id_attribute
+            ON stream_id_attribute.attrelid = relation_catalog.oid
+           AND stream_id_attribute.attnum = 1
+           AND stream_id_attribute.attname = 'stream_id'
+           AND stream_id_attribute.atttypid = 'bigint'::regtype
+           AND stream_id_attribute.attnotnull
+           AND NOT stream_id_attribute.attisdropped
+          JOIN pg_catalog.pg_attribute AS chunk_seq_attribute
+            ON chunk_seq_attribute.attrelid = relation_catalog.oid
+           AND chunk_seq_attribute.attnum = 2
+           AND chunk_seq_attribute.attname = 'chunk_seq'
+           AND chunk_seq_attribute.atttypid = 'bigint'::regtype
+           AND chunk_seq_attribute.attnotnull
+           AND NOT chunk_seq_attribute.attisdropped
+          JOIN pg_catalog.pg_attribute AS row_ordinal_attribute
+            ON row_ordinal_attribute.attrelid = relation_catalog.oid
+           AND row_ordinal_attribute.attnum = 3
+           AND row_ordinal_attribute.attname = 'row_ordinal'
+           AND row_ordinal_attribute.atttypid = 'bigint'::regtype
+           AND row_ordinal_attribute.attnotnull
+           AND NOT row_ordinal_attribute.attisdropped
+          JOIN pg_catalog.pg_attribute AS weight_attribute
+            ON weight_attribute.attrelid = relation_catalog.oid
+           AND weight_attribute.attnum = 4
+           AND weight_attribute.attname = 'weight'
+           AND weight_attribute.atttypid = 'bigint'::regtype
+           AND weight_attribute.attnotnull
+           AND NOT weight_attribute.attisdropped
+          JOIN pg_catalog.pg_attribute AS row_value_attribute
+            ON row_value_attribute.attrelid = relation_catalog.oid
+           AND row_value_attribute.attnum = 5
+           AND row_value_attribute.attname = 'row_value'
+           AND row_value_attribute.atttypid = row_type.oid
+           AND row_value_attribute.attnotnull
+           AND NOT row_value_attribute.attisdropped
+         WHERE payload.stream_id = v_stream_id
+           AND (
+               SELECT count(*)
+                 FROM pg_catalog.pg_attribute AS fixed_attribute
+                WHERE fixed_attribute.attrelid = relation_catalog.oid
+                  AND fixed_attribute.attnum > 0
+                  AND NOT fixed_attribute.attisdropped
+           ) = 5;
+
+        -- Convert only this task's remaining source rows.  The running prefix
+        -- is bounded by the stream's row and actual typed-byte targets; the
+        -- first row may stand alone when its typed representation is larger
+        -- than the byte target.
+        EXECUTE pg_catalog.format(
+            'WITH candidates AS MATERIALIZED (
+               SELECT event.input_seq,
+                      event.weight,
+                      event.payload
+                 FROM shiba_internal.change_log AS event
+                WHERE event.ingress_txn_id = $3
+                  AND event.source_oid = $4
+                  AND event.input_seq BETWEEN $5 AND $6
+                ORDER BY event.input_seq
+                LIMIT $7
+             ),
+             converted AS MATERIALIZED (
+               SELECT candidate.input_seq,
+                      candidate.weight,
+                      pg_catalog.row_number() OVER (
+                        ORDER BY candidate.input_seq
+                      ) AS ordinal,
+                      pg_catalog.jsonb_populate_record(
+                        NULL::%s,
+                        candidate.payload
+                      ) AS row_value
+                 FROM candidates AS candidate
+             ),
+             measured AS (
+               SELECT converted.*,
+                      shiba_internal.effect_row_bytes(
+                        converted.row_value
+                      ) AS row_bytes
+                 FROM converted
+             ),
+             running AS (
+               SELECT measured.*,
+                      sum(measured.row_bytes) OVER (
+                        ORDER BY measured.input_seq
+                        ROWS UNBOUNDED PRECEDING
+                      ) AS running_bytes
+                 FROM measured
+             ),
+             selected AS (
+               SELECT running.*
+                 FROM running
+                WHERE running.ordinal = 1
+                   OR (
+                     running.ordinal <= $7
+                     AND running.running_bytes <= $8
+                   )
+             )
+             SELECT count(*)::bigint,
+                    coalesce(
+                      sum(selected.row_bytes),
+                      0
+                    )::bigint,
+                    max(selected.input_seq)
+               FROM selected',
+            v_row_type
+        )
+        INTO STRICT v_payload_rows,
+                    v_payload_bytes,
+                    v_selected_last_input_seq
+        USING v_stream_id,
+              v_expected_chunk_seq,
+              v_task.ingress_txn_id,
+              v_task.source_oid,
+              greatest(v_current_input_seq, v_first_input_seq),
+              v_last_input_seq,
+              v_target_chunk_rows,
+              v_target_chunk_bytes;
+
+        IF v_payload_rows < 1 OR v_payload_bytes < 1 THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'XX001',
+                MESSAGE = format(
+                    'source publication %s/%s/%s has no typed payload',
+                    v_task.ingress_txn_id,
+                    v_task.batch_ordinal,
+                    v_task.source_oid
+                );
+        END IF;
+
+        SELECT append.outcome,
+               append.appended_chunk_seq
+          INTO STRICT v_append_outcome,
+                      v_appended_chunk_seq
+          FROM shiba_internal.append_effect_stream_chunk(
+                   v_stream_id,
+                   v_expected_chunk_seq,
+                   'data',
+                   v_payload_rows,
+                   v_payload_bytes,
+                   v_final_lsn
+               ) AS append;
+
+        IF v_append_outcome = 'appended' THEN
+            EXECUTE pg_catalog.format(
+                'WITH candidates AS MATERIALIZED (
+                   SELECT event.input_seq,
+                          event.weight,
+                          event.payload
+                     FROM shiba_internal.change_log AS event
+                    WHERE event.ingress_txn_id = $3
+                      AND event.source_oid = $4
+                      AND event.input_seq BETWEEN $5 AND $6
+                    ORDER BY event.input_seq
+                    LIMIT $7
+                 ),
+                 converted AS MATERIALIZED (
+                   SELECT candidate.input_seq,
+                          candidate.weight,
+                          pg_catalog.row_number() OVER (
+                            ORDER BY candidate.input_seq
+                          ) AS ordinal,
+                          pg_catalog.jsonb_populate_record(
+                            NULL::%s,
+                            candidate.payload
+                          ) AS row_value
+                     FROM candidates AS candidate
+                 ),
+                 measured AS (
+                   SELECT converted.*,
+                          shiba_internal.effect_row_bytes(
+                            converted.row_value
+                          ) AS row_bytes
+                     FROM converted
+                 ),
+                 running AS (
+                   SELECT measured.*,
+                          sum(measured.row_bytes) OVER (
+                            ORDER BY measured.input_seq
+                            ROWS UNBOUNDED PRECEDING
+                          ) AS running_bytes
+                     FROM measured
+                 )
+                 INSERT INTO %s (
+                     stream_id,
+                     chunk_seq,
+                     row_ordinal,
+                     weight,
+                     row_value
+                 )
+                 SELECT $1,
+                        $2,
+                        (running.ordinal - 1)::bigint,
+                        running.weight,
+                        running.row_value
+                   FROM running
+                  WHERE running.ordinal = 1
+                     OR (
+                       running.ordinal <= $7
+                       AND running.running_bytes <= $8
+                     )
+                  ORDER BY running.input_seq',
+                v_row_type,
+                v_payload_relation
+            )
+            USING v_stream_id,
+                  v_appended_chunk_seq,
+                  v_task.ingress_txn_id,
+                  v_task.source_oid,
+                  greatest(v_current_input_seq, v_first_input_seq),
+                  v_last_input_seq,
+                  v_target_chunk_rows,
+                  v_target_chunk_bytes;
+
+            GET DIAGNOSTICS v_inserted_rows = ROW_COUNT;
+            EXECUTE pg_catalog.format(
+                'SELECT count(*)::bigint,
+                        coalesce(
+                          sum(shiba_internal.effect_row_bytes(
+                            stored.row_value
+                          )),
+                          0
+                        )::bigint
+                   FROM %s AS stored
+                  WHERE stored.stream_id = $1
+                    AND stored.chunk_seq = $2',
+                v_payload_relation
+            )
+            INTO STRICT v_stored_rows,
+                        v_stored_bytes
+            USING v_stream_id,
+                  v_appended_chunk_seq;
+
+            IF v_inserted_rows <> v_payload_rows
+               OR v_stored_rows <> v_payload_rows
+               OR v_stored_bytes <> v_payload_bytes THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = 'XX001',
+                    MESSAGE = format(
+                        'source publication %s/%s/%s typed payload measured %s/%s, inserted %s, and stored %s/%s',
+                        v_task.ingress_txn_id,
+                        v_task.batch_ordinal,
+                        v_task.source_oid,
+                        v_payload_rows,
+                        v_payload_bytes,
+                        v_inserted_rows,
+                        v_stored_rows,
+                        v_stored_bytes
+                    );
+            END IF;
+
+            SELECT min(event.input_seq)
+              INTO v_next_source_input_seq
+              FROM shiba_internal.change_log AS event
+             WHERE event.ingress_txn_id = v_task.ingress_txn_id
+               AND event.source_oid = v_task.source_oid
+               AND event.input_seq > v_selected_last_input_seq
+               AND event.input_seq <= v_last_input_seq;
+
+            outcome := CASE
+                WHEN v_next_source_input_seq IS NULL THEN 'completed'
+                ELSE 'appended'
+            END;
+            chunk_seq := v_appended_chunk_seq;
+        ELSIF v_append_outcome = 'discarded' THEN
+            -- The last consumer can disappear after the eligibility check.
+            -- append_effect_stream_chunk resolves that race while holding the
+            -- stream lock and deliberately creates no empty chunk.
+            outcome := 'discarded';
+        ELSIF v_append_outcome = 'blocked' THEN
+            outcome := 'blocked';
+        ELSE
+            RAISE EXCEPTION USING
+                ERRCODE = 'XX001',
+                MESSAGE = format(
+                    'unknown source stream append outcome %s',
+                    v_append_outcome
+                );
+        END IF;
+    END IF;
+
+    IF outcome IN ('appended', 'completed', 'discarded') THEN
+        UPDATE shiba_internal.source_publications AS publication
+           SET next_input_seq = CASE
+                   WHEN outcome = 'appended' THEN v_next_source_input_seq
+                   ELSE NULL
+               END
+         WHERE publication.ingress_txn_id = v_task.ingress_txn_id
+           AND publication.batch_ordinal = v_task.batch_ordinal
+           AND publication.source_oid = v_task.source_oid
+           AND publication.next_input_seq = v_current_input_seq;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '40001',
+                MESSAGE = 'source publication task changed during append';
+        END IF;
+
+        IF outcome IN ('completed', 'discarded') THEN
+            UPDATE shiba_internal.ingress_transactions AS txn
+               SET pending_publications = txn.pending_publications - 1
+             WHERE txn.ingress_txn_id = v_task.ingress_txn_id
+               AND txn.pending_publications > 0;
+
+            IF NOT FOUND THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = 'XX001',
+                    MESSAGE = 'source publication counter reached zero before its task';
+            END IF;
+        END IF;
+    END IF;
+
+    SELECT EXISTS (
+        SELECT 1
+          FROM shiba_internal.ingress_transactions AS txn
+         WHERE txn.slot_generation = p_slot_generation
+           AND txn.pending_publications > 0
+    )
+      INTO has_pending;
     RETURN NEXT;
 END;
 $$;
@@ -1278,7 +1703,11 @@ BEGIN
        SET confirmed_lsn = v_confirmed_lsn,
            replay_safe_lsn = v_replay_safe_lsn,
            updated_at = clock_timestamp()
-     WHERE replay.slot_generation = p_slot_generation;
+     WHERE replay.slot_generation = p_slot_generation
+       AND (
+           replay.confirmed_lsn IS DISTINCT FROM v_confirmed_lsn
+           OR replay.replay_safe_lsn IS DISTINCT FROM v_replay_safe_lsn
+       );
 
     RETURN v_replay_safe_lsn;
 END;
@@ -1294,23 +1723,16 @@ REVOKE ALL ON FUNCTION
     shiba_internal.claim_ingress_transaction(bigint, bigint, pg_lsn)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
-    shiba_internal.insert_ingress_event(
-        bigint, pg_lsn, bigint, integer, oid, bigint, jsonb
-    )
-    FROM PUBLIC;
-REVOKE ALL ON FUNCTION
     shiba_internal.insert_ingress_events(bigint, jsonb)
-    FROM PUBLIC;
-REVOKE ALL ON FUNCTION
-    shiba_internal.record_ingress_batch(
-        bigint, pg_lsn, bytea, bigint, bigint
-    )
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
     shiba_internal.commit_ingress_transaction(bigint, pg_lsn, pg_lsn)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
-    shiba_internal.route_ingress_page(integer)
+    shiba_internal.advance_ingress_publication_frontier(bigint)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION
+    shiba_internal.publish_source_batch(bigint)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
     shiba_internal.ingress_feedback_upper_bound(bigint)

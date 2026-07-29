@@ -13,24 +13,22 @@ run_gate() {
   "$@"
 }
 
-run_gate "Rust formatting" cargo fmt -- --check
+run_gate "Clean-cut architecture guard" \
+  "${project_root}/scripts/test-clean-cut.sh"
+run_gate "Rust formatting" cargo fmt --all -- --check
 run_gate "Rust lints" cargo clippy --all-targets -- -D warnings
 run_gate "Rust unit and pgrx integration tests" cargo test --lib
+run_gate "Continuous effect-stream core test" \
+  "${project_root}/scripts/test-effect-stream-core.sh"
 run_gate "Durable logical-replication ingress test" \
   "${project_root}/scripts/test-replication-ingress.sh"
-run_gate "PostgreSQL asynchronous acceptance test" \
-  "${project_root}/scripts/test-e2e.sh"
-run_gate "Single-source deterministic differential test" \
-  "${project_root}/scripts/test-differential-single.sh"
-run_gate "Join and subquery deterministic differential test" \
-  "${project_root}/scripts/test-join-differential.sh"
-run_gate "Concurrency, transaction, and recovery test" \
-  "${project_root}/scripts/test-concurrency-recovery.sh"
-run_gate "Single-Runtime architecture and shared-log test" \
-  "${project_root}/scripts/test-executor-architecture.sh"
-run_gate "Deterministic Runtime failpoint recovery test" \
-  "${project_root}/scripts/test-failpoint-recovery.sh"
-run_gate "Runtime resource-bound and low-work_mem test" \
-  "${project_root}/scripts/test-memory-bounds.sh"
+run_gate "Stateless Scan/Filter/Project/Sink test" \
+  "${project_root}/scripts/test-stateless-kernels.sh"
+run_gate "Shared fanout recovery and backpressure test" \
+  "${project_root}/scripts/test-fanout-recovery.sh"
+run_gate "Aggregate and Distinct recovery test" \
+  "${project_root}/scripts/test-aggregate-distinct-kernels.sh"
+run_gate "Window and TopN recovery test" \
+  "${project_root}/scripts/test-window-topn-kernels.sh"
 
 printf '\nAll Shiba correctness gates passed.\n'

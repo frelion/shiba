@@ -1,56 +1,32 @@
-CREATE SCHEMA shiba_internal;
+CREATE SCHEMA IF NOT EXISTS shiba_internal;
 REVOKE ALL ON SCHEMA shiba_internal FROM PUBLIC;
 
--- Rust keeps JSONB as the extension ABI, while PostgreSQL converts every
--- commit to this typed row shape before a physical operator consumes it.
--- Keeping the type internal lets physical operators move to set-based SQL
--- without exposing a user-facing composite type or changing the WAL inbox.
-CREATE TYPE shiba_internal.delta_event AS (
-    source_oid oid,
-    delta integer,
-    row_data jsonb
-);
-
-CREATE TABLE shiba_internal.stream_views (
-    result_oid oid PRIMARY KEY,
-    view_kind text NOT NULL DEFAULT 'aggregate'
-      CHECK (view_kind IN ('aggregate','window','distinct','topn')),
-    source_oid oid NOT NULL,
-    group_column name,
-    result_group_column name,
-    count_column name,
-    count_distinct boolean NOT NULL DEFAULT false,
-    count_input_source text CHECK (count_input_source IN ('left','right')),
-    count_input_column name,
-    sum_input_column name,
-    sum_column name,
+-- One row is one user-visible, continuously maintained result table.
+CREATE TABLE shiba_internal.dataflows (
+    result_oid oid PRIMARY KEY CHECK (result_oid <> 0::oid),
+    plan jsonb NOT NULL CHECK (jsonb_typeof(plan) = 'object'),
     activation_lsn pg_lsn NOT NULL,
-    creator_oid oid NOT NULL DEFAULT (session_user::regrole::oid),
-    -- Composite-to-JSONB identity must use the same type-output settings at
-    -- registration/backfill and later Runtime apply.
-    execution_settings jsonb NOT NULL DEFAULT jsonb_build_object(
-      'TimeZone',current_setting('TimeZone'),
-      'DateStyle',current_setting('DateStyle'),
-      'IntervalStyle',current_setting('IntervalStyle'),
-      'extra_float_digits',current_setting('extra_float_digits'),
-      'bytea_output',current_setting('bytea_output')
-    ) CHECK (
-      jsonb_typeof(execution_settings)='object'
-      AND execution_settings ?& ARRAY[
-        'TimeZone','DateStyle','IntervalStyle','extra_float_digits','bytea_output'
-      ]
-    ),
+    active boolean NOT NULL DEFAULT true,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+CREATE TABLE shiba_internal.dataflow_sources (
+    result_oid oid NOT NULL
+      REFERENCES shiba_internal.dataflows(result_oid) ON DELETE CASCADE,
+    source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
+    PRIMARY KEY (result_oid, source_oid)
+);
+
+CREATE INDEX dataflow_sources_source_idx
+  ON shiba_internal.dataflow_sources(source_oid, result_oid);
+
 -- Only indexes created through shiba.create_index are removable through the
--- user API.  PostgreSQL does not support foreign keys into pg_class/pg_authid,
--- so the lifecycle event trigger removes rows when an index is dropped and
--- every API operation revalidates the stored object identity by OID.
+-- user API. PostgreSQL catalog OIDs cannot be foreign-key targets, so every
+-- lifecycle operation revalidates the live object identity.
 CREATE TABLE shiba_internal.managed_indexes (
     index_oid oid PRIMARY KEY,
     result_oid oid NOT NULL
-      REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
+      REFERENCES shiba_internal.dataflows(result_oid) ON DELETE CASCADE,
     index_name name NOT NULL,
     index_columns name[] NOT NULL,
     creator_oid oid NOT NULL,
@@ -58,262 +34,27 @@ CREATE TABLE shiba_internal.managed_indexes (
     UNIQUE (result_oid, index_name)
 );
 
-CREATE TABLE shiba_internal.stream_filters (
-    result_oid oid NOT NULL REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    input_side text NOT NULL CHECK (input_side IN ('left', 'right')),
-    source_oid oid NOT NULL,
-    phase text NOT NULL DEFAULT 'pre' CHECK (phase IN ('pre','post')),
-    predicate_sql text NOT NULL,
-    PRIMARY KEY (result_oid, input_side)
-);
-
-CREATE TABLE shiba_internal.stream_having (
-    result_oid oid PRIMARY KEY REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    predicate_sql text NOT NULL
-);
-
-CREATE TABLE shiba_internal.stream_join_filters (
-    result_oid oid PRIMARY KEY REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    predicate_sql text NOT NULL
-);
-
-CREATE TABLE shiba_internal.inner_join_views (
-    result_oid oid PRIMARY KEY REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    join_type text NOT NULL CHECK (
-      join_type IN ('inner','left','right','full','semi','anti','null_anti')
-    ),
-    right_source_oid oid NOT NULL,
-    left_join_column name NOT NULL,
-    right_join_column name NOT NULL,
-    group_source text NOT NULL CHECK (group_source IN ('left', 'right')),
-    group_column name NOT NULL,
-    sum_source text NOT NULL CHECK (sum_source IN ('left', 'right'))
-);
-
--- A bag, not a set: identical source rows must retain their multiplicity.
-CREATE TABLE shiba_internal.join_arrangements (
-    result_oid oid NOT NULL REFERENCES shiba_internal.inner_join_views(result_oid) ON DELETE CASCADE,
-    input_side text NOT NULL CHECK (input_side IN ('left', 'right')),
-    -- JSONB preserves SQL NULL separately from an empty string and retains
-    -- equality semantics for typed scalar keys such as numeric 1 and 1.0.
-    join_key jsonb NOT NULL,
-    row_data jsonb NOT NULL,
-    multiplicity bigint NOT NULL CHECK (multiplicity > 0),
-    PRIMARY KEY (result_oid, input_side, join_key, row_data)
-);
-
-CREATE INDEX shiba_join_arrangements_probe_idx
-    ON shiba_internal.join_arrangements (result_oid, input_side, join_key);
-
--- The durable logical graph is independent of the currently implemented
--- physical operators.  PostgreSQL plans the SELECT; Shiba stores that plan as
--- a directed graph so new incremental operators do not require a new DDL
--- syntax or another SQL-text parser.
-CREATE TABLE shiba_internal.stream_graphs (
-    result_oid oid PRIMARY KEY REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    plan jsonb NOT NULL,
-    logical_plan jsonb NOT NULL DEFAULT '{}'::jsonb,
-    analyzed_query jsonb NOT NULL DEFAULT '{}'::jsonb,
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-
-CREATE TABLE shiba_internal.stream_graph_nodes (
-    result_oid oid NOT NULL REFERENCES shiba_internal.stream_graphs(result_oid) ON DELETE CASCADE,
-    node_id text NOT NULL,
-    operator text NOT NULL,
-    properties jsonb NOT NULL,
-    PRIMARY KEY (result_oid, node_id)
-);
-
-CREATE TABLE shiba_internal.stream_graph_edges (
-    result_oid oid NOT NULL REFERENCES shiba_internal.stream_graphs(result_oid) ON DELETE CASCADE,
-    upstream_node_id text NOT NULL,
-    downstream_node_id text NOT NULL,
-    PRIMARY KEY (result_oid, upstream_node_id, downstream_node_id),
-    FOREIGN KEY (result_oid, upstream_node_id)
-        REFERENCES shiba_internal.stream_graph_nodes(result_oid, node_id) ON DELETE CASCADE,
-    FOREIGN KEY (result_oid, downstream_node_id)
-        REFERENCES shiba_internal.stream_graph_nodes(result_oid, node_id) ON DELETE CASCADE
-);
-
-CREATE TABLE shiba_internal.operator_instances (
-    result_oid oid NOT NULL REFERENCES shiba_internal.stream_graphs(result_oid) ON DELETE CASCADE,
-    node_id text NOT NULL,
-    operator text NOT NULL,
-    config jsonb NOT NULL,
-    stateful boolean NOT NULL,
-    PRIMARY KEY (result_oid, node_id)
-);
-
--- A logical graph has one versioned physical plan.  plan_id is a stable,
--- database-wide identity; version identifies the physical-plan format.
-CREATE TABLE shiba_internal.physical_plans (
-    result_oid oid PRIMARY KEY
-        REFERENCES shiba_internal.stream_graphs(result_oid) ON DELETE CASCADE,
-    plan_id bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
-    version integer NOT NULL CHECK (version > 0),
-    plan jsonb NOT NULL CHECK (jsonb_typeof(plan) = 'object'),
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    UNIQUE (result_oid, plan_id)
-);
-
--- Every cataloged v1 Stage relation is typed and UNLOGGED. Inline and
--- statement-materialized Stages live only in the physical-plan descriptor.
--- A relation-backed Stage is a rebuildable batch-scoped cache, never durable
--- operator state.
-CREATE TABLE shiba_internal.physical_stages (
-    result_oid oid NOT NULL,
-    plan_id bigint NOT NULL,
+-- One row is one stage's durable CAS authority and runtime identity.
+CREATE TABLE shiba_internal.operator_checkpoints (
+    result_oid oid NOT NULL
+      REFERENCES shiba_internal.dataflows(result_oid) ON DELETE CASCADE,
     stage_id integer NOT NULL CHECK (stage_id >= 0),
-    stage_name text NOT NULL CHECK (btrim(stage_name) <> ''),
-    storage text NOT NULL CHECK (storage = 'unlogged'),
-    relation_oid oid NOT NULL UNIQUE,
-    relation_name name NOT NULL,
-    schema_spec jsonb NOT NULL CHECK (jsonb_typeof(schema_spec) = 'array'),
-    index_spec jsonb NOT NULL DEFAULT '[]'::jsonb
-        CHECK (jsonb_typeof(index_spec) = 'array'),
-    PRIMARY KEY (result_oid, stage_id),
-    UNIQUE (result_oid, stage_name),
-    FOREIGN KEY (result_oid, plan_id)
-        REFERENCES shiba_internal.physical_plans(result_oid, plan_id)
-        ON DELETE CASCADE
+    revision bigint NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    has_continuation boolean NOT NULL DEFAULT false,
+    admitted_rows bigint NOT NULL DEFAULT 0 CHECK (admitted_rows >= 0),
+    admitted_bytes bigint NOT NULL DEFAULT 0 CHECK (admitted_bytes >= 0),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (result_oid, stage_id)
 );
 
-CREATE TABLE shiba_internal.aggregate_state (
-    result_oid oid NOT NULL REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    group_key jsonb NOT NULL,
-    row_count bigint NOT NULL CHECK (row_count >= 0),
-    count_value bigint NOT NULL CHECK (count_value >= 0),
-    sum_nonnull_count bigint NOT NULL CHECK (sum_nonnull_count >= 0),
-    sum_value numeric NOT NULL,
-    PRIMARY KEY (result_oid, group_key)
-);
-
-CREATE TABLE shiba_internal.distinct_state (
-    result_oid oid NOT NULL REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    group_key jsonb NOT NULL,
-    value_key jsonb NOT NULL,
-    multiplicity bigint NOT NULL CHECK (multiplicity > 0),
-    PRIMARY KEY(result_oid,group_key,value_key)
-);
-
--- Shared UNLOGGED scratch for folding one ingress batch before applying it to
--- authoritative state and the result table. Apply must leave it empty between
--- batches; it is not recovery authority.
-CREATE UNLOGGED TABLE shiba_internal.aggregate_group_fold_stage (
-    result_oid oid NOT NULL
-        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    commit_lsn pg_lsn NOT NULL,
-    group_key jsonb NOT NULL,
-    row_count_delta bigint NOT NULL,
-    row_count_min_prefix bigint NOT NULL,
-    count_value_delta bigint NOT NULL DEFAULT 0,
-    sum_nonnull_delta bigint NOT NULL,
-    sum_nonnull_min_prefix bigint NOT NULL,
-    sum_delta numeric NOT NULL,
-    PRIMARY KEY (result_oid,commit_lsn,group_key)
-);
-
-CREATE UNLOGGED TABLE shiba_internal.aggregate_distinct_fold_stage (
-    result_oid oid NOT NULL
-        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    commit_lsn pg_lsn NOT NULL,
-    group_key jsonb NOT NULL,
-    value_key jsonb NOT NULL,
-    multiplicity_delta bigint NOT NULL,
-    multiplicity_min_prefix bigint NOT NULL,
-    PRIMARY KEY (result_oid,commit_lsn,group_key,value_key)
-);
-
-CREATE UNLOGGED TABLE shiba_internal.distinct_fold_stage (
-    result_oid oid NOT NULL
-        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    commit_lsn pg_lsn NOT NULL,
-    row_key jsonb NOT NULL,
-    multiplicity_delta bigint NOT NULL,
-    minimum_prefix bigint NOT NULL,
-    PRIMARY KEY (result_oid,commit_lsn,row_key)
-);
-
-CREATE TABLE shiba_internal.window_views (
-    result_oid oid PRIMARY KEY REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    partition_column name NOT NULL,
-    result_partition_column name NOT NULL,
-    order_column name NOT NULL,
-    order_direction text NOT NULL CHECK (order_direction IN ('asc','desc')),
-    nulls_first boolean NOT NULL,
-    output_columns name[] NOT NULL,
-    target_expressions text[] NOT NULL,
-    CHECK (cardinality(output_columns)=cardinality(target_expressions))
-);
-
-CREATE TABLE shiba_internal.window_rows (
-    result_oid oid NOT NULL REFERENCES shiba_internal.window_views(result_oid) ON DELETE CASCADE,
-    partition_key jsonb NOT NULL,
-    row_data jsonb NOT NULL,
-    multiplicity bigint NOT NULL CHECK (multiplicity>0),
-    PRIMARY KEY(result_oid,partition_key,row_data)
-);
-
-CREATE TABLE shiba_internal.distinct_views (
-    result_oid oid PRIMARY KEY REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    source_columns name[] NOT NULL,
-    output_columns name[] NOT NULL,
-    CHECK (cardinality(source_columns)=cardinality(output_columns))
-);
-
-CREATE TABLE shiba_internal.projection_state (
-    result_oid oid NOT NULL REFERENCES shiba_internal.distinct_views(result_oid) ON DELETE CASCADE,
-    row_key jsonb NOT NULL,
-    multiplicity bigint NOT NULL CHECK (multiplicity>0),
-    PRIMARY KEY(result_oid,row_key)
-);
-
-CREATE TABLE shiba_internal.topn_views (
-    result_oid oid PRIMARY KEY REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    order_column name NOT NULL,
-    order_direction text NOT NULL CHECK (order_direction IN ('asc','desc')),
-    nulls_first boolean NOT NULL,
-    limit_count bigint NOT NULL CHECK (limit_count>0),
-    limit_offset bigint NOT NULL DEFAULT 0 CHECK (limit_offset>=0),
-    source_columns name[] NOT NULL,
-    output_columns name[] NOT NULL,
-    CHECK (cardinality(source_columns)=cardinality(output_columns))
-);
-
-CREATE TABLE shiba_internal.topn_rows (
-    result_oid oid NOT NULL REFERENCES shiba_internal.topn_views(result_oid) ON DELETE CASCADE,
-    row_data jsonb NOT NULL,
-    multiplicity bigint NOT NULL CHECK (multiplicity>0),
-    PRIMARY KEY(result_oid,row_data)
-);
-
-CREATE TABLE shiba_internal.view_progress (
-    result_oid oid PRIMARY KEY REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    applied_lsn pg_lsn,
-    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-
--- DAGs are logical runtimes scheduled cooperatively by the Runtime.  This
--- table intentionally contains no PostgreSQL-process lease or heartbeat.
-CREATE TABLE shiba_internal.dag_runtime_state (
-    result_oid oid PRIMARY KEY REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    active boolean NOT NULL DEFAULT true,
-    last_scheduled_at timestamptz,
-    last_error text,
-    failed_at timestamptz,
-    CHECK ((last_error IS NULL) = (failed_at IS NULL))
-);
-
--- One dynamic "shiba runtime" process owns routing, DAG scheduling, apply, and
--- change-log GC for this database.
+-- One database-scoped Runtime owns replication, publication, operator
+-- scheduling, and bounded garbage collection.
 CREATE TABLE shiba_internal.runtime_state (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     active boolean NOT NULL DEFAULT false,
     owner_pid integer CHECK (owner_pid > 0),
     started_at timestamptz,
     last_heartbeat timestamptz,
-    last_requested_at timestamptz,
     launch_generation bigint NOT NULL DEFAULT 0 CHECK (launch_generation >= 0),
     pending_launch_xid xid8,
     pending_since timestamptz,
@@ -322,16 +63,10 @@ CREATE TABLE shiba_internal.runtime_state (
     CHECK (owner_pid IS NULL OR pending_launch_xid IS NULL)
 );
 
--- Durable ingress is the only routing and operator input model. Replication
--- buffers and parser state are disposable; the LOGGED ingress, cursor,
--- operator-state, and result relations are the crash-recovery authority.
-
--- A generation changes whenever a logical slot is recreated.  Runtime code
--- provisions this row before decoding and retires the preceding active
--- generation explicitly.  persisted_lsn is the greatest decode batch whose
--- table transaction committed.  confirmed_lsn and replay_safe_lsn advance
--- independently: confirmation intent is not proof that the slot position has
--- reached durable storage.
+-- A generation changes whenever the logical slot is recreated. persisted_lsn
+-- is durable decode progress. published_lsn is the greatest contiguous source
+-- transaction frontier whose effects have all reached source streams or were
+-- intentionally discarded. Neither value is inferred from Runtime memory.
 CREATE TABLE shiba_internal.ingress_replay_state (
     slot_generation bigint PRIMARY KEY CHECK (slot_generation > 0),
     slot_name name NOT NULL CHECK (length(slot_name::text) > 0),
@@ -340,13 +75,16 @@ CREATE TABLE shiba_internal.ingress_replay_state (
     system_identifier text NOT NULL CHECK (length(system_identifier) > 0),
     slot_baseline_lsn pg_lsn NOT NULL,
     state text NOT NULL DEFAULT 'active'
-        CHECK (state IN ('active', 'retired', 'invalid')),
+      CHECK (state IN ('active', 'retired')),
     persisted_lsn pg_lsn,
+    published_lsn pg_lsn,
     confirmed_lsn pg_lsn,
     replay_safe_lsn pg_lsn,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     retired_at timestamptz,
+    CHECK (published_lsn IS NULL OR persisted_lsn IS NOT NULL),
+    CHECK (published_lsn IS NULL OR published_lsn <= persisted_lsn),
     CHECK (confirmed_lsn IS NULL OR persisted_lsn IS NOT NULL),
     CHECK (confirmed_lsn IS NULL OR confirmed_lsn <= persisted_lsn),
     CHECK (replay_safe_lsn IS NULL OR confirmed_lsn IS NOT NULL),
@@ -355,232 +93,285 @@ CREATE TABLE shiba_internal.ingress_replay_state (
     UNIQUE (slot_name, slot_generation)
 );
 
--- At most one generation for a database/slot pair may accept new ingress.
-CREATE UNIQUE INDEX shiba_ingress_active_slot_idx
-    ON shiba_internal.ingress_replay_state (database_oid, slot_name)
-    WHERE state = 'active';
+CREATE UNIQUE INDEX ingress_active_slot_idx
+  ON shiba_internal.ingress_replay_state(database_oid, slot_name)
+  WHERE state = 'active';
 
--- With pgoutput streaming=off, Begin.final_lsn is known before any row
--- messages are emitted and must equal the later Commit.commit_lsn.
+-- With pgoutput streaming disabled, Begin.final_lsn is available before its
+-- row messages and equals the later Commit.commit_lsn.
 CREATE TABLE shiba_internal.ingress_transactions (
     ingress_txn_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     slot_generation bigint NOT NULL
-        REFERENCES shiba_internal.ingress_replay_state(slot_generation)
-        ON DELETE RESTRICT,
-    source_xid bigint NOT NULL
-        CHECK (source_xid BETWEEN 0 AND 4294967295),
+      REFERENCES shiba_internal.ingress_replay_state(slot_generation)
+      ON DELETE RESTRICT,
+    source_xid bigint NOT NULL CHECK (source_xid BETWEEN 0 AND 4294967295),
     final_lsn pg_lsn NOT NULL,
     status text NOT NULL DEFAULT 'open'
-        CHECK (status IN ('open', 'committed')),
+      CHECK (status IN ('open', 'committed')),
     commit_lsn pg_lsn,
     end_lsn pg_lsn,
-    next_input_seq bigint NOT NULL DEFAULT 1 CHECK (next_input_seq > 0),
     event_count bigint NOT NULL DEFAULT 0 CHECK (event_count >= 0),
     payload_bytes bigint NOT NULL DEFAULT 0 CHECK (payload_bytes >= 0),
+    batch_count bigint NOT NULL DEFAULT 0 CHECK (batch_count >= 0),
+    pending_publications bigint NOT NULL DEFAULT 0
+      CHECK (pending_publications >= 0),
     opened_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     finalized_at timestamptz,
     UNIQUE (slot_generation, source_xid, final_lsn),
     UNIQUE (ingress_txn_id, final_lsn),
-    CHECK (next_input_seq = event_count + 1),
     CHECK (
-        (status = 'open'
-          AND commit_lsn IS NULL
-          AND end_lsn IS NULL
-          AND finalized_at IS NULL)
-        OR
-        (status = 'committed'
-          AND commit_lsn IS NOT NULL
-          AND end_lsn IS NOT NULL
-          AND finalized_at IS NOT NULL
-          AND final_lsn = commit_lsn
-          AND commit_lsn <= end_lsn)
+      (
+        status = 'open'
+        AND commit_lsn IS NULL
+        AND end_lsn IS NULL
+        AND finalized_at IS NULL
+      )
+      OR
+      (
+        status = 'committed'
+        AND commit_lsn IS NOT NULL
+        AND end_lsn IS NOT NULL
+        AND finalized_at IS NOT NULL
+        AND final_lsn = commit_lsn
+        AND commit_lsn <= end_lsn
+      )
     )
 );
 
--- Commit records have stable WAL positions.  This also prevents two source
--- transactions from being admitted as the same source epoch.
-CREATE UNIQUE INDEX shiba_ingress_commit_lsn_idx
-    ON shiba_internal.ingress_transactions (commit_lsn)
-    WHERE status = 'committed';
+CREATE UNIQUE INDEX ingress_commit_lsn_idx
+  ON shiba_internal.ingress_transactions(commit_lsn)
+  WHERE status = 'committed';
 
-CREATE INDEX shiba_ingress_open_txn_idx
-    ON shiba_internal.ingress_transactions
-       (slot_generation, source_xid, final_lsn)
-    WHERE status = 'open';
+CREATE INDEX ingress_open_txn_idx
+  ON shiba_internal.ingress_transactions(slot_generation, source_xid, final_lsn)
+  WHERE status = 'open';
 
--- A batch is the durability and feedback unit, not the event identity.  A
--- 32-byte digest is supplied by the protocol parser (SHA-256 in v2).
-CREATE TABLE shiba_internal.ingress_decode_batches (
-    slot_generation bigint NOT NULL
-        REFERENCES shiba_internal.ingress_replay_state(slot_generation)
-        ON DELETE RESTRICT,
-    decode_end_lsn pg_lsn NOT NULL,
-    message_digest bytea NOT NULL
-        CHECK (octet_length(message_digest) = 32),
-    event_count bigint NOT NULL CHECK (event_count >= 0),
-    payload_bytes bigint NOT NULL CHECK (payload_bytes >= 0),
-    persisted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (slot_generation, decode_end_lsn, message_digest)
-);
+CREATE INDEX ingress_publication_order_idx
+  ON shiba_internal.ingress_transactions(
+    slot_generation, final_lsn, ingress_txn_id
+  );
 
--- Payload is stored exactly once regardless of DAG fan-out.  input_seq is
--- allocated only for a new stable event identity; replay keeps the original
--- value.  JSONB is the v2 SQL ABI until physical operators consume typed Stage
--- rows directly.
+CREATE INDEX ingress_pending_publication_idx
+  ON shiba_internal.ingress_transactions(slot_generation)
+  WHERE pending_publications > 0;
+
+-- A source row image is stored once. input_seq is stable across replay even
+-- when the replication transport regroups CopyData frames.
 CREATE TABLE shiba_internal.change_log (
     ingress_txn_id bigint NOT NULL
-        REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
-        ON DELETE CASCADE,
+      REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
+      ON DELETE CASCADE,
     change_lsn pg_lsn NOT NULL,
     change_ordinal bigint NOT NULL CHECK (change_ordinal >= 0),
     image_ordinal integer NOT NULL CHECK (image_ordinal >= 0),
     input_seq bigint NOT NULL CHECK (input_seq > 0),
     source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
     weight bigint NOT NULL CHECK (weight IN (-1, 1)),
-    -- Immutable wire-text image used for replay conflict detection.
-    typed_payload jsonb NOT NULL,
-    -- Bounded-batch normalization fills the operator-facing typed image.
-    canonical_payload jsonb,
-    payload_bytes bigint NOT NULL CHECK (payload_bytes >= 0),
+    payload jsonb NOT NULL,
     persisted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (
-        ingress_txn_id,
-        change_lsn,
-        change_ordinal,
-        image_ordinal
+      ingress_txn_id, change_lsn, change_ordinal, image_ordinal
     ),
     UNIQUE (ingress_txn_id, input_seq)
 );
 
--- Stable downstream work units derived from first-seen input_seq allocations.
--- Replication delivery can regroup already persisted CopyData frames after a
--- restart, so ingress_decode_batches are replay checkpoints rather than a
--- safe apply cursor.  A row is created only for the new, contiguous input_seq
--- range inserted by one bounded ingress transaction.
+CREATE INDEX change_log_source_batch_idx
+  ON shiba_internal.change_log(ingress_txn_id, source_oid, input_seq);
+
+-- Each bounded prefix admitted by ingress is independently publishable.
 CREATE TABLE shiba_internal.ingress_apply_batches (
     ingress_txn_id bigint NOT NULL
-        REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
-        ON DELETE CASCADE,
+      REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
+      ON DELETE CASCADE,
     batch_ordinal bigint NOT NULL CHECK (batch_ordinal > 0),
     first_input_seq bigint NOT NULL CHECK (first_input_seq > 0),
     last_input_seq bigint NOT NULL CHECK (last_input_seq >= first_input_seq),
-    event_count bigint NOT NULL CHECK (event_count > 0),
     persisted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (ingress_txn_id, batch_ordinal),
-    UNIQUE (ingress_txn_id, first_input_seq, last_input_seq),
-    CHECK (event_count = last_input_seq - first_input_seq + 1)
+    UNIQUE (ingress_txn_id, first_input_seq, last_input_seq)
 );
 
--- Shared UNLOGGED row-bag scratch for one TopN or Window input batch. Apply
--- must leave it empty between batches. partition_key is JSON null for TopN.
-CREATE UNLOGGED TABLE shiba_internal.unary_batch_rows (
-    result_oid oid NOT NULL
-        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    ingress_txn_id bigint NOT NULL
-        REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
-        ON DELETE CASCADE,
-    partition_key jsonb NOT NULL,
-    row_data jsonb NOT NULL,
-    multiplicity_delta bigint NOT NULL,
-    minimum_prefix bigint NOT NULL,
-    PRIMARY KEY (result_oid,ingress_txn_id,partition_key,row_data)
-);
-
--- Shared UNLOGGED folded rows for one Join input batch. Candidate generation
--- consumes both sides and clears the rows in the same apply transaction.
-CREATE UNLOGGED TABLE shiba_internal.join_batch_rows (
-    result_oid oid NOT NULL
-        REFERENCES shiba_internal.inner_join_views(result_oid)
-        ON DELETE CASCADE,
-    ingress_txn_id bigint NOT NULL,
-    commit_lsn pg_lsn NOT NULL,
-    input_side text NOT NULL CHECK (input_side IN ('left','right')),
-    join_key jsonb NOT NULL,
-    row_data jsonb NOT NULL,
-    multiplicity_delta bigint NOT NULL,
-    multiplicity_min_prefix bigint NOT NULL,
-    PRIMARY KEY (
-        result_oid,ingress_txn_id,input_side,join_key,row_data
-    ),
-    FOREIGN KEY (ingress_txn_id,commit_lsn)
-        REFERENCES shiba_internal.ingress_transactions
-                   (ingress_txn_id,final_lsn)
-        ON DELETE CASCADE
-);
-
-CREATE INDEX shiba_join_batch_commit_idx
-    ON shiba_internal.join_batch_rows (result_oid,commit_lsn,input_side);
-
--- With pgoutput streaming=off, PostgreSQL emits Begin and row messages only
--- after the source transaction has committed. final_lsn is therefore the
--- stable source epoch before Shiba receives the trailing pgoutput Commit.
-CREATE VIEW shiba_internal.effective_change_log AS
-SELECT event.ingress_txn_id,
-       txn.final_lsn AS commit_lsn,
-       event.input_seq AS sequence,
-       event.change_lsn,
-       event.change_ordinal,
-       event.image_ordinal,
-       event.source_oid,
-       event.weight::integer AS delta,
-       event.canonical_payload AS row_data,
-       event.payload_bytes,
-       event.persisted_at
-  FROM shiba_internal.change_log AS event
- JOIN shiba_internal.ingress_transactions AS txn
-    ON txn.ingress_txn_id = event.ingress_txn_id
- WHERE event.canonical_payload IS NOT NULL;
-
--- Every stable apply batch is independently routable before pgoutput Commit.
--- subscriber_cursor is the last result OID visited for this batch.
-CREATE TABLE shiba_internal.routing_tasks (
+-- Publication work is per source, not per subscribing dataflow. A published
+-- chunk is shared by every Scan consumer of that source stream.
+CREATE TABLE shiba_internal.source_publications (
     ingress_txn_id bigint NOT NULL,
     batch_ordinal bigint NOT NULL,
-    commit_lsn pg_lsn NOT NULL,
-    subscriber_cursor oid NOT NULL DEFAULT 0::oid,
-    status text NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'routing', 'complete', 'failed')),
-    attempts bigint NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
+    next_input_seq bigint CHECK (next_input_seq > 0),
+    PRIMARY KEY (ingress_txn_id, batch_ordinal, source_oid),
+    FOREIGN KEY (ingress_txn_id, batch_ordinal)
+      REFERENCES shiba_internal.ingress_apply_batches(
+        ingress_txn_id, batch_ordinal
+      )
+      ON DELETE CASCADE
+);
+
+CREATE INDEX source_publications_ready_idx
+  ON shiba_internal.source_publications(
+    source_oid, ingress_txn_id, batch_ordinal
+  )
+  WHERE next_input_seq IS NOT NULL;
+
+-- One producer output is one durable stream. Each downstream edge adds a
+-- consumer cursor; fanout never copies the payload.
+CREATE TABLE shiba_internal.effect_streams (
+    stream_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    producer_kind text NOT NULL CHECK (producer_kind IN ('source', 'operator')),
+    slot_generation bigint,
+    source_oid oid,
+    producer_result_oid oid,
+    producer_stage_id integer,
+    next_chunk_seq bigint NOT NULL DEFAULT 1 CHECK (next_chunk_seq >= 1),
+    first_retained_chunk_seq bigint NOT NULL DEFAULT 1
+      CHECK (first_retained_chunk_seq >= 1),
+    latest_data_lsn pg_lsn,
+    published_frontier_lsn pg_lsn,
+    buffered_chunks bigint NOT NULL DEFAULT 0 CHECK (buffered_chunks >= 0),
+    buffered_rows numeric NOT NULL DEFAULT 0 CHECK (buffered_rows >= 0),
+    buffered_bytes numeric NOT NULL DEFAULT 0 CHECK (buffered_bytes >= 0),
+    target_chunk_rows bigint NOT NULL CHECK (target_chunk_rows > 0),
+    target_chunk_bytes bigint NOT NULL CHECK (target_chunk_bytes > 0),
+    high_chunks bigint NOT NULL CHECK (high_chunks > 0),
+    high_rows bigint NOT NULL CHECK (high_rows > 0),
+    high_bytes bigint NOT NULL CHECK (high_bytes > 0),
+    low_chunks bigint NOT NULL CHECK (low_chunks >= 0),
+    low_rows bigint NOT NULL CHECK (low_rows >= 0),
+    low_bytes bigint NOT NULL CHECK (low_bytes >= 0),
+    backpressured boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    FOREIGN KEY (slot_generation)
+      REFERENCES shiba_internal.ingress_replay_state(slot_generation)
+      ON DELETE RESTRICT,
+    FOREIGN KEY (producer_result_oid, producer_stage_id)
+      REFERENCES shiba_internal.operator_checkpoints(result_oid, stage_id)
+      ON DELETE CASCADE,
+    CHECK (
+      (
+        producer_kind = 'source'
+        AND slot_generation IS NOT NULL
+        AND source_oid IS NOT NULL
+        AND source_oid <> 0::oid
+        AND producer_result_oid IS NULL
+        AND producer_stage_id IS NULL
+        AND published_frontier_lsn IS NULL
+      )
+      OR
+      (
+        producer_kind = 'operator'
+        AND slot_generation IS NULL
+        AND source_oid IS NULL
+        AND producer_result_oid IS NOT NULL
+        AND producer_stage_id IS NOT NULL
+        AND producer_stage_id >= 0
+      )
+    ),
+    CHECK (first_retained_chunk_seq <= next_chunk_seq),
+    CHECK (
+      buffered_chunks::numeric
+        = next_chunk_seq::numeric - first_retained_chunk_seq::numeric
+    ),
+    CHECK (target_chunk_rows <= high_rows),
+    CHECK (target_chunk_bytes <= high_bytes),
+    CHECK (low_chunks < high_chunks),
+    CHECK (low_rows < high_rows),
+    CHECK (low_bytes < high_bytes)
+);
+
+CREATE UNIQUE INDEX effect_stream_source_producer_idx
+  ON shiba_internal.effect_streams(slot_generation, source_oid)
+  WHERE producer_kind = 'source';
+
+CREATE UNIQUE INDEX effect_stream_operator_producer_idx
+  ON shiba_internal.effect_streams(
+    producer_result_oid, producer_stage_id
+  )
+  WHERE producer_kind = 'operator';
+
+-- payload_bytes is the logical typed-effect size: sum(effect_row_bytes(
+-- row_value)). The helper materializes the typed composite before measuring it
+-- and adds eight bytes for weight, so TOAST does not change accounting.
+-- stream_id, chunk_seq, and row_ordinal are bounded independently by row_count.
+CREATE TABLE shiba_internal.effect_stream_chunks (
+    stream_id bigint NOT NULL
+      REFERENCES shiba_internal.effect_streams(stream_id) ON DELETE CASCADE,
+    chunk_seq bigint NOT NULL CHECK (chunk_seq >= 1),
+    chunk_kind text NOT NULL CHECK (chunk_kind IN ('data', 'frontier')),
+    row_count bigint NOT NULL CHECK (row_count >= 0),
+    payload_bytes bigint NOT NULL CHECK (payload_bytes >= 0),
+    chunk_lsn pg_lsn NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (stream_id, chunk_seq),
+    CHECK (
+      (
+        chunk_kind = 'data'
+        AND row_count > 0
+        AND payload_bytes > 0
+      )
+      OR
+      (
+        chunk_kind = 'frontier'
+        AND row_count = 0
+        AND payload_bytes = 0
+      )
+    )
+);
+
+-- Source consumers keep their dataflow activation boundary. Operator
+-- consumers start at 0/0 so the producer's activation SnapshotFrontier is a
+-- real frontier advance.
+CREATE TABLE shiba_internal.effect_stream_consumers (
+    stream_id bigint NOT NULL
+      REFERENCES shiba_internal.effect_streams(stream_id) ON DELETE CASCADE,
+    result_oid oid NOT NULL,
+    consumer_stage_id integer NOT NULL CHECK (consumer_stage_id >= 0),
+    input_port integer NOT NULL CHECK (input_port >= 0),
+    next_chunk_seq bigint NOT NULL CHECK (next_chunk_seq >= 1),
+    activation_lsn pg_lsn NOT NULL,
+    consumed_frontier_lsn pg_lsn NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    completed_at timestamptz,
-    last_error text,
-    PRIMARY KEY (ingress_txn_id,batch_ordinal),
-    FOREIGN KEY (ingress_txn_id,batch_ordinal)
-        REFERENCES shiba_internal.ingress_apply_batches
-                   (ingress_txn_id,batch_ordinal)
-        ON DELETE CASCADE,
-    FOREIGN KEY (ingress_txn_id, commit_lsn)
-        REFERENCES shiba_internal.ingress_transactions
-                   (ingress_txn_id, final_lsn)
-        ON DELETE CASCADE,
-    CHECK ((status = 'complete') = (completed_at IS NOT NULL)),
-    CHECK ((status = 'failed') = (last_error IS NOT NULL))
+    PRIMARY KEY (stream_id, result_oid, consumer_stage_id, input_port),
+    UNIQUE (result_oid, consumer_stage_id, input_port),
+    FOREIGN KEY (result_oid, consumer_stage_id)
+      REFERENCES shiba_internal.operator_checkpoints(result_oid, stage_id)
+      ON DELETE CASCADE,
+    CHECK (consumed_frontier_lsn >= activation_lsn)
 );
 
-CREATE INDEX shiba_routing_tasks_ready_idx
-    ON shiba_internal.routing_tasks
-       (commit_lsn, ingress_txn_id, batch_ordinal)
-    WHERE status IN ('pending', 'routing');
-
--- A DAG inbox row references the ingress transaction directly. Payload is
--- never copied per DAG, and RESTRICT prevents GC while any DAG still needs it.
-CREATE TABLE shiba_internal.dag_inbox (
-    result_oid oid NOT NULL
-        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
-    ingress_txn_id bigint NOT NULL,
-    commit_lsn pg_lsn NOT NULL,
-    next_batch_ordinal bigint NOT NULL DEFAULT 1
-        CHECK (next_batch_ordinal > 0),
-    PRIMARY KEY (result_oid, ingress_txn_id),
-    UNIQUE (result_oid, commit_lsn),
-    FOREIGN KEY (ingress_txn_id, commit_lsn)
-        REFERENCES shiba_internal.ingress_transactions
-                   (ingress_txn_id, final_lsn)
-        ON DELETE RESTRICT
+-- Every stream owns one generated composite and one LOGGED payload relation.
+-- relation_oid and row_type_oid are the authority; runtime code must recheck
+-- their live namespace/name identity and never guess an object name.
+CREATE TABLE shiba_internal.effect_stream_payloads (
+    stream_id bigint PRIMARY KEY
+      REFERENCES shiba_internal.effect_streams(stream_id) ON DELETE CASCADE,
+    relation_oid oid NOT NULL UNIQUE,
+    row_type_oid oid NOT NULL UNIQUE
 );
 
-CREATE INDEX shiba_dag_inbox_commit_idx
-    ON shiba_internal.dag_inbox (commit_lsn);
+-- Each stateful kernel owns typed, LOGGED relations and records them here.
+-- The common catalog knows only object identity and typed schema, never the
+-- operator-specific row layout.
+CREATE TABLE shiba_internal.operator_state_relations (
+    result_oid oid NOT NULL,
+    stage_id integer NOT NULL,
+    state_slot integer NOT NULL CHECK (state_slot >= 0),
+    relation_oid oid NOT NULL UNIQUE,
+    PRIMARY KEY (result_oid, stage_id, state_slot),
+    FOREIGN KEY (result_oid, stage_id)
+      REFERENCES shiba_internal.operator_checkpoints(result_oid, stage_id)
+      ON DELETE CASCADE
+);
 
-INSERT INTO shiba_internal.runtime_state (singleton) VALUES (true);
+-- Continuations are also kernel-owned typed relations. A checkpoint's
+-- has_continuation flag is the small CAS authority; this row identifies the
+-- typed durable object that holds its resumable cursor.
+CREATE TABLE shiba_internal.operator_continuation_relations (
+    result_oid oid NOT NULL,
+    stage_id integer NOT NULL,
+    relation_oid oid NOT NULL UNIQUE,
+    PRIMARY KEY (result_oid, stage_id),
+    FOREIGN KEY (result_oid, stage_id)
+      REFERENCES shiba_internal.operator_checkpoints(result_oid, stage_id)
+      ON DELETE CASCADE
+);
+
+INSERT INTO shiba_internal.runtime_state(singleton) VALUES (true);

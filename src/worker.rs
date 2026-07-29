@@ -1,8 +1,8 @@
 //! One database-level Runtime background worker.
 //!
-//! WAL routing, DAG scheduling, relational operator execution, and change-log
+//! WAL ingestion, source publication, relational operator execution, and
 //! garbage collection are bounded phases of one SPI-connected PostgreSQL
-//! backend. A DAG runtime is plan metadata, never a process or thread.
+//! backend. Loaded dataflows are plan metadata, never processes or threads.
 
 use crate::postgres::{format_lsn, parse_lsn};
 use crate::{config, ingress, logical, replication};
@@ -17,11 +17,13 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 const RUNTIME_IDLE_WAIT: Duration = Duration::from_millis(25);
-const ROUTE_MAX_SUBSCRIBERS_PER_PAGE: i32 = 64;
-const APPLY_MAX_TRANSACTIONS_PER_ROUND: usize = 64;
-const APPLY_TIME_BUDGET: Duration = Duration::from_millis(50);
+const OPERATOR_MAX_STEPS_PER_ROUND: usize = 64;
+const OPERATOR_TIME_BUDGET: Duration = Duration::from_millis(50);
 const GC_MAX_TRANSACTIONS_PER_ROUND: i32 = 64;
+const GC_MAX_EFFECT_STREAMS_PER_ROUND: i32 = 64;
+const GC_MAX_EFFECT_CHUNKS_PER_STREAM: i32 = 64;
 const GC_INTERVAL: Duration = Duration::from_millis(250);
+const REPLICATION_STATUS_INTERVAL: Duration = Duration::from_millis(250);
 const LAUNCH_TRANSACTION_WAIT: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
 const PROC_ARRAY_LWLOCK_INDEX_PG17: usize = 4;
@@ -148,9 +150,11 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
     let mut ingress_runtime = initialize_ingress();
 
     log!("Shiba Runtime started for database {database_name}");
-    let mut runtimes =
-        DeterministicLru::<pg_sys::Oid, logical::DagRuntime>::new(config::max_cached_dags());
-    let mut round_robin_cursor = None;
+    let mut loaded_dataflows = DeterministicLru::<pg_sys::Oid, logical::LoadedDataflow>::new(
+        config::max_cached_dataflows(),
+    );
+    let mut result_cursor = None;
+    let mut effect_stream_gc_cursor = None;
     let mut idle = false;
     let mut next_gc = Instant::now();
 
@@ -165,49 +169,40 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
         }
         reload_config_if_requested();
 
-        let routed = match route_ingress_once(&mut ingress_runtime) {
+        let ingress_work = match ingest_and_publish_once(&mut ingress_runtime) {
             RuntimePhase::Inactive => break 'runtime,
             RuntimePhase::Worked(count) => count,
         };
 
-        let Some(ready_dags) = BackgroundWorker::transaction(|| {
+        let Some(ready_results) = BackgroundWorker::transaction(|| {
             if !runtime_is_active() {
                 return None;
             }
             update_runtime_heartbeat();
-            Some(ready_dag_oids(round_robin_cursor))
+            Some(ready_result_oids(result_cursor))
         }) else {
             break 'runtime;
         };
-        let obsolete_runtimes = runtimes
-            .set_capacity(config::max_cached_dags())
-            .into_iter()
-            .map(|(result_oid, runtime)| (result_oid, runtime.generation().to_owned()))
-            .collect::<Vec<_>>();
-        if !obsolete_runtimes.is_empty() {
-            BackgroundWorker::transaction(|| {
-                for (result_oid, generation) in &obsolete_runtimes {
-                    logical::release_physical_programs(*result_oid, generation)
-                        .expect("Shiba could not release an obsolete physical program");
-                }
-            });
-        }
+        let _ = loaded_dataflows.set_capacity(config::max_cached_dataflows());
 
-        let apply_phase =
-            apply_ready_dags_bounded(&mut runtimes, &mut round_robin_cursor, ready_dags);
-        match apply_phase {
-            ApplyPhase::RuntimeInactive | ApplyPhase::SignalReceived => break 'runtime,
-            ApplyPhase::Worked | ApplyPhase::Idle => {}
+        let operator_phase =
+            step_ready_operators_bounded(&mut loaded_dataflows, &mut result_cursor, ready_results);
+        match operator_phase {
+            OperatorPhase::RuntimeInactive | OperatorPhase::SignalReceived => break 'runtime,
+            OperatorPhase::Worked | OperatorPhase::Idle => {}
         }
 
         let collected = if Instant::now() >= next_gc {
-            let count = BackgroundWorker::transaction(|| gc_change_log(ingress_runtime.generation));
+            let count = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                gc_change_log(ingress_runtime.generation)
+                    + gc_effect_streams(&mut effect_stream_gc_cursor)
+            }));
             next_gc = Instant::now() + GC_INTERVAL;
             count
         } else {
             0
         };
-        idle = routed == 0 && apply_phase != ApplyPhase::Worked && collected == 0;
+        idle = ingress_work == 0 && operator_phase != OperatorPhase::Worked && collected == 0;
 
         if !idle {
             // Each phase is bounded and each source transaction has already
@@ -230,14 +225,53 @@ struct IngressRuntime {
     generation: i64,
     ingress: ingress::ReplicationIngress,
     persisted_lsn: u64,
+    feedback: FeedbackState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FeedbackState {
+    // Periodic status messages may repeat persisted_lsn. Keep the catalog
+    // watermark in memory so those transport heartbeats stay catalog-free.
+    recorded_feedback_lsn: u64,
     pending_feedback: Option<u64>,
     queued_feedback: Option<u64>,
+    last_status_update: Instant,
+}
+
+impl FeedbackState {
+    fn queue(&mut self, feedback_lsn: u64) {
+        self.pending_feedback = Some(
+            self.pending_feedback
+                .map_or(feedback_lsn, |pending| pending.max(feedback_lsn)),
+        );
+    }
+
+    fn advance_recorded_feedback(&mut self, feedback_lsn: u64) -> Option<u64> {
+        if feedback_lsn == 0 || feedback_lsn <= self.recorded_feedback_lsn {
+            return None;
+        }
+        self.recorded_feedback_lsn = feedback_lsn;
+        Some(feedback_lsn)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FeedbackOperation {
+    FlushQueued,
+    SendPending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FeedbackTransition {
+    state: FeedbackState,
+    catalog_record: Option<u64>,
 }
 
 struct IngressBootstrap {
     generation: i64,
     slot_name: String,
     start_lsn: u64,
+    confirmed_lsn: u64,
 }
 
 fn initialize_ingress() -> IngressRuntime {
@@ -256,12 +290,17 @@ fn initialize_ingress() -> IngressRuntime {
             publication_names: &["shiba_publication"],
         })
         .unwrap_or_else(|error| panic!("Shiba could not start logical replication: {error}"));
+    let now = Instant::now();
     IngressRuntime {
         generation: bootstrap.generation,
         ingress: ingress::ReplicationIngress::new(transport, config::max_cached_relations()),
         persisted_lsn: bootstrap.start_lsn,
-        pending_feedback: None,
-        queued_feedback: None,
+        feedback: FeedbackState {
+            recorded_feedback_lsn: bootstrap.confirmed_lsn,
+            pending_feedback: None,
+            queued_feedback: None,
+            last_status_update: now.checked_sub(REPLICATION_STATUS_INTERVAL).unwrap_or(now),
+        },
     }
 }
 
@@ -278,26 +317,82 @@ fn bootstrap_ingress() -> IngressBootstrap {
     .expect("Shiba could not initialize its ingress generation")
     .expect("ingress generation initialization returned no row");
     let generation_argument = unsafe { [DatumWithOid::new(generation, pg_sys::INT8OID)] };
-    let persisted_lsn = Spi::get_one_with_args::<String>(
-        "SELECT coalesce(persisted_lsn, '0/0'::pg_lsn)::text
+    let (persisted_lsn, confirmed_lsn) = Spi::get_two_with_args::<String, String>(
+        "SELECT coalesce(persisted_lsn, '0/0'::pg_lsn)::text,
+                coalesce(confirmed_lsn, '0/0'::pg_lsn)::text
          FROM shiba_internal.ingress_feedback_upper_bound($1)",
         &generation_argument,
     )
-    .expect("Shiba could not read its durable ingress position")
-    .expect("ingress generation has no feedback state");
+    .expect("Shiba could not read its durable ingress position");
     IngressBootstrap {
         generation,
         slot_name,
-        start_lsn: parse_lsn(&persisted_lsn).expect("invalid durable ingress LSN"),
+        start_lsn: parse_lsn(
+            &persisted_lsn.expect("ingress generation has no durable feedback state"),
+        )
+        .expect("invalid durable ingress LSN"),
+        confirmed_lsn: parse_lsn(
+            &confirmed_lsn.expect("ingress generation has no confirmed feedback state"),
+        )
+        .expect("invalid confirmed ingress LSN"),
     }
 }
 
-fn route_ingress_once(runtime: &mut IngressRuntime) -> RuntimePhase {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourcePublicationOutcome {
+    Idle,
+    Blocked,
+    Appended,
+    Completed,
+    Discarded,
+}
+
+impl SourcePublicationOutcome {
+    fn from_sql(value: &str) -> Self {
+        match value {
+            "idle" => Self::Idle,
+            "blocked" => Self::Blocked,
+            "appended" => Self::Appended,
+            "completed" => Self::Completed,
+            "discarded" => Self::Discarded,
+            unexpected => panic!("Shiba received unknown source publication outcome {unexpected}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SourcePublication {
+    outcome: SourcePublicationOutcome,
+    final_lsn: Option<String>,
+    has_pending: bool,
+}
+
+fn ingest_and_publish_once(runtime: &mut IngressRuntime) -> RuntimePhase {
     if !BackgroundWorker::transaction(runtime_is_active) {
         return RuntimePhase::Inactive;
     }
 
-    flush_ingress_feedback(runtime);
+    maintain_ingress_feedback(runtime, false);
+    let publication = publish_source_once(runtime.generation);
+    advance_ingress_publication_frontier(runtime.generation);
+    let publication_work = usize::from(matches!(
+        publication.outcome,
+        SourcePublicationOutcome::Appended
+            | SourcePublicationOutcome::Completed
+            | SourcePublicationOutcome::Discarded
+    ));
+
+    // A durable source task is always drained before more WAL is read. The
+    // status heartbeat above still keeps the full-duplex replication
+    // connection alive while this branch applies backpressure. If
+    // every source-local head is backpressured, operator scheduling below can
+    // consume already-published chunks and GC can release the low watermark.
+    // This bounds change_log staging to the current ingress batch instead of
+    // buffering an unbounded replication stream behind a slow DAG.
+    if publication.has_pending {
+        return RuntimePhase::Worked(publication_work);
+    }
+
     let budget = ingress::IngressBudget {
         max_events: config::ingress_batch_rows(),
         max_wire_bytes: config::ingress_batch_bytes(),
@@ -317,6 +412,7 @@ fn route_ingress_once(runtime: &mut IngressRuntime) -> RuntimePhase {
                     test_failpoints::claim(
                         "runtime_ingress_after_partial_batch",
                         None,
+                        None,
                         Some(&decode_lsn),
                     )
                 }) {
@@ -326,15 +422,14 @@ fn route_ingress_once(runtime: &mut IngressRuntime) -> RuntimePhase {
             }
             if let Some(feedback_lsn) = feedback_lsn {
                 runtime.persisted_lsn = runtime.persisted_lsn.max(feedback_lsn);
-                runtime.pending_feedback = Some(runtime.persisted_lsn);
-                flush_ingress_feedback(runtime);
+                runtime.feedback.queue(runtime.persisted_lsn);
+                maintain_ingress_feedback(runtime, false);
             }
             1
         }
         ingress::IngressPoll::Pending { reply_requested } => {
             if reply_requested {
-                runtime.pending_feedback = Some(runtime.persisted_lsn);
-                flush_ingress_feedback(runtime);
+                maintain_ingress_feedback(runtime, true);
             }
             0
         }
@@ -343,68 +438,210 @@ fn route_ingress_once(runtime: &mut IngressRuntime) -> RuntimePhase {
         }
     };
 
-    let routed = BackgroundWorker::transaction(|| {
-        let arguments = unsafe {
-            [DatumWithOid::new(
-                ROUTE_MAX_SUBSCRIBERS_PER_PAGE,
-                pg_sys::INT4OID,
-            )]
-        };
-        Spi::get_one_with_args::<bool>(
-            "SELECT worked
-             FROM shiba_internal.route_ingress_page($1)",
-            &arguments,
-        )
-        .expect("Shiba could not route a bounded subscriber page")
-        .unwrap_or(false)
-    });
-    RuntimePhase::Worked(ingested + usize::from(routed))
+    RuntimePhase::Worked(ingested + publication_work)
 }
 
-fn flush_ingress_feedback(runtime: &mut IngressRuntime) {
-    if let Some(queued_lsn) = runtime.queued_feedback {
-        match runtime
-            .ingress
-            .transport_mut()
-            .flush()
-            .unwrap_or_else(|error| panic!("Shiba could not flush replication feedback: {error}"))
+fn publish_source_once(generation: i64) -> SourcePublication {
+    let generation_argument = unsafe { [DatumWithOid::new(generation, pg_sys::INT8OID)] };
+    let publication = BackgroundWorker::transaction(|| {
+        let (outcome, final_lsn, has_pending) = Spi::get_three_with_args::<String, String, bool>(
+            "SELECT outcome,
+                        final_lsn::text,
+                        has_pending
+                   FROM shiba_internal.publish_source_batch($1)",
+            &generation_argument,
+        )
+        .expect("Shiba could not publish a bounded source batch");
+        let outcome = SourcePublicationOutcome::from_sql(
+            &outcome.expect("source publication returned NULL outcome"),
+        );
+        let publication = SourcePublication {
+            outcome,
+            final_lsn,
+            has_pending: has_pending.expect("source publication returned NULL pending state"),
+        };
+        if matches!(
+            publication.outcome,
+            SourcePublicationOutcome::Appended | SourcePublicationOutcome::Completed
+        ) && publication.final_lsn.is_none()
         {
-            replication::WriteStatus::Flushed => {
-                record_ingress_feedback(runtime.generation, queued_lsn);
-                runtime.queued_feedback = None;
+            panic!("appended source chunk returned NULL causal LSN");
+        }
+
+        #[cfg(any(test, feature = "pg_test"))]
+        if matches!(
+            publication.outcome,
+            SourcePublicationOutcome::Appended | SourcePublicationOutcome::Completed
+        ) {
+            if let Some(pause) = test_failpoints::claim(
+                "source_publication_before_commit",
+                None,
+                None,
+                publication.final_lsn.as_deref(),
+            ) {
+                log!(
+                    "Shiba test failpoint reached: source_publication_before_commit at {}",
+                    publication.final_lsn.as_deref().unwrap_or("unknown LSN")
+                );
+                std::thread::sleep(pause);
+                panic!("Shiba test failpoint: Runtime exited before source publication commit");
             }
-            replication::WriteStatus::PendingFlush => return,
-            replication::WriteStatus::WouldBlock => {
-                panic!("libpq flush returned an impossible WouldBlock status")
-            }
+        }
+        publication
+    });
+
+    #[cfg(any(test, feature = "pg_test"))]
+    if matches!(
+        publication.outcome,
+        SourcePublicationOutcome::Appended | SourcePublicationOutcome::Completed
+    ) {
+        let pause = BackgroundWorker::transaction(|| {
+            test_failpoints::claim(
+                "source_publication_after_commit",
+                None,
+                None,
+                publication.final_lsn.as_deref(),
+            )
+        });
+        if let Some(pause) = pause {
+            log!(
+                "Shiba test failpoint reached: source_publication_after_commit at {}",
+                publication.final_lsn.as_deref().unwrap_or("unknown LSN")
+            );
+            std::thread::sleep(pause);
+            panic!("Shiba test failpoint: Runtime exited after source publication commit");
         }
     }
 
-    let Some(feedback_lsn) = runtime.pending_feedback.take() else {
+    publication
+}
+
+fn advance_ingress_publication_frontier(generation: i64) {
+    let generation_argument = unsafe { [DatumWithOid::new(generation, pg_sys::INT8OID)] };
+    BackgroundWorker::transaction(|| {
+        Spi::run_with_args(
+            "SELECT shiba_internal.advance_ingress_publication_frontier($1)",
+            &generation_argument,
+        )
+        .expect("Shiba could not advance its source publication frontier");
+    });
+}
+
+fn maintain_ingress_feedback(runtime: &mut IngressRuntime, reply_requested: bool) {
+    let now = Instant::now();
+    if runtime.feedback.queued_feedback.is_some() {
+        let status = runtime
+            .ingress
+            .transport_mut()
+            .flush()
+            .unwrap_or_else(|error| panic!("Shiba could not flush replication feedback: {error}"));
+        let transition = reduce_feedback(
+            runtime.feedback,
+            FeedbackOperation::FlushQueued,
+            status,
+            now,
+        );
+        apply_feedback_transition(runtime, transition);
+        if status != replication::WriteStatus::Flushed {
+            return;
+        }
+    }
+
+    if replication_status_due(runtime.feedback.last_status_update, now, reply_requested) {
+        runtime.feedback.queue(runtime.persisted_lsn);
+    }
+
+    let Some(feedback_lsn) = runtime.feedback.pending_feedback else {
         return;
     };
-    match runtime
+    let status = runtime
         .ingress
         .transport_mut()
         // Durable ingress is the receiver's write/flush point.  It is not the
         // DAG apply point; reporting it as apply could incorrectly satisfy a
         // synchronous_commit=remote_apply source transaction.
         .send_standby_status(feedback_lsn, feedback_lsn, 0, false)
-        .unwrap_or_else(|error| panic!("Shiba could not send replication feedback: {error}"))
-    {
-        replication::WriteStatus::Flushed => {
-            record_ingress_feedback(runtime.generation, feedback_lsn);
+        .unwrap_or_else(|error| panic!("Shiba could not send replication feedback: {error}"));
+    let transition = reduce_feedback(
+        runtime.feedback,
+        FeedbackOperation::SendPending,
+        status,
+        now,
+    );
+    apply_feedback_transition(runtime, transition);
+}
+
+fn replication_status_due(
+    last_status_update: Instant,
+    now: Instant,
+    reply_requested: bool,
+) -> bool {
+    reply_requested
+        || now.saturating_duration_since(last_status_update) >= REPLICATION_STATUS_INTERVAL
+}
+
+fn reduce_feedback(
+    mut state: FeedbackState,
+    operation: FeedbackOperation,
+    status: replication::WriteStatus,
+    now: Instant,
+) -> FeedbackTransition {
+    let feedback_lsn = match operation {
+        FeedbackOperation::FlushQueued => state
+            .queued_feedback
+            .expect("feedback reducer cannot flush an empty queue"),
+        FeedbackOperation::SendPending => {
+            assert!(
+                state.queued_feedback.is_none(),
+                "feedback reducer cannot send behind an unflushed status"
+            );
+            state
+                .pending_feedback
+                .expect("feedback reducer cannot send empty pending feedback")
         }
-        replication::WriteStatus::PendingFlush => {
-            runtime.queued_feedback = Some(feedback_lsn);
+    };
+    let mut catalog_record = None;
+    match (operation, status) {
+        (FeedbackOperation::FlushQueued, replication::WriteStatus::Flushed) => {
+            state.queued_feedback = None;
+            catalog_record = state.advance_recorded_feedback(feedback_lsn);
         }
-        replication::WriteStatus::WouldBlock => {
-            runtime.pending_feedback = Some(feedback_lsn);
+        (FeedbackOperation::FlushQueued, replication::WriteStatus::PendingFlush) => {}
+        (FeedbackOperation::FlushQueued, replication::WriteStatus::WouldBlock) => {
+            panic!("libpq flush returned an impossible WouldBlock status")
         }
+        (FeedbackOperation::SendPending, replication::WriteStatus::Flushed) => {
+            state.pending_feedback = None;
+            state.last_status_update = now;
+            catalog_record = state.advance_recorded_feedback(feedback_lsn);
+        }
+        (FeedbackOperation::SendPending, replication::WriteStatus::PendingFlush) => {
+            state.pending_feedback = None;
+            state.queued_feedback = Some(feedback_lsn);
+            state.last_status_update = now;
+        }
+        (FeedbackOperation::SendPending, replication::WriteStatus::WouldBlock) => {}
+    }
+    FeedbackTransition {
+        state,
+        catalog_record,
     }
 }
 
+fn apply_feedback_transition(runtime: &mut IngressRuntime, transition: FeedbackTransition) {
+    if let Some(feedback_lsn) = transition.catalog_record {
+        record_ingress_feedback(runtime.generation, feedback_lsn);
+    }
+    runtime.feedback = transition.state;
+}
+
 fn record_ingress_feedback(generation: i64, feedback_lsn: u64) {
+    // Before the first decoded commit, a keepalive reply may flush PostgreSQL's
+    // sentinel 0/0 position. It acknowledges no WAL and therefore has no
+    // durable ingress fact to record.
+    if feedback_lsn == 0 {
+        return;
+    }
     let feedback_lsn = format_lsn(feedback_lsn);
     BackgroundWorker::transaction(|| {
         let arguments = unsafe {
@@ -449,7 +686,7 @@ fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> Opti
                     "image_ordinal": event.image_ordinal,
                     "source_oid": event.source_oid,
                     "weight": event.weight,
-                    "typed_payload": event.payload,
+                    "payload": event.payload,
                 })
             })
             .collect(),
@@ -467,34 +704,12 @@ fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> Opti
     )
     .expect("Shiba could not persist a bounded ingress event batch");
 
-    let decode_end_lsn = format_lsn(batch.decode_end_lsn);
     let feedback_lsn = batch
         .finalization
         .as_ref()
         .map(|finalization| match finalization {
             ingress::IngressFinalization::Commit { end_lsn, .. } => *end_lsn,
         });
-    let digest = batch.digest.to_vec();
-    let batch_arguments = unsafe {
-        [
-            DatumWithOid::new(generation, pg_sys::INT8OID),
-            DatumWithOid::new(decode_end_lsn.as_str(), pg_sys::TEXTOID),
-            DatumWithOid::new(digest, pg_sys::BYTEAOID),
-            DatumWithOid::new(
-                i64::try_from(batch.events.len()).expect("event batch exceeds bigint"),
-                pg_sys::INT8OID,
-            ),
-            DatumWithOid::new(
-                i64::try_from(batch.wire_bytes).expect("v2 wire-byte count exceeds bigint"),
-                pg_sys::INT8OID,
-            ),
-        ]
-    };
-    Spi::run_with_args(
-        "SELECT shiba_internal.record_ingress_batch($1, $2::pg_lsn, $3, $4, $5)",
-        &batch_arguments,
-    )
-    .expect("Shiba could not checkpoint a bounded ingress batch");
 
     match &batch.finalization {
         Some(ingress::IngressFinalization::Commit {
@@ -525,32 +740,20 @@ fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> Opti
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DagStep {
-    RuntimeInactive,
-    Inactive,
-    Retry,
-    BatchApplied { has_more: bool, commit_lsn: u64 },
-    InboxCompleted { has_more: bool },
-    ResourceBlocked,
-    Quarantined,
-    Idle,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ApplyPhase {
+enum OperatorPhase {
     RuntimeInactive,
     SignalReceived,
     Worked,
     Idle,
 }
 
-fn apply_ready_dags_bounded(
-    runtimes: &mut DeterministicLru<pg_sys::Oid, logical::DagRuntime>,
-    round_robin_cursor: &mut Option<pg_sys::Oid>,
-    mut ready_dags: Vec<pg_sys::Oid>,
-) -> ApplyPhase {
-    rotate_after_cursor(&mut ready_dags, *round_robin_cursor);
-    let mut ready_dags = VecDeque::from(ready_dags);
+fn step_ready_operators_bounded(
+    loaded_dataflows: &mut DeterministicLru<pg_sys::Oid, logical::LoadedDataflow>,
+    result_cursor: &mut Option<pg_sys::Oid>,
+    mut ready_results: Vec<pg_sys::Oid>,
+) -> OperatorPhase {
+    rotate_after_cursor(&mut ready_results, *result_cursor);
+    let mut ready_results = VecDeque::from(ready_results);
     let started = Instant::now();
     let mut attempted = 0;
     let mut worked = 0;
@@ -558,225 +761,182 @@ fn apply_ready_dags_bounded(
     while drain_has_capacity(
         attempted,
         started.elapsed(),
-        APPLY_MAX_TRANSACTIONS_PER_ROUND,
-        APPLY_TIME_BUDGET,
+        OPERATOR_MAX_STEPS_PER_ROUND,
+        OPERATOR_TIME_BUDGET,
     ) {
-        let Some(result_oid) = ready_dags.pop_front() else {
+        let Some(result_oid) = ready_results.pop_front() else {
             break;
         };
         if !BackgroundWorker::wait_latch(Some(Duration::ZERO))
             || BackgroundWorker::sigint_received()
         {
-            return ApplyPhase::SignalReceived;
+            return OperatorPhase::SignalReceived;
         }
         reload_config_if_requested();
 
-        *round_robin_cursor = Some(result_oid);
+        *result_cursor = Some(result_oid);
         attempted += 1;
-        let step = apply_one_dag_transaction(runtimes, result_oid);
-        match step {
-            DagStep::RuntimeInactive => return ApplyPhase::RuntimeInactive,
-            DagStep::BatchApplied {
-                has_more,
-                commit_lsn,
-            } => {
-                worked += 1;
-                crash_after_applied_batch(result_oid, commit_lsn);
-                if has_more {
-                    ready_dags.push_back(result_oid);
-                }
-            }
-            DagStep::InboxCompleted { has_more } => {
-                worked += 1;
-                if has_more {
-                    // Routing does not run during this bounded phase. Requeue a
-                    // DAG with known backlog at the tail to preserve fairness
-                    // without opening a later empty apply transaction.
-                    ready_dags.push_back(result_oid);
-                }
-            }
-            DagStep::ResourceBlocked | DagStep::Quarantined => {
-                worked += 1;
-            }
-            // Retry once in this round, then give other DAGs and Runtime phases
-            // a chance before taking a fresh transaction snapshot.
-            DagStep::Retry | DagStep::Inactive | DagStep::Idle => {}
+        let Some((outcome, has_more)) = step_one_operator(loaded_dataflows, result_oid) else {
+            return OperatorPhase::RuntimeInactive;
+        };
+        if matches!(
+            outcome,
+            logical::StepOutcome::Progress | logical::StepOutcome::Yield
+        ) {
+            worked += 1;
+        }
+        if has_more {
+            ready_results.push_back(result_oid);
         }
     }
 
     if worked == 0 {
-        ApplyPhase::Idle
+        OperatorPhase::Idle
     } else {
-        ApplyPhase::Worked
+        OperatorPhase::Worked
     }
 }
 
-fn apply_one_dag_transaction(
-    runtimes: &mut DeterministicLru<pg_sys::Oid, logical::DagRuntime>,
+fn step_one_operator(
+    loaded_dataflows: &mut DeterministicLru<pg_sys::Oid, logical::LoadedDataflow>,
     result_oid: pg_sys::Oid,
-) -> DagStep {
+) -> Option<(logical::StepOutcome, bool)> {
     // A panic terminates this single-threaded worker, so its backend-local
     // cache cannot be observed in a partially updated state.
-    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+    let committed = BackgroundWorker::transaction(AssertUnwindSafe(|| {
         if !runtime_is_active() {
-            return DagStep::RuntimeInactive;
+            return None;
         }
-        if !dag_is_active(result_oid) {
-            if let Some(runtime) = runtimes.remove(&result_oid) {
-                runtime
-                    .release_physical_programs()
-                    .expect("Shiba could not release an inactive physical program");
-            }
-            return DagStep::Inactive;
+        if !try_lock_dataflow_for_step(result_oid) {
+            return Some((None, false));
         }
-        let generation =
-            dag_generation(result_oid).expect("active Shiba DAG has no runtime generation");
-        if runtimes
-            .peek(&result_oid)
-            .is_some_and(|runtime| !runtime.matches_generation(&generation))
-        {
-            if let Some(runtime) = runtimes.remove(&result_oid) {
-                runtime
-                    .release_physical_programs()
-                    .expect("Shiba could not release a superseded physical program");
-            }
+        if !dataflow_is_active(result_oid) {
+            loaded_dataflows.remove(&result_oid);
+            return Some((None, false));
         }
-        if !runtimes.contains_key(&result_oid) {
-            match logical::DagRuntime::load(result_oid) {
-                Ok(logical::LoadOutcome::Loaded(runtime)) => {
-                    for (_, evicted) in runtimes.insert(result_oid, runtime) {
-                        evicted
-                            .release_physical_programs()
-                            .expect("Shiba could not release an evicted physical program");
-                    }
-                }
-                Ok(logical::LoadOutcome::Retry) => return DagStep::Retry,
-                Ok(logical::LoadOutcome::Quarantined) => return DagStep::Quarantined,
-                Err(error) => {
-                    logical::DagRuntime::quarantine(result_oid, &error)
-                        .expect("Shiba could not quarantine an unloadable DAG");
-                    return DagStep::Quarantined;
-                }
-            }
+        if !loaded_dataflows.contains_key(&result_oid) {
+            let dataflow = logical::LoadedDataflow::load(result_oid)
+                .expect("Shiba could not load a dataflow from durable operator state");
+            let _ = loaded_dataflows.insert(result_oid, dataflow);
         }
-        let outcome = {
-            let runtime = runtimes
-                .get(&result_oid)
-                .expect("Shiba DAG runtime cache lost a loaded DAG");
-            process_next_dag_transaction(result_oid, runtime)
+        let budget = logical::WorkBudget::new(
+            config::stage_chunk_rows(),
+            config::stage_chunk_bytes(),
+            config::stage_chunk_rows(),
+            config::stage_chunk_bytes(),
+        );
+        let step = {
+            let dataflow = loaded_dataflows
+                .get_mut(&result_oid)
+                .expect("Shiba loaded-dataflow cache lost an active dataflow");
+            dataflow
+                .step(budget)
+                .expect("Shiba operator step did not commit")
         };
-        if matches!(
-            outcome,
-            DagStep::Inactive | DagStep::ResourceBlocked | DagStep::Quarantined
-        ) {
-            if let Some(runtime) = runtimes.remove(&result_oid) {
-                runtime
-                    .release_physical_programs()
-                    .expect("Shiba could not release a stopped physical program");
+        #[cfg(any(test, feature = "pg_test"))]
+        if let Some(step) = step.filter(|step| {
+            matches!(
+                step.outcome,
+                logical::StepOutcome::Progress | logical::StepOutcome::Yield
+            )
+        }) {
+            let stage_id = i32::try_from(step.stage_id).expect("operator stage ID exceeds integer");
+            if let Some(pause) = test_failpoints::claim(
+                "operator_step_before_commit",
+                Some(result_oid),
+                Some(stage_id),
+                None,
+            ) {
+                log!(
+                    "Shiba test failpoint reached: operator_step_before_commit result {result_oid} stage {stage_id}"
+                );
+                std::thread::sleep(pause);
+                panic!(
+                    "Shiba test failpoint: Runtime exited before committing result {result_oid} stage {stage_id}"
+                );
             }
         }
-        outcome
-    }))
-}
+        Some((step, dag_has_ready_operator(result_oid)))
+    }))?;
 
-fn process_next_dag_transaction(result_oid: pg_sys::Oid, runtime: &logical::DagRuntime) -> DagStep {
-    let apply_result = runtime
-        .apply_next_transaction()
-        .expect("Shiba could not execute the next DAG inbox transaction");
-    let batch_commit_lsn = match apply_result.outcome {
-        logical::NextApplyOutcome::BatchApplied => Some(
-            parse_lsn(
-                apply_result
-                    .commit_lsn
-                    .as_deref()
-                    .expect("applied Shiba DAG batch returned no commit LSN"),
-            )
-            .expect("applied Shiba DAG batch returned an invalid commit LSN"),
-        ),
-        logical::NextApplyOutcome::Retry => return DagStep::Retry,
-        logical::NextApplyOutcome::ResourceBlocked => return DagStep::ResourceBlocked,
-        logical::NextApplyOutcome::Quarantined => return DagStep::Quarantined,
-        logical::NextApplyOutcome::Inactive => return DagStep::Inactive,
-        logical::NextApplyOutcome::Idle => return DagStep::Idle,
-        logical::NextApplyOutcome::Waiting => return DagStep::Idle,
-        logical::NextApplyOutcome::CommitCompleted => None,
+    let (step, has_more) = committed;
+    let Some(step) = step else {
+        return Some((logical::StepOutcome::Idle, has_more));
     };
     #[cfg(any(test, feature = "pg_test"))]
-    if apply_result.outcome == logical::NextApplyOutcome::CommitCompleted {
-        let commit_lsn = apply_result
-            .commit_lsn
-            .as_deref()
-            .expect("applied Shiba DAG transaction returned no commit LSN");
-        if let Some(pause) = test_failpoints::claim(
-            "runtime_apply_before_commit",
-            Some(result_oid),
-            Some(commit_lsn),
-        ) {
+    if matches!(
+        step.outcome,
+        logical::StepOutcome::Progress | logical::StepOutcome::Yield
+    ) {
+        let stage_id = i32::try_from(step.stage_id).expect("operator stage ID exceeds integer");
+        let pause = BackgroundWorker::transaction(|| {
+            test_failpoints::claim(
+                "operator_step_after_commit",
+                Some(result_oid),
+                Some(stage_id),
+                None,
+            )
+        });
+        if let Some(pause) = pause {
             log!(
-                "Shiba test failpoint reached: runtime_apply_before_commit result {result_oid} commit {commit_lsn}"
+                "Shiba test failpoint reached: operator_step_after_commit result {result_oid} stage {stage_id}"
             );
             std::thread::sleep(pause);
             panic!(
-                "Shiba test failpoint: runtime exited after final batch SQL for {commit_lsn} and before transaction commit"
+                "Shiba test failpoint: Runtime exited after committing result {result_oid} stage {stage_id}"
             );
         }
     }
+    Some((step.outcome, has_more))
+}
 
+fn dag_has_ready_operator(result_oid: pg_sys::Oid) -> bool {
     let result = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
-    let has_more = Spi::get_one_with_args::<bool>(
+    Spi::get_one_with_args::<bool>(
         "SELECT EXISTS (
-             SELECT 1
-             FROM shiba_internal.dag_inbox AS inbox
-             JOIN shiba_internal.ingress_transactions AS txn
-               ON txn.ingress_txn_id = inbox.ingress_txn_id
-             WHERE inbox.result_oid = $1::oid
-               AND (
-                   txn.status = 'committed'
-                   OR EXISTS (
-                       SELECT 1
-                       FROM shiba_internal.ingress_apply_batches AS batch
-                       WHERE batch.ingress_txn_id = inbox.ingress_txn_id
-                         AND batch.batch_ordinal = inbox.next_batch_ordinal
+           SELECT 1
+           FROM shiba_internal.operator_checkpoints AS checkpoint
+           WHERE checkpoint.result_oid = $1::oid
+             AND (
+               checkpoint.has_continuation
+               OR EXISTS (
+                 SELECT 1
+                 FROM shiba_internal.effect_stream_consumers AS consumer
+                 JOIN shiba_internal.effect_streams AS input_stream
+                   ON input_stream.stream_id = consumer.stream_id
+                 WHERE consumer.result_oid = checkpoint.result_oid
+                   AND consumer.consumer_stage_id = checkpoint.stage_id
+                   AND (
+                     consumer.next_chunk_seq < input_stream.next_chunk_seq
+                     OR (
+                       input_stream.producer_kind = 'source'
+                       AND EXISTS (
+                         SELECT 1
+                         FROM shiba_internal.ingress_replay_state publication
+                         WHERE publication.slot_generation
+                                 = input_stream.slot_generation
+                           AND publication.published_lsn IS NOT NULL
+                           AND consumer.consumed_frontier_lsn
+                                 < publication.published_lsn
+                       )
+                     )
                    )
                )
+             )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM shiba_internal.effect_streams AS output_stream
+               WHERE output_stream.producer_kind = 'operator'
+                 AND output_stream.producer_result_oid = checkpoint.result_oid
+                 AND output_stream.producer_stage_id = checkpoint.stage_id
+                 AND output_stream.backpressured
+             )
          )",
         &result,
     )
-    .expect("Shiba could not inspect the remaining DAG inbox backlog")
-    .expect("Shiba DAG inbox backlog check returned NULL");
-    update_dag_last_scheduled(result_oid);
-    match batch_commit_lsn {
-        Some(commit_lsn) => DagStep::BatchApplied {
-            has_more,
-            commit_lsn,
-        },
-        None => DagStep::InboxCompleted { has_more },
-    }
+    .expect("Shiba could not inspect durable operator readiness")
+    .expect("Shiba durable operator readiness returned NULL")
 }
-
-#[cfg(any(test, feature = "pg_test"))]
-fn crash_after_applied_batch(result_oid: pg_sys::Oid, commit_lsn: u64) {
-    let commit_lsn = format_lsn(commit_lsn);
-    let pause = BackgroundWorker::transaction(|| {
-        test_failpoints::claim(
-            "runtime_apply_after_batch",
-            Some(result_oid),
-            Some(&commit_lsn),
-        )
-    });
-    if let Some(pause) = pause {
-        log!(
-            "Shiba test failpoint reached: runtime_apply_after_batch result {result_oid} commit {commit_lsn}"
-        );
-        std::thread::sleep(pause);
-        panic!(
-            "Shiba test failpoint: runtime exited after committing an applied batch for {commit_lsn}"
-        );
-    }
-}
-
-#[cfg(not(any(test, feature = "pg_test")))]
-fn crash_after_applied_batch(_result_oid: pg_sys::Oid, _commit_lsn: u64) {}
 
 fn gc_change_log(generation: i64) -> i64 {
     let generation_argument = unsafe { [DatumWithOid::new(generation, pg_sys::INT8OID)] };
@@ -785,61 +945,15 @@ fn gc_change_log(generation: i64) -> i64 {
         &generation_argument,
     )
     .expect("Shiba could not reconcile its logical-slot replay-safe LSN");
-    let collected = Spi::get_one_with_args::<i64>("SELECT shiba._gc_change_log($1)", unsafe {
-        &[DatumWithOid::new(
-            GC_MAX_TRANSACTIONS_PER_ROUND,
-            pg_sys::INT4OID,
-        )]
-    })
-    .expect("Shiba could not garbage-collect its change log")
-    .unwrap_or(0);
-    Spi::run_with_args(
-        "WITH garbage AS (
-             SELECT batch.decode_end_lsn, batch.message_digest
-             FROM shiba_internal.ingress_decode_batches AS batch
-             JOIN shiba_internal.ingress_replay_state AS replay
-               ON replay.slot_generation = batch.slot_generation
-             WHERE batch.slot_generation = $1
-               AND batch.decode_end_lsn <= replay.replay_safe_lsn
-               AND batch.persisted_at < clock_timestamp()
-                   - current_setting('shiba.ingress_retention')::interval
-             ORDER BY batch.decode_end_lsn
-             LIMIT 64
-         )
-         DELETE FROM shiba_internal.ingress_decode_batches AS batch
-         USING garbage
-         WHERE batch.slot_generation = $1
-           AND batch.decode_end_lsn = garbage.decode_end_lsn
-           AND batch.message_digest = garbage.message_digest",
-        &generation_argument,
-    )
-    .expect("Shiba could not garbage-collect ingress decode batches");
-    Spi::run(
-        "WITH garbage AS (
-             SELECT batch.slot_generation,
-                    batch.decode_end_lsn,
-                    batch.message_digest
-             FROM shiba_internal.ingress_decode_batches AS batch
-             JOIN shiba_internal.ingress_replay_state AS replay
-               ON replay.slot_generation = batch.slot_generation
-              AND replay.state = 'retired'
-             WHERE NOT EXISTS (
-                       SELECT 1
-                       FROM shiba_internal.ingress_transactions AS txn
-                       WHERE txn.slot_generation = batch.slot_generation
-                   )
-               AND batch.persisted_at < clock_timestamp()
-                   - current_setting('shiba.ingress_retention')::interval
-             ORDER BY batch.slot_generation, batch.decode_end_lsn
-             LIMIT 64
-         )
-         DELETE FROM shiba_internal.ingress_decode_batches AS batch
-         USING garbage
-         WHERE batch.slot_generation = garbage.slot_generation
-           AND batch.decode_end_lsn = garbage.decode_end_lsn
-           AND batch.message_digest = garbage.message_digest",
-    )
-    .expect("Shiba could not garbage-collect retired ingress decode batches");
+    let collected_transactions =
+        Spi::get_one_with_args::<i64>("SELECT shiba._gc_change_log($1)", unsafe {
+            &[DatumWithOid::new(
+                GC_MAX_TRANSACTIONS_PER_ROUND,
+                pg_sys::INT4OID,
+            )]
+        })
+        .expect("Shiba could not garbage-collect its change log")
+        .unwrap_or(0);
     Spi::run(
         "WITH garbage AS (
              SELECT replay.slot_generation
@@ -854,8 +968,9 @@ fn gc_change_log(generation: i64) -> i64 {
                    )
                AND NOT EXISTS (
                        SELECT 1
-                       FROM shiba_internal.ingress_decode_batches AS batch
-                       WHERE batch.slot_generation = replay.slot_generation
+                       FROM shiba_internal.effect_streams AS stream
+                       WHERE stream.producer_kind = 'source'
+                         AND stream.slot_generation = replay.slot_generation
                    )
              ORDER BY replay.slot_generation
              LIMIT 8
@@ -865,9 +980,141 @@ fn gc_change_log(generation: i64) -> i64 {
          WHERE replay.slot_generation = garbage.slot_generation",
     )
     .expect("Shiba could not garbage-collect retired ingress generations");
-    Spi::run("SELECT shiba_internal._compact_shared_fold_stages()")
-        .expect("Shiba could not compact its empty shared fold Stages");
-    collected
+    collected_transactions
+}
+
+fn gc_effect_streams(cursor: &mut Option<i64>) -> i64 {
+    let row_limit =
+        i64::try_from(config::stage_chunk_rows()).expect("operator row budget exceeds bigint");
+    let byte_limit =
+        i64::try_from(config::stage_chunk_bytes()).expect("operator byte budget exceeds bigint");
+    let stream_ids = gc_effect_stream_ids(*cursor);
+    let next_cursor = stream_ids.last().copied();
+    // The fair rotation may wrap from high IDs back to low IDs. Locking in
+    // that order would invert StepTxn's global stream-ID order, so resolve the
+    // still-existing candidates and lock them in ascending order first.
+    let locked_stream_ids = lock_effect_streams_for_gc(&stream_ids);
+    let mut deleted_chunks = 0_i64;
+    for stream_id in locked_stream_ids {
+        let arguments = unsafe {
+            [
+                DatumWithOid::new(stream_id, pg_sys::INT8OID),
+                DatumWithOid::new(GC_MAX_EFFECT_CHUNKS_PER_STREAM, pg_sys::INT4OID),
+                DatumWithOid::new(row_limit, pg_sys::INT8OID),
+                DatumWithOid::new(byte_limit, pg_sys::INT8OID),
+            ]
+        };
+        let deleted = Spi::get_one_with_args::<i64>(
+            "SELECT deleted_chunks
+             FROM shiba_internal.gc_effect_stream(
+               $1::bigint, $2::integer, $3::bigint, $4::bigint
+             )",
+            &arguments,
+        )
+        .expect("Shiba could not garbage-collect a durable effect stream")
+        .expect("Shiba effect-stream garbage collection returned NULL");
+        deleted_chunks = deleted_chunks
+            .checked_add(deleted)
+            .expect("Shiba effect-stream garbage collection count overflowed");
+    }
+    if let Some(next_cursor) = next_cursor {
+        *cursor = Some(next_cursor);
+    }
+    deleted_chunks
+}
+
+fn lock_effect_streams_for_gc(stream_ids: &[i64]) -> Vec<i64> {
+    if stream_ids.is_empty() {
+        return Vec::new();
+    }
+    let arguments = unsafe { [DatumWithOid::new(stream_ids.to_vec(), pg_sys::INT8ARRAYOID)] };
+    Spi::connect_mut(|client| {
+        client
+            .update(
+                "SELECT stream.stream_id
+                 FROM shiba_internal.effect_streams AS stream
+                 WHERE stream.stream_id = ANY($1::bigint[])
+                 ORDER BY stream.stream_id
+                 FOR UPDATE OF stream",
+                None,
+                &arguments,
+            )
+            .expect("Shiba could not lock effect streams for garbage collection")
+            .map(|row| {
+                row.get::<i64>(1)
+                    .expect("invalid locked effect-stream ID")
+                    .expect("NULL locked effect-stream ID")
+            })
+            .collect()
+    })
+}
+
+fn gc_effect_stream_ids(cursor: Option<i64>) -> Vec<i64> {
+    let mut stream_ids =
+        gc_effect_stream_ids_in_range(cursor, true, GC_MAX_EFFECT_STREAMS_PER_ROUND);
+    let limit = usize::try_from(GC_MAX_EFFECT_STREAMS_PER_ROUND)
+        .expect("effect-stream GC round limit exceeds usize");
+    if cursor.is_some() && stream_ids.len() < limit {
+        let remaining = i32::try_from(limit - stream_ids.len())
+            .expect("remaining effect-stream GC limit exceeds integer");
+        stream_ids.extend(gc_effect_stream_ids_in_range(cursor, false, remaining));
+    }
+    stream_ids
+}
+
+fn gc_effect_stream_ids_in_range(cursor: Option<i64>, after_cursor: bool, limit: i32) -> Vec<i64> {
+    Spi::connect_mut(|client| {
+        let (predicate, arguments) = match cursor {
+            Some(cursor) => {
+                let comparison = if after_cursor { ">" } else { "<=" };
+                (
+                    format!("AND stream.stream_id {comparison} $1::bigint"),
+                    unsafe {
+                        vec![
+                            DatumWithOid::new(cursor, pg_sys::INT8OID),
+                            DatumWithOid::new(limit, pg_sys::INT4OID),
+                        ]
+                    },
+                )
+            }
+            None => (String::new(), unsafe {
+                vec![DatumWithOid::new(limit, pg_sys::INT4OID)]
+            }),
+        };
+        let limit_parameter = if cursor.is_some() { "$2" } else { "$1" };
+        let query = format!(
+            "SELECT stream.stream_id
+             FROM shiba_internal.effect_streams AS stream
+             WHERE stream.first_retained_chunk_seq < stream.next_chunk_seq
+               {predicate}
+               AND (
+                 (
+                   stream.producer_kind = 'source'
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM shiba_internal.effect_stream_consumers AS consumer
+                     WHERE consumer.stream_id = stream.stream_id
+                   )
+                 )
+                 OR stream.first_retained_chunk_seq < (
+                   SELECT min(consumer.next_chunk_seq)
+                   FROM shiba_internal.effect_stream_consumers AS consumer
+                   WHERE consumer.stream_id = stream.stream_id
+                 )
+             )
+             ORDER BY stream.stream_id
+             LIMIT {limit_parameter}"
+        );
+        client
+            .update(&query, None, &arguments)
+            .expect("Shiba could not discover effect streams ready for garbage collection")
+            .map(|row| {
+                row.get::<i64>(1)
+                    .expect("invalid effect-stream GC stream ID")
+                    .expect("NULL effect-stream GC stream ID")
+            })
+            .collect()
+    })
 }
 
 fn rotate_after_cursor(result_oids: &mut [pg_sys::Oid], cursor: Option<pg_sys::Oid>) {
@@ -938,15 +1185,19 @@ where
         self.entries.contains_key(key)
     }
 
-    fn peek(&self, key: &K) -> Option<&V> {
-        self.entries.get(key).map(|cached| &cached.value)
-    }
-
+    #[cfg(test)]
     fn get(&mut self, key: &K) -> Option<&V> {
         let sequence = self.next_sequence();
         let cached = self.entries.get_mut(key)?;
         cached.last_used = sequence;
         Some(&cached.value)
+    }
+
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        let sequence = self.next_sequence();
+        let cached = self.entries.get_mut(key)?;
+        cached.last_used = sequence;
+        Some(&mut cached.value)
     }
 
     fn insert(&mut self, key: K, value: V) -> Vec<(K, V)> {
@@ -1161,17 +1412,6 @@ fn update_runtime_heartbeat() {
     );
 }
 
-fn update_dag_last_scheduled(result_oid: pg_sys::Oid) {
-    let result = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
-    Spi::run_with_args(
-        "UPDATE shiba_internal.dag_runtime_state
-         SET last_scheduled_at = clock_timestamp()
-         WHERE result_oid = $1::oid",
-        &result,
-    )
-    .expect("Shiba could not update DAG scheduling state");
-}
-
 fn current_database_name() -> String {
     Spi::get_one::<String>("SELECT current_database()::text")
         .expect("Shiba could not identify the current database")
@@ -1192,12 +1432,12 @@ fn runtime_is_active() -> bool {
     .unwrap_or(false)
 }
 
-fn dag_is_active(result_oid: pg_sys::Oid) -> bool {
+fn dataflow_is_active(result_oid: pg_sys::Oid) -> bool {
     let arguments = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
     Spi::get_one_with_args::<bool>(
         "SELECT EXISTS (
              SELECT 1
-             FROM shiba_internal.dag_runtime_state
+             FROM shiba_internal.dataflows
              WHERE result_oid = $1::oid AND active
          )",
         &arguments,
@@ -1207,31 +1447,31 @@ fn dag_is_active(result_oid: pg_sys::Oid) -> bool {
     .unwrap_or(false)
 }
 
-fn dag_generation(result_oid: pg_sys::Oid) -> Option<String> {
+fn try_lock_dataflow_for_step(result_oid: pg_sys::Oid) -> bool {
     let arguments = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
-    Spi::get_one_with_args::<String>(
-        "SELECT physical.plan_id::text
-         FROM shiba_internal.dag_runtime_state runtime
-         JOIN shiba_internal.physical_plans physical USING(result_oid)
-         WHERE runtime.result_oid = $1::oid AND runtime.active",
+    Spi::get_one_with_args::<bool>(
+        "SELECT pg_try_advisory_xact_lock(
+           shiba_internal.dataflow_lock_key($1::oid)
+         )",
         &arguments,
     )
-    .expect("Shiba could not inspect the DAG runtime generation")
+    .expect("Shiba could not acquire the dataflow step lock")
+    .expect("Shiba dataflow step lock returned NULL")
 }
 
-fn ready_dag_oids(cursor: Option<pg_sys::Oid>) -> Vec<pg_sys::Oid> {
-    let limit = i32::try_from(APPLY_MAX_TRANSACTIONS_PER_ROUND)
-        .expect("apply transaction round limit exceeds integer");
-    let mut ready = ready_dag_oids_in_range(cursor, true, limit);
-    if cursor.is_some() && ready.len() < APPLY_MAX_TRANSACTIONS_PER_ROUND {
-        let remaining = i32::try_from(APPLY_MAX_TRANSACTIONS_PER_ROUND - ready.len())
-            .expect("remaining ready DAG limit exceeds integer");
-        ready.extend(ready_dag_oids_in_range(cursor, false, remaining));
+fn ready_result_oids(cursor: Option<pg_sys::Oid>) -> Vec<pg_sys::Oid> {
+    let limit = i32::try_from(OPERATOR_MAX_STEPS_PER_ROUND)
+        .expect("operator step round limit exceeds integer");
+    let mut ready = ready_result_oids_in_range(cursor, true, limit);
+    if cursor.is_some() && ready.len() < OPERATOR_MAX_STEPS_PER_ROUND {
+        let remaining = i32::try_from(OPERATOR_MAX_STEPS_PER_ROUND - ready.len())
+            .expect("remaining ready result limit exceeds integer");
+        ready.extend(ready_result_oids_in_range(cursor, false, remaining));
     }
     ready
 }
 
-fn ready_dag_oids_in_range(
+fn ready_result_oids_in_range(
     cursor: Option<pg_sys::Oid>,
     after_cursor: bool,
     limit: i32,
@@ -1241,7 +1481,7 @@ fn ready_dag_oids_in_range(
             Some(cursor) => {
                 let comparison = if after_cursor { ">" } else { "<=" };
                 (
-                    format!("AND runtime.result_oid {comparison} $1::oid"),
+                    format!("AND dataflow.result_oid {comparison} $1::oid"),
                     unsafe {
                         vec![
                             DatumWithOid::new(cursor, pg_sys::OIDOID),
@@ -1256,36 +1496,59 @@ fn ready_dag_oids_in_range(
         };
         let limit_parameter = if cursor.is_some() { "$2" } else { "$1" };
         let query = format!(
-            "SELECT runtime.result_oid
-             FROM shiba_internal.dag_runtime_state runtime
-             WHERE runtime.active
+            "SELECT dataflow.result_oid
+             FROM shiba_internal.dataflows dataflow
+             WHERE dataflow.active
                {predicate}
                AND EXISTS (
-                   SELECT 1
-                   FROM shiba_internal.dag_inbox inbox
-                   JOIN shiba_internal.ingress_transactions txn
-                     ON txn.ingress_txn_id = inbox.ingress_txn_id
-                   WHERE inbox.result_oid = runtime.result_oid
-                     AND (
-                         txn.status = 'committed'
-                         OR EXISTS (
-                             SELECT 1
-                             FROM shiba_internal.ingress_apply_batches batch
-                             WHERE batch.ingress_txn_id = inbox.ingress_txn_id
-                               AND batch.batch_ordinal = inbox.next_batch_ordinal
+                 SELECT 1
+                 FROM shiba_internal.operator_checkpoints checkpoint
+                 WHERE checkpoint.result_oid = dataflow.result_oid
+                   AND (
+                     checkpoint.has_continuation
+                     OR EXISTS (
+                       SELECT 1
+                       FROM shiba_internal.effect_stream_consumers consumer
+                       JOIN shiba_internal.effect_streams input_stream
+                         ON input_stream.stream_id = consumer.stream_id
+                       WHERE consumer.result_oid = checkpoint.result_oid
+                         AND consumer.consumer_stage_id = checkpoint.stage_id
+                         AND (
+                           consumer.next_chunk_seq < input_stream.next_chunk_seq
+                           OR (
+                             input_stream.producer_kind = 'source'
+                             AND EXISTS (
+                               SELECT 1
+                               FROM shiba_internal.ingress_replay_state publication
+                               WHERE publication.slot_generation
+                                       = input_stream.slot_generation
+                                 AND publication.published_lsn IS NOT NULL
+                                 AND consumer.consumed_frontier_lsn
+                                       < publication.published_lsn
+                             )
+                           )
                          )
                      )
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM shiba_internal.effect_streams output_stream
+                     WHERE output_stream.producer_kind = 'operator'
+                       AND output_stream.producer_result_oid = checkpoint.result_oid
+                       AND output_stream.producer_stage_id = checkpoint.stage_id
+                       AND output_stream.backpressured
+                   )
                )
-             ORDER BY runtime.result_oid
+             ORDER BY dataflow.result_oid
              LIMIT {limit_parameter}"
         );
         client
             .update(&query, None, &arguments)
-            .expect("Shiba could not discover ready DAGs")
+            .expect("Shiba could not discover ready operator graphs")
             .map(|row| {
                 row.get::<pg_sys::Oid>(1)
-                    .expect("invalid ready DAG OID")
-                    .expect("NULL ready DAG OID")
+                    .expect("invalid ready result OID")
+                    .expect("NULL ready result OID")
             })
             .collect()
     })
@@ -1299,6 +1562,7 @@ mod test_failpoints {
     pub(super) fn claim(
         kind: &str,
         result_oid: Option<pg_sys::Oid>,
+        stage_id: Option<i32>,
         commit_lsn: Option<&str>,
     ) -> Option<Duration> {
         let available = Spi::get_one::<bool>(
@@ -1312,12 +1576,16 @@ mod test_failpoints {
         }
 
         let result_oid = result_oid.unwrap_or(pg_sys::InvalidOid);
+        let stage_id = stage_id.unwrap_or(-1);
+        let has_commit_lsn = commit_lsn.is_some();
         let commit_lsn = commit_lsn.unwrap_or("0/0");
         let arguments = unsafe {
             [
                 DatumWithOid::new(kind, pg_sys::TEXTOID),
                 DatumWithOid::new(result_oid, pg_sys::OIDOID),
+                DatumWithOid::new(stage_id, pg_sys::INT4OID),
                 DatumWithOid::new(commit_lsn, pg_sys::TEXTOID),
+                DatumWithOid::new(has_commit_lsn, pg_sys::BOOLOID),
             ]
         };
         let pause_ms = Spi::get_one_with_args::<i32>(
@@ -1327,7 +1595,12 @@ mod test_failpoints {
                AND NOT fired
                AND (runtime_pid IS NULL OR runtime_pid = pg_backend_pid())
                AND (result_oid IS NULL OR result_oid = $2::oid)
-               AND (commit_lsn IS NULL OR commit_lsn = $3::pg_lsn)",
+               AND (stage_id IS NULL OR stage_id = $3::integer)
+               AND (
+                 NOT $5::boolean
+                 OR commit_lsn IS NULL
+                 OR commit_lsn = $4::pg_lsn
+               )",
             &arguments,
         )
         .expect("Shiba could not inspect its test worker failpoint");
@@ -1335,13 +1608,23 @@ mod test_failpoints {
             Spi::run_with_args(
                 "UPDATE public.shiba_runtime_failpoints
                  SET runtime_pid = pg_backend_pid(),
-                     commit_lsn = COALESCE(commit_lsn, $3::pg_lsn),
+                     stage_id = COALESCE(stage_id, NULLIF($3::integer, -1)),
+                     commit_lsn = CASE
+                       WHEN $5::boolean
+                         THEN COALESCE(commit_lsn, $4::pg_lsn)
+                       ELSE commit_lsn
+                     END,
                      fired = true
                  WHERE kind = $1
                    AND NOT fired
                    AND (runtime_pid IS NULL OR runtime_pid = pg_backend_pid())
                    AND (result_oid IS NULL OR result_oid = $2::oid)
-                   AND (commit_lsn IS NULL OR commit_lsn = $3::pg_lsn)",
+                   AND (stage_id IS NULL OR stage_id = $3::integer)
+                   AND (
+                     NOT $5::boolean
+                     OR commit_lsn IS NULL
+                     OR commit_lsn = $4::pg_lsn
+                   )",
                 &arguments,
             )
             .expect("Shiba could not claim its test worker failpoint");
@@ -1354,9 +1637,301 @@ mod test_failpoints {
     }
 }
 
+#[cfg(any(test, feature = "pg_test"))]
+mod worker_catalog_tests {
+    use super::*;
+
+    #[pg_test(schema = "tests")]
+    fn effect_stream_gc_advances_past_a_full_page_of_still_eligible_streams() {
+        Spi::run(
+            r#"
+            CREATE TABLE tests.effect_stream_gc_result (
+                marker integer
+            );
+
+            INSERT INTO shiba_internal.dataflows(
+                result_oid,
+                plan,
+                activation_lsn,
+                active
+            )
+            VALUES (
+                'tests.effect_stream_gc_result'::regclass,
+                '{}'::jsonb,
+                '0/0',
+                false
+            );
+
+            INSERT INTO shiba_internal.operator_checkpoints(
+                result_oid,
+                stage_id
+            )
+            SELECT 'tests.effect_stream_gc_result'::regclass,
+                   stage_id
+            FROM generate_series(0, 259) AS stage_id;
+
+            INSERT INTO shiba_internal.effect_streams(
+                producer_kind,
+                producer_result_oid,
+                producer_stage_id,
+                next_chunk_seq,
+                first_retained_chunk_seq,
+                buffered_chunks,
+                buffered_rows,
+                buffered_bytes,
+                target_chunk_rows,
+                target_chunk_bytes,
+                high_chunks,
+                high_rows,
+                high_bytes,
+                low_chunks,
+                low_rows,
+                low_bytes
+            )
+            SELECT 'operator',
+                   'tests.effect_stream_gc_result'::regclass,
+                   producer_stage_id,
+                   CASE WHEN producer_stage_id < 64 THEN 66 ELSE 2 END,
+                   1,
+                   CASE WHEN producer_stage_id < 64 THEN 65 ELSE 1 END,
+                   CASE WHEN producer_stage_id < 64 THEN 65 ELSE 1 END,
+                   CASE WHEN producer_stage_id < 64 THEN 65 ELSE 1 END,
+                   1,
+                   1,
+                   1024,
+                   1024,
+                   1024,
+                   0,
+                   0,
+                   0
+            FROM generate_series(0, 129) AS producer_stage_id
+            ORDER BY producer_stage_id;
+
+            INSERT INTO shiba_internal.effect_stream_chunks(
+                stream_id,
+                chunk_seq,
+                chunk_kind,
+                row_count,
+                payload_bytes,
+                chunk_lsn
+            )
+            SELECT stream.stream_id,
+                   chunk_seq,
+                   'data',
+                   1,
+                   1,
+                   '0/1'
+            FROM shiba_internal.effect_streams AS stream
+            CROSS JOIN LATERAL generate_series(
+                1,
+                CASE WHEN stream.producer_stage_id < 64 THEN 65 ELSE 1 END
+            ) AS chunk_seq
+            WHERE stream.producer_result_oid
+                    = 'tests.effect_stream_gc_result'::regclass;
+
+            INSERT INTO shiba_internal.effect_stream_consumers(
+                stream_id,
+                result_oid,
+                consumer_stage_id,
+                input_port,
+                next_chunk_seq,
+                activation_lsn,
+                consumed_frontier_lsn
+            )
+            SELECT stream.stream_id,
+                   stream.producer_result_oid,
+                   stream.producer_stage_id + 130,
+                   0,
+                   stream.next_chunk_seq,
+                   '0/0',
+                   '0/0'
+            FROM shiba_internal.effect_streams AS stream
+            WHERE stream.producer_result_oid
+                    = 'tests.effect_stream_gc_result'::regclass;
+            "#,
+        )
+        .expect("effect-stream GC fairness fixture should be created");
+
+        let stream_ids = Spi::connect_mut(|client| {
+            client
+                .update(
+                    "SELECT stream_id
+                     FROM shiba_internal.effect_streams
+                     WHERE producer_result_oid
+                             = 'tests.effect_stream_gc_result'::regclass
+                     ORDER BY producer_stage_id",
+                    None,
+                    &[],
+                )
+                .expect("effect-stream GC fixture should be queryable")
+                .map(|row| {
+                    row.get::<i64>(1)
+                        .expect("invalid effect-stream ID")
+                        .expect("NULL effect-stream ID")
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(stream_ids.len(), 130);
+
+        let mut cursor = Some(
+            stream_ids[0]
+                .checked_sub(1)
+                .expect("effect-stream IDs are positive"),
+        );
+        assert_eq!(gc_effect_streams(&mut cursor), 64 * 64);
+        assert_eq!(cursor, Some(stream_ids[63]));
+        assert_eq!(
+            Spi::get_one::<bool>(&format!(
+                "SELECT stream.first_retained_chunk_seq
+                          < min(consumer.next_chunk_seq)
+                 FROM shiba_internal.effect_streams AS stream
+                 JOIN shiba_internal.effect_stream_consumers AS consumer
+                   USING (stream_id)
+                 WHERE stream.stream_id = {}
+                 GROUP BY stream.first_retained_chunk_seq",
+                stream_ids[0]
+            ))
+            .expect("low-ID stream eligibility should be queryable"),
+            Some(true),
+        );
+
+        assert_eq!(gc_effect_streams(&mut cursor), 64);
+        assert_eq!(cursor, Some(stream_ids[127]));
+
+        let low_stream_chunks = Spi::get_one::<i64>(&format!(
+            "SELECT count(*)
+             FROM shiba_internal.effect_stream_chunks
+             WHERE stream_id = {}",
+            stream_ids[0]
+        ))
+        .expect("low-ID stream chunks should be queryable")
+        .expect("low-ID stream chunk count should not be NULL");
+        let later_stream_chunks = Spi::get_one::<i64>(&format!(
+            "SELECT count(*)
+             FROM shiba_internal.effect_stream_chunks
+             WHERE stream_id = {}",
+            stream_ids[64]
+        ))
+        .expect("later stream chunks should be queryable")
+        .expect("later stream chunk count should not be NULL");
+        assert_eq!(low_stream_chunks, 1);
+        assert_eq!(later_stream_chunks, 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replication_status_is_periodic_but_reply_requests_bypass_the_interval() {
+        let last_update = Instant::now();
+        assert!(!replication_status_due(
+            last_update,
+            last_update + REPLICATION_STATUS_INTERVAL - Duration::from_millis(1),
+            false,
+        ));
+        assert!(replication_status_due(
+            last_update,
+            last_update + REPLICATION_STATUS_INTERVAL,
+            false,
+        ));
+        assert!(replication_status_due(
+            last_update,
+            last_update + Duration::from_millis(1),
+            true,
+        ));
+    }
+
+    #[test]
+    fn feedback_reducer_preserves_order_across_nonblocking_writes() {
+        let started = Instant::now();
+        let initial = FeedbackState {
+            recorded_feedback_lsn: 0,
+            pending_feedback: Some(200),
+            queued_feedback: Some(100),
+            last_status_update: started,
+        };
+
+        let first_wait = reduce_feedback(
+            initial,
+            FeedbackOperation::FlushQueued,
+            replication::WriteStatus::PendingFlush,
+            started + Duration::from_millis(1),
+        );
+        assert_eq!(first_wait.state, initial);
+        assert_eq!(first_wait.catalog_record, None);
+        let second_wait = reduce_feedback(
+            first_wait.state,
+            FeedbackOperation::FlushQueued,
+            replication::WriteStatus::PendingFlush,
+            started + Duration::from_millis(2),
+        );
+        assert_eq!(second_wait, first_wait);
+
+        let first_flush = reduce_feedback(
+            second_wait.state,
+            FeedbackOperation::FlushQueued,
+            replication::WriteStatus::Flushed,
+            started + Duration::from_millis(3),
+        );
+        assert_eq!(first_flush.state.recorded_feedback_lsn, 100);
+        assert_eq!(first_flush.state.queued_feedback, None);
+        assert_eq!(first_flush.state.pending_feedback, Some(200));
+        assert_eq!(first_flush.catalog_record, Some(100));
+
+        let send_blocked = reduce_feedback(
+            first_flush.state,
+            FeedbackOperation::SendPending,
+            replication::WriteStatus::WouldBlock,
+            started + Duration::from_millis(4),
+        );
+        assert_eq!(send_blocked.state, first_flush.state);
+        assert_eq!(send_blocked.catalog_record, None);
+        let still_blocked = reduce_feedback(
+            send_blocked.state,
+            FeedbackOperation::SendPending,
+            replication::WriteStatus::WouldBlock,
+            started + Duration::from_millis(5),
+        );
+        assert_eq!(still_blocked, send_blocked);
+        let send_queued = reduce_feedback(
+            still_blocked.state,
+            FeedbackOperation::SendPending,
+            replication::WriteStatus::PendingFlush,
+            started + Duration::from_millis(6),
+        );
+        assert_eq!(send_queued.state.recorded_feedback_lsn, 100);
+        assert_eq!(send_queued.state.pending_feedback, None);
+        assert_eq!(send_queued.state.queued_feedback, Some(200));
+        assert_eq!(
+            send_queued.state.last_status_update,
+            started + Duration::from_millis(6)
+        );
+        assert_eq!(send_queued.catalog_record, None);
+
+        let second_flush = reduce_feedback(
+            send_queued.state,
+            FeedbackOperation::FlushQueued,
+            replication::WriteStatus::Flushed,
+            started + Duration::from_millis(7),
+        );
+        assert_eq!(second_flush.state.recorded_feedback_lsn, 200);
+        assert_eq!(second_flush.state.queued_feedback, None);
+        assert_eq!(second_flush.catalog_record, Some(200));
+
+        let mut heartbeat = second_flush.state;
+        heartbeat.queue(200);
+        let repeated = reduce_feedback(
+            heartbeat,
+            FeedbackOperation::SendPending,
+            replication::WriteStatus::Flushed,
+            started + Duration::from_millis(8),
+        );
+        assert_eq!(repeated.state.recorded_feedback_lsn, 200);
+        assert_eq!(repeated.state.pending_feedback, None);
+        assert_eq!(repeated.catalog_record, None);
+    }
 
     #[test]
     fn runtime_wakeup_is_deduplicated_and_prepare_clears_it() {
@@ -1406,7 +1981,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_dags_rotate_after_previous_cursor() {
+    fn ready_results_rotate_after_previous_cursor() {
         let mut result_oids: Vec<_> = [10, 20, 30, 40]
             .into_iter()
             .map(pg_sys::Oid::from)
@@ -1422,7 +1997,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_dag_rotation_handles_missing_cursor() {
+    fn ready_result_rotation_handles_missing_cursor() {
         let mut result_oids: Vec<_> = [10, 20, 30].into_iter().map(pg_sys::Oid::from).collect();
         rotate_after_cursor(&mut result_oids, Some(pg_sys::Oid::from(25)));
         assert_eq!(
@@ -1465,7 +2040,7 @@ mod tests {
         assert_eq!(cache.get(&30), Some(&"thirty"));
 
         assert_eq!(cache.set_capacity(1), vec![(10, "ten"), (20, "twenty")]);
-        assert_eq!(cache.peek(&30), Some(&"thirty"));
+        assert_eq!(cache.get(&30), Some(&"thirty"));
     }
 
     #[test]
@@ -1476,6 +2051,6 @@ mod tests {
         assert!(cache.insert(10_u32, "new").is_empty());
 
         assert_eq!(cache.insert(30, "thirty"), vec![(20, "twenty")]);
-        assert_eq!(cache.peek(&10), Some(&"new"));
+        assert_eq!(cache.get(&10), Some(&"new"));
     }
 }

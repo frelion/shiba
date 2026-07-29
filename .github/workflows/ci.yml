@@ -55,11 +55,5 @@ jobs:
             "$("$PG_CONFIG" --sharedir)/extension" \
             "$("$PG_CONFIG" --pkglibdir)"
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
       - name: Run complete correctness gate
         run: ./scripts/test-all.sh

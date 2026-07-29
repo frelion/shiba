@@ -1,740 +1,706 @@
-//! Validation and runtime execution descriptors.
-//!
-//! Persisted nodes intentionally keep `serde_json::Value` for wire
-//! compatibility. At this boundary every config is decoded into an
-//! operator-specific struct before it can select a physical pipeline.
+//! Validation for the one persisted and executable dataflow plan.
 
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
-use super::model::{LogicalNode, LogicalPlan, OperatorKind, LOGICAL_PLAN_VERSION};
-use super::physical::PhysicalDagPlan;
+use super::model::{
+    BindingId, BoolExprKind, DataflowPlan, DataflowStage, OperatorKind, OperatorSpec, ScalarExpr,
+    SlotId, SlotType,
+};
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ExecutionPipeline {
-    Aggregate,
-    Join,
-    Window,
-    Distinct,
-    #[serde(rename = "topn")]
-    TopN,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ExecutionJoinType {
-    Inner,
-    Left,
-    Right,
-    Full,
-    Semi,
-    Anti,
-    NullAnti,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(super) struct ExecutionDescriptor {
-    pub(super) pipeline: ExecutionPipeline,
-    pub(super) left_source_oid: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) right_source_oid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) join_type: Option<ExecutionJoinType>,
-}
-
-impl LogicalPlan {
-    pub(super) fn validate_for(&self, result_oid: u32) -> Result<PhysicalDagPlan, String> {
-        if self.version != LOGICAL_PLAN_VERSION {
-            return Err(format!(
-                "unsupported logical plan version {} (expected {LOGICAL_PLAN_VERSION})",
-                self.version
-            ));
-        }
-        if self.nodes.is_empty() {
-            return Err("logical plan has no nodes".into());
+impl DataflowPlan {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        validate_execution_settings(&self.execution_settings)?;
+        if self.stages.is_empty() {
+            return Err("dataflow plan has no stages".into());
         }
 
-        let mut node_indexes = HashMap::with_capacity(self.nodes.len());
-        for (index, node) in self.nodes.iter().enumerate() {
-            if node.id.is_empty() {
-                return Err("logical plan contains an empty node ID".into());
-            }
-            if node_indexes.insert(node.id.as_str(), index).is_some() {
-                return Err(format!("duplicate logical plan node ID {}", node.id));
-            }
-        }
-
-        let mut incoming = vec![0_usize; self.nodes.len()];
-        let mut outgoing = vec![Vec::new(); self.nodes.len()];
-        let mut destination_inputs = HashSet::with_capacity(self.edges.len());
-        for edge in &self.edges {
-            let from = *node_indexes
-                .get(edge.from.as_str())
-                .ok_or_else(|| format!("edge references missing upstream node {}", edge.from))?;
-            let to = *node_indexes
-                .get(edge.to.as_str())
-                .ok_or_else(|| format!("edge references missing downstream node {}", edge.to))?;
-            if !destination_inputs.insert((to, edge.input)) {
+        let mut consumers = vec![HashSet::new(); self.stages.len()];
+        let mut scan_count = 0;
+        let mut sink_count = 0;
+        for (stage_id, stage) in self.stages.iter().enumerate() {
+            let label = format!("stage {stage_id}");
+            let expected_inputs = usize::from(stage.spec.kind().input_count());
+            if stage.inputs.len() != expected_inputs {
                 return Err(format!(
-                    "node {} has duplicate input {}",
-                    edge.to, edge.input
+                    "{label} ({:?}) requires {expected_inputs} inputs, found {}",
+                    stage.spec.kind(),
+                    stage.inputs.len()
                 ));
             }
-            if !self.nodes[to].operator.is_join() && edge.input != 0 {
-                return Err(format!(
-                    "non-join node {} uses input {}",
-                    edge.to, edge.input
-                ));
+            for input in &stage.inputs {
+                let upstream = usize::try_from(input.upstream_stage_id)
+                    .map_err(|_| format!("{label} has an invalid upstream stage ID"))?;
+                if upstream >= stage_id {
+                    return Err(format!("{label} has a non-upstream input"));
+                }
+                consumers[upstream].insert(stage_id);
             }
-            incoming[to] += 1;
-            outgoing[from].push(to);
-        }
-
-        let mut source_oids = HashSet::new();
-        let mut sinks = Vec::new();
-        for (index, node) in self.nodes.iter().enumerate() {
-            match node.operator {
-                OperatorKind::Scan => {
-                    if incoming[index] != 0 {
-                        return Err(format!("scan node {} has an upstream input", node.id));
+            validate_stage(stage, &label)?;
+            match &stage.spec {
+                OperatorSpec::Scan(spec) => {
+                    if spec.source_oid == 0 {
+                        return Err(format!("{label} has an invalid source OID"));
                     }
-                    let source_oid = source_oid(node)?;
-                    if !source_oids.insert(source_oid) {
-                        return Err(format!("duplicate scan source OID {source_oid}"));
-                    }
+                    scan_count += 1;
                 }
-                OperatorKind::Sink => {
-                    sinks.push(index);
-                    if node.config["result_oid"].as_u64() != Some(u64::from(result_oid)) {
-                        return Err(format!(
-                            "sink node {} targets the wrong result OID",
-                            node.id
-                        ));
-                    }
-                }
-                _ if incoming[index] == 0 => {
-                    return Err(format!("non-scan node {} is unreachable", node.id));
+                OperatorSpec::Sink => {
+                    sink_count += 1;
                 }
                 _ => {}
             }
-            if node.operator.is_join()
-                && (incoming[index] != 2
-                    || !destination_inputs.contains(&(index, 0))
-                    || !destination_inputs.contains(&(index, 1)))
-            {
-                return Err(format!(
-                    "join node {} must have exactly inputs 0 and 1",
-                    node.id
-                ));
-            }
-            if node.operator != OperatorKind::Scan
-                && !node.operator.is_join()
-                && incoming[index] != 1
-            {
-                return Err(format!(
-                    "unary node {} must have exactly one input",
-                    node.id
-                ));
-            }
-            if node.operator == OperatorKind::Sink {
-                if !outgoing[index].is_empty() {
-                    return Err(format!("sink node {} has downstream nodes", node.id));
-                }
-            } else if outgoing[index].is_empty() {
-                return Err(format!("node {} does not lead to the sink", node.id));
-            }
         }
-        if source_oids.is_empty() {
-            return Err("logical plan has no scan nodes".into());
+        if scan_count == 0 {
+            return Err("dataflow plan has no Scan stage".into());
         }
-        if sinks.len() != 1 {
+        if sink_count != 1 {
             return Err(format!(
-                "logical plan must contain exactly one sink, found {}",
-                sinks.len()
+                "dataflow plan must contain exactly one Sink, found {sink_count}"
             ));
         }
-
-        reject_cycles(&incoming, &outgoing)?;
-        self.validate_execution_grammar(&node_indexes, source_oids)
-    }
-
-    fn validate_execution_grammar(
-        &self,
-        node_indexes: &HashMap<&str, usize>,
-        source_oids: HashSet<u32>,
-    ) -> Result<PhysicalDagPlan, String> {
-        let join_nodes: Vec<_> = self
-            .nodes
-            .iter()
-            .filter(|node| node.operator.is_join())
-            .collect();
-        let count = |kind| {
-            self.nodes
-                .iter()
-                .filter(|node| node.operator == kind)
-                .count()
-        };
-        let aggregate_count = count(OperatorKind::Aggregate);
-        let window_count = count(OperatorKind::Window);
-        let topn_count = count(OperatorKind::TopN);
-        let distinct_count = count(OperatorKind::Distinct);
-        let core_count = aggregate_count
-            + window_count
-            + topn_count
-            + usize::from(aggregate_count == 0) * distinct_count;
-        if join_nodes.len() > 1
-            || aggregate_count > 1
-            || window_count > 1
-            || topn_count > 1
-            || distinct_count > 1
-            || core_count != 1
-            || (!join_nodes.is_empty() && aggregate_count != 1)
-        {
-            return Err("logical plan must contain exactly one supported operator core".into());
-        }
-
-        let pipeline = if !join_nodes.is_empty() {
-            ExecutionPipeline::Join
-        } else if aggregate_count == 1 {
-            ExecutionPipeline::Aggregate
-        } else if window_count == 1 {
-            ExecutionPipeline::Window
-        } else if topn_count == 1 {
-            ExecutionPipeline::TopN
-        } else {
-            ExecutionPipeline::Distinct
-        };
-        let join_type = join_nodes
-            .first()
-            .map(|node| execution_join_type(node.operator))
-            .transpose()?;
-
-        let node = |id: &str| -> Result<&LogicalNode, String> {
-            node_indexes
-                .get(id)
-                .map(|index| &self.nodes[*index])
-                .ok_or_else(|| format!("logical plan is missing required node {id}"))
-        };
-        let optional = |id: &str| node_indexes.contains_key(id);
-        let mut expected_nodes = vec![
-            ("scan_left", OperatorKind::Scan),
-            ("project", OperatorKind::Project),
-            ("sink", OperatorKind::Sink),
-        ];
-        if optional("filter_left") {
-            expected_nodes.push(("filter_left", OperatorKind::Filter));
-        }
-        let left_tail = if optional("filter_left") {
-            "filter_left"
-        } else {
-            "scan_left"
-        };
-        let mut expected_edges = Vec::new();
-        if optional("filter_left") {
-            expected_edges.push(("scan_left", "filter_left", 0));
-        }
-
-        match pipeline {
-            ExecutionPipeline::Join => {
-                expected_nodes.push(("scan_right", OperatorKind::Scan));
-                expected_nodes.push(("join", join_nodes[0].operator));
-                if optional("filter_right") {
-                    expected_nodes.push(("filter_right", OperatorKind::Filter));
-                    expected_edges.push(("scan_right", "filter_right", 0));
+        for (stage_id, stage) in self.stages.iter().enumerate() {
+            if stage.spec.kind() == OperatorKind::Sink {
+                if !consumers[stage_id].is_empty() {
+                    return Err(format!("Sink stage {stage_id} has a downstream consumer"));
                 }
-                let right_tail = if optional("filter_right") {
-                    "filter_right"
-                } else {
-                    "scan_right"
-                };
-                expected_edges.push((left_tail, "join", 0));
-                expected_edges.push((right_tail, "join", 1));
-                let mut tail = "join";
-                if optional("filter_join") {
-                    expected_nodes.push(("filter_join", OperatorKind::Filter));
-                    expected_edges.push((tail, "filter_join", 0));
-                    tail = "filter_join";
-                }
-                if optional("distinct") {
-                    expected_nodes.push(("distinct", OperatorKind::Distinct));
-                    expected_edges.push((tail, "distinct", 0));
-                    tail = "distinct";
-                }
-                expected_nodes.push(("aggregate", OperatorKind::Aggregate));
-                expected_edges.push((tail, "aggregate", 0));
-                finish_expected_tail(
-                    &mut expected_nodes,
-                    &mut expected_edges,
-                    "aggregate",
-                    optional("having"),
-                );
-            }
-            ExecutionPipeline::Aggregate => {
-                let mut tail = left_tail;
-                if optional("distinct") {
-                    expected_nodes.push(("distinct", OperatorKind::Distinct));
-                    expected_edges.push((tail, "distinct", 0));
-                    tail = "distinct";
-                }
-                expected_nodes.push(("aggregate", OperatorKind::Aggregate));
-                expected_edges.push((tail, "aggregate", 0));
-                finish_expected_tail(
-                    &mut expected_nodes,
-                    &mut expected_edges,
-                    "aggregate",
-                    optional("having"),
-                );
-            }
-            ExecutionPipeline::Window => {
-                expected_nodes.push(("window", OperatorKind::Window));
-                expected_edges.extend([
-                    (left_tail, "window", 0),
-                    ("window", "project", 0),
-                    ("project", "sink", 0),
-                ]);
-            }
-            ExecutionPipeline::Distinct => {
-                expected_nodes.push(("distinct", OperatorKind::Distinct));
-                expected_edges.extend([
-                    (left_tail, "distinct", 0),
-                    ("distinct", "project", 0),
-                    ("project", "sink", 0),
-                ]);
-            }
-            ExecutionPipeline::TopN => {
-                expected_nodes.push(("topn", OperatorKind::TopN));
-                expected_edges.extend([
-                    (left_tail, "topn", 0),
-                    ("topn", "project", 0),
-                    ("project", "sink", 0),
-                ]);
+            } else if consumers[stage_id].is_empty() {
+                return Err(format!("stage {stage_id} has no durable path to the Sink"));
             }
         }
-        if expected_nodes.len() != self.nodes.len() {
-            return Err("logical plan contains an operator outside the supported grammar".into());
-        }
-        for (id, operator) in &expected_nodes {
-            let actual = node(id)?;
-            if actual.operator != *operator {
-                return Err(format!("node {id} has an invalid operator or position"));
-            }
-            validate_operator_config(actual, pipeline)?;
-        }
-
-        if matches!(
-            pipeline,
-            ExecutionPipeline::Aggregate | ExecutionPipeline::Join
-        ) {
-            validate_aggregate_chain(&node, optional, pipeline)?;
-        }
-        let actual_edges: HashSet<_> = self
-            .edges
-            .iter()
-            .map(|edge| (edge.from.as_str(), edge.to.as_str(), edge.input))
-            .collect();
-        let expected_edges: HashSet<_> = expected_edges.into_iter().collect();
-        if actual_edges != expected_edges {
-            return Err("logical plan edges do not match the supported operator order".into());
-        }
-
-        let left_source_oid = source_oid(node("scan_left")?)?;
-        let right_source_oid = if pipeline == ExecutionPipeline::Join {
-            Some(source_oid(node("scan_right")?)?)
-        } else {
-            None
-        };
-        let expected_sources: HashSet<_> = [Some(left_source_oid), right_source_oid]
-            .into_iter()
-            .flatten()
-            .collect();
-        if source_oids != expected_sources {
-            return Err("logical plan scan sources do not match its execution inputs".into());
-        }
-        PhysicalDagPlan::compile(
-            self,
-            ExecutionDescriptor {
-                pipeline,
-                left_source_oid,
-                right_source_oid,
-                join_type,
-            },
-            source_oids,
-        )
+        validate_slot_bindings(&self.stages)
     }
 }
 
-fn reject_cycles(incoming: &[usize], outgoing: &[Vec<usize>]) -> Result<(), String> {
-    let mut queue: VecDeque<_> = incoming
-        .iter()
-        .enumerate()
-        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
-        .collect();
-    let mut remaining = incoming.to_vec();
-    let mut visited = 0;
-    while let Some(node) = queue.pop_front() {
-        visited += 1;
-        for &downstream in &outgoing[node] {
-            remaining[downstream] -= 1;
-            if remaining[downstream] == 0 {
-                queue.push_back(downstream);
-            }
-        }
-    }
-    if visited == incoming.len() {
-        Ok(())
-    } else {
-        Err("logical plan contains a cycle".into())
-    }
-}
-
-fn finish_expected_tail<'a>(
-    nodes: &mut Vec<(&'a str, OperatorKind)>,
-    edges: &mut Vec<(&'a str, &'a str, u16)>,
-    mut tail: &'a str,
-    has_having: bool,
-) {
-    if has_having {
-        nodes.push(("having", OperatorKind::Having));
-        edges.push((tail, "having", 0));
-        tail = "having";
-    }
-    edges.push((tail, "project", 0));
-    edges.push(("project", "sink", 0));
-}
-
-fn execution_join_type(operator: OperatorKind) -> Result<ExecutionJoinType, String> {
-    match operator {
-        OperatorKind::InnerJoin => Ok(ExecutionJoinType::Inner),
-        OperatorKind::LeftJoin => Ok(ExecutionJoinType::Left),
-        OperatorKind::RightJoin => Ok(ExecutionJoinType::Right),
-        OperatorKind::FullJoin => Ok(ExecutionJoinType::Full),
-        OperatorKind::SemiJoin => Ok(ExecutionJoinType::Semi),
-        OperatorKind::AntiJoin => Ok(ExecutionJoinType::Anti),
-        OperatorKind::NullAwareAntiJoin => Ok(ExecutionJoinType::NullAnti),
-        _ => Err("non-join operator cannot define a join execution type".into()),
-    }
-}
-
-fn source_oid(node: &LogicalNode) -> Result<u32, String> {
-    decode_config::<ScanConfig>(node, &["source_oid"])
-        .and_then(|config| {
-            (config.source_oid != 0)
-                .then_some(config.source_oid)
-                .ok_or_else(|| "source_oid must be nonzero".into())
-        })
-        .map_err(|_| format!("scan node {} has invalid source_oid", node.id))
-}
-
-fn validate_aggregate_chain<'a>(
-    node: &impl Fn(&str) -> Result<&'a LogicalNode, String>,
-    optional: impl Fn(&str) -> bool,
-    pipeline: ExecutionPipeline,
+pub(crate) fn validate_execution_settings(
+    settings: &super::model::ExecutionSettings,
 ) -> Result<(), String> {
-    let aggregate = &node("aggregate")?.config;
-    let has_distinct = optional("distinct");
-    if aggregate["count_distinct"].as_bool() != Some(has_distinct) {
-        return Err("aggregate count_distinct config disagrees with the operator pipeline".into());
+    if settings.timezone.is_empty()
+        || settings.datestyle.is_empty()
+        || settings.intervalstyle.is_empty()
+        || !(-15..=3).contains(&settings.extra_float_digits)
+        || !matches!(settings.bytea_output.as_str(), "hex" | "escape")
+    {
+        return Err("dataflow plan has invalid captured execution settings".into());
     }
-    if pipeline == ExecutionPipeline::Join && aggregate["group_source"].is_null() {
-        return Err("join aggregate config must identify its group input side".into());
+    Ok(())
+}
+
+fn validate_stage(stage: &DataflowStage, label: &str) -> Result<(), String> {
+    let inputs = &stage.schema.inputs;
+    let outputs = &stage.schema.outputs;
+    let input_count = stage.spec.kind().input_count();
+    let mut bindings = HashMap::with_capacity(inputs.len());
+    for input in inputs {
+        if input.input >= input_count {
+            return Err(format!(
+                "{label} declares binding {:?} on invalid input port {}",
+                input.binding, input.input
+            ));
+        }
+        validate_slot_type(&input.type_, label)?;
+        if bindings.insert(input.binding, &input.type_).is_some() {
+            return Err(format!(
+                "{label} declares duplicate input binding {:?}",
+                input.binding
+            ));
+        }
     }
-    if has_distinct {
-        let distinct = &node("distinct")?.config;
-        if distinct["group_source"] != aggregate["group_source"]
-            || distinct["group_column"] != aggregate["group_column"]
-            || distinct["value_source"] != aggregate["count_input_source"]
-            || distinct["value_column"] != aggregate["count_input_column"]
-        {
-            return Err("distinct config disagrees with its downstream aggregate config".into());
+
+    let mut slots = HashSet::with_capacity(outputs.len());
+    for output in outputs {
+        validate_slot_type(&output.type_, label)?;
+        if !slots.insert(output.slot) {
+            return Err(format!(
+                "{label} declares duplicate output slot {:?}",
+                output.slot
+            ));
+        }
+    }
+
+    let spec_outputs = stage.spec.output_slots();
+    let schema_outputs: Vec<_> = outputs.iter().map(|output| output.slot).collect();
+    if spec_outputs != schema_outputs {
+        return Err(format!("{label} operator outputs do not match its schema"));
+    }
+    validate_operator_spec(stage, label, &bindings)
+}
+
+fn validate_operator_spec(
+    stage: &DataflowStage,
+    label: &str,
+    bindings: &HashMap<BindingId, &SlotType>,
+) -> Result<(), String> {
+    match &stage.spec {
+        OperatorSpec::Scan(spec) => {
+            if spec.source_oid == 0
+                || spec.columns.iter().any(|column| column.attnum == 0)
+                || has_duplicates(spec.columns.iter().map(|column| column.output))
+            {
+                return Err(format!("{label} has an invalid Scan specification"));
+            }
+        }
+        OperatorSpec::Distinct(spec) => {
+            for key in &spec.keys {
+                validate_sort_group_expression(key, bindings, label, "DISTINCT key")?;
+            }
+        }
+        OperatorSpec::Aggregate(spec) => {
+            if has_duplicates(spec.aggregates.iter().map(|aggregate| aggregate.ref_id))
+                || spec
+                    .aggregates
+                    .iter()
+                    .any(|aggregate| aggregate.ref_id == 0 || aggregate.function_oid == 0)
+            {
+                return Err(format!("{label} has an invalid aggregate reference"));
+            }
+            for group in &spec.groups {
+                validate_sort_group_expression(&group.key, bindings, label, "GROUP BY key")?;
+            }
+            for aggregate in &spec.aggregates {
+                validate_slot_type(&aggregate.type_, label)?;
+                for distinct in &aggregate.distinct {
+                    validate_sort_group_expression(
+                        distinct,
+                        bindings,
+                        label,
+                        "aggregate DISTINCT key",
+                    )?;
+                }
+                for order in &aggregate.order_by {
+                    validate_sort_group_expression(
+                        order,
+                        bindings,
+                        label,
+                        "aggregate ORDER BY key",
+                    )?;
+                }
+            }
+        }
+        OperatorSpec::Window(spec) => {
+            if has_duplicates(spec.functions.iter().map(|function| function.ref_id))
+                || spec
+                    .functions
+                    .iter()
+                    .any(|function| function.ref_id == 0 || function.function_oid == 0)
+                || spec.frame.start_in_range_function_oid == Some(0)
+                || spec.frame.end_in_range_function_oid == Some(0)
+            {
+                return Err(format!("{label} has an invalid Window specification"));
+            }
+            for function in &spec.functions {
+                validate_slot_type(&function.type_, label)?;
+            }
+            for partition in &spec.partition_by {
+                validate_sort_group_expression(
+                    partition,
+                    bindings,
+                    label,
+                    "window PARTITION BY key",
+                )?;
+            }
+            for order in &spec.order_by {
+                validate_sort_group_expression(order, bindings, label, "window ORDER BY key")?;
+            }
+        }
+        OperatorSpec::TopN(spec) if spec.order_by.is_empty() => {
+            return Err(format!("{label} has an invalid TopN ordering"));
+        }
+        _ => {}
+    }
+    if let OperatorSpec::TopN(spec) = &stage.spec {
+        for order in &spec.order_by {
+            validate_sort_group_expression(order, bindings, label, "TopN ORDER BY key")?;
+        }
+    }
+
+    for expression in stage.spec.expressions() {
+        validate_scalar_expr(expression, bindings, label)?;
+    }
+    Ok(())
+}
+
+fn validate_sort_group_expression(
+    sort: &super::model::SortGroupExpr,
+    bindings: &HashMap<BindingId, &SlotType>,
+    label: &str,
+    role: &str,
+) -> Result<(), String> {
+    if sort.equality_operator_oid == 0 || sort.sort_operator_oid == 0 {
+        return Err(format!("{label} has an invalid {role} operator"));
+    }
+    validate_slot_type(&sort.type_, label)?;
+    validate_expression_type(&sort.expr, &sort.type_, bindings, label, role)
+}
+
+fn validate_expression_type(
+    expression: &ScalarExpr,
+    declared: &SlotType,
+    bindings: &HashMap<BindingId, &SlotType>,
+    label: &str,
+    role: &str,
+) -> Result<(), String> {
+    let resolved = expression_type(expression, bindings)
+        .ok_or_else(|| format!("{label} has a {role} expression with no resolved type"))?;
+    if resolved != *declared {
+        return Err(format!(
+            "{label} has a {role} expression whose declared type does not match its expression"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scalar_expr(
+    expression: &ScalarExpr,
+    bindings: &HashMap<BindingId, &SlotType>,
+    node_id: &str,
+) -> Result<(), String> {
+    let mut error = None;
+    expression.visit(&mut |part| {
+        if error.is_some() {
+            return;
+        }
+        error = match part {
+            ScalarExpr::Input { binding } if !bindings.contains_key(binding) => Some(format!(
+                "node {node_id} expression references unknown input binding {binding:?}"
+            )),
+            ScalarExpr::Constant { type_, .. } if type_.type_oid == 0 => {
+                Some(format!("node {node_id} has an invalid constant"))
+            }
+            ScalarExpr::Call {
+                function_oid,
+                type_,
+                ..
+            } if *function_oid == 0 || type_.type_oid == 0 => {
+                Some(format!("node {node_id} has an invalid function call"))
+            }
+            ScalarExpr::Operator {
+                operator_oid,
+                type_,
+                ..
+            }
+            | ScalarExpr::Distinct {
+                operator_oid,
+                type_,
+                ..
+            }
+            | ScalarExpr::NullIf {
+                operator_oid,
+                type_,
+                ..
+            }
+            | ScalarExpr::ScalarArrayOperator {
+                operator_oid,
+                type_,
+                ..
+            } if *operator_oid == 0 || type_.type_oid == 0 => {
+                Some(format!("node {node_id} has an invalid operator call"))
+            }
+            ScalarExpr::Bool { op, args }
+                if args.is_empty() || (*op == BoolExprKind::Not && args.len() != 1) =>
+            {
+                Some(format!("node {node_id} has an invalid boolean expression"))
+            }
+            ScalarExpr::Coalesce { args, type_ } if args.is_empty() || type_.type_oid == 0 => {
+                Some(format!("node {node_id} has an invalid coalesce expression"))
+            }
+            ScalarExpr::Case { arms, type_, .. } if arms.is_empty() || type_.type_oid == 0 => {
+                Some(format!("node {node_id} has an invalid case expression"))
+            }
+            ScalarExpr::CaseTest { type_ } if type_.type_oid == 0 => Some(format!(
+                "node {node_id} has an invalid CASE operand placeholder"
+            )),
+            ScalarExpr::Relabel { type_, .. }
+            | ScalarExpr::CoerceViaIo { type_, .. }
+            | ScalarExpr::CoerceToDomain { type_, .. }
+            | ScalarExpr::Collate { type_, .. }
+                if type_.type_oid == 0 =>
+            {
+                Some(format!("node {node_id} has an invalid coercion"))
+            }
+            _ => None,
+        };
+    });
+    if error.is_none() {
+        error = validate_case_test_scope(expression, &[], bindings, node_id).err();
+    }
+    error.map_or(Ok(()), Err)
+}
+
+fn validate_case_test_scope(
+    expression: &ScalarExpr,
+    case_operands: &[SlotType],
+    bindings: &HashMap<BindingId, &SlotType>,
+    node_id: &str,
+) -> Result<(), String> {
+    match expression {
+        ScalarExpr::CaseTest { type_ } => {
+            let Some(operand_type) = case_operands.last() else {
+                return Err(format!(
+                    "node {node_id} has a CASE operand placeholder outside a simple CASE arm"
+                ));
+            };
+            if type_.type_oid != operand_type.type_oid
+                || type_.typmod != operand_type.typmod
+                || type_.collation_oid != operand_type.collation_oid
+            {
+                return Err(format!(
+                    "node {node_id} has a CASE operand placeholder with the wrong type"
+                ));
+            }
+        }
+        ScalarExpr::Input { .. } | ScalarExpr::Constant { .. } => {}
+        ScalarExpr::Call { args, .. }
+        | ScalarExpr::Operator { args, .. }
+        | ScalarExpr::Bool { args, .. }
+        | ScalarExpr::Coalesce { args, .. } => {
+            for argument in args {
+                validate_case_test_scope(argument, case_operands, bindings, node_id)?;
+            }
+        }
+        ScalarExpr::Distinct { left, right, .. }
+        | ScalarExpr::NullIf { left, right, .. }
+        | ScalarExpr::ScalarArrayOperator { left, right, .. } => {
+            validate_case_test_scope(left, case_operands, bindings, node_id)?;
+            validate_case_test_scope(right, case_operands, bindings, node_id)?;
+        }
+        ScalarExpr::BooleanTest { arg, .. }
+        | ScalarExpr::NullTest { arg, .. }
+        | ScalarExpr::Relabel { arg, .. }
+        | ScalarExpr::CoerceViaIo { arg, .. }
+        | ScalarExpr::CoerceToDomain { arg, .. }
+        | ScalarExpr::Collate { arg, .. } => {
+            validate_case_test_scope(arg, case_operands, bindings, node_id)?;
+        }
+        ScalarExpr::Case {
+            operand,
+            arms,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                validate_case_test_scope(operand, case_operands, bindings, node_id)?;
+            }
+            let mut arm_operands = case_operands.to_vec();
+            if let Some(operand) = operand {
+                arm_operands.push(expression_type(operand, bindings).ok_or_else(|| {
+                    format!("node {node_id} has a simple CASE operand with no type")
+                })?);
+            }
+            for arm in arms {
+                validate_case_test_scope(&arm.when, &arm_operands, bindings, node_id)?;
+                validate_case_test_scope(&arm.then, case_operands, bindings, node_id)?;
+            }
+            validate_case_test_scope(else_expr, case_operands, bindings, node_id)?;
         }
     }
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ScanConfig {
-    source_oid: u32,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PredicateConfig {
-    predicate_sql: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JoinFilterConfig {
-    left_predicate_sql: Option<String>,
-    right_predicate_sql: Option<String>,
-    join_predicate_sql: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JoinConfig {
-    left_key: String,
-    right_key: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProjectionConfig {
-    source_columns: Vec<String>,
-    output_columns: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AggregateDistinctConfig {
-    group_source: Option<InputSide>,
-    group_column: Option<String>,
-    value_source: InputSide,
-    value_column: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum InputSide {
-    Left,
-    Right,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AggregateConfig {
-    group_source: Option<InputSide>,
-    group_column: Option<String>,
-    count_column: Option<String>,
-    count_distinct: bool,
-    count_input_source: Option<InputSide>,
-    count_input_column: Option<String>,
-    sum_input: Option<String>,
-    sum_column: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WindowConfig {
-    partition_column: String,
-    result_partition_column: String,
-    order_column: String,
-    order_direction: String,
-    nulls_first: bool,
-    output_columns: Vec<String>,
-    target_expressions: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TopNConfig {
-    order_column: String,
-    order_direction: String,
-    nulls_first: bool,
-    limit_count: i64,
-    limit_offset: i64,
-    source_columns: Vec<String>,
-    output_columns: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AggregateProjectConfig {
-    source_group: Option<String>,
-    result_group: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WindowProjectConfig {
-    output_columns: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SinkConfig {
-    result_oid: u64,
-}
-
-fn decode_config<T: for<'de> Deserialize<'de>>(
-    node: &LogicalNode,
-    keys: &[&str],
-) -> Result<T, String> {
-    let object = node
-        .config
-        .as_object()
-        .ok_or_else(|| format!("node {} config must be an object", node.id))?;
-    if object.len() != keys.len() || !keys.iter().all(|key| object.contains_key(*key)) {
-        return Err(format!(
-            "node {} has an invalid or incomplete operator config",
-            node.id
-        ));
-    }
-    serde_json::from_value(node.config.clone()).map_err(|_| {
-        format!(
-            "node {} has an invalid or incomplete operator config",
-            node.id
-        )
+fn expression_type(
+    expression: &ScalarExpr,
+    bindings: &HashMap<BindingId, &SlotType>,
+) -> Option<SlotType> {
+    Some(match expression {
+        ScalarExpr::Input { binding } => (*bindings.get(binding)?).clone(),
+        ScalarExpr::Constant { type_, .. }
+        | ScalarExpr::Call { type_, .. }
+        | ScalarExpr::Operator { type_, .. }
+        | ScalarExpr::Distinct { type_, .. }
+        | ScalarExpr::NullIf { type_, .. }
+        | ScalarExpr::ScalarArrayOperator { type_, .. }
+        | ScalarExpr::Coalesce { type_, .. }
+        | ScalarExpr::Case { type_, .. }
+        | ScalarExpr::CaseTest { type_ }
+        | ScalarExpr::Relabel { type_, .. }
+        | ScalarExpr::CoerceViaIo { type_, .. }
+        | ScalarExpr::CoerceToDomain { type_, .. }
+        | ScalarExpr::Collate { type_, .. } => type_.clone(),
+        ScalarExpr::Bool { .. } | ScalarExpr::BooleanTest { .. } | ScalarExpr::NullTest { .. } => {
+            SlotType {
+                type_oid: 16,
+                typmod: -1,
+                collation_oid: 0,
+                nullable: true,
+            }
+        }
     })
 }
 
-fn order_is_valid(direction: &str) -> bool {
-    direction.eq_ignore_ascii_case("asc") || direction.eq_ignore_ascii_case("desc")
+fn validate_slot_type(type_: &SlotType, node_id: &str) -> Result<(), String> {
+    if type_.type_oid == 0 {
+        Err(format!(
+            "node {node_id} declares a slot with invalid type OID"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
-fn validate_operator_config(node: &LogicalNode, pipeline: ExecutionPipeline) -> Result<(), String> {
-    let invalid = || {
-        format!(
-            "node {} has an invalid or incomplete operator config",
-            node.id
-        )
-    };
-    let valid = match node.operator {
-        OperatorKind::Scan => source_oid(node).is_ok(),
-        OperatorKind::Filter if node.id == "filter_join" => {
-            let config = decode_config::<JoinFilterConfig>(
-                node,
-                &[
-                    "left_predicate_sql",
-                    "right_predicate_sql",
-                    "join_predicate_sql",
-                ],
-            )?;
-            config.left_predicate_sql.is_some()
-                || config.right_predicate_sql.is_some()
-                || config.join_predicate_sql.is_some()
-        }
-        OperatorKind::Filter | OperatorKind::Having => {
-            let config = decode_config::<PredicateConfig>(node, &["predicate_sql"])?;
-            let _ = config.predicate_sql;
-            true
-        }
-        operator if operator.is_join() => {
-            let config = decode_config::<JoinConfig>(node, &["left_key", "right_key"])?;
-            let _ = (config.left_key, config.right_key);
-            true
-        }
-        OperatorKind::Distinct if pipeline == ExecutionPipeline::Distinct => {
-            let config =
-                decode_config::<ProjectionConfig>(node, &["source_columns", "output_columns"])?;
-            config.source_columns.len() == config.output_columns.len()
-        }
-        OperatorKind::Distinct => {
-            let config = decode_config::<AggregateDistinctConfig>(
-                node,
-                &[
-                    "group_source",
-                    "group_column",
-                    "value_source",
-                    "value_column",
-                ],
-            )?;
-            let group_is_valid = if pipeline == ExecutionPipeline::Aggregate {
-                config.group_source.is_none()
-            } else {
-                config.group_source.is_some()
-            };
-            let _ = (
-                config.group_column,
-                config.value_source,
-                config.value_column,
-            );
-            group_is_valid
-        }
-        OperatorKind::Aggregate => {
-            let config = decode_config::<AggregateConfig>(
-                node,
-                &[
-                    "group_source",
-                    "group_column",
-                    "count_column",
-                    "count_distinct",
-                    "count_input_source",
-                    "count_input_column",
-                    "sum_input",
-                    "sum_column",
-                ],
-            )?;
-            let count_input_consistent =
-                config.count_input_source.is_none() == config.count_input_column.is_none();
-            let sum_input_consistent = config.sum_input.is_none() == config.sum_column.is_none();
-            let distinct_has_input = !config.count_distinct || config.count_input_source.is_some();
-            let has_output = config.count_column.is_some() || config.sum_column.is_some();
-            let _ = (config.group_source, config.group_column);
-            count_input_consistent && sum_input_consistent && distinct_has_input && has_output
-        }
-        OperatorKind::Window => {
-            let config = decode_config::<WindowConfig>(
-                node,
-                &[
-                    "partition_column",
-                    "result_partition_column",
-                    "order_column",
-                    "order_direction",
-                    "nulls_first",
-                    "output_columns",
-                    "target_expressions",
-                ],
-            )?;
-            let _ = (
-                config.partition_column,
-                config.result_partition_column,
-                config.order_column,
-                config.nulls_first,
-            );
-            order_is_valid(&config.order_direction)
-                && config.output_columns.len() == config.target_expressions.len()
-        }
-        OperatorKind::TopN => validate_topn(node)?,
-        OperatorKind::Project => match pipeline {
-            ExecutionPipeline::Aggregate | ExecutionPipeline::Join => {
-                let config = decode_config::<AggregateProjectConfig>(
-                    node,
-                    &["source_group", "result_group"],
-                )?;
-                let _ = (config.source_group, config.result_group);
-                true
+fn validate_slot_bindings(stages: &[DataflowStage]) -> Result<(), String> {
+    let mut bound = vec![HashSet::<BindingId>::new(); stages.len()];
+    for (stage_id, stage) in stages.iter().enumerate() {
+        let downstream: HashMap<_, _> = stage
+            .schema
+            .inputs
+            .iter()
+            .map(|input| (input.binding, (input.input, &input.type_)))
+            .collect();
+        for (input_port, input) in stage.inputs.iter().enumerate() {
+            let upstream_outputs = &stages[input.upstream_stage_id as usize].schema.outputs;
+            let upstream: HashMap<SlotId, &SlotType> = upstream_outputs
+                .iter()
+                .map(|output| (output.slot, &output.type_))
+                .collect();
+            for binding in &input.bindings {
+                let source = upstream.get(&binding.source_slot).ok_or_else(|| {
+                    format!(
+                        "input {} -> {stage_id} references an unknown output slot",
+                        input.upstream_stage_id
+                    )
+                })?;
+                let (port, target) = downstream.get(&binding.target_binding).ok_or_else(|| {
+                    format!(
+                        "input {} -> {stage_id} references an unknown input binding",
+                        input.upstream_stage_id
+                    )
+                })?;
+                if usize::from(*port) != input_port
+                    || *source != *target
+                    || !bound[stage_id].insert(binding.target_binding)
+                {
+                    return Err(format!(
+                        "input {} -> {stage_id} has an invalid slot binding",
+                        input.upstream_stage_id
+                    ));
+                }
             }
-            ExecutionPipeline::Window => {
-                let config = decode_config::<WindowProjectConfig>(node, &["output_columns"])?;
-                let _ = config.output_columns;
-                true
-            }
-            ExecutionPipeline::Distinct => {
-                let config =
-                    decode_config::<ProjectionConfig>(node, &["source_columns", "output_columns"])?;
-                config.source_columns.len() == config.output_columns.len()
-            }
-            ExecutionPipeline::TopN => validate_topn(node)?,
-        },
-        OperatorKind::Sink => {
-            let config = decode_config::<SinkConfig>(node, &["result_oid"])?;
-            let _ = config.result_oid;
-            true
         }
-        _ => false,
-    };
-    valid.then_some(()).ok_or_else(invalid)
+        if downstream
+            .keys()
+            .any(|binding| !bound[stage_id].contains(binding))
+        {
+            return Err(format!("stage {stage_id} has an unbound input"));
+        }
+    }
+    Ok(())
 }
 
-fn validate_topn(node: &LogicalNode) -> Result<bool, String> {
-    let config = decode_config::<TopNConfig>(
-        node,
-        &[
-            "order_column",
-            "order_direction",
-            "nulls_first",
-            "limit_count",
-            "limit_offset",
-            "source_columns",
-            "output_columns",
-        ],
-    )?;
-    let _ = (config.order_column, config.nulls_first);
-    Ok(order_is_valid(&config.order_direction)
-        && config.limit_count >= 0
-        && config.limit_offset >= 0
-        && config.source_columns.len() == config.output_columns.len())
+fn has_duplicates<T: Eq + std::hash::Hash>(values: impl IntoIterator<Item = T>) -> bool {
+    let mut seen = HashSet::new();
+    values.into_iter().any(|value| !seen.insert(value))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logical::model::{
+        DataflowInput, DataflowPlan, DataflowStage, DatumRepr, ExecutionSettings, FilterSpec,
+        InputSlot, JoinKind, JoinSpec, NamedExpr, OutputSlot, ProjectSpec, ScanColumn, ScanSpec,
+        SlotBinding, StageSchema,
+    };
+
+    fn int_type() -> SlotType {
+        SlotType {
+            type_oid: 23,
+            typmod: -1,
+            collation_oid: 0,
+            nullable: false,
+        }
+    }
+
+    fn bool_constant() -> ScalarExpr {
+        ScalarExpr::Constant {
+            type_: SlotType {
+                type_oid: 16,
+                typmod: -1,
+                collation_oid: 0,
+                nullable: false,
+            },
+            value: Some(DatumRepr::Text("t".into())),
+        }
+    }
+
+    fn settings() -> ExecutionSettings {
+        ExecutionSettings {
+            timezone: "UTC".into(),
+            datestyle: "ISO, MDY".into(),
+            intervalstyle: "postgres".into(),
+            extra_float_digits: 1,
+            bytea_output: "hex".into(),
+        }
+    }
+
+    fn schema(inputs: &[(u32, u16)], outputs: &[u32]) -> StageSchema {
+        StageSchema {
+            inputs: inputs
+                .iter()
+                .map(|(binding, input)| InputSlot {
+                    binding: BindingId(*binding),
+                    input: *input,
+                    type_: int_type(),
+                })
+                .collect(),
+            outputs: outputs
+                .iter()
+                .map(|slot| OutputSlot {
+                    slot: SlotId(*slot),
+                    type_: int_type(),
+                })
+                .collect(),
+        }
+    }
+
+    fn input(upstream_stage_id: u32, source_slot: u32, target_binding: u32) -> DataflowInput {
+        DataflowInput {
+            upstream_stage_id,
+            bindings: vec![SlotBinding {
+                source_slot: SlotId(source_slot),
+                target_binding: BindingId(target_binding),
+            }],
+        }
+    }
+
+    fn branch_and_fanin_plan() -> DataflowPlan {
+        DataflowPlan {
+            execution_settings: settings(),
+            stages: vec![
+                DataflowStage {
+                    spec: OperatorSpec::Scan(ScanSpec {
+                        source_oid: 41,
+                        columns: vec![ScanColumn {
+                            output: SlotId(1),
+                            attnum: 1,
+                        }],
+                    }),
+                    schema: schema(&[], &[1]),
+                    inputs: vec![],
+                },
+                DataflowStage {
+                    spec: OperatorSpec::Filter(FilterSpec {
+                        predicate: bool_constant(),
+                        outputs: vec![NamedExpr {
+                            output: SlotId(2),
+                            name: None,
+                            expr: ScalarExpr::Input {
+                                binding: BindingId(10),
+                            },
+                        }],
+                    }),
+                    schema: schema(&[(10, 0)], &[2]),
+                    inputs: vec![input(0, 1, 10)],
+                },
+                DataflowStage {
+                    spec: OperatorSpec::Project(ProjectSpec {
+                        expressions: vec![NamedExpr {
+                            output: SlotId(3),
+                            name: None,
+                            expr: ScalarExpr::Input {
+                                binding: BindingId(20),
+                            },
+                        }],
+                    }),
+                    schema: schema(&[(20, 0)], &[3]),
+                    inputs: vec![input(0, 1, 20)],
+                },
+                DataflowStage {
+                    spec: OperatorSpec::Join(JoinSpec {
+                        kind: JoinKind::Inner,
+                        condition: bool_constant(),
+                        outputs: vec![NamedExpr {
+                            output: SlotId(4),
+                            name: None,
+                            expr: ScalarExpr::Input {
+                                binding: BindingId(30),
+                            },
+                        }],
+                    }),
+                    schema: schema(&[(30, 0), (31, 1)], &[4]),
+                    inputs: vec![input(1, 2, 30), input(2, 3, 31)],
+                },
+                DataflowStage {
+                    spec: OperatorSpec::Sink,
+                    schema: schema(&[(40, 0)], &[]),
+                    inputs: vec![input(3, 4, 40)],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn accepts_topological_branch_and_fanin() {
+        let plan = branch_and_fanin_plan();
+        plan.validate().unwrap();
+        assert_eq!(
+            plan.stages
+                .iter()
+                .filter(|stage| stage.spec.kind() == OperatorKind::Join)
+                .count(),
+            1
+        );
+        assert_eq!(
+            plan.stages
+                .iter()
+                .filter(|stage| {
+                    stage
+                        .inputs
+                        .iter()
+                        .any(|input| input.upstream_stage_id == 0)
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn persisted_plan_rejects_unknown_fields_at_every_level() {
+        let plan = branch_and_fanin_plan();
+        let mut json = serde_json::to_value(&plan).unwrap();
+        json["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<DataflowPlan>(json).is_err());
+
+        let mut json = serde_json::to_value(&plan).unwrap();
+        json["stages"][0]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<DataflowPlan>(json).is_err());
+
+        let mut json = serde_json::to_value(&plan).unwrap();
+        json["stages"][0]["schema"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<DataflowPlan>(json).is_err());
+    }
+
+    #[test]
+    fn rejects_non_upstream_input() {
+        let mut plan = branch_and_fanin_plan();
+        plan.stages[1].inputs[0].upstream_stage_id = 1;
+        assert!(plan.validate().unwrap_err().contains("non-upstream"));
+    }
+
+    #[test]
+    fn rejects_unknown_output_slot_and_input_binding() {
+        let mut unknown_slot = branch_and_fanin_plan();
+        unknown_slot.stages[1].inputs[0].bindings[0].source_slot = SlotId(999);
+        assert!(unknown_slot
+            .validate()
+            .unwrap_err()
+            .contains("unknown output slot"));
+
+        let mut unknown_binding = branch_and_fanin_plan();
+        unknown_binding.stages[1].inputs[0].bindings[0].target_binding = BindingId(999);
+        assert!(unknown_binding
+            .validate()
+            .unwrap_err()
+            .contains("unknown input binding"));
+    }
+
+    #[test]
+    fn rejects_scalar_reference_to_unknown_binding() {
+        let mut plan = branch_and_fanin_plan();
+        let OperatorSpec::Filter(spec) = &mut plan.stages[1].spec else {
+            unreachable!()
+        };
+        spec.predicate = ScalarExpr::Input {
+            binding: BindingId(999),
+        };
+        assert!(plan
+            .validate()
+            .unwrap_err()
+            .contains("expression references unknown input binding"));
+    }
 }

@@ -58,7 +58,7 @@ pub struct StartReplicationOptions<'a> {
     pub publication_names: &'a [&'a str],
 }
 
-/// A CopyData message after removing only the physical replication envelope.
+/// A CopyData message after removing only the replication wire envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplicationMessage {
     XLogData {
@@ -268,7 +268,7 @@ impl ReplicationTransport {
     }
 
     /// Start pgoutput protocol version 2 with in-progress transaction
-    /// streaming enabled.
+    /// streaming disabled.
     pub fn start_replication(
         &mut self,
         options: StartReplicationOptions<'_>,

@@ -1,6 +1,6 @@
 //! ProcessUtility hook that reserves `shiba` CTAS declarations.
 
-use crate::query_tree;
+use crate::query_lowering::{self, LoweredQuery, LoweringError};
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use std::ffi::CStr;
@@ -10,6 +10,28 @@ static mut PREVIOUS_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = Non
 pub unsafe fn install_process_utility_hook() {
     PREVIOUS_PROCESS_UTILITY_HOOK = pg_sys::ProcessUtility_hook;
     pg_sys::ProcessUtility_hook = Some(shiba_process_utility);
+}
+
+/// Extract and lower the analyzed Query owned by a live CTAS statement.
+///
+/// # Safety
+/// `pstmt` must be null or point to the `PlannedStmt` supplied to the current
+/// ProcessUtility hook call.
+unsafe fn inspect_ctas(
+    pstmt: *mut pg_sys::PlannedStmt,
+) -> Option<Result<LoweredQuery, LoweringError>> {
+    if pstmt.is_null() || (*pstmt).utilityStmt.is_null() {
+        return None;
+    }
+    let utility = (*pstmt).utilityStmt;
+    if (*utility).type_ != pg_sys::NodeTag::T_CreateTableAsStmt {
+        return None;
+    }
+    let statement = utility.cast::<pg_sys::CreateTableAsStmt>();
+    if (*statement).query.is_null() || (*(*statement).query).type_ != pg_sys::NodeTag::T_Query {
+        return None;
+    }
+    Some(query_lowering::lower((*statement).query.cast()))
 }
 
 #[pg_guard]
@@ -24,44 +46,38 @@ unsafe extern "C-unwind" fn shiba_process_utility(
     dest: *mut pg_sys::DestReceiver,
     query_completion: *mut pg_sys::QueryCompletion,
 ) {
-    prepare_stream_drops(pstmt);
-    let declaration = shiba_table_declaration(pstmt, query_string);
-    let inspection = query_tree::inspect_ctas(pstmt);
-    let is_stream_declaration = declaration.is_some() && inspection.is_some();
-    if declaration.is_some() && !is_stream_declaration && !pg_sys::creating_extension {
-        error!("the shiba schema only accepts CREATE TABLE shiba.name AS SELECT ... stream declarations");
+    prepare_dataflow_drops(pstmt);
+    let declaration = is_shiba_table_declaration(pstmt);
+    let inspection = inspect_ctas(pstmt);
+    let is_dataflow_declaration = declaration && inspection.is_some();
+    if declaration && !is_dataflow_declaration && !pg_sys::creating_extension {
+        error!(
+            "the shiba schema only accepts CREATE TABLE shiba.name AS SELECT ... dataflow declarations"
+        );
     }
-    let declaration = is_stream_declaration.then_some(declaration).flatten();
-    if declaration.is_some() && inspection.is_none() {
-        error!("Shiba could not access PostgreSQL's analyzed CTAS Query tree");
-    }
-    let inspection = if declaration.is_some() {
+    let inspection = if is_dataflow_declaration {
         Some(match inspection.expect("checked above") {
             Ok(inspection) => inspection,
-            Err(error) => error!("Shiba cannot execute this stream declaration: {error}"),
+            Err(error) => error!("Shiba cannot execute this dataflow declaration: {error}"),
         })
     } else {
         None
     };
     if let Some(inspection) = &inspection {
-        Spi::run("SELECT shiba._begin_stream_registration()")
+        Spi::run("SELECT shiba._begin_dataflow_registration()")
             .expect("Shiba failed to enter database registration lifecycle");
-        let lock_analysis = serde_json::json!({
-            "sources": inspection
-                .validated
-                .sources()
-                .into_iter()
-                .map(|oid| serde_json::json!({ "oid": oid }))
-                .collect::<Vec<_>>(),
-            "subqueries": [],
-        })
-        .to_string();
-        let argument = DatumWithOid::new(lock_analysis.as_str(), pg_sys::TEXTOID);
+        let sources = inspection
+            .source_oids()
+            .into_iter()
+            .map(pg_sys::Oid::from)
+            .collect::<Vec<_>>();
+        let argument = DatumWithOid::new(sources, pg_sys::OIDARRAYOID);
         Spi::run_with_args(
-            "SELECT shiba._lock_sources_for_analysis($1::jsonb)",
+            "SELECT shiba._lock_dataflow_sources($1::oid[])",
             &[argument],
         )
-        .expect("Shiba failed to lock the source table for backfill");
+        .expect("Shiba failed to lock the source table for activation");
+        suppress_ctas_data(pstmt);
     }
     if let Some(previous_hook) = PREVIOUS_PROCESS_UTILITY_HOOK {
         previous_hook(
@@ -86,26 +102,67 @@ unsafe extern "C-unwind" fn shiba_process_utility(
             query_completion,
         );
     }
-    if let Some(declaration) = declaration {
-        let query_analysis = inspection.expect("checked above").wire_json;
-        let arguments = [
-            DatumWithOid::new(declaration.as_str(), pg_sys::TEXTOID),
-            DatumWithOid::new(query_analysis.as_str(), pg_sys::TEXTOID),
-        ];
+    if is_dataflow_declaration {
+        let result_oid = ctas_result_oid(pstmt)
+            .unwrap_or_else(|| error!("Shiba could not resolve the new CTAS result relation"));
+        let inspection = inspection.expect("checked above");
+        let plan = inspection.finish();
+        plan.validate()
+            .unwrap_or_else(|error| error!("Shiba rejected this dataflow declaration: {error}"));
+        let plan = serde_json::to_string(&plan).expect("Shiba dataflow plan is not serializable");
+        let arguments = unsafe {
+            [
+                DatumWithOid::new(result_oid, pg_sys::OIDOID),
+                DatumWithOid::new(plan.as_str(), pg_sys::TEXTOID),
+            ]
+        };
         Spi::run_with_args(
-            "SELECT shiba._register_stream_table($1, $2::jsonb)",
+            "SELECT shiba._register_dataflow($1::oid, $2::text)",
             &arguments,
         )
-        .expect("Shiba failed to register the stream table");
-        Spi::run_with_args(
-            "SELECT shiba._store_query_analysis($1, $2::jsonb)",
-            &arguments,
-        )
-        .expect("Shiba failed to persist its analyzed Query tree");
+        .expect("Shiba failed to register the dataflow");
     }
 }
 
-unsafe fn prepare_stream_drops(pstmt: *mut pg_sys::PlannedStmt) {
+/// Make PostgreSQL create only the analyzed CTAS result schema. Scan
+/// provisioners spool the one authoritative activation snapshot after every
+/// source lock is held and before this registration transaction commits.
+///
+/// # Safety
+/// `pstmt` must be the same live CTAS statement passed to the utility hook.
+unsafe fn suppress_ctas_data(pstmt: *mut pg_sys::PlannedStmt) {
+    let statement = (*pstmt).utilityStmt.cast::<pg_sys::CreateTableAsStmt>();
+    (*(*statement).into).skipData = true;
+}
+
+/// Resolve the CTAS target after `standard_ProcessUtility` has created it.
+///
+/// # Safety
+/// `pstmt` must be the same live CTAS statement passed to the utility hook.
+unsafe fn ctas_result_oid(pstmt: *mut pg_sys::PlannedStmt) -> Option<pg_sys::Oid> {
+    if pstmt.is_null() || (*pstmt).utilityStmt.is_null() {
+        return None;
+    }
+    let utility = (*pstmt).utilityStmt;
+    if (*utility).type_ != pg_sys::NodeTag::T_CreateTableAsStmt {
+        return None;
+    }
+    let statement = utility.cast::<pg_sys::CreateTableAsStmt>();
+    let target = (*statement).into.as_ref()?.rel;
+    if target.is_null() {
+        return None;
+    }
+    let oid = pg_sys::RangeVarGetRelidExtended(
+        target,
+        pg_sys::NoLock as pg_sys::LOCKMODE,
+        0,
+        None,
+        std::ptr::null_mut(),
+    );
+    (oid != pg_sys::InvalidOid).then_some(oid)
+}
+
+unsafe fn prepare_dataflow_drops(pstmt: *mut pg_sys::PlannedStmt) {
     if pstmt.is_null() || (*pstmt).utilityStmt.is_null() {
         return;
     }
@@ -115,7 +172,7 @@ unsafe fn prepare_stream_drops(pstmt: *mut pg_sys::PlannedStmt) {
         guard_drop_owned_ast(drop_statement);
         // DROP OWNED removes directly owned objects even under the default
         // RESTRICT behavior; CASCADE only controls dependent objects.
-        lock_all_dags_before_indirect_drop();
+        lock_all_dataflows_before_indirect_drop();
         return;
     }
     if (*utility).type_ != pg_sys::NodeTag::T_DropStmt {
@@ -126,7 +183,7 @@ unsafe fn prepare_stream_drops(pstmt: *mut pg_sys::PlannedStmt) {
         guard_extension_drop_ast(drop_statement);
     }
     if (*drop_statement).behavior == pg_sys::DropBehavior::DROP_CASCADE {
-        lock_all_dags_before_indirect_drop();
+        lock_all_dataflows_before_indirect_drop();
     }
     if (*drop_statement).removeType == pg_sys::ObjectType::OBJECT_EXTENSION {
         return;
@@ -134,7 +191,7 @@ unsafe fn prepare_stream_drops(pstmt: *mut pg_sys::PlannedStmt) {
     if (*drop_statement).removeType != pg_sys::ObjectType::OBJECT_TABLE {
         return;
     }
-    if Spi::get_one::<bool>("SELECT to_regclass('shiba_internal.stream_views') IS NOT NULL")
+    if Spi::get_one::<bool>("SELECT to_regclass('shiba_internal.dataflows') IS NOT NULL")
         .ok()
         .flatten()
         != Some(true)
@@ -179,9 +236,7 @@ unsafe fn prepare_stream_drops(pstmt: *mut pg_sys::PlannedStmt) {
         let argument = unsafe { [DatumWithOid::new(*relation_oid, pg_sys::OIDOID)] };
         let is_source = Spi::get_one_with_args::<bool>(
             "SELECT EXISTS (
-               SELECT 1 FROM shiba_internal.stream_views WHERE source_oid=$1
-               UNION ALL
-               SELECT 1 FROM shiba_internal.inner_join_views WHERE right_source_oid=$1
+               SELECT 1 FROM shiba_internal.dataflow_sources WHERE source_oid=$1
              )",
             &argument,
         )
@@ -199,7 +254,7 @@ unsafe fn prepare_stream_drops(pstmt: *mut pg_sys::PlannedStmt) {
         let argument = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
         let is_result = Spi::get_one_with_args::<bool>(
             "SELECT EXISTS (
-               SELECT 1 FROM shiba_internal.stream_views WHERE result_oid=$1
+               SELECT 1 FROM shiba_internal.dataflows WHERE result_oid=$1
              )",
             &argument,
         )
@@ -217,7 +272,7 @@ unsafe fn prepare_stream_drops(pstmt: *mut pg_sys::PlannedStmt) {
             .collect::<Vec<_>>()
             .join(",");
         Spi::run(&format!(
-            "SELECT shiba._prepare_stream_drops(ARRAY[{oid_list}]::oid[])"
+            "SELECT shiba._prepare_dataflow_drops(ARRAY[{oid_list}]::oid[])"
         ))
         .expect("Shiba failed to quiesce result DAGs before DROP");
     }
@@ -241,16 +296,16 @@ unsafe fn guard_drop_owned_ast(drop_statement: *mut pg_sys::DropOwnedStmt) {
     }
 }
 
-fn lock_all_dags_before_indirect_drop() {
-    if Spi::get_one::<bool>("SELECT to_regclass('shiba_internal.stream_views') IS NOT NULL")
+fn lock_all_dataflows_before_indirect_drop() {
+    if Spi::get_one::<bool>("SELECT to_regclass('shiba_internal.dataflows') IS NOT NULL")
         .ok()
         .flatten()
         != Some(true)
     {
         return;
     }
-    Spi::run("SELECT shiba_internal._lock_all_dags_for_utility()")
-        .expect("Shiba failed to serialize indirect DROP with DAG execution");
+    Spi::run("SELECT shiba_internal._lock_all_dataflows_for_utility()")
+        .expect("Shiba failed to serialize indirect DROP with dataflow execution");
 }
 
 unsafe fn guard_extension_drop_ast(drop_statement: *mut pg_sys::DropStmt) {
@@ -302,20 +357,16 @@ fn ensure_shiba_slot_inactive() {
     .expect("Shiba failed to inspect its logical slot before DROP EXTENSION")
     .unwrap_or(false);
     let catalog_exists = Spi::get_one::<bool>(
-        "SELECT to_regclass('shiba_internal.stream_views') IS NOT NULL
-           AND to_regclass('shiba_internal.runtime_state') IS NOT NULL
-           AND to_regclass('shiba_internal.dag_runtime_state') IS NOT NULL",
+        "SELECT to_regclass('shiba_internal.dataflows') IS NOT NULL
+           AND to_regclass('shiba_internal.runtime_state') IS NOT NULL",
     )
     .expect("Shiba failed to inspect its catalog before DROP EXTENSION")
     .unwrap_or(false);
     let lifecycle_clean = if catalog_exists {
         Spi::get_one::<bool>(
-            "SELECT NOT EXISTS (SELECT 1 FROM shiba_internal.stream_views)
+            "SELECT NOT EXISTS (SELECT 1 FROM shiba_internal.dataflows)
                AND NOT EXISTS (
                  SELECT 1 FROM shiba_internal.runtime_state WHERE active
-               )
-               AND NOT EXISTS (
-                 SELECT 1 FROM shiba_internal.dag_runtime_state WHERE active
                )
                AND NOT EXISTS (
                  SELECT 1
@@ -333,16 +384,13 @@ fn ensure_shiba_slot_inactive() {
     }
 }
 
-unsafe fn shiba_table_declaration(
-    pstmt: *mut pg_sys::PlannedStmt,
-    query_string: *const std::ffi::c_char,
-) -> Option<String> {
-    if pstmt.is_null() || query_string.is_null() {
-        return None;
+unsafe fn is_shiba_table_declaration(pstmt: *mut pg_sys::PlannedStmt) -> bool {
+    if pstmt.is_null() {
+        return false;
     }
     let utility = (*pstmt).utilityStmt;
     if utility.is_null() {
-        return None;
+        return false;
     }
     let target_relation = match (*utility).type_ {
         pg_sys::NodeTag::T_CreateStmt => utility
@@ -355,30 +403,14 @@ unsafe fn shiba_table_declaration(
             .and_then(|create| create.into.as_ref())
             .map(|into| into.rel),
         _ => None,
-    }?;
+    };
+    let Some(target_relation) = target_relation else {
+        return false;
+    };
     if target_relation.is_null() {
-        return None;
+        return false;
     }
     let target_namespace = pg_sys::RangeVarGetCreationNamespace(target_relation);
     let shiba_namespace = pg_sys::get_namespace_oid(c"shiba".as_ptr(), true);
-    if target_namespace != shiba_namespace || shiba_namespace == pg_sys::InvalidOid {
-        return None;
-    }
-    let query_bytes = CStr::from_ptr(query_string).to_bytes();
-    let statement_start = (*pstmt).stmt_location;
-    if statement_start < 0 || statement_start as usize >= query_bytes.len() {
-        return None;
-    }
-    let statement_start = statement_start as usize;
-    let statement_end = if (*pstmt).stmt_len <= 0 {
-        query_bytes.len()
-    } else {
-        statement_start
-            .saturating_add((*pstmt).stmt_len as usize)
-            .min(query_bytes.len())
-    };
-    let statement = String::from_utf8_lossy(&query_bytes[statement_start..statement_end])
-        .trim()
-        .to_string();
-    Some(statement)
+    shiba_namespace != pg_sys::InvalidOid && target_namespace == shiba_namespace
 }

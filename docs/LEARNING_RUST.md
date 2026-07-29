@@ -1,173 +1,413 @@
-# Learn Rust by reading Shiba
+# Reading Shiba as a Rust project
 
-Shiba is a real PostgreSQL extension, but its Rust side has one linear story:
+This guide assumes you know structs, enums, `match`, `Option`, `Result`,
+iterators, borrowing, and ownership. It does not assume PostgreSQL extension
+experience.
+
+Shiba has two main Rust paths:
 
 ```text
-bytes -> messages -> committed changes -> plans -> one Runtime loop -> SQL
+registration:
+  analyzed PostgreSQL Query
+    → DataflowPlan
+    → typed streams/state/continuation relations
+
+execution:
+  pgoutput bytes
+    → bounded ingress batch
+    → source EffectStream
+    → bounded Rust kernel steps
+    → Sink
 ```
 
-You do not need to understand PostgreSQL internals before starting. Read the
-files below in order and stop after any chapter; each one teaches a useful
-piece of Rust on its own.
+Rust owns protocol parsing, Query lowering, kernel phase/continuation state
+machines, budgets, recovery decisions, and scheduling. PostgreSQL owns durable
+typed relations, set operations, locks, and transaction commit.
 
-## 0. Get a green baseline
+Read [`ARCHITECTURE.md`](ARCHITECTURE.md) first if the execution path itself is
+not yet clear.
 
-Shiba requires PostgreSQL 17, its development headers, Rust, and
-`cargo-pgrx 0.19.1`. After the setup in the main README, run:
+For one live ingress batch, this is the function-level path to keep in view:
 
-```bash
-cargo test --lib
-cargo clippy --all-targets -- -D warnings
+```text
+shiba_runtime_main
+├── ingest_and_publish_once
+│   ├── publish_source_once
+│   │     publishes work persisted by an earlier Runtime loop
+│   ├── ReplicationIngress::poll_batch
+│   └── persist_ingress_batch
+│         makes the new publication work durable
+└── step_ready_operators_bounded
+    └── step_one_operator
+        └── LoadedDataflow::step
+            └── execute_operator_step
+                └── crate::kernel::execute_step (dispatcher.rs)
+                    └── linear/join/distinct/aggregate/window/topn/sink::execute
+                        └── StepTxn::finish
 ```
 
-The unit suite includes real pgrx integration tests. If both commands pass,
-your environment matches CI.
+`ingest_and_publish_once` tries pending publication before reading more WAL, so
+a batch persisted near the bottom of one loop is normally published near the
+top of the next. A committed output chunk then makes a downstream stage
+runnable; the call tree is repeated once per bounded stage step until Sink
+commits the corresponding result effects.
 
-## 1. Start with a round trip
+## 1. Small pure-Rust helpers
 
-Open [`src/postgres.rs`](../src/postgres.rs).
+Start with [`src/postgres.rs`](../src/postgres.rs).
 
-This is the smallest complete module in Shiba. It quotes PostgreSQL identifiers
-and converts a WAL position between `u64` and PostgreSQL LSN text. It
-demonstrates:
+It parses and formats PostgreSQL LSNs and quotes identifiers. There are no
+PostgreSQL pointers in this file. Look for:
 
-- small pure functions;
-- `Result<T, E>` and the `?` operator;
-- integer conversion without hidden allocation;
-- table-driven tests;
-- why an encoder and decoder should be tested together.
+- checked integer conversions;
+- the difference between parsed values and display strings;
+- specific error returns instead of fallback values;
+- round-trip tests.
 
-Run only this chapter's tests:
+Run:
 
 ```bash
 cargo test --lib postgres::tests
 ```
 
-Try adding another malformed LSN case before changing the parser. The test
-gives you a safe place to learn pattern matching and error propagation.
+## 2. Parsing untrusted protocol bytes
 
-## 2. Read bytes without panicking
-
-Next open [`src/pgoutput.rs`](../src/pgoutput.rs), then
+Read [`src/pgoutput.rs`](../src/pgoutput.rs), then
 [`src/replication.rs`](../src/replication.rs).
 
-`pgoutput.rs` converts untrusted WAL bytes into typed messages.
-`replication.rs` owns the smaller libpq transport envelope. Together they show:
+`pgoutput.rs` turns a borrowed byte slice into message enums.
+`replication.rs` handles the libpq replication envelope and connection
+lifetime.
 
-- slices and checked offsets;
-- big-endian integer decoding;
-- lifetimes at a C FFI boundary;
-- RAII cleanup through `Drop`;
-- error enums and `std::error::Error`;
-- why protocol parsers test every truncation point.
+Follow one INSERT from its tag byte to `Message::Insert`. Then follow an UPDATE
+with `UnchangedToast`; ingress must receive a complete old and new row image.
 
-The important rule is simple: validate a length before slicing. Search for
-`require_length` and follow one message from its tag byte to its enum variant.
+Relevant Rust details:
+
+- slice bounds are checked before indexing;
+- protocol variants are enums, not string tags;
+- the parser borrows bytes where ownership is unnecessary;
+- `?` preserves the original error path;
+- `Drop` releases libpq resources;
+- `unsafe` is kept at the FFI boundary.
+
+Run:
 
 ```bash
 cargo test --lib pgoutput::tests
 cargo test --lib replication::tests
 ```
 
-## 3. Follow a state machine
+The truncation tests cut valid messages at every byte offset. They verify that
+short input returns an error rather than panicking.
 
-Open [`src/ingress.rs`](../src/ingress.rs).
+## 3. The ingress state machine
 
-Ingress accepts replication messages, remembers transaction state, and emits a
-bounded batch only when it is safe. This chapter demonstrates:
+Read [`src/ingress.rs`](../src/ingress.rs).
 
-- modeling states with enums instead of boolean combinations;
-- keeping mutable state behind a narrow API;
-- separating transport from protocol logic;
-- applying row and byte budgets without splitting an indivisible message.
+`ReplicationIngress::poll_batch` owns the in-memory state for the pgoutput
+transaction currently being read. It returns one of:
 
-Draw the states on paper, then compare them with `IngressPoll` and
-`IngressFinalization`. If a transition is hard to name, it probably needs a
-type or test.
+- a bounded `IngressBatch`;
+- `Pending`, when no complete work is available yet;
+- `End`, when the replication connection ended.
+
+Look at:
+
+- `IngressBudget`;
+- the row and wire-byte counters;
+- `PendingBatch`;
+- `IngressFinalization`;
+- conversion of INSERT/DELETE/UPDATE into signed row effects.
+
+Transaction streaming is disabled, so the source transaction is already
+committed when its rows arrive. `IngressFinalization` still matters: it records
+whether Shiba has read the trailing protocol `Commit` and can advance its
+durable feedback LSN. Source data chunks may run before that record, but the
+generation-wide causal frontier cannot pass an unfinalized transaction.
+
+Run:
 
 ```bash
 cargo test --lib ingress::tests
 ```
 
-## 4. Turn PostgreSQL trees into Rust types
+## 4. PostgreSQL Query to one owned plan
 
-Read [`src/query_tree.rs`](../src/query_tree.rs) only at its public boundary,
-then move to [`src/query_analysis.rs`](../src/query_analysis.rs).
+Read these files together:
 
-The first file contains the unavoidable unsafe PostgreSQL pointer adapter. The
-second contains owned, ordinary Rust and turns an open analysis record into a
-closed `ValidatedQuery`. Together they show:
+1. [`src/ddl.rs`](../src/ddl.rs), starting at `inspect_ctas`
+2. [`src/query_lowering.rs`](../src/query_lowering.rs)
+3. [`src/logical/model.rs`](../src/logical/model.rs)
+4. [`src/logical/validate.rs`](../src/logical/validate.rs)
 
-- keeping `unsafe` at one boundary;
-- replacing related booleans with enums and structs;
-- `TryFrom`-style validation;
-- making unsupported states fail before execution.
+`ddl.rs` receives PostgreSQL-owned `pg_sys::Query` pointers.
+`query_lowering.rs` converts them immediately into owned Rust values:
 
-## 5. Compile data into data
+- a stage ID is a `u32` equal to the stage's array position;
+- `SlotId` identifies an output;
+- `BindingId` identifies a local input;
+- `SlotType` records type OID, typmod, collation, and nullability;
+- `OperatorSpec` records one generic operator contract.
 
-Read the `src/logical/` directory in this order:
+`DataflowPlan` is the only persisted plan. There is no second physical-plan
+type and no runtime plan rewrite.
 
-1. [`model.rs`](../src/logical/model.rs) — the persisted JSON contract;
-2. [`compile.rs`](../src/logical/compile.rs) — metadata becomes a logical DAG;
-3. [`validate.rs`](../src/logical/validate.rs) — invalid graphs fail closed;
-4. [`physical.rs`](../src/logical/physical.rs) — logical nodes become stages;
-5. [`runtime.rs`](../src/logical/runtime.rs) — the thin PostgreSQL bridge.
+`validate.rs` checks the graph after lowering and after JSON reload. Serde
+uses `deny_unknown_fields`, so removing a plan field is a clean cut: old JSON
+does not silently acquire default behavior.
 
-This part shows a scalable Rust design: persisted data types stay small,
-construction, validation, lowering, and execution live in separate modules,
-and each boundary returns a typed result.
+Useful Rust details:
+
+- owned values leave the `unsafe` PostgreSQL pointer scope;
+- `SlotId` and `BindingId` newtypes prevent mixing output and input identities;
+- recursive enums represent scalar expressions;
+- deterministic collections keep plan output stable;
+- validation is separate from deserialization.
+
+Run:
 
 ```bash
-cargo test --lib logical::tests
-cargo test --lib logical::physical::tests
+cargo test --lib query_lowering
+cargo test --lib logical::
 ```
 
-## 6. See the whole system in one loop
+## 5. Compiling typed scalar SQL
 
-Finally open [`src/worker.rs`](../src/worker.rs) and begin at
+Read [`src/scalar_sql.rs`](../src/scalar_sql.rs).
+
+The persisted plan contains an AST and catalog OIDs, not user-provided SQL
+fragments. The compiler:
+
+1. resolves each OID again;
+2. checks the trusted `pg_catalog` boundary and function properties;
+3. quotes current identifiers;
+4. renders typed constants and arguments.
+
+`SqlBinding` maps a `BindingId` to a kernel-controlled table alias and column
+name. This is why a kernel can generate dynamic typed SQL without concatenating
+arbitrary query text.
+
+The catalog is exposed through a small trait. Production uses SPI; unit tests
+use a deterministic fake implementation.
+
+## 6. Runnable state and the ready queue
+
+Read:
+
+1. [`src/logical/dataflow.rs`](../src/logical/dataflow.rs)
+2. [`src/logical/runtime.rs`](../src/logical/runtime.rs)
+
+The main types in `dataflow.rs` are:
+
+- `OperatorId`;
+- `InputFrontier`;
+- `DurableOperatorState`;
+- `WorkBudget`;
+- `StepOutcome`;
+- `ReadyQueue`.
+
+The queue contains only operator IDs. PostgreSQL rows own input positions,
+continuations, and output capacity. `ReadyQueue::rebuild` sorts runnable IDs,
+so restart behavior does not depend on row-return order.
+
+`runtime.rs` loads those durable facts with SPI and dispatches one stage. A
+`LoadedDataflow` is only a validated plan cache plus ready queue; dropping it
+does not lose progress.
+
+Run:
+
+```bash
+cargo test --lib logical::dataflow::tests
+```
+
+## 7. The common step transaction
+
+Read [`src/kernel/step.rs`](../src/kernel/step.rs).
+
+`StepTxn` does not start a nested transaction. The background worker has
+already opened one PostgreSQL transaction. `StepTxn::begin`:
+
+1. applies the plan's execution settings;
+2. locks input and output streams in stream-ID order;
+3. locks the checkpoint and consumer cursors;
+4. loads the checkpoint's shared admission row/byte counters;
+5. checks output backpressure;
+6. returns `Idle`, `Blocked`, or a ready `StepTxn`.
+
+The kernel then uses `read`, `lock`, and `write` through this value.
+`StepTxn::finish` updates the checkpoint only if its revision still equals the
+value locked at step start. The kernel passes the continuation fact already
+returned and validated by its bounded SQL primitive; the common path does not
+issue a second `count(*)`.
+
+Important invariant: after a kernel performs durable writes, it may finish
+with `Progress`/`Yield` or return an error. It does not return `Idle`/`Blocked`
+and commit partial work.
+
+Read [`src/kernel/stream.rs`](../src/kernel/stream.rs) next. It contains the
+shared chunk lookup, payload facts, output append, frontier append, and input
+cursor advance operations.
+
+## 8. Start with a stateless kernel
+
+Read [`src/kernel/linear.rs`](../src/kernel/linear.rs).
+
+The entry point handles Scan, Filter, and Project using the same control path.
+Follow:
+
+1. operator-spec validation;
+2. current chunk and continuation loading;
+3. input binding compilation;
+4. one bounded set SQL statement;
+5. output append;
+6. input advance or continuation replacement;
+7. `StepTxn::finish`.
+
+This file shows the intended kernel boundary: Rust has the phase and validates
+database facts; SQL performs typed set work over a bounded prefix.
+
+Then read [`src/kernel/sink.rs`](../src/kernel/sink.rs). Sink has no output
+stream. Its result-table DML and cursor/checkpoint changes still use the same
+step transaction, which is the exactly-once boundary.
+
+## 9. Read one high-fanout state machine
+
+Read [`src/kernel/join.rs`](../src/kernel/join.rs).
+
+Start with the Rust enums and structs, then inspect the generated SQL. The Rust
+types represent:
+
+- current input port;
+- current input row;
+- phase;
+- opposite-side keyset cursor;
+- match counters;
+- continuation transition results.
+
+Then follow `execute`. A high-fanout input row is not expanded into a Rust
+`Vec` of all matches. Each step asks PostgreSQL for one bounded keyset prefix,
+appends one output chunk, and persists the next cursor.
+
+After Join, compare:
+
+- [`distinct.rs`](../src/kernel/distinct.rs): exact SQL-key group state,
+  a typed bag of physical representatives, then an immediate bounded Drain of
+  the durable `-old,+new` effect queue;
+- [`aggregate.rs`](../src/kernel/aggregate.rs): Apply into an input bag and
+  dirty groups, then Drain rebuild and output replacement;
+- [`window.rs`](../src/kernel/window.rs): Apply into partition state, then
+  Drain through partition/frame/function phases;
+- [`topn.rs`](../src/kernel/topn.rs): Apply into ordered state, then Drain its
+  boundary and output diff.
+
+For Aggregate, Window, and TopN, a completed input chunk may advance before
+Drain starts. The durable Drain continuation therefore refers to typed state,
+not to a consumed chunk. `StepTxn` keeps their common admitted row/byte count;
+Aggregate keeps causal LSNs with dirty groups, Window with dirty partitions,
+and TopN in its singleton control row. The counters are cumulative since the
+last output frontier. Drain thresholds grow as `Q, 2Q, 4Q, ...` up to a fixed
+interval cap; an ordinary Drain retains the counters, and forwarding the
+frontier clears them in the same transaction.
+
+Window aggregate Fold may visit several output ordinals in one step. It counts
+frame-input rows/bytes, then charges one row plus the materialized
+function/candidate bytes for each finalization. If an accumulator is complete
+but finalization does not fit the remaining budget,
+`WindowFoldCursor::ready_to_finalize` persists that exact state. A missing
+frame relation row is a durable-state error, not an empty frame. Real empty
+frames still consume work items and are capped at 64 ordinals per step.
+
+Distinct is deliberately the exception: Apply pins its input chunk until its
+per-page effect queue is empty. With a one-row output budget, one Drain step
+publishes the `-old` retraction and a later step publishes the `+new` insertion;
+neither admits later input or a frontier in between.
+
+## 10. Registration and generated storage
+
+Read [`src/kernel/register.rs`](../src/kernel/register.rs).
+
+Registration walks the already validated `DataflowPlan` and creates:
+
+- one typed payload relation per stream;
+- one continuation relation per stage;
+- typed state relations required by that operator;
+- catalog rows that record relation and row-type OIDs.
+
+The operator modules expose their own `provision` function, but common OID,
+attribute, identifier, and payload checks are shared.
+
+Then return to [`src/ddl.rs`](../src/ddl.rs). The CTAS hook:
+
+1. lowers the query;
+2. locks source tables in OID order;
+3. asks PostgreSQL to create only the result schema;
+4. registers the plan and generated storage;
+5. copies the source snapshot into typed Scan bootstrap state.
+
+This is the main `unsafe` area because PostgreSQL owns the utility-statement
+pointers. The plan and registration contracts themselves are owned Rust data.
+
+## 11. The one Runtime loop
+
+Read [`src/worker.rs`](../src/worker.rs) by following calls from
 `shiba_runtime_main`.
 
-Do not read it top to bottom. Follow the loop's four phases:
+The loop performs:
 
-1. `route_ingress_once`;
-2. `ready_dag_oids`;
-3. `apply_ready_dags_bounded`;
-4. `gc_change_log`.
+```text
+publish one pending source prefix
+read one ingress batch when publication is drained
+keep replication feedback alive while publication is backpressured
+run a bounded round of ready operator steps
+periodically GC durable staging
+```
 
-Every phase is bounded, and only this one backend mutates its runtime cache.
-That single-owner rule is why the cache needs no thread synchronization. The
-hard database work stays in set-oriented SQL under `sql/`.
+Every source publication and operator step is wrapped in
+`BackgroundWorker::transaction`. A panic or error before the closure returns
+aborts that transaction. A crash after return sees the committed cursor and
+checkpoint on restart.
 
-At this point, read [`src/lib.rs`](../src/lib.rs). The module declarations and
-ordered `extension_sql_file!` calls should now look like a table of contents.
+The outer loop has a time/step budget, but it cannot interrupt a PostgreSQL
+statement. This is why each kernel's SQL primitive must enforce its own row
+and byte bounds.
 
-## Where Rust stops and SQL starts
+## 12. What remains in SQL files
 
-Shiba does not force row-oriented work into Rust:
+Read the installation order in [`src/lib.rs`](../src/lib.rs):
 
-| Rust owns | SQL owns |
+| File | Responsibility |
 | --- | --- |
-| hooks and process lifecycle | durable catalogs |
-| WAL transport and decoding | set-oriented operator kernels |
-| query-tree validation | result and operator state |
-| logical and physical plans | transactional acknowledgement |
-| bounded scheduling | garbage collection queries |
+| `sql/00_catalog.sql` | common durable catalog and constraints |
+| `sql/10_runtime.sql` | activation and Runtime identity |
+| `sql/11_ingress.sql` | ingress persistence and source publication |
+| `sql/12_effect_stream.sql` | shared stream append/cursor/GC primitives |
+| `sql/25_introspection.sql` | dataflow inspection |
+| `sql/30_registration.sql` | SQL-visible registration boundary and grants |
+| `sql/40_lifecycle.sql` | progress, index, drop, and deactivate APIs |
 
-That boundary is deliberate. Rust is used where types, byte safety, and state
-machines matter; PostgreSQL is used where transactions and relational
-execution matter.
+Operator phase machines do not live in PL/pgSQL. SQL files define catalog and
+shared transactional primitives; Rust kernels generate the small typed set
+operations needed for a particular step.
 
-## Good first contributions
+## Running checks
 
-Keep early changes observable and reversible:
+Use focused tests while reading:
 
-- improve a parser or protocol error message and add its failing test first;
-- replace duplicated PostgreSQL text handling with a helper plus round-trip
-  tests;
-- document one enum's states or one Runtime invariant;
-- add a malformed protocol case;
-- simplify a function while keeping its test names and outcomes unchanged.
+```bash
+cargo test --lib postgres::tests
+cargo test --lib pgoutput::tests
+cargo test --lib ingress::tests
+cargo test --lib logical::
+cargo test --lib kernel::
+```
 
-Before submitting a change, run the focused tests while editing and the full
-gate described in [`docs/TESTING.md`](TESTING.md) when execution, persistence,
-or recovery behavior changes.
+Run the complete gate before changing persistence, locking, continuation, or
+recovery behavior:
+
+```bash
+./scripts/test-all.sh
+```
+
+Server-level gates and their invariants are listed in
+[`TESTING.md`](TESTING.md).

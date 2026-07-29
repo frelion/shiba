@@ -20,7 +20,7 @@ AS $$
     WHERE extname = 'shiba'
 $$;
 
--- Keep Shiba's runtime identity and DAG locks out of the common small-key
+-- Keep Shiba's runtime identity and dataflow locks out of the common small-key
 -- advisory-lock space. Advisory locks remain cooperative by design.
 CREATE FUNCTION shiba_internal.identity_lock_namespace()
 RETURNS integer
@@ -32,7 +32,7 @@ AS $$
     SELECT 1397246274
 $$;
 
-CREATE FUNCTION shiba_internal.dag_lock_key(result_relation oid)
+CREATE FUNCTION shiba_internal.dataflow_lock_key(result_relation oid)
 RETURNS bigint
 LANGUAGE sql
 IMMUTABLE
@@ -57,7 +57,7 @@ AS $$
     )
 $$;
 
-CREATE FUNCTION shiba._begin_stream_registration()
+CREATE FUNCTION shiba._begin_dataflow_registration()
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -89,8 +89,9 @@ BEGIN
 END;
 $$;
 
--- Delete only confirmed, fully routed ingress transactions for which no DAG
--- reference remains. Deleting the transaction cascades to its one payload.
+-- Delete only slot-confirmed ingress transactions whose source effects are
+-- publication-safe.  Typed stream payload has its own consumer-driven GC;
+-- deleting this staging copy cannot remove a published effect.
 CREATE FUNCTION shiba._gc_change_log(max_transactions integer)
 RETURNS bigint
 LANGUAGE plpgsql
@@ -114,29 +115,8 @@ BEGIN
           AND txn.finalized_at < clock_timestamp()
               - pg_catalog.current_setting('shiba.ingress_retention')::interval
           AND replay.replay_safe_lsn >= txn.end_lsn
-          AND NOT EXISTS (
-              SELECT 1
-                FROM shiba_internal.routing_tasks AS task
-               WHERE task.ingress_txn_id = txn.ingress_txn_id
-                 AND task.status <> 'complete'
-          )
-          AND NOT EXISTS (
-              SELECT 1
-                FROM shiba_internal.ingress_apply_batches AS batch
-               WHERE batch.ingress_txn_id = txn.ingress_txn_id
-                 AND NOT EXISTS (
-                     SELECT 1
-                       FROM shiba_internal.routing_tasks AS task
-                      WHERE task.ingress_txn_id = batch.ingress_txn_id
-                        AND task.batch_ordinal = batch.batch_ordinal
-                        AND task.status = 'complete'
-                 )
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM shiba_internal.dag_inbox AS inbox
-            WHERE inbox.ingress_txn_id = txn.ingress_txn_id
-          )
+          AND replay.published_lsn >= txn.final_lsn
+          AND txn.pending_publications = 0
         ORDER BY txn.commit_lsn
         LIMIT max_transactions
         FOR UPDATE SKIP LOCKED
@@ -174,7 +154,7 @@ CREATE FUNCTION shiba.activate()
 RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, shiba_internal, public
+SET search_path = pg_catalog, shiba_internal
 AS $$
 DECLARE
     slot_created boolean;
@@ -218,20 +198,18 @@ BEGIN
     UPDATE shiba_internal.runtime_state
     SET active = true,
         last_heartbeat = NULL,
-        last_requested_at = NULL,
         pending_launch_xid = NULL,
         pending_since = NULL
     WHERE singleton AND NOT active;
-    UPDATE shiba_internal.dag_runtime_state
+    UPDATE shiba_internal.dataflows
     SET active = true
-    WHERE NOT active AND failed_at IS NULL;
+    WHERE NOT active;
     -- These queue relations are born empty.  Seed zero-row statistics before
     -- the first source commit so PostgreSQL does not plan the first handful
     -- of Runtime transactions with its default unknown-table cardinality.
     ANALYZE shiba_internal.ingress_transactions;
     ANALYZE shiba_internal.change_log;
-    ANALYZE shiba_internal.routing_tasks;
-    ANALYZE shiba_internal.dag_inbox;
+    ANALYZE shiba_internal.source_publications;
     PERFORM shiba._ensure_runtime();
     RETURN true;
 END;
@@ -277,7 +255,6 @@ BEGIN
     SET owner_pid = NULL,
         started_at = NULL,
         last_heartbeat = NULL,
-        last_requested_at = clock_timestamp(),
         launch_generation = next_generation,
         pending_launch_xid = launch_xid,
         pending_since = clock_timestamp()
@@ -289,36 +266,7 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION shiba._lock_sources_for_analysis(analysis jsonb)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, shiba_internal, public
-AS $$
-DECLARE
-    source_oid oid;
-    source_name text;
-BEGIN
-    FOR source_oid IN
-      SELECT DISTINCT oid
-      FROM (
-        SELECT (source ->> 'oid')::oid AS oid
-        FROM jsonb_array_elements(analysis -> 'sources') source
-        UNION ALL
-        SELECT (subquery ->> 'source_oid')::oid
-        FROM jsonb_array_elements(coalesce(analysis -> 'subqueries','[]'::jsonb)) subquery
-      ) sources
-      ORDER BY oid
-    LOOP
-      SELECT format('%I.%I',n.nspname,c.relname) INTO STRICT source_name
-      FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-      WHERE c.oid=source_oid;
-      EXECUTE format('LOCK TABLE %s IN SHARE ROW EXCLUSIVE MODE',source_name);
-    END LOOP;
-END;
-$$;
-
-CREATE FUNCTION shiba._prepare_stream_drops(result_relations oid[])
+CREATE FUNCTION shiba._prepare_dataflow_drops(result_relations oid[])
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -329,31 +277,27 @@ DECLARE
     source_oid oid;
     source_name text;
 BEGIN
-    -- DAG execution takes this transaction advisory lock before touching
+    -- Dataflow execution takes this transaction advisory lock before touching
     -- state. Acquire every result lock globally before every globally sorted
     -- source lock, so overlapping multi-result DROP statements cannot invert.
     FOR result_relation IN
       SELECT DISTINCT result_oid
-      FROM shiba_internal.stream_views
+      FROM shiba_internal.dataflows
       WHERE result_oid=ANY(result_relations)
       ORDER BY result_oid
     LOOP
-      PERFORM pg_advisory_xact_lock(shiba_internal.dag_lock_key(result_relation));
+      PERFORM pg_advisory_xact_lock(
+        shiba_internal.dataflow_lock_key(result_relation)
+      );
     END LOOP;
-    UPDATE shiba_internal.dag_runtime_state
+    UPDATE shiba_internal.dataflows
     SET active=false
     WHERE result_oid=ANY(result_relations);
     FOR source_oid IN
-      SELECT DISTINCT oid FROM (
-        SELECT stream.source_oid AS oid
-        FROM shiba_internal.stream_views stream
-        WHERE stream.result_oid=ANY(result_relations)
-        UNION
-        SELECT joined.right_source_oid
-        FROM shiba_internal.inner_join_views joined
-        WHERE joined.result_oid=ANY(result_relations)
-      ) sources
-      ORDER BY oid
+      SELECT DISTINCT source.source_oid
+      FROM shiba_internal.dataflow_sources AS source
+      WHERE source.result_oid=ANY(result_relations)
+      ORDER BY source.source_oid
     LOOP
       SELECT format('%I.%I',n.nspname,c.relname) INTO STRICT source_name
       FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
@@ -365,10 +309,11 @@ $$;
 
 -- DDL that can remove a result indirectly (for example DROP SCHEMA/OWNED
 -- ... CASCADE) cannot enumerate its final relation targets before PostgreSQL
--- dependency expansion. Acquire every DAG lifecycle lock first, in canonical
--- order, so the later sql_drop cleanup never reverses apply's DAG -> relation
--- lock order. This intentionally does not deactivate unrelated DAGs.
-CREATE FUNCTION shiba_internal._lock_all_dags_for_utility()
+-- dependency expansion. Acquire every dataflow lifecycle lock first, in
+-- canonical order, so the later sql_drop cleanup never reverses apply's
+-- dataflow -> relation lock order. This intentionally does not deactivate
+-- unrelated dataflows.
+CREATE FUNCTION shiba_internal._lock_all_dataflows_for_utility()
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -379,23 +324,14 @@ DECLARE
 BEGIN
     FOR result_relation IN
       SELECT result_oid
-      FROM shiba_internal.stream_views
+      FROM shiba_internal.dataflows
       ORDER BY result_oid
     LOOP
       PERFORM pg_advisory_xact_lock(
-        shiba_internal.dag_lock_key(result_relation)
+        shiba_internal.dataflow_lock_key(result_relation)
       );
     END LOOP;
 END;
-$$;
-
-CREATE FUNCTION shiba._prepare_stream_drop(result_relation oid)
-RETURNS void
-LANGUAGE sql
-SECURITY DEFINER
-SET search_path=pg_catalog,shiba_internal
-AS $$
-  SELECT shiba._prepare_stream_drops(ARRAY[result_relation])
 $$;
 
 CREATE FUNCTION shiba._request_runtime()
@@ -412,7 +348,7 @@ BEGIN
         PERFORM shiba._ensure_runtime();
         -- The Rust callback sets the Runtime latch only after this source
         -- transaction commits. Logical decoding therefore sees committed WAL
-        -- immediately without reducing the fallback poll or carrying rows.
+        -- immediately without reducing the idle poll or carrying rows.
         PERFORM shiba.wake_runtime_on_commit(state.owner_pid)
         FROM shiba_internal.runtime_state AS state
         WHERE state.singleton
@@ -458,64 +394,44 @@ BEGIN
     END IF;
     IF source_has_rls THEN
         RAISE EXCEPTION
-            'Shiba MVP does not support source tables with row-level security enabled or forced'
+            'Shiba sources cannot use row-level security'
             USING ERRCODE = 'feature_not_supported';
     END IF;
-    -- The MVP stores complete tuples as JSON.  Reject sources that can emit
-    -- unchanged-TOAST markers instead of silently deriving an incorrect row.
-    IF EXISTS (
-        SELECT 1 FROM pg_attribute
-        WHERE attrelid = source_relation AND attnum > 0 AND NOT attisdropped
-          AND attstorage <> 'p'
-    ) THEN
-        RAISE EXCEPTION 'Shiba MVP does not support TOASTable source columns'
-            USING ERRCODE = 'feature_not_supported';
-    END IF;
-    -- State identity round-trips through typed JSONB in a dedicated Runtime
-    -- session. Keep the MVP to built-in types whose input/output settings are
-    -- explicitly normalized; locale-sensitive money and arbitrary user base
-    -- types could otherwise encode the same value differently across sessions.
+    -- Ingress reconstructs unchanged TOAST columns from the UPDATE old tuple.
+    -- Generated storage and scalar evaluation accept PostgreSQL's built-in
+    -- types; user-defined type I/O is outside the trusted execution boundary.
     IF EXISTS (
         SELECT 1
-        FROM pg_attribute
-        WHERE attrelid=source_relation
-          AND attnum>0
-          AND NOT attisdropped
-          AND atttypid<>ALL(ARRAY[
-            'boolean'::regtype,
-            'smallint'::regtype,
-            'integer'::regtype,
-            'bigint'::regtype,
-            'real'::regtype,
-            'double precision'::regtype,
-            'numeric'::regtype,
-            'date'::regtype,
-            'time without time zone'::regtype,
-            'time with time zone'::regtype,
-            'timestamp without time zone'::regtype,
-            'timestamp with time zone'::regtype,
-            'interval'::regtype,
-            'uuid'::regtype,
-            'pg_lsn'::regtype,
-            'oid'::regtype,
-            'name'::regtype,
-            'text'::regtype,
-            'character varying'::regtype,
-            'character'::regtype,
-            'bytea'::regtype,
-            'bit'::regtype,
-            'bit varying'::regtype,
-            'inet'::regtype,
-            'cidr'::regtype,
-            'macaddr'::regtype,
-            'macaddr8'::regtype,
-            'json'::regtype,
-            'jsonb'::regtype
-          ]::oid[])
+        FROM pg_attribute AS attribute
+        JOIN pg_type AS type_catalog
+          ON type_catalog.oid = attribute.atttypid
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = type_catalog.typnamespace
+        WHERE attribute.attrelid = source_relation
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+          AND namespace.nspname <> 'pg_catalog'
     ) THEN
         RAISE EXCEPTION
-          'Shiba MVP source columns must use supported built-in identity types'
+          'Shiba source columns must use pg_catalog types'
           USING ERRCODE='feature_not_supported';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM pg_attribute AS attribute
+        JOIN pg_collation AS collation_catalog
+          ON collation_catalog.oid = attribute.attcollation
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = collation_catalog.collnamespace
+        WHERE attribute.attrelid = source_relation
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+          AND attribute.attcollation <> 0::oid
+          AND namespace.nspname <> 'pg_catalog'
+    ) THEN
+        RAISE EXCEPTION
+          'Shiba source columns must use pg_catalog collations'
+          USING ERRCODE = 'feature_not_supported';
     END IF;
 END;
 $$;

@@ -4,97 +4,80 @@
 [![Latest release](https://img.shields.io/github/v/release/frelion/shiba)](https://github.com/frelion/shiba/releases)
 [![License: PostgreSQL](https://img.shields.io/badge/license-PostgreSQL-blue.svg)](LICENSE)
 
-Shiba is a PostgreSQL 17 extension that keeps SQL result tables updated from
-committed WAL changes, without rescanning the source tables after each write.
+Shiba is a PostgreSQL 17 extension for continuously maintained SQL result
+tables. It reads committed WAL changes, propagates typed row effects through a
+stateful dataflow, and applies the final effects to an ordinary PostgreSQL
+table.
 
-> Status: experimental v0.1. Shiba supports a validated SQL subset and is not
-> a distributed execution engine.
+Status: experimental v0.1. Shiba is single-node and asynchronous.
 
-## Architecture
+## How it works
 
 ```mermaid
 flowchart LR
-    TX["source transaction"] -->|"COMMIT"| WAL["PostgreSQL WAL"]
-    WAL --> WS["pgoutput / walsender"]
+    WAL["committed WAL"] --> IN["bounded ingress"]
+    IN --> SRC[("shared source stream")]
+    SRC --> S["Scan"]
+    S --> O["generic Rust kernels<br/>bounded typed SQL"]
+    O --> K["Sink"]
+    K --> R[("result table")]
 
-    subgraph PG["PostgreSQL relations"]
-        LOG[("shared change_log")]
-        BATCH[("stable input ranges")]
-        INBOX[("per-result dag_inbox<br/>batch cursor")]
-        PLAN[("PhysicalDagPlan")]
-        SCRATCH[("current-batch<br/>UNLOGGED scratch")]
-        STATE[("operator state")]
-        RESULT[("result table")]
-    end
-
-    subgraph R["one Shiba Runtime per active database"]
-        DECODE["decode + bounded batching"]
-        ROUTE["find affected results"]
-        SCHEDULE["round-robin scheduler"]
-        APPLY["run the saved SQL plan"]
-    end
-
-    WS --> DECODE
-    DECODE --> LOG
-    LOG --> BATCH
-    BATCH -->|"each stable range"| ROUTE
-    ROUTE --> INBOX
-    INBOX --> SCHEDULE
-    SCHEDULE --> APPLY
-    PLAN -->|"read-only"| APPLY
-    APPLY --> SCRATCH
-    SCRATCH -->|"every batch commits"| STATE
-    SCRATCH -->|"every batch commits"| RESULT
-    STATE <-->|"read / write"| APPLY
-    APPLY -->|"advance batch cursor"| INBOX
+    ST[("typed durable state")] <--> S
+    ST <--> O
+    CT[("typed continuation")] <--> S
+    CT <--> O
+    CT <--> K
+    CP[("checkpoint")] <--> S
+    CP <--> O
+    CP <--> K
 ```
 
-Ingress normalizes DML into weighted rows: insert is `+1`, delete is `-1`, and
-update is `-1 old / +1 new`. It stores a source transaction once in
-`change_log` and records stable input ranges as it reads. Because pgoutput
-transaction streaming is disabled, PostgreSQL emits `Begin` and rows only
-after the source transaction has committed. The Runtime can therefore route
-and apply each stable range before it receives the trailing pgoutput `Commit`.
+Source DML becomes weighted rows:
 
-The scheduler reads one stable range per apply transaction. That transaction
-updates authoritative operator state, the result table, and the per-result
-batch cursor together. Each successful batch is immediately visible; a large
-source transaction is deliberately not one result-visibility boundary. If the
-consumer reaches the current end while the ingress transaction is still open,
-it keeps the inbox row and waits. The trailing `Commit` seals the batch list;
-only then may a consumer past the final range advance apply progress and remove
-the inbox entry. If one source transaction affects results A and B, their
-cursors advance independently. Replication feedback advances only after
-durable pgoutput `Commit` finalization, independently of result application.
+```text
+INSERT row       => (+1, row)
+DELETE old       => (-1, old)
+UPDATE old → new => (-1, old), (+1, new)
+```
 
-The detailed [architecture](docs/ARCHITECTURE.md) documents the stream model,
-operator state, scheduling, recovery, and resource bounds.
+Ingress persists and publishes bounded prefixes of a large source transaction
+without waiting for the trailing pgoutput `Commit` record. Operators consume
+bounded row-and-byte prefixes and persist a continuation when more work
+remains. A high-fanout Join therefore produces bounded chunks instead of
+materializing its full output in one transaction.
 
-The [Rust code tour](docs/LEARNING_RUST.md) traces the implementation from
-protocol parsers and state machines to PostgreSQL FFI and the Runtime loop.
+Aggregate, Window, and TopN separate input Apply from output Drain. Apply
+advances consumed chunks and records dirty state; Drain later rebuilds and
+publishes output in bounded pages. This avoids rebuilding the same state after
+every small fanout chunk.
 
-## Design constraints
+Every non-Sink stage writes one durable typed `EffectStream`. Each downstream
+input has its own cursor, so stream fanout shares payload instead of copying it.
+High/low watermarks propagate backpressure upstream.
 
-- Result maintenance is asynchronous and does not run inside the source
-  transaction.
-- PostgreSQL owns durable state and set-oriented SQL execution; Rust owns
-  protocol decoding, validation, planning, and scheduling.
-- Each active database has one Shiba Runtime. PostgreSQL logical decoding uses
-  a separate walsender.
-- Per-result source-commit and batch order is strict. Different results are
-  scheduled round-robin between ingress batches.
-- A running PostgreSQL statement is not preempted. High-fanout Join and large
-  Window/TopN work can still block the single Runtime.
+An operator step uses one PostgreSQL transaction so its internal state, cursor,
+continuation, output, and checkpoint recover together. The user-visible
+exactly-once boundary is a Sink step: result-table DML and the corresponding
+input position commit together. A source transaction is deliberately not a
+result-visibility boundary.
+
+There is one Shiba Runtime process per active database. Its in-memory plan
+cache and ready queue are disposable; PostgreSQL relations contain all
+recovery authority.
+
+The detailed [architecture](docs/ARCHITECTURE.md) follows an INSERT from WAL to
+the result table, then shows a real multi-source Join → Aggregate → Window →
+TopN DAG with its streams, state, recovery, and backpressure.
 
 ## Quick start
 
-### Requirements
+Requirements:
 
-- PostgreSQL 17 with development headers and `pg_config`;
-- Rust toolchain;
+- PostgreSQL 17 and its development headers;
+- a Rust toolchain;
 - `cargo-pgrx 0.19.1`.
 
-Install the extension from a checkout:
+Install from a checkout:
 
 ```bash
 cargo install cargo-pgrx --version 0.19.1
@@ -102,22 +85,26 @@ cargo pgrx init --pg17 /path/to/pg_config
 cargo pgrx install --pg-config /path/to/pg_config
 ```
 
-Configure and restart the target PostgreSQL server:
+Configure PostgreSQL and restart it:
 
 ```conf
 session_preload_libraries = 'shiba'
 wal_level = logical
 max_replication_slots = 4
+shiba.replication_conninfo = 'host=/var/run/postgresql dbname=my_database user=postgres'
 ```
 
-Activate Shiba once per database:
+Use peer, certificate, or passfile authentication for the replication
+connection; do not put a password in this setting.
+
+Activate Shiba in a database:
 
 ```sql
 CREATE EXTENSION shiba;
 SELECT shiba.activate();
 ```
 
-Then declare a streaming table:
+Create a source and a maintained result:
 
 ```sql
 CREATE TABLE public.orders (
@@ -133,36 +120,72 @@ FROM public.orders
 GROUP BY product_id;
 ```
 
-`shiba` is reserved for Shiba-managed result tables. Native PostgreSQL
-materialized views keep their normal `REFRESH MATERIALIZED VIEW` behavior.
-The complete SQL subset, permissions, and managed-index contract live in
-[docs/MVP.md](docs/MVP.md).
+The CTAS transaction creates the result schema and a durable typed snapshot for
+each Scan. The Runtime then sends that snapshot through the same dataflow used
+for live changes, so the result fills asynchronously after CTAS commits.
 
-## Supported query families
+Inspect progress and execution state:
 
-The current MVP supports typed Filter/Project, equality inner and outer joins,
-semi/anti joins from `EXISTS` and `IN`, grouped `COUNT`/`SUM`,
-`COUNT(DISTINCT)`, `HAVING`, top-level `DISTINCT`, ordered `LIMIT/OFFSET`, and
-partitioned windows. The exact contract and rejected SQL shapes are documented
-in [docs/MVP.md](docs/MVP.md).
+```sql
+SELECT * FROM shiba.progress('shiba.order_stats');
+SELECT shiba.explain_dataflow('shiba.order_stats');
+```
 
-## Development and testing
+The `shiba` schema is reserved for managed results. Native PostgreSQL
+materialized views keep their normal behavior. See [the SQL contract](docs/SQL.md)
+for accepted constructs, catalog restrictions, permissions, and lifecycle
+rules.
+
+## Query model
+
+PostgreSQL's analyzed query is lowered into one topologically ordered
+`DataflowPlan`. Complex queries compose these generic operators:
+
+- Scan
+- Filter
+- Project
+- Join
+- Distinct
+- Aggregate
+- Window
+- TopN
+- Sink
+
+Functions, operators, types, and collations are stored by catalog OID and
+revalidated before generated SQL runs. Shiba does not select a fixed
+query-family implementation and does not rescan source tables for live
+maintenance.
+
+## Resource controls
+
+The main bounds are:
+
+- `shiba.ingress_batch_rows`
+- `shiba.ingress_batch_bytes`
+- `shiba.stage_chunk_rows`
+- `shiba.stage_chunk_bytes`
+- `shiba.stage_admission_rows`
+- `shiba.stage_admission_bytes`
+- `shiba.max_cached_dataflows`
+- `shiba.max_cached_relations`
+- `shiba.runtime_work_mem`
+- `shiba.runtime_temp_file_limit`
+
+Ingress targets are checked after a complete pgoutput message, so one message
+(including both effects of an UPDATE) may cross them. Operator row targets are
+hard. One indivisible typed work item may exceed only the byte target and
+occupy one step; other work is split at a durable continuation.
+
+## Development
 
 ```bash
-cargo fmt -- --check
+cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ./scripts/test-all.sh
 ```
 
-The complete correctness and performance gates are documented in
-[docs/TESTING.md](docs/TESTING.md).
-
-## Releases
-
-Pushing a tag such as `v0.1.0` runs the release workflow. It builds a
-PostgreSQL 17 installation package, generates SHA-256 checksums, and publishes
-the artifacts to a GitHub Release. The process is described in
-[docs/RELEASING.md](docs/RELEASING.md).
+See [testing](docs/TESTING.md), the [Rust code tour](docs/LEARNING_RUST.md),
+and [release instructions](docs/RELEASING.md).
 
 ## License
 

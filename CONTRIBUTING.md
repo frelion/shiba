@@ -1,35 +1,62 @@
 # Contributing to Shiba
 
-Thanks for helping improve Shiba. Please open an issue before large changes so
-the supported SQL contract and recovery invariants can be discussed first.
-
-## Development setup
-
-Shiba targets PostgreSQL 17 and uses `cargo-pgrx 0.19.1`:
+Shiba targets PostgreSQL 17 and uses `cargo-pgrx 0.19.1`.
 
 ```bash
 cargo install cargo-pgrx --version 0.19.1
 cargo pgrx init --pg17 /path/to/pg_config
 ```
 
-## Before opening a pull request
+## Design rules
 
-Run the focused checks for your change, and run the complete gate when changing
-execution, registration, WAL routing, or recovery behavior:
+- PostgreSQL relations own durable state. Rust caches may be discarded at any
+  point.
+- `DataflowPlan` is the only plan contract from lowering through execution.
+- Operators exchange typed weighted rows through `EffectStream`.
+- One operator step atomically commits whichever durable changes it makes:
+  state, cursor, continuation, output, checkpoint, or Sink result DML.
+- Work is bounded by input/output rows and bytes. Large valid work resumes from
+  a typed durable continuation.
+- A source transaction is not a result-visibility boundary.
+- Missing kernels and unsupported catalog capabilities fail during
+  registration.
+- Contract changes are clean cuts. Delete removed types, JSON fields,
+  functions, tables, tests, and documentation; do not add aliases, dual writes,
+  decoder branches, or adapters for the old contract.
+
+## Before a pull request
+
+Run focused tests while editing and the complete gate before handing off a
+change to planning, persistence, operators, recovery, or lifecycle code:
 
 ```bash
-cargo fmt -- --check
+cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ./scripts/test-all.sh
 ```
 
-Every new operator or execution path should include plan-shape coverage,
-reference/differential coverage, end-to-end SQL coverage, and recovery coverage
-where applicable. Preserve commit ordering, atomic acknowledgement, and
-idempotent replay semantics.
+New operator behavior needs:
 
-## Pull requests
+- plan-shape and catalog-capability coverage;
+- real PostgreSQL result coverage;
+- row and byte bound assertions;
+- crash tests on both sides of commit;
+- backpressure and recovery coverage;
+- a chained DAG case when the operator can fan out or fan in.
 
-Describe the user-visible behavior, the supported SQL shape, correctness
-invariants, test commands, and any performance evidence. Do not present a
-filtered benchmark as the formal performance matrix.
+Do not run concurrent `cargo pgrx install` jobs against the same PostgreSQL
+installation.
+
+## Pull-request description
+
+State:
+
+- the user-visible behavior;
+- the plan or state contract that changed;
+- the recovery invariant;
+- the exact test commands and results;
+- any remaining unbounded statement or registration work.
+
+Performance claims need a reproducible workload, environment, raw measurements,
+and a matched baseline. Correctness gates must pass independently of benchmark
+results.

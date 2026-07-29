@@ -9,7 +9,6 @@ use crate::replication::{
     CopyDataPoll, ReplicationError, ReplicationMessage, ReplicationTransport,
 };
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -34,9 +33,6 @@ pub(crate) struct IngressBatch {
     pub source_xid: u32,
     pub final_lsn: u64,
     pub decode_end_lsn: u64,
-    pub digest: [u8; 32],
-    pub message_count: u64,
-    pub wire_bytes: u64,
     pub events: Vec<IngressEvent>,
     pub finalization: Option<IngressFinalization>,
 }
@@ -100,8 +96,6 @@ struct PendingBatch {
     source_xid: u32,
     final_lsn: u64,
     decode_end_lsn: u64,
-    hasher: Sha256,
-    message_count: u64,
     wire_bytes: u64,
     events: Vec<IngressEvent>,
     finalization: Option<IngressFinalization>,
@@ -116,8 +110,6 @@ impl PendingBatch {
             // batch. Begin.final_lsn identifies the whole transaction and
             // must never be treated as durable progress for a prefix batch.
             decode_end_lsn: 0,
-            hasher: Sha256::new(),
-            message_count: 0,
             wire_bytes: 0,
             events: Vec::new(),
             finalization: None,
@@ -126,10 +118,6 @@ impl PendingBatch {
 
     fn observe_frame(&mut self, wal_start: u64, payload: &[u8]) -> Result<(), IngressError> {
         self.decode_end_lsn = self.decode_end_lsn.max(wal_start);
-        self.message_count = self
-            .message_count
-            .checked_add(1)
-            .ok_or(IngressError::CounterOverflow("message"))?;
         self.wire_bytes = self
             .wire_bytes
             .checked_add(
@@ -137,13 +125,6 @@ impl PendingBatch {
                     .map_err(|_| IngressError::CounterOverflow("wire-byte"))?,
             )
             .ok_or(IngressError::CounterOverflow("wire-byte"))?;
-        self.hasher.update(wal_start.to_be_bytes());
-        self.hasher.update(
-            u64::try_from(payload.len())
-                .map_err(|_| IngressError::CounterOverflow("wire-byte"))?
-                .to_be_bytes(),
-        );
-        self.hasher.update(payload);
         Ok(())
     }
 
@@ -152,9 +133,6 @@ impl PendingBatch {
             source_xid: self.source_xid,
             final_lsn: self.final_lsn,
             decode_end_lsn: self.decode_end_lsn,
-            digest: self.hasher.finalize().into(),
-            message_count: self.message_count,
-            wire_bytes: self.wire_bytes,
             events: self.events,
             finalization: self.finalization,
         }
@@ -507,25 +485,5 @@ mod tests {
             serde_json::json!({"id": "1", "value": null})
         );
         assert!(tuple_to_json(&vec![Some("1".into())], &[]).is_err());
-    }
-
-    #[test]
-    fn pending_batch_digest_includes_wal_position_and_frame_boundary() {
-        let transaction = ActiveTransaction {
-            xid: 7,
-            final_lsn: 10,
-        };
-        let mut first = PendingBatch::new(transaction);
-        first.observe_frame(10, b"ab").unwrap();
-        let mut second = PendingBatch::new(transaction);
-        second.observe_frame(11, b"ab").unwrap();
-        let mut third = PendingBatch::new(transaction);
-        third.observe_frame(10, b"a").unwrap();
-        third.observe_frame(10, b"b").unwrap();
-        assert_ne!(first.finish().digest, second.finish().digest);
-        assert_ne!(
-            PendingBatch::new(transaction).finish().digest,
-            third.finish().digest
-        );
     }
 }
