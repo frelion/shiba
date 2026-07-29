@@ -497,6 +497,10 @@ DECLARE
     v_array_ordinal bigint;
     v_input_seq bigint;
     v_inserted boolean;
+    v_first_inserted_input_seq bigint;
+    v_last_inserted_input_seq bigint;
+    v_batch_ordinal bigint;
+    v_previous_last_input_seq bigint;
     v_source record;
     v_source_name text;
 BEGIN
@@ -559,6 +563,10 @@ BEGIN
 
         IF v_inserted THEN
             inserted_count := inserted_count + 1;
+            IF v_first_inserted_input_seq IS NULL THEN
+                v_first_inserted_input_seq := v_input_seq;
+            END IF;
+            v_last_inserted_input_seq := v_input_seq;
         ELSE
             replayed_count := replayed_count + 1;
         END IF;
@@ -605,6 +613,56 @@ BEGIN
                   last_input_seq,
                   v_source.source_oid;
         END LOOP;
+    END IF;
+
+    -- The ingress transaction header remains locked by insert_ingress_event
+    -- until the caller commits, so batch ordinal allocation is serialized
+    -- with input_seq allocation.  Replayed events create no second apply
+    -- batch even when the replication transport groups frames differently.
+    IF inserted_count > 0 THEN
+        IF v_first_inserted_input_seq IS NULL
+           OR v_last_inserted_input_seq IS NULL
+           OR v_last_inserted_input_seq - v_first_inserted_input_seq + 1
+                <> inserted_count THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'XX001',
+                MESSAGE = format(
+                    'new ingress events for transaction %s are not contiguous',
+                    p_ingress_txn_id
+                );
+        END IF;
+
+        SELECT coalesce(max(batch.batch_ordinal), 0) + 1,
+               max(batch.last_input_seq)
+          INTO v_batch_ordinal,
+               v_previous_last_input_seq
+          FROM shiba_internal.ingress_apply_batches AS batch
+         WHERE batch.ingress_txn_id = p_ingress_txn_id;
+
+        IF v_first_inserted_input_seq
+             <> coalesce(v_previous_last_input_seq + 1, 1) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'XX001',
+                MESSAGE = format(
+                    'ingress apply batches for transaction %s are not adjacent',
+                    p_ingress_txn_id
+                );
+        END IF;
+
+        INSERT INTO shiba_internal.ingress_apply_batches (
+            ingress_txn_id,
+            batch_ordinal,
+            first_input_seq,
+            last_input_seq,
+            event_count
+        )
+        VALUES (
+            p_ingress_txn_id,
+            v_batch_ordinal,
+            v_first_inserted_input_seq,
+            v_last_inserted_input_seq,
+            inserted_count
+        );
     END IF;
 
     RETURN NEXT;
@@ -728,6 +786,13 @@ DECLARE
     v_final_lsn pg_lsn;
     v_existing_commit_lsn pg_lsn;
     v_existing_end_lsn pg_lsn;
+    v_batch_count bigint;
+    v_batch_event_count bigint;
+    v_first_batch_ordinal bigint;
+    v_last_batch_ordinal bigint;
+    v_first_batch_input_seq bigint;
+    v_last_batch_input_seq bigint;
+    v_batches_are_adjacent boolean;
 BEGIN
     IF p_ingress_txn_id IS NULL
        OR p_commit_lsn IS NULL
@@ -812,7 +877,62 @@ BEGIN
                 );
         END IF;
 
-        -- Header-only finalization: no change_log row is scanned or updated.
+        -- The manifest is the downstream execution contract. Validate it at
+        -- the admission boundary so a damaged or incomplete range cannot be
+        -- mistaken for the final batch and published early.
+        WITH ordered_batches AS (
+            SELECT batch.batch_ordinal,
+                   batch.first_input_seq,
+                   batch.last_input_seq,
+                   batch.event_count,
+                   lag(batch.last_input_seq) OVER (
+                       ORDER BY batch.batch_ordinal
+                   ) AS previous_last_input_seq
+              FROM shiba_internal.ingress_apply_batches AS batch
+             WHERE batch.ingress_txn_id = p_ingress_txn_id
+        )
+        SELECT count(*),
+               coalesce(sum(batch.event_count), 0),
+               min(batch.batch_ordinal),
+               max(batch.batch_ordinal),
+               min(batch.first_input_seq)
+                   FILTER (WHERE batch.batch_ordinal = 1),
+               max(batch.last_input_seq),
+               coalesce(bool_and(
+                   batch.first_input_seq
+                     = coalesce(batch.previous_last_input_seq + 1, 1)
+               ), true)
+          INTO v_batch_count,
+               v_batch_event_count,
+               v_first_batch_ordinal,
+               v_last_batch_ordinal,
+               v_first_batch_input_seq,
+               v_last_batch_input_seq,
+               v_batches_are_adjacent
+          FROM ordered_batches AS batch;
+
+        IF (event_count = 0 AND v_batch_count <> 0)
+           OR (
+             event_count > 0
+             AND (
+               v_batch_count = 0
+               OR v_first_batch_ordinal <> 1
+               OR v_last_batch_ordinal <> v_batch_count
+               OR v_first_batch_input_seq <> 1
+               OR v_last_batch_input_seq <> event_count
+               OR v_batch_event_count <> event_count
+               OR NOT v_batches_are_adjacent
+             )
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'XX001',
+                MESSAGE = format(
+                    'ingress transaction %s has an invalid apply-batch manifest',
+                    p_ingress_txn_id
+                );
+        END IF;
+
+        -- Header-only finalization: no change_log row is updated.
         UPDATE shiba_internal.ingress_transactions AS txn
            SET status = 'committed',
                commit_lsn = p_commit_lsn,

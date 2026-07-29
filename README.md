@@ -4,10 +4,8 @@
 [![Latest release](https://img.shields.io/github/v/release/frelion/shiba)](https://github.com/frelion/shiba/releases)
 [![License: PostgreSQL](https://img.shields.io/badge/license-PostgreSQL-blue.svg)](LICENSE)
 
-Shiba is a PostgreSQL 17 extension for transaction-aware incremental view
-maintenance. It consumes committed transactions from `pgoutput`, transforms
-their row deltas through a persisted operator DAG, and asynchronously updates
-SQL result tables without rescanning registered source tables.
+Shiba is a PostgreSQL 17 extension that keeps SQL result tables updated from
+committed WAL changes, without rescanning the source tables after each write.
 
 > Status: experimental v0.1. Shiba supports a validated SQL subset and is not
 > a distributed execution engine.
@@ -21,45 +19,51 @@ flowchart LR
 
     subgraph PG["PostgreSQL relations"]
         LOG[("shared change_log")]
-        INBOX[("per-result dag_inbox")]
+        BATCH[("stable input ranges")]
+        INBOX[("per-result dag_inbox<br/>batch cursor")]
         PLAN[("PhysicalDagPlan")]
+        PENDING[("this transaction's<br/>unpublished summary")]
         STATE[("operator state")]
         RESULT[("result table")]
     end
 
     subgraph R["one Shiba Runtime per active database"]
         DECODE["decode + bounded batching"]
-        ROUTE["dependency routing"]
+        ROUTE["find affected results"]
         SCHEDULE["round-robin scheduler"]
-        APPLY["physical SQL pipeline"]
+        APPLY["run the saved SQL plan"]
         FEEDBACK["standby status feedback"]
     end
 
     WS --> DECODE
     DECODE --> LOG
-    LOG --> ROUTE
+    LOG --> BATCH
+    BATCH -->|"pgoutput Commit is durable"| ROUTE
     ROUTE --> INBOX
     INBOX --> SCHEDULE
     SCHEDULE --> APPLY
     PLAN -->|"read-only"| APPLY
+    APPLY --> PENDING
+    PENDING -->|"last batch publishes"| STATE
+    PENDING -->|"last batch publishes"| RESULT
     STATE <-->|"read / write"| APPLY
-    APPLY --> RESULT
     LOG -. "durable LSN" .-> FEEDBACK
     FEEDBACK -.-> WS
 ```
 
-The processing unit is a complete source transaction. Ingress normalizes DML
-into weighted rows: insert is `+1`, delete is `-1`, and update is
-`-1 old / +1 new`. A source transaction is stored once in `change_log`;
-`dag_inbox` contains durable per-result references to that shared input.
-Large source transactions may be persisted in bounded ingress batches, but
-they are not visible to routing or operator apply before the final `Commit`.
+Ingress normalizes DML into weighted rows: insert is `+1`, delete is `-1`, and
+update is `-1 old / +1 new`. It stores a source transaction once in
+`change_log` and records stable input ranges as it reads. The Runtime schedules
+the saved DAG only after the source `Commit` is durable.
 
-The physical pipeline combines the transaction delta with retained operator
-state for joins, aggregates, distinct, windows, or TopN. Operator state, result
-rows, apply progress, and inbox removal commit atomically for each result
-update. Replication feedback advances after durable ingress, independently of
-result apply.
+The scheduler then reads one stable range per apply transaction and merges it
+into a durable unpublished summary. For each result table, the last range
+atomically publishes the complete source transaction to operator state, the
+result table, and apply progress, then removes the inbox entry. If one source
+transaction affects results A and B, A may publish before B; Shiba does not
+publish multiple result tables in one shared PostgreSQL transaction.
+Replication feedback advances after durable ingress, independently of result
+publication.
 
 The detailed [architecture](docs/ARCHITECTURE.md) documents the stream model,
 operator state, scheduling, recovery, and resource bounds.
@@ -75,10 +79,10 @@ protocol parsers and state machines to PostgreSQL FFI and the Runtime loop.
   protocol decoding, validation, planning, and scheduling.
 - Each active database has one Shiba Runtime. PostgreSQL logical decoding uses
   a separate walsender.
-- Per-result source-commit order is strict; different results are scheduled
-  round-robin.
-- A running apply is not preempted. Long applies cause head-of-line blocking
-  for the single Runtime.
+- Per-result source-commit order is strict. Different results are scheduled
+  round-robin between ingress batches.
+- A running PostgreSQL statement is not preempted. Expensive final publication
+  can still block the single Runtime.
 
 ## Quick start
 

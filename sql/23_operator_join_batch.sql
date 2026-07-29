@@ -12,6 +12,171 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION shiba._prepare_join_batch(
+    result_relation oid,
+    p_ingress_txn_id bigint,
+    p_commit_lsn pg_lsn,
+    p_first_input_seq bigint,
+    p_last_input_seq bigint
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, shiba, shiba_internal
+AS $$
+DECLARE
+    stream_view shiba_internal.stream_views%ROWTYPE;
+    join_view shiba_internal.inner_join_views%ROWTYPE;
+    left_name text;
+    right_name text;
+    left_pre_filter_sql text;
+    right_pre_filter_sql text;
+    pending_rows bigint;
+    max_stage_rows bigint := coalesce(
+      nullif(current_setting('shiba.max_stage_rows',true),'')::bigint,
+      1000000
+    );
+BEGIN
+    IF p_first_input_seq IS NULL
+       OR p_last_input_seq IS NULL
+       OR p_first_input_seq<1
+       OR p_last_input_seq<p_first_input_seq
+       OR max_stage_rows<1 THEN
+      RAISE EXCEPTION 'invalid Shiba Join batch request'
+        USING ERRCODE='53400';
+    END IF;
+
+    SELECT * INTO STRICT stream_view
+    FROM shiba_internal.stream_views
+    WHERE result_oid=result_relation;
+    SELECT * INTO STRICT join_view
+    FROM shiba_internal.inner_join_views
+    WHERE result_oid=result_relation;
+    SELECT format('%I.%I',n.nspname,c.relname)
+    INTO STRICT left_name
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE c.oid=stream_view.source_oid;
+    SELECT format('%I.%I',n.nspname,c.relname)
+    INTO STRICT right_name
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE c.oid=join_view.right_source_oid;
+    SELECT coalesce((
+      SELECT predicate_sql
+      FROM shiba_internal.stream_filters
+      WHERE result_oid=result_relation
+        AND input_side='left'
+        AND phase='pre'
+    ),'true') INTO left_pre_filter_sql;
+    SELECT coalesce((
+      SELECT predicate_sql
+      FROM shiba_internal.stream_filters
+      WHERE result_oid=result_relation
+        AND input_side='right'
+        AND phase='pre'
+    ),'true') INTO right_pre_filter_sql;
+
+    EXECUTE format(
+      $prepare$
+      WITH input_events AS MATERIALIZED (
+        SELECT event.sequence AS ordinality,
+               'left'::text AS input_side,
+               coalesce(
+                 to_jsonb((input.row).%2$I),'null'::jsonb
+               ) AS join_key,
+               event.row_data,
+               event.delta::bigint AS multiplicity_delta
+        FROM shiba_internal.effective_change_log event
+        CROSS JOIN LATERAL (
+          SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
+        ) input
+        WHERE event.commit_lsn=$3
+          AND event.source_oid=$4
+          AND event.sequence BETWEEN $5 AND $6
+          AND event.delta IN (-1,1)
+          AND jsonb_typeof(event.row_data)='object'
+          AND coalesce((%3$s),false)
+        UNION ALL
+        SELECT event.sequence AS ordinality,
+               'right'::text AS input_side,
+               coalesce(
+                 to_jsonb((input.row).%5$I),'null'::jsonb
+               ) AS join_key,
+               event.row_data,
+               event.delta::bigint AS multiplicity_delta
+        FROM shiba_internal.effective_change_log event
+        CROSS JOIN LATERAL (
+          SELECT jsonb_populate_record(NULL::%4$s,event.row_data) AS row
+        ) input
+        WHERE event.commit_lsn=$3
+          AND event.source_oid=$7
+          AND event.sequence BETWEEN $5 AND $6
+          AND event.delta IN (-1,1)
+          AND jsonb_typeof(event.row_data)='object'
+          AND coalesce((%6$s),false)
+      ),
+      running AS MATERIALIZED (
+        SELECT event.*,
+               sum(event.multiplicity_delta) OVER (
+                 PARTITION BY event.input_side,event.join_key,event.row_data
+                 ORDER BY event.ordinality
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+               )::bigint AS multiplicity_prefix
+        FROM input_events event
+      ),
+      contributions AS (
+        SELECT input_side,join_key,row_data,
+               sum(multiplicity_delta)::bigint AS multiplicity_delta,
+               min(multiplicity_prefix)::bigint
+                 AS multiplicity_min_prefix
+        FROM running
+        GROUP BY input_side,join_key,row_data
+      )
+      INSERT INTO shiba_internal.join_pending_rows (
+        result_oid,ingress_txn_id,commit_lsn,input_side,
+        join_key,row_data,multiplicity_delta,multiplicity_min_prefix
+      )
+      SELECT $1,$2,$3,input_side,join_key,row_data,
+             multiplicity_delta,multiplicity_min_prefix
+      FROM contributions
+      ON CONFLICT (
+        result_oid,ingress_txn_id,input_side,join_key,row_data
+      ) DO UPDATE
+      SET multiplicity_min_prefix=least(
+            join_pending_rows.multiplicity_min_prefix,
+            join_pending_rows.multiplicity_delta
+              + EXCLUDED.multiplicity_min_prefix
+          ),
+          multiplicity_delta=
+            join_pending_rows.multiplicity_delta
+              + EXCLUDED.multiplicity_delta
+      $prepare$,
+      left_name,
+      join_view.left_join_column,
+      left_pre_filter_sql,
+      right_name,
+      join_view.right_join_column,
+      right_pre_filter_sql
+    )
+    USING result_relation,p_ingress_txn_id,p_commit_lsn,
+          stream_view.source_oid,p_first_input_seq,p_last_input_seq,
+          join_view.right_source_oid;
+
+    SELECT count(*)
+    INTO STRICT pending_rows
+    FROM shiba_internal.join_pending_rows
+    WHERE result_oid=result_relation
+      AND ingress_txn_id=p_ingress_txn_id;
+    IF pending_rows>max_stage_rows THEN
+      RAISE EXCEPTION
+        'Shiba JOIN commit % for result % retained % pending rows, limit %',
+        p_commit_lsn,result_relation::regclass,pending_rows,max_stage_rows
+        USING ERRCODE='53400',
+              HINT='Increase shiba.max_stage_rows or reduce commit key cardinality.';
+    END IF;
+END;
+$$;
+
 -- Apply one source commit as an exact relational JOIN transition.
 --
 -- The physical compiler owns one typed UNLOGGED join_delta stage per DAG.
@@ -90,7 +255,6 @@ DECLARE
     join_filter_sql text;
     having_sql text;
     visible_sql text;
-    applicable_events bigint;
     left_event_count bigint;
     right_event_count bigint;
     left_arrangement_rows bigint;
@@ -134,19 +298,12 @@ BEGIN
         USING ERRCODE='P0S01';
     END IF;
 
-    SELECT count(*),
-           count(*) FILTER (WHERE event.source_oid=left_source_oid),
-           count(*) FILTER (WHERE event.source_oid=right_source_oid)
-    INTO applicable_events,left_event_count,right_event_count
-    FROM shiba_internal.effective_change_log event
-    WHERE event.commit_lsn=p_commit_lsn
-      AND event.source_oid IN (left_source_oid,right_source_oid);
-    IF applicable_events=0 THEN
-      RAISE EXCEPTION
-        'Shiba DAG % inbox commit % has no applicable change-log events',
-        result_relation,p_commit_lsn
-        USING ERRCODE='P0S01';
-    END IF;
+    SELECT count(*) FILTER (WHERE event.input_side='left'),
+           count(*) FILTER (WHERE event.input_side='right')
+    INTO left_event_count,right_event_count
+    FROM shiba_internal.join_pending_rows event
+    WHERE event.result_oid=result_relation
+      AND event.commit_lsn=p_commit_lsn;
     SELECT
       count(*) FILTER (WHERE input_side='left'),
       count(*) FILTER (WHERE input_side='right')
@@ -235,6 +392,9 @@ BEGIN
         EXECUTE format('ANALYZE %s',stage_name);
       END IF;
       PERFORM shiba_internal._compact_physical_stages(result_relation);
+      DELETE FROM shiba_internal.join_pending_rows
+      WHERE result_oid=result_relation
+        AND commit_lsn=p_commit_lsn;
       RETURN;
     END IF;
 
@@ -306,40 +466,22 @@ BEGIN
     candidate_preflight_sql := format(
       $candidate_preflight$
       WITH left_event_rows AS MATERIALIZED (
-        SELECT coalesce(
-                 to_jsonb((input.row).%2$I),'null'::jsonb
-               ) AS join_key,
-               event.row_data,
-               sum(event.delta)::bigint AS weight
-        FROM shiba_internal.effective_change_log event
-        CROSS JOIN LATERAL (
-          SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
-        ) input
-        WHERE event.commit_lsn=$4
-          AND event.source_oid=$2
-          AND event.delta IN (-1,1)
-          AND jsonb_typeof(event.row_data)='object'
-          AND coalesce((%3$s),false)
-        GROUP BY 1,event.row_data
-        HAVING sum(event.delta)<>0
+        SELECT event.join_key,event.row_data,
+               event.multiplicity_delta AS weight
+        FROM shiba_internal.join_pending_rows event
+        WHERE event.result_oid=$1
+          AND event.commit_lsn=$4
+          AND event.input_side='left'
+          AND event.multiplicity_delta<>0
       ),
       right_event_rows AS MATERIALIZED (
-        SELECT coalesce(
-                 to_jsonb((input.row).%5$I),'null'::jsonb
-               ) AS join_key,
-               event.row_data,
-               sum(event.delta)::bigint AS weight
-        FROM shiba_internal.effective_change_log event
-        CROSS JOIN LATERAL (
-          SELECT jsonb_populate_record(NULL::%4$s,event.row_data) AS row
-        ) input
-        WHERE event.commit_lsn=$4
-          AND event.source_oid=$3
-          AND event.delta IN (-1,1)
-          AND jsonb_typeof(event.row_data)='object'
-          AND coalesce((%6$s),false)
-        GROUP BY 1,event.row_data
-        HAVING sum(event.delta)<>0
+        SELECT event.join_key,event.row_data,
+               event.multiplicity_delta AS weight
+        FROM shiba_internal.join_pending_rows event
+        WHERE event.result_oid=$1
+          AND event.commit_lsn=$4
+          AND event.input_side='right'
+          AND event.multiplicity_delta<>0
       ),
       affected_keys AS MATERIALIZED (
         SELECT join_key FROM left_event_rows
@@ -586,61 +728,13 @@ BEGIN
 
     stage_statement_sql := format(
       $stage_statement$
-      WITH input_events AS MATERIALIZED (
-        SELECT event.sequence AS ordinality,
-               'left'::text AS input_side,
-               coalesce(
-                 to_jsonb((input.row).%2$I),'null'::jsonb
-               ) AS join_key,
-               event.row_data,
-               event.delta::bigint AS multiplicity_delta
-        FROM shiba_internal.effective_change_log event
-        CROSS JOIN LATERAL (
-          SELECT jsonb_populate_record(
-            NULL::%1$s,event.row_data
-          ) AS row
-        ) input
-        WHERE event.commit_lsn=$4
-          AND event.source_oid=$2
-          AND event.delta IN (-1,1)
-          AND jsonb_typeof(event.row_data)='object'
-          AND coalesce((%3$s),false)
-        UNION ALL
-        SELECT event.sequence AS ordinality,
-               'right'::text AS input_side,
-               coalesce(
-                 to_jsonb((input.row).%5$I),'null'::jsonb
-               ) AS join_key,
-               event.row_data,
-               event.delta::bigint AS multiplicity_delta
-        FROM shiba_internal.effective_change_log event
-        CROSS JOIN LATERAL (
-          SELECT jsonb_populate_record(
-            NULL::%4$s,event.row_data
-          ) AS row
-        ) input
-        WHERE event.commit_lsn=$4
-          AND event.source_oid=$3
-          AND event.delta IN (-1,1)
-          AND jsonb_typeof(event.row_data)='object'
-          AND coalesce((%6$s),false)
-      ),
-      running_input AS MATERIALIZED (
-        SELECT event.*,
-               sum(event.multiplicity_delta) OVER (
-                 PARTITION BY event.input_side,event.join_key,event.row_data
-                 ORDER BY event.ordinality
-                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-               )::bigint AS multiplicity_prefix
-        FROM input_events event
-      ),
-      input_folded AS MATERIALIZED (
-        SELECT input_side,join_key,row_data,
-               sum(multiplicity_delta)::bigint AS multiplicity_delta,
-               min(multiplicity_prefix)::bigint
-                 AS multiplicity_min_prefix
-        FROM running_input
-        GROUP BY input_side,join_key,row_data
+      WITH input_folded AS MATERIALIZED (
+        SELECT event.input_side,event.join_key,event.row_data,
+               event.multiplicity_delta,
+               event.multiplicity_min_prefix
+        FROM shiba_internal.join_pending_rows event
+        WHERE event.result_oid=$1
+          AND event.commit_lsn=$4
       ),
       input_transition AS MATERIALIZED (
         SELECT delta.input_side,delta.join_key,delta.row_data,
@@ -1350,5 +1444,8 @@ BEGIN
       EXECUTE format('ANALYZE %s',stage_name);
     END IF;
     PERFORM shiba_internal._compact_physical_stages(result_relation);
+    DELETE FROM shiba_internal.join_pending_rows
+    WHERE result_oid=result_relation
+      AND commit_lsn=p_commit_lsn;
 END;
 $$;

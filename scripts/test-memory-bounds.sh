@@ -623,56 +623,6 @@ assert_one_runtime
 assert_query "${initial_runtime_pid}" "SELECT pid FROM pg_stat_activity
   WHERE backend_type='shiba runtime'"
 
-printf '\n==> Commit row and byte admission pause before operator execution\n'
-psql_memory -qc "ALTER SYSTEM SET shiba.max_commit_rows = '1'"
-psql_memory -Atqc "SELECT pg_reload_conf()" >/dev/null
-psql_memory -qc "
-  INSERT INTO public.memory_limited_source
-  VALUES (3,11,110),(4,12,120)"
-wait_for_resource_pause \
-  "shiba.memory_limited_result" "${initial_runtime_pid}"
-assert_query "2|1" "
-  SELECT ingress.event_count || '|' || count(inbox.*)
-  FROM shiba_internal.dag_inbox inbox
-  JOIN shiba_internal.ingress_transactions ingress
-    USING(ingress_txn_id,commit_lsn)
-  WHERE inbox.result_oid='shiba.memory_limited_result'::regclass
-  GROUP BY ingress.event_count"
-psql_memory -qc "ALTER SYSTEM SET shiba.max_commit_rows = '1000000'"
-psql_memory -Atqc "SELECT pg_reload_conf()" >/dev/null
-assert_query "t" "SELECT shiba.resume('shiba.memory_limited_result')"
-wait_for_query "0" "
-  SELECT count(*) FROM shiba_internal.dag_inbox
-  WHERE result_oid='shiba.memory_limited_result'::regclass" \
-  "the row-admitted commit replay"
-
-psql_memory -qc "ALTER SYSTEM SET shiba.max_commit_bytes = '1'"
-psql_memory -Atqc "SELECT pg_reload_conf()" >/dev/null
-psql_memory -qc "
-  INSERT INTO public.memory_limited_source VALUES (5,13,130)"
-wait_for_resource_pause \
-  "shiba.memory_limited_result" "${initial_runtime_pid}"
-assert_query "t" "
-  SELECT ingress.payload_bytes>1
-  FROM shiba_internal.dag_inbox inbox
-  JOIN shiba_internal.ingress_transactions ingress
-    USING(ingress_txn_id,commit_lsn)
-  WHERE inbox.result_oid='shiba.memory_limited_result'::regclass"
-psql_memory -qc \
-  "ALTER SYSTEM SET shiba.max_commit_bytes = '1073741824'"
-psql_memory -Atqc "SELECT pg_reload_conf()" >/dev/null
-assert_query "t" "SELECT shiba.resume('shiba.memory_limited_result')"
-wait_for_native_match "
-  SELECT group_id,count(*)::bigint,sum(amount)::bigint
-  FROM public.memory_limited_source
-  GROUP BY group_id
-" "shiba.memory_limited_result" \
-  "group_id,row_count::bigint,total_amount::bigint" \
-  "the byte-admitted commit replay"
-assert_one_runtime
-assert_query "${initial_runtime_pid}" "SELECT pid FROM pg_stat_activity
-  WHERE backend_type='shiba runtime'"
-
 sample_runtime_rss "${initial_runtime_pid}"
 if test -n "${max_runtime_rss_kb}" &&
    test "${peak_runtime_rss_kb}" -gt "${max_runtime_rss_kb}"; then

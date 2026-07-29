@@ -18,13 +18,152 @@ BEGIN
 END;
 $$;
 
--- DISTINCT is a threshold over projected keys.  Fold the ordered source
--- transaction in fixed-size statements, composing each key's (sum,min-prefix)
--- summary in an UNLOGGED Stage. Apply that Stage in bounded key batches while
--- the caller's one outer transaction preserves source-commit atomicity.
+-- Prepare one stable ingress input_seq range into a durable row-bag summary.
+-- TopN uses a JSON-null partition; Window supplies its actual partition
+-- column. The caller advances dag_inbox.next_batch_ordinal in this same
+-- transaction, so a retry cannot merge one batch twice.
+CREATE FUNCTION shiba._prepare_unary_pending_batch(
+    stream_view shiba_internal.stream_views,
+    p_ingress_txn_id bigint,
+    p_commit_lsn pg_lsn,
+    p_first_input_seq bigint,
+    p_last_input_seq bigint,
+    p_partition_column name
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, shiba, shiba_internal
+AS $$
+DECLARE
+    source_name text;
+    filter_sql text;
+    partition_sql text;
+    pending_rows bigint;
+    max_stage_rows bigint := coalesce(
+      nullif(current_setting('shiba.max_stage_rows',true),'')::bigint,
+      1000000
+    );
+BEGIN
+    IF p_ingress_txn_id IS NULL
+       OR p_commit_lsn IS NULL
+       OR p_first_input_seq IS NULL
+       OR p_last_input_seq IS NULL
+       OR p_first_input_seq<1
+       OR p_last_input_seq<p_first_input_seq
+       OR max_stage_rows<1 THEN
+      RAISE EXCEPTION 'invalid Shiba unary batch request'
+        USING ERRCODE='53400';
+    END IF;
+
+    SELECT format('%I.%I',n.nspname,c.relname)
+    INTO STRICT source_name
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE c.oid=stream_view.source_oid;
+    SELECT coalesce((
+      SELECT predicate_sql
+      FROM shiba_internal.stream_filters
+      WHERE result_oid=stream_view.result_oid
+        AND input_side='left'
+        AND phase='pre'
+    ),'true') INTO filter_sql;
+    partition_sql := CASE
+      WHEN p_partition_column IS NULL THEN '''null''::jsonb'
+      ELSE format(
+        'coalesce(to_jsonb((input.row).%I),''null''::jsonb)',
+        p_partition_column
+      )
+    END;
+
+    EXECUTE format(
+      $prepare$
+      WITH typed_events AS MATERIALIZED (
+        SELECT event.sequence AS ordinality,
+               event.delta::bigint AS delta,
+               %3$s AS partition_key,
+               input.row
+        FROM shiba_internal.effective_change_log event
+        CROSS JOIN LATERAL (
+          SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
+        ) input
+        WHERE event.commit_lsn=$3
+          AND event.source_oid=$4
+          AND event.sequence BETWEEN $5 AND $6
+          AND coalesce((%2$s),false)
+      ),
+      canonical_events AS (
+        SELECT event.ordinality,event.delta,event.partition_key,
+               canonical.row_data
+        FROM typed_events event
+        CROSS JOIN LATERAL (
+          SELECT jsonb_object_agg(entry.key,entry.value) AS row_data
+          FROM jsonb_each_text(to_jsonb(event.row)) entry
+        ) canonical
+      ),
+      running AS (
+        SELECT partition_key,row_data,delta,
+               sum(delta) OVER (
+                 PARTITION BY partition_key,row_data
+                 ORDER BY ordinality
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+               )::bigint AS prefix
+        FROM canonical_events
+      ),
+      contributions AS (
+        SELECT partition_key,row_data,
+               sum(delta)::bigint AS multiplicity_delta,
+               min(prefix)::bigint AS minimum_prefix
+        FROM running
+        GROUP BY partition_key,row_data
+      )
+      INSERT INTO shiba_internal.unary_pending_rows (
+        result_oid,ingress_txn_id,partition_key,row_data,
+        multiplicity_delta,minimum_prefix
+      )
+      SELECT $1,$2,partition_key,row_data,
+             multiplicity_delta,minimum_prefix
+      FROM contributions
+      ON CONFLICT (
+        result_oid,ingress_txn_id,partition_key,row_data
+      ) DO UPDATE
+      SET minimum_prefix=least(
+            unary_pending_rows.minimum_prefix,
+            unary_pending_rows.multiplicity_delta
+              + EXCLUDED.minimum_prefix
+          ),
+          multiplicity_delta=
+            unary_pending_rows.multiplicity_delta
+              + EXCLUDED.multiplicity_delta
+      $prepare$,
+      source_name,filter_sql,partition_sql
+    )
+    USING stream_view.result_oid,p_ingress_txn_id,p_commit_lsn,
+          stream_view.source_oid,p_first_input_seq,p_last_input_seq;
+
+    SELECT count(*)
+    INTO STRICT pending_rows
+    FROM shiba_internal.unary_pending_rows
+    WHERE result_oid=stream_view.result_oid
+      AND ingress_txn_id=p_ingress_txn_id;
+    IF pending_rows>max_stage_rows THEN
+      RAISE EXCEPTION
+        'Shiba commit % for result % retained % pending rows, limit %',
+        p_commit_lsn,stream_view.result_oid::regclass,
+        pending_rows,max_stage_rows
+        USING ERRCODE='53400',
+              HINT='Increase shiba.max_stage_rows or reduce commit key cardinality.';
+    END IF;
+END;
+$$;
+
+-- DISTINCT folds one stable ingress batch into durable pending state. The
+-- final batch publishes folded keys in stage_chunk_rows-sized statements.
 CREATE FUNCTION shiba._apply_distinct_batch(
     stream_view shiba_internal.stream_views,
-    p_commit_lsn pg_lsn
+    p_commit_lsn pg_lsn,
+    p_first_input_seq bigint,
+    p_last_input_seq bigint,
+    p_finalize boolean DEFAULT true
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -45,11 +184,7 @@ DECLARE
       nullif(current_setting('shiba.max_stage_rows',true),'')::bigint,
       1000000
     );
-    cursor_sequence integer := 0;
-    next_sequence integer;
-    input_rows bigint;
     folded_rows bigint;
-    folded_work bigint := 0;
     applied_rows bigint;
     apply_cursor jsonb;
     next_apply_cursor jsonb;
@@ -92,31 +227,28 @@ BEGIN
     FROM unnest(distinct_view.output_columns)
       WITH ORDINALITY columns(output_column,ordinal);
 
-    IF chunk_rows<1 OR max_stage_rows<1 THEN
+    IF chunk_rows<1 OR max_stage_rows<1
+       OR p_first_input_seq IS NULL
+       OR p_last_input_seq IS NULL
+       OR p_first_input_seq < 1
+       OR p_last_input_seq < p_first_input_seq THEN
       RAISE EXCEPTION 'invalid Shiba Stage resource configuration'
         USING ERRCODE='53400';
     END IF;
 
-    DELETE FROM shiba_internal.distinct_fold_stage
-    WHERE result_oid=stream_view.result_oid
-      AND commit_lsn=p_commit_lsn;
-
-    LOOP
-      EXECUTE format(
+    EXECUTE format(
         $fold_statement$
-        WITH raw_chunk AS MATERIALIZED (
+        WITH raw_batch AS MATERIALIZED (
           SELECT event.sequence AS ordinality,event.delta,event.row_data
           FROM shiba_internal.effective_change_log event
           WHERE event.commit_lsn=$2
             AND event.source_oid=$3
-            AND event.sequence>$4
-          ORDER BY event.sequence
-          LIMIT $5
+            AND event.sequence BETWEEN $4 AND $5
         ),
         typed_events AS MATERIALIZED (
           SELECT event.ordinality,
                  event.delta::bigint AS delta,input.row
-          FROM raw_chunk event
+          FROM raw_batch event
           CROSS JOIN LATERAL (
             SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
           ) input
@@ -162,28 +294,30 @@ BEGIN
                   + EXCLUDED.multiplicity_delta
           RETURNING 1
         )
-        SELECT
-          coalesce((SELECT max(ordinality) FROM raw_chunk),$4),
-          (SELECT count(*) FROM raw_chunk),
-          (SELECT count(*) FROM stage_merged)
+        SELECT count(*) FROM stage_merged
         $fold_statement$,
         source_name,filter_sql,key_arguments
       )
-      INTO STRICT next_sequence,input_rows,folded_rows
       USING stream_view.result_oid,p_commit_lsn,stream_view.source_oid,
-            cursor_sequence,chunk_rows;
+            p_first_input_seq,p_last_input_seq;
 
-      EXIT WHEN input_rows=0;
-      cursor_sequence := next_sequence;
-      folded_work := folded_work+folded_rows;
-      IF folded_work>max_stage_rows THEN
-        RAISE EXCEPTION
-          'Shiba DISTINCT commit % for result % exceeded Stage work limit %',
-          p_commit_lsn,stream_view.result_oid::regclass,max_stage_rows
-          USING ERRCODE='53400',
-                HINT='Increase shiba.max_stage_rows or split the source transaction.';
-      END IF;
-    END LOOP;
+    SELECT count(*)
+    INTO STRICT folded_rows
+    FROM shiba_internal.distinct_fold_stage
+    WHERE result_oid=stream_view.result_oid
+      AND commit_lsn=p_commit_lsn;
+    IF folded_rows>max_stage_rows THEN
+      RAISE EXCEPTION
+        'Shiba DISTINCT commit % for result % retained % pending keys, limit %',
+        p_commit_lsn,stream_view.result_oid::regclass,
+        folded_rows,max_stage_rows
+        USING ERRCODE='53400',
+              HINT='Increase shiba.max_stage_rows or reduce commit key cardinality.';
+    END IF;
+
+    IF NOT p_finalize THEN
+      RETURN;
+    END IF;
 
     LOOP
       EXECUTE format(
@@ -296,7 +430,11 @@ $$;
 -- sink does not require reading state writes made earlier in the statement.
 CREATE FUNCTION shiba._apply_topn_batch(
     stream_view shiba_internal.stream_views,
-    p_commit_lsn pg_lsn
+    p_ingress_txn_id bigint,
+    p_commit_lsn pg_lsn,
+    p_first_input_seq bigint,
+    p_last_input_seq bigint,
+    p_finalize boolean DEFAULT true
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -342,6 +480,18 @@ BEGIN
     FROM unnest(topn_view.source_columns,topn_view.output_columns)
       WITH ORDINALITY columns(source_column,output_column,ordinal);
 
+    PERFORM shiba._prepare_unary_pending_batch(
+      stream_view,
+      p_ingress_txn_id,
+      p_commit_lsn,
+      p_first_input_seq,
+      p_last_input_seq,
+      NULL
+    );
+    IF NOT p_finalize THEN
+      RETURN;
+    END IF;
+
     EXECUTE format(
       $bound$
       SELECT
@@ -352,20 +502,16 @@ BEGIN
         )
         +(
           SELECT count(*)
-          FROM shiba_internal.effective_change_log event
-          CROSS JOIN LATERAL (
-            SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
-          ) input
-          WHERE event.commit_lsn=$2
-            AND event.source_oid=$3
-            AND event.delta>0
-            AND coalesce((%2$s),false)
+          FROM shiba_internal.unary_pending_rows pending
+          WHERE pending.result_oid=$1
+            AND pending.ingress_txn_id=$2
+            AND pending.multiplicity_delta>0
         )
       $bound$,
-      source_name,filter_sql
+      source_name
     )
     INTO STRICT state_row_upper_bound
-    USING stream_view.result_oid,p_commit_lsn,stream_view.source_oid;
+    USING stream_view.result_oid,p_ingress_txn_id;
     IF state_row_upper_bound>max_stage_rows
        OR topn_view.limit_offset::numeric+topn_view.limit_count::numeric
             > max_stage_rows::numeric THEN
@@ -378,38 +524,13 @@ BEGIN
 
     EXECUTE format(
       $statement$
-      WITH typed_events AS MATERIALIZED (
-        SELECT event.sequence AS ordinality,
-               event.delta::bigint AS delta,input.row
-        FROM shiba_internal.effective_change_log event
-        CROSS JOIN LATERAL (
-          SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
-        ) input
-        WHERE event.commit_lsn=$2
-          AND event.source_oid=$3
-          AND coalesce((%2$s),false)
-      ),
-      canonical_events AS (
-        SELECT event.ordinality,event.delta,canonical.row_data
-        FROM typed_events event
-        CROSS JOIN LATERAL (
-          SELECT jsonb_object_agg(entry.key,entry.value) AS row_data
-          FROM jsonb_each_text(to_jsonb(event.row)) entry
-        ) canonical
-      ),
-      running AS (
-        SELECT row_data,delta,
-               sum(delta) OVER (
-                 PARTITION BY row_data ORDER BY ordinality
-                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-               )::bigint AS prefix
-        FROM canonical_events
-      ),
-      contributions AS (
-        SELECT row_data,sum(delta)::bigint AS multiplicity_delta,
-               min(prefix)::bigint AS minimum_prefix
-        FROM running
-        GROUP BY row_data
+      WITH contributions AS MATERIALIZED (
+        SELECT pending.row_data,
+               pending.multiplicity_delta,
+               pending.minimum_prefix
+        FROM shiba_internal.unary_pending_rows pending
+        WHERE pending.result_oid=$1
+          AND pending.ingress_txn_id=$2
       ),
       transitions AS MATERIALIZED (
         SELECT contribution.row_data,contribution.multiplicity_delta,
@@ -530,7 +651,11 @@ BEGIN
       CASE topn_view.nulls_first WHEN true THEN 'FIRST' ELSE 'LAST' END,
       topn_view.limit_offset,topn_view.limit_count
     )
-    USING stream_view.result_oid,p_commit_lsn,stream_view.source_oid;
+    USING stream_view.result_oid,p_ingress_txn_id;
+
+    DELETE FROM shiba_internal.unary_pending_rows
+    WHERE result_oid=stream_view.result_oid
+      AND ingress_txn_id=p_ingress_txn_id;
 END;
 $$;
 
@@ -539,7 +664,11 @@ $$;
 -- commit's validated transition relation.
 CREATE FUNCTION shiba._apply_window_batch(
     stream_view shiba_internal.stream_views,
-    p_commit_lsn pg_lsn
+    p_ingress_txn_id bigint,
+    p_commit_lsn pg_lsn,
+    p_first_input_seq bigint,
+    p_last_input_seq bigint,
+    p_finalize boolean DEFAULT true
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -588,23 +717,29 @@ BEGIN
     FROM unnest(window_view.target_expressions)
       WITH ORDINALITY target(expression,ordinal);
 
+    PERFORM shiba._prepare_unary_pending_batch(
+      stream_view,
+      p_ingress_txn_id,
+      p_commit_lsn,
+      p_first_input_seq,
+      p_last_input_seq,
+      window_view.partition_column
+    );
+    IF NOT p_finalize THEN
+      RETURN;
+    END IF;
+
     EXECUTE format(
       $bound$
-      WITH typed_events AS MATERIALIZED (
-        SELECT event.delta::bigint AS delta,
-               coalesce(
-                 to_jsonb((input.row).%3$I),'null'::jsonb
-               ) AS partition_key
-        FROM shiba_internal.effective_change_log event
-        CROSS JOIN LATERAL (
-          SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
-        ) input
-        WHERE event.commit_lsn=$2
-          AND event.source_oid=$3
-          AND coalesce((%2$s),false)
+      WITH pending_events AS MATERIALIZED (
+        SELECT pending.partition_key,
+               pending.multiplicity_delta
+        FROM shiba_internal.unary_pending_rows pending
+        WHERE pending.result_oid=$1
+          AND pending.ingress_txn_id=$2
       ),
       changed_partitions AS MATERIALIZED (
-        SELECT DISTINCT partition_key FROM typed_events
+        SELECT DISTINCT partition_key FROM pending_events
       )
       SELECT
         coalesce((
@@ -614,13 +749,13 @@ BEGIN
           WHERE state.result_oid=$1
         ),0)
         +coalesce((
-          SELECT sum(greatest(delta,0)) FROM typed_events
+          SELECT sum(greatest(multiplicity_delta,0))
+          FROM pending_events
         ),0)
-      $bound$,
-      source_name,filter_sql,window_view.partition_column
+      $bound$
     )
     INTO STRICT affected_row_upper_bound
-    USING stream_view.result_oid,p_commit_lsn,stream_view.source_oid;
+    USING stream_view.result_oid,p_ingress_txn_id;
     IF affected_row_upper_bound>max_stage_rows THEN
       RAISE EXCEPTION
         'Shiba window commit % for result % may rebuild % rows, limit %',
@@ -632,42 +767,14 @@ BEGIN
 
     EXECUTE format(
       $statement$
-      WITH typed_events AS MATERIALIZED (
-        SELECT event.sequence AS ordinality,
-               event.delta::bigint AS delta,input.row
-        FROM shiba_internal.effective_change_log event
-        CROSS JOIN LATERAL (
-          SELECT jsonb_populate_record(NULL::%1$s,event.row_data) AS row
-        ) input
-        WHERE event.commit_lsn=$2
-          AND event.source_oid=$3
-          AND coalesce((%2$s),false)
-      ),
-      canonical_events AS (
-        SELECT event.ordinality,event.delta,
-               coalesce(to_jsonb((event.row).%3$I),'null'::jsonb)
-                 AS partition_key,
-               canonical.row_data
-        FROM typed_events event
-        CROSS JOIN LATERAL (
-          SELECT jsonb_object_agg(entry.key,entry.value) AS row_data
-          FROM jsonb_each_text(to_jsonb(event.row)) entry
-        ) canonical
-      ),
-      running AS (
-        SELECT partition_key,row_data,delta,
-               sum(delta) OVER (
-                 PARTITION BY partition_key,row_data ORDER BY ordinality
-                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-               )::bigint AS prefix
-        FROM canonical_events
-      ),
-      contributions AS (
-        SELECT partition_key,row_data,
-               sum(delta)::bigint AS multiplicity_delta,
-               min(prefix)::bigint AS minimum_prefix
-        FROM running
-        GROUP BY partition_key,row_data
+      WITH contributions AS MATERIALIZED (
+        SELECT pending.partition_key,
+               pending.row_data,
+               pending.multiplicity_delta,
+               pending.minimum_prefix
+        FROM shiba_internal.unary_pending_rows pending
+        WHERE pending.result_oid=$1
+          AND pending.ingress_txn_id=$2
       ),
       transitions AS MATERIALIZED (
         SELECT contribution.partition_key,contribution.row_data,
@@ -762,6 +869,10 @@ BEGIN
       source_name,filter_sql,window_view.partition_column,result_name,
       window_view.result_partition_column,quoted_outputs,expressions
     )
-    USING stream_view.result_oid,p_commit_lsn,stream_view.source_oid;
+    USING stream_view.result_oid,p_ingress_txn_id;
+
+    DELETE FROM shiba_internal.unary_pending_rows
+    WHERE result_oid=stream_view.result_oid
+      AND ingress_txn_id=p_ingress_txn_id;
 END;
 $$;

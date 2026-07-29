@@ -23,14 +23,6 @@ const DEFAULT_MAX_STAGE_ROWS: i32 = 1_000_000;
 const MIN_MAX_STAGE_ROWS: i32 = 1;
 const MAX_MAX_STAGE_ROWS: i32 = i32::MAX;
 
-const DEFAULT_MAX_COMMIT_ROWS: i32 = 1_000_000;
-const MIN_MAX_COMMIT_ROWS: i32 = 1;
-const MAX_MAX_COMMIT_ROWS: i32 = i32::MAX;
-
-const DEFAULT_MAX_COMMIT_BYTES: i32 = 1_073_741_824;
-const MIN_MAX_COMMIT_BYTES: i32 = 1;
-const MAX_MAX_COMMIT_BYTES: i32 = i32::MAX;
-
 const DEFAULT_INGRESS_BATCH_ROWS: i32 = 2_048;
 const MIN_INGRESS_BATCH_ROWS: i32 = 1;
 const MAX_INGRESS_BATCH_ROWS: i32 = 1_000_000;
@@ -53,8 +45,6 @@ static RUNTIME_TEMP_FILE_LIMIT_KB: GucSetting<i32> =
 static MAX_CACHED_DAGS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_CACHED_DAGS);
 static STAGE_CHUNK_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_STAGE_CHUNK_ROWS);
 static MAX_STAGE_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_STAGE_ROWS);
-static MAX_COMMIT_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_COMMIT_ROWS);
-static MAX_COMMIT_BYTES: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_COMMIT_BYTES);
 static INGRESS_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_BATCH_ROWS);
 static INGRESS_BATCH_BYTES: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_BATCH_BYTES);
 static MAX_CACHED_RELATIONS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_CACHED_RELATIONS);
@@ -109,26 +99,6 @@ pub fn init() {
         &MAX_STAGE_ROWS,
         MIN_MAX_STAGE_ROWS,
         MAX_MAX_STAGE_ROWS,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
-    GucRegistry::define_int_guc(
-        c"shiba.max_commit_rows",
-        c"Maximum number of row changes allowed in one source commit.",
-        c"SQL admission checks can read this value with current_setting to enforce commit row quotas.",
-        &MAX_COMMIT_ROWS,
-        MIN_MAX_COMMIT_ROWS,
-        MAX_MAX_COMMIT_ROWS,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
-    GucRegistry::define_int_guc(
-        c"shiba.max_commit_bytes",
-        c"Maximum bytes allowed in one source commit.",
-        c"SQL admission checks can read this value with current_setting to enforce commit byte quotas.",
-        &MAX_COMMIT_BYTES,
-        MIN_MAX_COMMIT_BYTES,
-        MAX_MAX_COMMIT_BYTES,
         GucContext::Sighup,
         GucFlags::default(),
     );
@@ -241,8 +211,6 @@ mod tests {
         assert!((MIN_MAX_CACHED_DAGS..=MAX_MAX_CACHED_DAGS).contains(&DEFAULT_MAX_CACHED_DAGS));
         assert!((MIN_STAGE_CHUNK_ROWS..=MAX_STAGE_CHUNK_ROWS).contains(&DEFAULT_STAGE_CHUNK_ROWS));
         assert!((MIN_MAX_STAGE_ROWS..=MAX_MAX_STAGE_ROWS).contains(&DEFAULT_MAX_STAGE_ROWS));
-        assert!((MIN_MAX_COMMIT_ROWS..=MAX_MAX_COMMIT_ROWS).contains(&DEFAULT_MAX_COMMIT_ROWS));
-        assert!((MIN_MAX_COMMIT_BYTES..=MAX_MAX_COMMIT_BYTES).contains(&DEFAULT_MAX_COMMIT_BYTES));
         assert!(
             (MIN_INGRESS_BATCH_ROWS..=MAX_INGRESS_BATCH_ROWS).contains(&DEFAULT_INGRESS_BATCH_ROWS)
         );

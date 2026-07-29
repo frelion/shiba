@@ -187,20 +187,22 @@ BEGIN
 END;
 $$;
 
--- Canonical single-source aggregate executor.  Each statement handles at most
--- stage_chunk_rows input rows or folded keys/groups.  The caller still
--- owns one outer transaction for the complete DAG commit, so state, sink,
--- progress, inbox acknowledgement, and Stage cleanup remain atomic.
+-- Fold one stable ingress batch into durable pending state. The last batch
+-- also publishes the complete source transaction atomically. stage_chunk_rows
+-- is used only while publishing folded keys; ingress already chose the input
+-- batch boundary.
 --
 -- A chunk summary (total,min-prefix) is associative:
 --   total(a || b) = total(a) + total(b)
 --   min(a || b) = least(min(a), total(a) + min(b))
 -- This preserves ordered retraction validation while bounding each window,
 -- hash/group, MERGE, and sink statement by a configured chunk.
-CREATE FUNCTION shiba._apply_single_source_aggregate_temp_free(
+CREATE FUNCTION shiba._apply_aggregate_batch(
     stream_view shiba_internal.stream_views,
     p_commit_lsn pg_lsn,
-    only_insertions boolean
+    p_first_input_seq bigint,
+    p_last_input_seq bigint,
+    p_finalize boolean DEFAULT true
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -221,10 +223,7 @@ DECLARE
       nullif(current_setting('shiba.max_stage_rows',true),'')::bigint,
       1000000
     );
-    lower_sequence integer := 0;
-    upper_sequence integer;
-    folded_rows bigint;
-    folded_work bigint := 0;
+    pending_rows bigint;
 BEGIN
     IF stream_view.view_kind <> 'aggregate' THEN
       RAISE EXCEPTION
@@ -241,11 +240,6 @@ BEGIN
         'Shiba single-source aggregate specialization does not accept JOIN results'
         USING ERRCODE='P0S01';
     END IF;
-
-    -- Keep the API-compatible hint visible to PL/pgSQL.  Prefix validation is
-    -- intentionally retained even for insertion-only callers so correctness
-    -- does not depend on a dispatcher hint.
-    PERFORM only_insertions;
 
     SELECT format('%I.%I',n.nspname,c.relname)
     INTO STRICT source_name
@@ -277,34 +271,16 @@ BEGIN
       ELSE 'NULL::jsonb'
     END;
 
-    IF chunk_rows<1 OR max_stage_rows<1 THEN
+    IF chunk_rows<1 OR max_stage_rows<1
+       OR p_first_input_seq IS NULL
+       OR p_last_input_seq IS NULL
+       OR p_first_input_seq < 1
+       OR p_last_input_seq < p_first_input_seq THEN
       RAISE EXCEPTION 'invalid Shiba Stage resource configuration'
         USING ERRCODE='53400';
     END IF;
 
-    -- A result advisory lock is held by the dispatcher.  Clearing every row
-    -- for that result prevents stale/re-entrant Stage data from being mixed
-    -- with this replay; an error rolls the cleanup back with the outer apply.
-    DELETE FROM shiba_internal.aggregate_distinct_fold_stage
-    WHERE result_oid=stream_view.result_oid;
-    DELETE FROM shiba_internal.aggregate_group_fold_stage
-    WHERE result_oid=stream_view.result_oid;
-
-    LOOP
-      SELECT max(chunk.sequence)
-      INTO upper_sequence
-      FROM (
-        SELECT event.sequence
-        FROM shiba_internal.effective_change_log event
-        WHERE event.commit_lsn=p_commit_lsn
-          AND event.source_oid=stream_view.source_oid
-          AND event.sequence>lower_sequence
-        ORDER BY event.sequence
-        LIMIT chunk_rows
-      ) chunk;
-      EXIT WHEN upper_sequence IS NULL;
-
-      EXECUTE format(
+    EXECUTE format(
         $fold$
         WITH decoded AS MATERIALIZED (
           SELECT event.sequence AS ordinality,
@@ -328,8 +304,7 @@ BEGIN
           ) input
           WHERE event.commit_lsn=$2
             AND event.source_oid=$3
-            AND event.sequence>$4
-            AND event.sequence<=$5
+            AND event.sequence BETWEEN $4 AND $5
             AND event.delta IN (-1,1)
             AND jsonb_typeof(event.row_data)='object'
             AND coalesce((%5$s),false)
@@ -431,19 +406,36 @@ BEGIN
         count_input_sql,
         stream_view.sum_input_column,
         filter_sql
-      ) INTO STRICT folded_rows
+      )
         USING stream_view.result_oid,p_commit_lsn,stream_view.source_oid,
-              lower_sequence,upper_sequence,stream_view.count_distinct;
-      folded_work := folded_work+folded_rows;
-      IF folded_work>max_stage_rows THEN
-        RAISE EXCEPTION
-          'Shiba aggregate commit % for result % exceeded Stage work limit %',
-          p_commit_lsn,stream_view.result_oid::regclass,max_stage_rows
-          USING ERRCODE='53400',
-                HINT='Increase shiba.max_stage_rows or split the source transaction.';
-      END IF;
-      lower_sequence := upper_sequence;
-    END LOOP;
+              p_first_input_seq,p_last_input_seq,stream_view.count_distinct;
+
+    SELECT
+        (
+          SELECT count(*)
+          FROM shiba_internal.aggregate_group_fold_stage
+          WHERE result_oid=stream_view.result_oid
+            AND commit_lsn=p_commit_lsn
+        )
+        +(
+          SELECT count(*)
+          FROM shiba_internal.aggregate_distinct_fold_stage
+          WHERE result_oid=stream_view.result_oid
+            AND commit_lsn=p_commit_lsn
+        )
+    INTO STRICT pending_rows;
+    IF pending_rows>max_stage_rows THEN
+      RAISE EXCEPTION
+        'Shiba aggregate commit % for result % retained % pending keys, limit %',
+        p_commit_lsn,stream_view.result_oid::regclass,
+        pending_rows,max_stage_rows
+        USING ERRCODE='53400',
+              HINT='Increase shiba.max_stage_rows or reduce commit key cardinality.';
+    END IF;
+
+    IF NOT p_finalize THEN
+      RETURN;
+    END IF;
 
     -- DISTINCT keys are independent once their complete ordered summaries
     -- have been folded.  Apply bounded key sets and accumulate zero-boundary

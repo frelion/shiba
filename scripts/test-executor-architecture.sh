@@ -314,7 +314,7 @@ wait_for_query "0" "
 wait_for_result "public.arch_shared_source" "shiba.arch_shared_a"
 wait_for_result "public.arch_shared_source" "shiba.arch_shared_b"
 
-printf '\n==> Round-robin DAG fairness and one-commit transaction boundaries\n'
+printf '\n==> Round-robin DAG fairness at apply-batch boundaries\n'
 psql_arch -qc "
   CREATE TABLE public.arch_fair_source_a (
     event_id integer PRIMARY KEY,group_id integer NOT NULL,amount integer NOT NULL
@@ -425,7 +425,7 @@ wait_for_result "public.arch_fair_source_a" "shiba.arch_fair_result_a"
 wait_for_result "public.arch_fair_source_b" "shiba.arch_fair_result_b"
 assert_one_runtime
 
-printf '\n==> Long apply exposes single-process head-of-line blocking\n'
+printf '\n==> Long SQL execution exposes single-process head-of-line blocking\n'
 psql_arch -qc "
   CREATE TABLE public.arch_long_apply_gate(enabled boolean NOT NULL);
   INSERT INTO public.arch_long_apply_gate VALUES (true);

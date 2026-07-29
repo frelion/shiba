@@ -146,20 +146,24 @@ SPI-connected backend. A logical `DagRuntime` is cached plan metadata, not a
 worker or thread. Result changes are therefore eventually consistent, and the
 number of result DAGs does not change PostgreSQL process count.
 
-The Runtime consumes one atomic source commit for one DAG at a time. It rotates
-ready DAGs at commit boundaries and does not run SPI concurrently on Rust
-threads. A source commit is non-preemptible: a large apply temporarily delays
-routing, every other DAG, and garbage collection.
+The Runtime does not run SPI concurrently on Rust threads. After a source
+commit is fully ingested, it prepares one stable ingress batch for one DAG per
+apply transaction and rotates ready DAGs between batches. The final batch
+publishes the complete source commit atomically. A PostgreSQL statement is
+still non-preemptible, so an expensive final publication can temporarily delay
+routing, other DAGs, and garbage collection.
 
 Each committed transaction is durably deduplicated by its commit LSN, and each
 result records an activation LSN immediately after its locked CTAS backfill.
 Every decoded delta is stored once in the shared durable `change_log`.
 `dag_inbox` stores at most one lightweight `(result_oid, commit_lsn)` reference
-per affected DAG, so payload is not duplicated by fanout. Operator SQL reads
-the ordered shared payload directly. Operator state, result rows, progress, and
-acknowledgement of one DAG reference remain one atomic Runtime transaction.
-This prevents both crash replay double-counting and replaying pre-backfill WAL
-into a newly-created result.
+and a batch cursor per affected DAG, so payload is not duplicated by fanout.
+Operator SQL reads one `ingress_apply_batches` input range and merges it into
+LOGGED pending state in the same transaction that advances the cursor. On the
+last batch, operator state, result rows, progress, pending cleanup, and
+acknowledgement of the DAG reference commit together. This prevents crash
+replay double-counting and replaying pre-backfill WAL into a newly-created
+result.
 `shiba_internal.view_progress.applied_lsn` exposes the per-result commit-LSN
 watermark.
 
@@ -170,12 +174,13 @@ relations stay fused, relations reused inside one statement use
 UNLOGGED `join_delta` Stage when its exact output must cross SQL statements.
 Join input delta remains statement-materialized.
 
-All recovery authority remains logged: `change_log`, `dag_inbox`, progress,
-arrangements, operator state, and result rows. The UNLOGGED Stage is
-commit-scoped derived data. Normal apply creates no temporary table and
-performs no DDL. If PostgreSQL crashes before apply commits, the logged inbox
-and change-log input remain and the replacement Runtime rebuilds the Stage
-during complete-transaction replay.
+All recovery authority remains logged: `change_log`, stable apply ranges,
+`dag_inbox`, pending operator summaries, progress, arrangements, operator
+state, and result rows. The typed UNLOGGED Join Stage is derived data used only
+inside final publication. Normal apply creates no temporary table and performs
+no DDL. After a crash, the replacement Runtime resumes at the persisted batch
+cursor; a failed current batch is retried, while earlier pending summaries are
+retained.
 
 The Runtime is configured for PostgreSQL to restart it after an abnormal exit
 while the postmaster stays up. Because it is dynamically registered, a
@@ -183,13 +188,11 @@ postmaster restart does not itself re-register it: the next statement on a
 registered source table, or an explicit `SELECT shiba.activate()`, restores the
 single Runtime.
 
-If loading or applying one DAG fails, the current commit is rolled back, its
-durable inbox reference and its shared payload are retained, and that DAG is
-marked failed (quarantined) while other DAGs continue on subsequent scheduler
-turns. `shiba.activate()` does not automatically reactivate a failed DAG.
-Recovery requires fixing the underlying cause and explicitly clearing/retrying
-that DAG. Shared payload is garbage-collected only after no DAG references its
-source transaction.
+If loading or applying one DAG fails, the current apply transaction rolls
+back. Previously committed pending batches, the inbox cursor, and shared input
+remain consistent. Resource-limit failures pause that DAG; deterministic
+plan/operator failures quarantine it while other DAGs continue. Shared payload
+is garbage-collected only after no DAG references its source transaction.
 
 Applications can inspect a result's public progress surface without reading internal tables:
 

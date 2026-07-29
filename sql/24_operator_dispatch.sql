@@ -121,7 +121,10 @@ CREATE FUNCTION shiba._apply_claimed_dag_commit(
     result_relation oid,
     execution_descriptor jsonb,
     ingress_transaction_id bigint,
-    commit_lsn pg_lsn
+    commit_lsn pg_lsn,
+    p_first_input_seq bigint,
+    p_last_input_seq bigint,
+    p_finalize boolean DEFAULT true
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -132,19 +135,6 @@ DECLARE
     stream_view shiba_internal.stream_views%ROWTYPE;
     execution_pipeline text := execution_descriptor->>'pipeline';
     left_source_oid oid := (execution_descriptor->>'left_source_oid')::oid;
-    source_commit_lsn pg_lsn := commit_lsn;
-    use_unary_batch boolean :=
-      execution_pipeline IN ('window','distinct','topn');
-    commit_event_count bigint;
-    commit_payload_bytes bigint;
-    max_commit_rows bigint := coalesce(
-      nullif(current_setting('shiba.max_commit_rows',true),'')::bigint,
-      1000000
-    );
-    max_commit_bytes bigint := coalesce(
-      nullif(current_setting('shiba.max_commit_bytes',true),'')::bigint,
-      1073741824
-    );
 BEGIN
     IF jsonb_typeof(execution_descriptor) IS DISTINCT FROM 'object'
        OR left_source_oid IS NULL
@@ -180,12 +170,6 @@ BEGIN
     PERFORM set_config(
       'bytea_output',stream_view.execution_settings->>'bytea_output',true
     );
-    IF use_unary_batch AND stream_view.source_oid<>left_source_oid THEN
-      RAISE EXCEPTION
-        'logical plan unary input disagrees with metadata for result %',
-        result_relation
-        USING ERRCODE='P0S01';
-    END IF;
     IF stream_view.source_oid<>left_source_oid THEN
       RAISE EXCEPTION
         'logical plan left input disagrees with metadata for result %',
@@ -193,49 +177,68 @@ BEGIN
         USING ERRCODE='P0S01';
     END IF;
 
-    SELECT txn.event_count,txn.payload_bytes
-    INTO STRICT commit_event_count,commit_payload_bytes
-    FROM shiba_internal.ingress_transactions txn
-    WHERE txn.ingress_txn_id=ingress_transaction_id
-      AND txn.commit_lsn=source_commit_lsn
-      AND txn.status='committed';
-    IF commit_event_count>max_commit_rows
-       OR commit_payload_bytes>max_commit_bytes THEN
-      RAISE EXCEPTION
-        'Shiba source commit % exceeds Runtime admission: % rows/% bytes, limits %/%',
-        source_commit_lsn,commit_event_count,commit_payload_bytes,
-        max_commit_rows,max_commit_bytes
-        USING ERRCODE='53400',
-              HINT='Increase shiba.max_commit_rows/max_commit_bytes or split the source transaction.';
-    END IF;
-
     IF execution_pipeline='join' THEN
-      PERFORM shiba._apply_join_commit_temp_free(
-        result_relation,execution_descriptor,source_commit_lsn
+      PERFORM shiba._prepare_join_batch(
+        result_relation,
+        ingress_transaction_id,
+        commit_lsn,
+        p_first_input_seq,
+        p_last_input_seq
       );
+      IF p_finalize THEN
+        PERFORM shiba._apply_join_commit_temp_free(
+          result_relation,execution_descriptor,commit_lsn
+        );
+      END IF;
     ELSIF execution_pipeline='aggregate' THEN
-      PERFORM shiba._apply_single_source_aggregate_temp_free(
-        stream_view,source_commit_lsn,false
+      PERFORM shiba._apply_aggregate_batch(
+        stream_view,
+        commit_lsn,
+        p_first_input_seq,
+        p_last_input_seq,
+        p_finalize
       );
     ELSIF execution_pipeline='distinct' THEN
-      PERFORM shiba._apply_distinct_batch(stream_view,source_commit_lsn);
+      PERFORM shiba._apply_distinct_batch(
+        stream_view,
+        commit_lsn,
+        p_first_input_seq,
+        p_last_input_seq,
+        p_finalize
+      );
     ELSIF execution_pipeline='topn' THEN
-      PERFORM shiba._apply_topn_batch(stream_view,source_commit_lsn);
+      PERFORM shiba._apply_topn_batch(
+        stream_view,
+        ingress_transaction_id,
+        commit_lsn,
+        p_first_input_seq,
+        p_last_input_seq,
+        p_finalize
+      );
     ELSIF execution_pipeline='window' THEN
-      PERFORM shiba._apply_window_batch(stream_view,source_commit_lsn);
+      PERFORM shiba._apply_window_batch(
+        stream_view,
+        ingress_transaction_id,
+        commit_lsn,
+        p_first_input_seq,
+        p_last_input_seq,
+        p_finalize
+      );
     END IF;
 
-    PERFORM shiba._advance_dag_progress(result_relation,commit_lsn::text);
+    IF p_finalize THEN
+      PERFORM shiba._advance_dag_progress(result_relation,commit_lsn::text);
+    END IF;
 END;
 $$;
 
 -- Apply an already-claimed commit inside an intentional PL/pgSQL
 -- subtransaction:
--- an operator/SPI error rolls back every state/result/progress mutation from
--- this source commit. Explicitly transient concurrency failures leave the DAG
--- active for a later transaction retry; deterministic failures quarantine it.
--- The normal entry point requests acknowledgement here so its affected-row
--- count is part of the same error/isolation protocol.
+-- an operator/SPI error rolls back the current batch and its cursor advance.
+-- Earlier prepared batches are already durable; final publication keeps
+-- state, result, progress, pending cleanup, and acknowledgement atomic.
+-- Explicitly transient concurrency failures leave the DAG active for retry;
+-- deterministic failures quarantine it.
 CREATE FUNCTION shiba._apply_claimed_dag_safely(
     result_relation oid,
     execution_descriptor jsonb,
@@ -249,16 +252,65 @@ SECURITY DEFINER
 SET search_path = pg_catalog, shiba, shiba_internal
 AS $$
 DECLARE
+    execution_pipeline text := execution_descriptor->>'pipeline';
     error_state text;
     error_message text;
     error_detail text;
     error_hint text;
     acknowledged_rows bigint;
+    claimed_batch_ordinal bigint;
+    first_input_seq bigint;
+    last_input_seq bigint;
+    final_batch boolean;
 BEGIN
     BEGIN
+        SELECT inbox.next_batch_ordinal,
+               batch.first_input_seq,
+               batch.last_input_seq,
+               NOT EXISTS (
+                 SELECT 1
+                 FROM shiba_internal.ingress_apply_batches AS later
+                 WHERE later.ingress_txn_id=p_ingress_txn_id
+                   AND later.batch_ordinal>inbox.next_batch_ordinal
+               )
+        INTO STRICT claimed_batch_ordinal,
+                    first_input_seq,
+                    last_input_seq,
+                    final_batch
+        FROM shiba_internal.dag_inbox AS inbox
+        JOIN shiba_internal.ingress_apply_batches AS batch
+          ON batch.ingress_txn_id=inbox.ingress_txn_id
+         AND batch.batch_ordinal=inbox.next_batch_ordinal
+        WHERE inbox.result_oid=result_relation
+          AND inbox.ingress_txn_id=p_ingress_txn_id
+          AND inbox.commit_lsn=p_commit_lsn;
+
         PERFORM shiba._apply_claimed_dag_commit(
-          result_relation,execution_descriptor,p_ingress_txn_id,p_commit_lsn
+          result_relation,
+          execution_descriptor,
+          p_ingress_txn_id,
+          p_commit_lsn,
+          first_input_seq,
+          last_input_seq,
+          final_batch
         );
+
+        IF NOT final_batch THEN
+          UPDATE shiba_internal.dag_inbox AS inbox
+          SET next_batch_ordinal=inbox.next_batch_ordinal+1
+          WHERE inbox.result_oid=result_relation
+            AND inbox.ingress_txn_id=p_ingress_txn_id
+            AND inbox.next_batch_ordinal=claimed_batch_ordinal;
+          GET DIAGNOSTICS acknowledged_rows = ROW_COUNT;
+          IF acknowledged_rows<>1 THEN
+            RAISE EXCEPTION
+              'Shiba DAG % batch cursor for commit % affected % rows, expected 1',
+              result_relation::regclass,p_commit_lsn,acknowledged_rows
+              USING ERRCODE='P0S01';
+          END IF;
+          RETURN 'prepared';
+        END IF;
+
         IF acknowledge THEN
           DELETE FROM shiba_internal.dag_inbox AS inbox
           WHERE inbox.result_oid=result_relation

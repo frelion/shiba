@@ -27,9 +27,10 @@ Shiba is tested against a real PostgreSQL 17 server, not a mock database.
    `COUNT(DISTINCT)`, top-level DISTINCT, TopN/OFFSET, windows, all supported
    joins, cross-input predicates, and semi/anti/null-aware anti joins.
 6. **Concurrency and recovery tests** exercise concurrent mixed DML, large
-   commit and rollback batches, durable inbox replay, persistent-slot replay
-   across an immediate PostgreSQL restart, and result DROP racing with writers.
-   Every blocking operation and poll has a hard timeout.
+   commit and rollback batches, crash after a committed prepare batch, durable
+   cursor resume, final-publication rollback, persistent-slot replay across an
+   immediate PostgreSQL restart, and result DROP racing with writers. Every
+   blocking operation and poll has a hard timeout.
 
 ## Required scenarios
 
@@ -37,13 +38,18 @@ Shiba is tested against a real PostgreSQL 17 server, not a mock database.
 - exactly one `shiba runtime` starts for an active database, independent of
   result-DAG count; no `shiba router`, `shiba executor`, or per-DAG worker is
   present in `pg_stat_activity`;
-- the one Runtime schedules multiple `DagRuntime` instances round-robin at
-  source-commit boundaries: after the current non-preemptible commit finishes,
-  a continuously backlogged DAG cannot monopolize every subsequent commit
-  slot; the test does not claim time slicing within one large commit;
+- the one Runtime schedules multiple `DagRuntime` instances round-robin
+  between ingress apply batches; a continuously backlogged DAG cannot
+  monopolize every subsequent transaction slot;
 - one source transaction stores each decoded delta exactly once in
   `change_log`, while `dag_inbox` stores exactly one row per affected DAG and
   commit, with no payload column;
+- replayed ingress produces stable, contiguous, non-overlapping
+  `ingress_apply_batches`; each DAG cursor advances in the same transaction as
+  its LOGGED pending summary;
+- crashing after a committed prepare batch leaves result and progress
+  unchanged, then a replacement Runtime resumes at the next batch and
+  publishes exactly once;
 - registration persists exactly one valid `PhysicalDagPlan` generation per
   DAG; Runtime execution loads that generation instead of compiling per
   commit;
@@ -146,8 +152,9 @@ Single-Runtime architecture acceptance must additionally prove the
 process/runtime boundary: result-DAG count does not increase PostgreSQL
 background-worker count; Router and Executor processes do not exist; payload
 fanout is shared; round-robin preserves per-DAG commit order; poison input
-retains replay data; UNLOGGED Stage loss is rebuilt from logged
-inbox/change-log input; and DROP allows unreferenced payload GC. Static
+retains replay data; batch cursors and LOGGED pending state survive restart;
+UNLOGGED Join Stage loss is rebuilt from logged input; and DROP allows
+unreferenced payload GC. Static
 architecture checks additionally reject apply-time `CREATE UNLOGGED`, TEMP
 tables, and per-data-row loops. The shell gate cannot directly prove the
 absence of a Rust transaction-sized `Vec`; that requires a Rust-level

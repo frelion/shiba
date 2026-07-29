@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Deterministically crash the test-only single Runtime at the two durable
-# handoff boundaries that ordinary kill-based recovery tests cannot target:
-# apply-before-inbox-ack and route-before-slot-advance.
+# Deterministically crash the test-only single Runtime at durable handoff
+# boundaries that ordinary kill-based recovery tests cannot target.
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pg_config_path="${PG_CONFIG:-/opt/homebrew/opt/postgresql@17/bin/pg_config}"
@@ -153,6 +152,7 @@ cargo pgrx install --pg-config "${pg_config_path}" --features pg_test
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
+  printf "shiba.ingress_batch_rows = 4\n"
   printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s'\n" \
     "${pg_socket_dir}" "${pg_port}" "${database_name}" "$(id -un)"
 } >>"${pg_data_dir}/postgresql.conf"
@@ -196,6 +196,99 @@ wait_for_query "0" "${baseline_diff}" "the initial result"
 
 result_oid="$(psql_gate -Atqc "
   SELECT 'shiba.failpoint_result'::regclass::oid::integer")"
+
+printf '\n==> Runtime crash after a durable prepared batch\n'
+set_dag_active "${result_oid}" false
+progress_before_prepare="$(psql_gate -Atqc "
+  SELECT coalesce(applied_lsn::text,'NULL')
+  FROM shiba_internal.view_progress
+  WHERE result_oid=${result_oid}::oid")"
+psql_gate -qc "
+  INSERT INTO public.failpoint_source
+  SELECT id,5,id
+  FROM generate_series(100,20099) AS id"
+wait_for_query "1" "
+  SELECT count(*) FROM shiba_internal.dag_inbox
+  WHERE result_oid=${result_oid}::oid" \
+  "the multi-batch commit to reach the durable inbox"
+prepare_lsn="$(psql_gate -Atqc "
+  SELECT commit_lsn FROM shiba_internal.dag_inbox
+  WHERE result_oid=${result_oid}::oid")"
+prepare_log_lsn="$(psql_gate -Atqc "
+  SELECT split_part('${prepare_lsn}','/',1)
+         || '/' ||
+         lpad(split_part('${prepare_lsn}','/',2),8,'0')")"
+assert_query "t" "
+  SELECT count(*)>1
+  FROM shiba_internal.ingress_apply_batches batch
+  JOIN shiba_internal.dag_inbox inbox
+    ON inbox.ingress_txn_id=batch.ingress_txn_id
+  WHERE inbox.result_oid=${result_oid}::oid
+    AND inbox.commit_lsn='${prepare_lsn}'::pg_lsn"
+prepare_runtime_pid="$(runtime_pid)"
+psql_gate -qc "
+  INSERT INTO public.shiba_runtime_failpoints
+    (kind,runtime_pid,result_oid,commit_lsn,pause_ms)
+  VALUES
+    ('runtime_apply_after_prepared_batch',${prepare_runtime_pid},
+     ${result_oid}::oid,'${prepare_lsn}'::pg_lsn,2000);
+  UPDATE shiba_internal.dag_runtime_state
+  SET active=true
+  WHERE result_oid=${result_oid}::oid"
+
+wait_for_log \
+  "test failpoint reached: runtime_apply_after_prepared_batch result ${result_oid} commit ${prepare_log_lsn}" \
+  "the Runtime to commit one prepared batch"
+# The failpoint is claimed in a new transaction after the prepare transaction
+# commits. Freeze the DAG while the Runtime is paused so the replacement cannot
+# consume the remaining batches before the recovery assertions.
+set_dag_active "${result_oid}" false
+assert_query "2|0|${progress_before_prepare}|true" "
+  SELECT
+    (SELECT next_batch_ordinal FROM shiba_internal.dag_inbox
+     WHERE result_oid=${result_oid}::oid
+       AND commit_lsn='${prepare_lsn}'::pg_lsn)
+    || '|' ||
+    (SELECT count(*) FROM shiba.failpoint_result WHERE group_id=5)
+    || '|' ||
+    (SELECT coalesce(applied_lsn::text,'NULL')
+     FROM shiba_internal.view_progress
+     WHERE result_oid=${result_oid}::oid)
+    || '|' ||
+    (SELECT fired FROM public.shiba_runtime_failpoints
+     WHERE kind='runtime_apply_after_prepared_batch')"
+assert_query "1" "
+  SELECT count(*)
+  FROM shiba_internal.aggregate_group_fold_stage
+  WHERE result_oid=${result_oid}::oid
+    AND commit_lsn='${prepare_lsn}'::pg_lsn"
+
+wait_for_log \
+  "runtime exited after committing a prepared batch for ${prepare_log_lsn}" \
+  "the post-prepare failpoint"
+wait_for_query "0" "
+  SELECT count(*) FROM pg_stat_activity
+  WHERE backend_type='shiba runtime' AND pid=${prepare_runtime_pid}" \
+  "the failed Runtime to exit"
+wait_for_replacement_runtime "${prepare_runtime_pid}"
+
+psql_gate -qc "
+  DELETE FROM public.shiba_runtime_failpoints
+  WHERE kind='runtime_apply_after_prepared_batch';
+  UPDATE shiba_internal.dag_runtime_state
+  SET active=true
+  WHERE result_oid=${result_oid}::oid"
+wait_for_query "0" "${baseline_diff}" \
+  "the replacement Runtime to resume at the next prepared batch"
+wait_for_query "0|0" "
+  SELECT
+    (SELECT count(*) FROM shiba_internal.dag_inbox
+     WHERE result_oid=${result_oid}::oid)
+    || '|' ||
+    (SELECT count(*) FROM shiba_internal.aggregate_group_fold_stage
+     WHERE result_oid=${result_oid}::oid
+       AND commit_lsn='${prepare_lsn}'::pg_lsn)" \
+  "the resumed commit to publish and clear pending state"
 
 printf '\n==> Runtime apply-before-ack rollback\n'
 set_dag_active "${result_oid}" false
@@ -269,7 +362,11 @@ wait_for_query "0" "
 
 apply_panic="Shiba test failpoint: runtime exited after applying commit ${apply_lsn} and before acknowledgement"
 apply_exit="background worker \"shiba runtime\" (PID ${apply_runtime_pid}) exited with exit code 1"
+prepare_panic="Shiba test failpoint: runtime exited after committing a prepared batch for ${prepare_log_lsn}"
+prepare_exit="background worker \"shiba runtime\" (PID ${prepare_runtime_pid}) exited with exit code 1"
 
+assert_log_count 1 "${prepare_panic}" "the expected post-prepare panic"
+assert_log_count 1 "${prepare_exit}" "the failed post-prepare Runtime PID exit"
 assert_log_count 1 \
   "Shiba test failpoint reached: runtime_apply_before_ack result ${result_oid} commit ${apply_lsn}" \
   "the apply boundary arrival with exact result OID and commit LSN"
@@ -279,16 +376,18 @@ assert_log_count 1 "${apply_exit}" "the failed apply Runtime PID exit"
 runtime_exit_log="$(mktemp /tmp/shiba-runtime-failpoint-exits.XXXXXX)"
 grep 'background worker "shiba runtime"' \
   "${pg_log_file}" >"${runtime_exit_log}" || true
-if test "$(wc -l <"${runtime_exit_log}" | tr -d ' ')" != "1" ||
+if test "$(wc -l <"${runtime_exit_log}" | tr -d ' ')" != "2" ||
+   ! grep -Fq "${prepare_exit}" "${runtime_exit_log}" ||
    ! grep -Fq "${apply_exit}" "${runtime_exit_log}"; then
   sed -n '1,120p' "${runtime_exit_log}" >&2
   rm -f "${runtime_exit_log}"
-  fail "expected exactly one deliberately failed Runtime exit record"
+  fail "expected exactly two deliberately failed Runtime exit records"
 fi
 rm -f "${runtime_exit_log}"
 
 unexpected_log="$(mktemp /tmp/shiba-runtime-failpoint-unexpected.XXXXXX)"
 grep -nE 'WARNING|ERROR|FATAL|PANIC' "${pg_log_file}" |
+  grep -Fv -e "${prepare_panic}" |
   grep -Fv -e "${apply_panic}" \
   >"${unexpected_log}" || true
 if test -s "${unexpected_log}"; then

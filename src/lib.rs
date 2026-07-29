@@ -159,17 +159,6 @@ mod tests {
                 .expect("max_cached_dags should be readable"),
             Some(128)
         );
-        assert_eq!(
-            Spi::get_one::<i32>("SELECT current_setting('shiba.max_commit_rows', true)::integer")
-                .expect("max_commit_rows should be readable"),
-            Some(1_000_000)
-        );
-        assert_eq!(
-            Spi::get_one::<i32>("SELECT current_setting('shiba.max_commit_bytes', true)::integer")
-                .expect("max_commit_bytes should be readable"),
-            Some(1_073_741_824)
-        );
-
         worker::configure_runtime_session();
 
         let settings = Spi::get_three::<String, String, String>(
@@ -237,6 +226,78 @@ mod tests {
         assert_eq!(first, Some(true));
         assert_eq!(second, Some(false));
         assert_eq!(claims, Some(1));
+    }
+
+    #[pg_test]
+    fn ingress_commit_rejects_an_invalid_apply_batch_manifest() {
+        Spi::run(
+            r#"
+            INSERT INTO shiba_internal.ingress_replay_state (
+                slot_generation,
+                slot_name,
+                database_oid,
+                system_identifier,
+                slot_baseline_lsn
+            )
+            SELECT 2,
+                   'shiba_manifest_pg_test',
+                   oid,
+                   (SELECT system_identifier::text
+                      FROM pg_catalog.pg_control_system()),
+                   '0/0'
+              FROM pg_catalog.pg_database
+             WHERE datname = current_database();
+
+            WITH claimed AS (
+                SELECT ingress_txn_id
+                  FROM shiba_internal.claim_ingress_transaction(
+                      2, 43, '0/234560'
+                  )
+            )
+            INSERT INTO shiba_internal.ingress_apply_batches (
+                ingress_txn_id,
+                batch_ordinal,
+                first_input_seq,
+                last_input_seq,
+                event_count
+            )
+            SELECT ingress_txn_id, 2, 1, 1, 1
+              FROM claimed;
+
+            DO $test$
+            BEGIN
+                BEGIN
+                    PERFORM shiba_internal.commit_ingress_transaction(
+                        (
+                            SELECT ingress_txn_id
+                              FROM shiba_internal.ingress_transactions
+                             WHERE slot_generation=2
+                               AND source_xid=43
+                        ),
+                        '0/234560',
+                        '0/234570'
+                    );
+                    RAISE EXCEPTION 'invalid manifest unexpectedly committed';
+                EXCEPTION
+                    WHEN data_corrupted THEN NULL;
+                END;
+            END
+            $test$;
+            "#,
+        )
+        .expect("invalid ingress manifest should fail closed");
+
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT status
+                   FROM shiba_internal.ingress_transactions
+                  WHERE slot_generation=2
+                    AND source_xid=43"
+            )
+            .expect("manifest test transaction should remain queryable")
+            .as_deref(),
+            Some("open")
+        );
     }
 
     #[pg_test]

@@ -197,11 +197,11 @@ CREATE TABLE shiba_internal.distinct_state (
     PRIMARY KEY(result_oid,group_key,value_key)
 );
 
--- Shared, rebuildable fold Stages for single-source aggregates.  They are
--- keyed by result and source commit so a Runtime replay cannot mix summaries
--- from different DAG commits.  UNLOGGED avoids WAL duplication; PostgreSQL
--- transaction rollback still makes state/sink application atomic.
-CREATE UNLOGGED TABLE shiba_internal.aggregate_group_fold_stage (
+-- Durable, commit-private fold state for single-source aggregates. Each
+-- ingress apply batch merges an ordered summary here and commits its inbox
+-- cursor in the same transaction. The rows remain invisible to users until
+-- the final batch publishes state and sink changes.
+CREATE TABLE shiba_internal.aggregate_group_fold_stage (
     result_oid oid NOT NULL
         REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
     commit_lsn pg_lsn NOT NULL,
@@ -215,7 +215,7 @@ CREATE UNLOGGED TABLE shiba_internal.aggregate_group_fold_stage (
     PRIMARY KEY (result_oid,commit_lsn,group_key)
 );
 
-CREATE UNLOGGED TABLE shiba_internal.aggregate_distinct_fold_stage (
+CREATE TABLE shiba_internal.aggregate_distinct_fold_stage (
     result_oid oid NOT NULL
         REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
     commit_lsn pg_lsn NOT NULL,
@@ -226,7 +226,7 @@ CREATE UNLOGGED TABLE shiba_internal.aggregate_distinct_fold_stage (
     PRIMARY KEY (result_oid,commit_lsn,group_key,value_key)
 );
 
-CREATE UNLOGGED TABLE shiba_internal.distinct_fold_stage (
+CREATE TABLE shiba_internal.distinct_fold_stage (
     result_oid oid NOT NULL
         REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
     commit_lsn pg_lsn NOT NULL,
@@ -454,6 +454,67 @@ CREATE TABLE shiba_internal.change_log (
     UNIQUE (ingress_txn_id, input_seq)
 );
 
+-- Stable downstream work units derived from first-seen input_seq allocations.
+-- Replication delivery can regroup already persisted CopyData frames after a
+-- restart, so ingress_decode_batches are replay checkpoints rather than a
+-- safe apply cursor.  A row is created only for the new, contiguous input_seq
+-- range inserted by one bounded ingress transaction.
+CREATE TABLE shiba_internal.ingress_apply_batches (
+    ingress_txn_id bigint NOT NULL
+        REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
+        ON DELETE CASCADE,
+    batch_ordinal bigint NOT NULL CHECK (batch_ordinal > 0),
+    first_input_seq bigint NOT NULL CHECK (first_input_seq > 0),
+    last_input_seq bigint NOT NULL CHECK (last_input_seq >= first_input_seq),
+    event_count bigint NOT NULL CHECK (event_count > 0),
+    persisted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (ingress_txn_id, batch_ordinal),
+    UNIQUE (ingress_txn_id, first_input_seq, last_input_seq),
+    CHECK (event_count = last_input_seq - first_input_seq + 1)
+);
+
+-- Durable row-bag summaries prepared one ingress batch at a time for TopN and
+-- Window. partition_key is JSON null for TopN. The associative total/minimum
+-- prefix pair preserves ordered retraction validation across batch commits.
+CREATE TABLE shiba_internal.unary_pending_rows (
+    result_oid oid NOT NULL
+        REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
+    ingress_txn_id bigint NOT NULL
+        REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
+        ON DELETE CASCADE,
+    partition_key jsonb NOT NULL,
+    row_data jsonb NOT NULL,
+    multiplicity_delta bigint NOT NULL,
+    minimum_prefix bigint NOT NULL,
+    PRIMARY KEY (result_oid,ingress_txn_id,partition_key,row_data)
+);
+
+-- Durable folded source rows prepared for one Join commit. Join candidate
+-- generation remains a finalization step, so the complete left/right delta
+-- and its cross term are computed together against committed arrangements.
+CREATE TABLE shiba_internal.join_pending_rows (
+    result_oid oid NOT NULL
+        REFERENCES shiba_internal.inner_join_views(result_oid)
+        ON DELETE CASCADE,
+    ingress_txn_id bigint NOT NULL,
+    commit_lsn pg_lsn NOT NULL,
+    input_side text NOT NULL CHECK (input_side IN ('left','right')),
+    join_key jsonb NOT NULL,
+    row_data jsonb NOT NULL,
+    multiplicity_delta bigint NOT NULL,
+    multiplicity_min_prefix bigint NOT NULL,
+    PRIMARY KEY (
+        result_oid,ingress_txn_id,input_side,join_key,row_data
+    ),
+    FOREIGN KEY (ingress_txn_id,commit_lsn)
+        REFERENCES shiba_internal.ingress_transactions
+                   (ingress_txn_id,commit_lsn)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX shiba_join_pending_commit_idx
+    ON shiba_internal.join_pending_rows (result_oid,commit_lsn,input_side);
+
 -- PostgreSQL has already applied top-level and subtransaction rollback
 -- semantics before pgoutput emits rows when streaming=off.  Consumers only
 -- need committed, normalized payload.
@@ -519,6 +580,8 @@ CREATE TABLE shiba_internal.dag_inbox (
         REFERENCES shiba_internal.stream_views(result_oid) ON DELETE CASCADE,
     ingress_txn_id bigint NOT NULL,
     commit_lsn pg_lsn NOT NULL,
+    next_batch_ordinal bigint NOT NULL DEFAULT 1
+        CHECK (next_batch_ordinal > 0),
     PRIMARY KEY (result_oid, ingress_txn_id),
     UNIQUE (result_oid, commit_lsn),
     FOREIGN KEY (ingress_txn_id, commit_lsn)

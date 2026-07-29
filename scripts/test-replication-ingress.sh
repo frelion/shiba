@@ -177,8 +177,6 @@ wait_for_query "1|15" "
   WHERE group_id=7
 " "ingress update/delete DAG application"
 
-psql_ingress -qc "ALTER SYSTEM SET shiba.max_commit_rows = '2'"
-psql_ingress -qc "SELECT pg_reload_conf()"
 psql_ingress -qc "
   BEGIN;
   INSERT INTO public.ingress_dag_source VALUES (10, 9, 40);
@@ -194,16 +192,13 @@ wait_for_query "2|100" "
   SELECT row_count, total_amount
   FROM shiba.ingress_dag_totals
   WHERE group_id=9
-" "effective rollback-aware apply admission"
+" "effective rollback-aware batch apply"
 assert_query "0" "
   SELECT count(*)
   FROM shiba_internal.dag_runtime_state
   WHERE result_oid='shiba.ingress_dag_totals'::regclass
     AND NOT active
 "
-psql_ingress -qc "ALTER SYSTEM RESET shiba.max_commit_rows"
-psql_ingress -qc "SELECT pg_reload_conf()"
-
 psql_ingress -qc "
   CREATE TABLE public.shiba_runtime_failpoints (
     kind text PRIMARY KEY,
@@ -291,6 +286,35 @@ assert_query "t|t" "
   SELECT max(event_count) <= 4,
          max(payload_bytes) <= 32768
   FROM shiba_internal.ingress_decode_batches
+"
+assert_query "t|t|t|t|t|t" "
+  WITH target AS (
+    SELECT ingress_txn_id,event_count
+    FROM shiba_internal.ingress_transactions
+    WHERE status='committed'
+    ORDER BY event_count DESC
+    LIMIT 1
+  ),
+  ordered AS (
+    SELECT batch.*,
+           lag(batch.last_input_seq) OVER (
+             ORDER BY batch.batch_ordinal
+           ) AS previous_last_input_seq
+    FROM shiba_internal.ingress_apply_batches AS batch
+    JOIN target USING(ingress_txn_id)
+  )
+  SELECT
+    sum(ordered.event_count)=max(target.event_count),
+    min(ordered.first_input_seq)=1,
+    max(ordered.last_input_seq)=max(target.event_count),
+    bool_and(
+      ordered.previous_last_input_seq IS NULL
+      OR ordered.first_input_seq=ordered.previous_last_input_seq+1
+    ),
+    max(ordered.event_count)<=4,
+    count(*)>10
+  FROM ordered
+  CROSS JOIN target
 "
 assert_query "t|t" "
   SELECT
