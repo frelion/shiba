@@ -78,6 +78,12 @@ cases include:
 - INSERT, DELETE, and UPDATE as weighted row images;
 - streamed top-level rollback remaining invisible and replaying after restart;
 - a large source transaction admitted in many bounded batches;
+- forced walsender termination while a streamed prefix is durable, followed by
+  exact replay and publication after reconnect;
+- immediate postmaster restart while a streamed prefix is durable, ensuring
+  the crash-aborted source transaction releases its ingress admission budget;
+- concurrent streamed writers sharing admission accounting, with exact-once
+  publication and configured source-chunk bounds;
 - streamed batches hidden from source streams until pgoutput `Commit`;
 - top-level and subtransaction aborts producing no DAG effects;
 - header-only Commit finalization;

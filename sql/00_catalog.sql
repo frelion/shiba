@@ -82,6 +82,12 @@ CREATE TABLE shiba_internal.ingress_replay_state (
     replay_safe_lsn pg_lsn,
     open_payload_bytes bigint NOT NULL DEFAULT 0
       CHECK (open_payload_bytes >= 0),
+    -- Open streamed transactions are valid across a Runtime restart, but not
+    -- across a postmaster crash: PostgreSQL aborts their source transaction.
+    -- Keep the server epoch alongside their accounting so bootstrap can
+    -- distinguish those two cases without guessing from replication output.
+    postmaster_started_at timestamptz NOT NULL
+      DEFAULT pg_catalog.pg_postmaster_start_time(),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     retired_at timestamptz,

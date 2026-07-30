@@ -313,6 +313,11 @@ fn bootstrap_ingress() -> IngressBootstrap {
     .expect("Shiba could not initialize its ingress generation")
     .expect("ingress generation initialization returned no row");
     let generation_argument = unsafe { [DatumWithOid::new(generation, pg_sys::INT8OID)] };
+    Spi::run_with_args(
+        "SELECT shiba_internal.reconcile_postmaster_restart($1)",
+        &generation_argument,
+    )
+    .expect("Shiba could not reconcile ingress state after postmaster restart");
     let (persisted_lsn, confirmed_lsn) = Spi::get_two_with_args::<String, String>(
         "SELECT coalesce(persisted_lsn, '0/0'::pg_lsn)::text,
                 coalesce(confirmed_lsn, '0/0'::pg_lsn)::text

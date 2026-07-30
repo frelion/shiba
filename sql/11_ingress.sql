@@ -534,6 +534,68 @@ BEGIN
 END;
 $$;
 
+-- PostgreSQL does not promise a StreamAbort record after a postmaster crash:
+-- logical decoding simply omits the source transaction that crash recovery
+-- aborted.  Its already-durable streamed prefix must therefore be finalized
+-- locally before it can retain admission budget forever.  A normal Runtime
+-- restart keeps the same postmaster epoch and deliberately does nothing.
+CREATE FUNCTION shiba_internal.reconcile_postmaster_restart(
+    p_slot_generation bigint
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_recorded_started_at timestamptz;
+    v_current_started_at timestamptz;
+    v_aborted_count bigint;
+BEGIN
+    IF p_slot_generation IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22004',
+            MESSAGE = 'ingress slot generation must not be NULL';
+    END IF;
+
+    v_current_started_at := pg_catalog.pg_postmaster_start_time();
+
+    -- Lock-order level 1.  This shares the same generation-row serialization
+    -- point as admission and explicit StreamAbort processing.
+    SELECT replay.postmaster_started_at
+      INTO STRICT v_recorded_started_at
+      FROM shiba_internal.ingress_replay_state AS replay
+     WHERE replay.slot_generation = p_slot_generation
+       AND replay.state = 'active'
+     FOR UPDATE;
+
+    IF v_recorded_started_at = v_current_started_at THEN
+        RETURN 0;
+    END IF;
+
+    UPDATE shiba_internal.ingress_transactions AS txn
+       SET status = 'aborted',
+           -- Crash recovery gives no protocol Abort LSN.  The immutable
+           -- transaction-start LSN is a deterministic local final identity;
+           -- aborted transactions never advance replication feedback.
+           final_lsn = txn.transaction_start_lsn,
+           end_lsn = txn.transaction_start_lsn,
+           pending_publications = 0,
+           finalized_at = clock_timestamp()
+     WHERE txn.slot_generation = p_slot_generation
+       AND txn.status = 'open';
+    GET DIAGNOSTICS v_aborted_count = ROW_COUNT;
+
+    UPDATE shiba_internal.ingress_replay_state AS replay
+       SET postmaster_started_at = v_current_started_at,
+           open_payload_bytes = 0,
+           updated_at = clock_timestamp()
+     WHERE replay.slot_generation = p_slot_generation;
+
+    RETURN v_aborted_count;
+END;
+$$;
+
 CREATE FUNCTION shiba_internal.abort_ingress_subtransaction(
     p_ingress_txn_id bigint,
     p_source_subxid bigint
@@ -878,6 +940,9 @@ REVOKE ALL ON FUNCTION
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
     shiba_internal.abort_ingress_transaction(bigint, pg_lsn)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION
+    shiba_internal.reconcile_postmaster_restart(bigint)
     FROM PUBLIC;
 REVOKE ALL ON FUNCTION
     shiba_internal.abort_ingress_subtransaction(bigint, bigint)

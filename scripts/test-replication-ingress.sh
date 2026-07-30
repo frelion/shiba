@@ -26,6 +26,17 @@ test_wait_sleep=0.1
 source "${project_root}/scripts/test-lib.sh"
 trap cleanup EXIT
 
+wait_for_runtime_and_walsender() {
+  wait_for_query "1|1" "
+    SELECT
+      count(*) FILTER (WHERE backend_type='shiba runtime'),
+      count(*) FILTER (
+        WHERE backend_type='walsender' AND application_name='shiba'
+      )
+    FROM pg_stat_activity
+  " "the Runtime and its walsender"
+}
+
 cd "${project_root}"
 PG_CONFIG="${pg_config_path}" \
   cargo pgrx install --pg-config "${pg_config_path}" --features pg_test
@@ -58,14 +69,7 @@ PG_CONFIG="${pg_config_path}" \
 
 psql_ingress -qc "CREATE EXTENSION shiba"
 psql_ingress -qc "SELECT shiba.activate()"
-wait_for_query "1|1" "
-  SELECT
-    count(*) FILTER (WHERE backend_type='shiba runtime'),
-    count(*) FILTER (
-      WHERE backend_type='walsender' AND application_name='shiba'
-    )
-  FROM pg_stat_activity
-" "the Runtime and its walsender"
+wait_for_runtime_and_walsender
 
 active_generation="$(psql_ingress -Atqc "
   SELECT slot_generation
@@ -955,6 +959,250 @@ assert_query "${large_tx_rows}|${large_tx_rows}" "
       FROM shiba_internal.ingress_transactions
       WHERE ingress_txn_id=${large_txn}
     )
+"
+
+# A postmaster crash aborts source transactions. A streamed prefix can already
+# be durable in Shiba, but PostgreSQL need not later emit a logical StreamAbort
+# for that crash-aborted transaction. Restart must retire the orphaned prefix
+# before it can consume the staging budget or block a future replay.
+postmaster_crash_first_id=92000001
+postmaster_crash_last_id=92000256
+psql_ingress -qc "
+  BEGIN;
+  INSERT INTO public.source_a
+  SELECT ${postmaster_crash_first_id}+id-1,repeat('c',4096)
+  FROM generate_series(1,256) AS id;
+  SELECT pg_sleep(30);
+  COMMIT;
+" &
+postmaster_crash_writer_pid=$!
+wait_for_query "1" "
+  SELECT count(*)
+  FROM shiba_internal.ingress_transactions AS txn
+  WHERE txn.status='open'
+    AND txn.event_count > 0
+    AND EXISTS (
+      SELECT 1
+      FROM shiba_internal.change_log AS event
+      WHERE event.ingress_txn_id=txn.ingress_txn_id
+        AND (event.payload->>'id')::bigint
+            BETWEEN ${postmaster_crash_first_id} AND ${postmaster_crash_last_id}
+    )
+" "a durable streamed prefix before postmaster crash"
+postmaster_crash_txn="$(psql_ingress -Atqc "
+  SELECT txn.ingress_txn_id
+  FROM shiba_internal.ingress_transactions AS txn
+  WHERE txn.status='open'
+    AND EXISTS (
+      SELECT 1
+      FROM shiba_internal.change_log AS event
+      WHERE event.ingress_txn_id=txn.ingress_txn_id
+        AND (event.payload->>'id')::bigint
+            BETWEEN ${postmaster_crash_first_id} AND ${postmaster_crash_last_id}
+    )
+")"
+postmaster_crash_event_count="$(psql_ingress -Atqc "
+  SELECT count(*)
+  FROM shiba_internal.change_log
+  WHERE ingress_txn_id=${postmaster_crash_txn}
+")"
+"${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -m immediate -w stop >/dev/null
+wait "${postmaster_crash_writer_pid}" || true
+"${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -l "${pg_log_file}" \
+  -o "-k ${pg_socket_dir} -p ${pg_port}" -t 30 -w start >/dev/null
+psql_ingress -qc "SELECT shiba.activate()"
+wait_for_runtime_and_walsender
+psql_ingress -qc "
+  INSERT INTO public.source_a(id,payload)
+  VALUES (92000300,'postmaster-restart-sentinel')
+"
+wait_for_query "aborted|0|${postmaster_crash_event_count}|0" "
+  SELECT txn.status||'|'||txn.pending_publications||'|'||
+         count(event.*)||'|'||replay.open_payload_bytes
+  FROM shiba_internal.ingress_transactions AS txn
+  JOIN shiba_internal.ingress_replay_state AS replay
+    ON replay.slot_generation=txn.slot_generation
+  LEFT JOIN shiba_internal.change_log AS event
+    ON event.ingress_txn_id=txn.ingress_txn_id
+  WHERE txn.ingress_txn_id=${postmaster_crash_txn}
+  GROUP BY txn.status,txn.pending_publications,replay.open_payload_bytes
+" "postmaster-crash ingress cleanup"
+assert_query "0" "
+  SELECT count(*)
+  FROM public.source_a
+  WHERE id BETWEEN ${postmaster_crash_first_id} AND ${postmaster_crash_last_id}
+"
+wait_for_query "1|1" "
+  SELECT
+    count(*) FILTER (WHERE txn.status='committed')||'|'||
+    count(*) FILTER (WHERE txn.pending_publications=0)
+  FROM shiba_internal.ingress_transactions AS txn
+  JOIN shiba_internal.change_log AS event USING (ingress_txn_id)
+  WHERE event.source_oid='public.source_a'::regclass
+    AND event.payload->>'id'='92000300'
+" "the postmaster-restart sentinel"
+
+# A walsender can disappear independently of both postmaster and Runtime.
+# Replay must reuse the durable streamed prefix exactly once after the Runtime
+# reconnects, then publish the committed transaction without missing or
+# duplicating any source row.
+disconnect_first_id=93000001
+disconnect_last_id=93000256
+disconnect_runtime_pid="$(runtime_pid)"
+disconnect_walsender_pid="$(psql_ingress -Atqc "
+  SELECT pid
+  FROM pg_stat_activity
+  WHERE backend_type='walsender'
+    AND application_name='shiba'
+")"
+psql_ingress -qc "
+  BEGIN;
+  INSERT INTO public.source_a
+  SELECT ${disconnect_first_id}+id-1,repeat('d',4096)
+  FROM generate_series(1,256) AS id;
+  SELECT pg_sleep(5);
+  COMMIT;
+" &
+disconnect_writer_pid=$!
+wait_for_query "1" "
+  SELECT count(*)
+  FROM shiba_internal.ingress_transactions AS txn
+  WHERE txn.status='open'
+    AND txn.event_count > 0
+    AND EXISTS (
+      SELECT 1
+      FROM shiba_internal.change_log AS event
+      WHERE event.ingress_txn_id=txn.ingress_txn_id
+        AND (event.payload->>'id')::bigint
+            BETWEEN ${disconnect_first_id} AND ${disconnect_last_id}
+    )
+" "a durable streamed prefix before walsender termination"
+assert_query "t" "SELECT pg_terminate_backend(${disconnect_walsender_pid})"
+wait_for_runtime_replacement "${disconnect_runtime_pid}"
+wait_for_query "1" "
+  SELECT count(*)
+  FROM pg_stat_activity
+  WHERE backend_type='walsender'
+    AND application_name='shiba'
+    AND pid<>${disconnect_walsender_pid}
+" "a replacement walsender"
+wait "${disconnect_writer_pid}"
+wait_for_query "committed|256|256|256|0" "
+  SELECT txn.status||'|'||txn.event_count||'|'||
+         (
+           SELECT count(*)
+           FROM shiba_internal.change_log AS event
+           WHERE event.ingress_txn_id=txn.ingress_txn_id
+         )||'|'||
+         coalesce(
+           (
+             SELECT sum(chunk.row_count)
+             FROM shiba_internal.effect_stream_chunks AS chunk
+             WHERE chunk.stream_id=${source_a_stream}
+               AND chunk.chunk_lsn=txn.final_lsn
+           ),
+           0
+         )||'|'||txn.pending_publications
+  FROM shiba_internal.ingress_transactions AS txn
+  WHERE txn.status='committed'
+    AND EXISTS (
+      SELECT 1
+      FROM shiba_internal.change_log AS event
+      WHERE event.ingress_txn_id=txn.ingress_txn_id
+        AND (event.payload->>'id')::bigint
+            BETWEEN ${disconnect_first_id} AND ${disconnect_last_id}
+    )
+" "exact replay after walsender reconnect"
+assert_query "256|256" "
+  SELECT count(*)||'|'||count(DISTINCT id)
+  FROM public.source_a
+  WHERE id BETWEEN ${disconnect_first_id} AND ${disconnect_last_id}
+"
+
+# Concurrent writers may stream several open source transactions at once.
+# Their durable prefixes share one admission counter, but each committed WAL
+# transaction must remain exact-once and source publication must keep its
+# configured four-row chunk bound.
+concurrent_first_id=94000001
+concurrent_writer_count=3
+concurrent_rows_per_writer=128
+concurrent_last_id=$((
+  concurrent_first_id + concurrent_writer_count * concurrent_rows_per_writer - 1
+))
+concurrent_writer_pids=()
+for ((concurrent_writer = 0;
+     concurrent_writer < concurrent_writer_count;
+     concurrent_writer++)); do
+  concurrent_start_id=$((
+    concurrent_first_id + concurrent_writer * concurrent_rows_per_writer
+  ))
+  psql_ingress -qc "
+    BEGIN;
+    INSERT INTO public.source_a
+    SELECT ${concurrent_start_id}+id-1,repeat('m',4096)
+    FROM generate_series(1,${concurrent_rows_per_writer}) AS id;
+    SELECT pg_sleep(4);
+    COMMIT;
+  " &
+  concurrent_writer_pids+=("$!")
+done
+wait_for_query "${concurrent_writer_count}" "
+  SELECT count(DISTINCT txn.ingress_txn_id)
+  FROM shiba_internal.ingress_transactions AS txn
+  JOIN shiba_internal.change_log AS event
+    ON event.ingress_txn_id=txn.ingress_txn_id
+  WHERE txn.status='open'
+    AND (event.payload->>'id')::bigint
+        BETWEEN ${concurrent_first_id} AND ${concurrent_last_id}
+" "durable prefixes from all concurrent writers"
+wait_for_query "t" "
+  SELECT replay.open_payload_bytes > 0
+  FROM shiba_internal.ingress_replay_state AS replay
+  WHERE replay.slot_generation=${active_generation}
+" "shared open-transaction admission accounting"
+for concurrent_writer_pid in "${concurrent_writer_pids[@]}"; do
+  wait "${concurrent_writer_pid}"
+done
+wait_for_query "${concurrent_writer_count}|$((
+  concurrent_writer_count * concurrent_rows_per_writer
+))|$((concurrent_writer_count * concurrent_rows_per_writer))|0|t" "
+  WITH transactions AS (
+    SELECT txn.ingress_txn_id,
+           txn.event_count,
+           txn.pending_publications,
+           txn.final_lsn
+    FROM shiba_internal.ingress_transactions AS txn
+    WHERE txn.status='committed'
+      AND EXISTS (
+        SELECT 1
+        FROM shiba_internal.change_log AS event
+        WHERE event.ingress_txn_id=txn.ingress_txn_id
+          AND (event.payload->>'id')::bigint
+              BETWEEN ${concurrent_first_id} AND ${concurrent_last_id}
+      )
+  )
+  SELECT count(*)||'|'||sum(event_count)||'|'||
+         (
+           SELECT count(*)
+           FROM shiba_internal.change_log AS event
+           WHERE (event.payload->>'id')::bigint
+                 BETWEEN ${concurrent_first_id} AND ${concurrent_last_id}
+         )||'|'||max(pending_publications)||'|'||
+         (
+           SELECT bool_and(chunk.row_count <= 4)
+           FROM shiba_internal.effect_stream_chunks AS chunk
+           JOIN transactions AS txn
+             ON txn.final_lsn=chunk.chunk_lsn
+           WHERE chunk.stream_id=${source_a_stream}
+         )
+  FROM transactions
+" "concurrent exact-once publication within the source chunk bound"
+assert_query "$((concurrent_writer_count * concurrent_rows_per_writer))|$((
+  concurrent_writer_count * concurrent_rows_per_writer
+))" "
+  SELECT count(*)||'|'||count(DISTINCT id)
+  FROM public.source_a
+  WHERE id BETWEEN ${concurrent_first_id} AND ${concurrent_last_id}
 "
 
 # A streamed top-level Abort has no protocol end_lsn. It is durable and

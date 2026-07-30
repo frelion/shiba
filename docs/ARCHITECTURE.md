@@ -466,6 +466,11 @@ capacity 选择 runnable result 和 stage。cache 淘汰或 Runtime 重启后仍
 - 已持久化部分 ingress batches、但尚未读到 pgoutput `Commit` 时失败：这些 batch
   仍对 DAG 不可见；slot 重放这笔 source transaction，稳定 transaction/event
   identity 避免重复写入；
+- walsender 断开会使 Runtime 重建复制连接；同一 postmaster epoch 的 open header
+  保留，依靠上述稳定 identity 精确重放；
+- postmaster 重启会中止所有尚未提交的 source transaction。bootstrap 比较持久化的
+  postmaster epoch，随后将遗留的 open header 标记为 aborted 并释放
+  `open_payload_bytes`；该事务不会等待一个不存在的 `StreamAbort`；
 - source publication 提交前失败：payload、metadata 和 cursor 一起回滚；
 - source publication 提交后失败：cursor 已前进，从下一个前缀继续；
 - operator step 提交前失败：state、output、cursor、continuation 和 checkpoint
