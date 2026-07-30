@@ -268,7 +268,7 @@ impl ReplicationTransport {
     }
 
     /// Start pgoutput protocol version 2 with in-progress transaction
-    /// streaming disabled.
+    /// streaming enabled.
     pub fn start_replication(
         &mut self,
         options: StartReplicationOptions<'_>,
@@ -314,7 +314,7 @@ impl ReplicationTransport {
 
         let command = format!(
             "START_REPLICATION SLOT {} LOGICAL {} \
-             (proto_version '2', publication_names {}, streaming 'off')",
+             (proto_version '2', publication_names {}, streaming 'on')",
             options.slot,
             format_lsn(options.start_lsn),
             escaped_publications

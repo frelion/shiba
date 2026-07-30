@@ -117,14 +117,15 @@ Look at:
 - `IngressBudget`;
 - the row and wire-byte counters;
 - `PendingBatch`;
-- `IngressFinalization`;
+- `IngressBoundary`;
 - conversion of INSERT/DELETE/UPDATE into signed row effects.
 
-Transaction streaming is disabled, so the source transaction is already
-committed when its rows arrive. `IngressFinalization` still matters: it records
-whether Shiba has read the trailing protocol `Commit` and can advance its
-durable feedback LSN. Source data chunks may run before that record, but the
-generation-wide causal frontier cannot pass an unfinalized transaction.
+Protocol-v2 transaction streaming is enabled. `StreamStart/StreamStop` batches
+are durably staged under the first segment's WAL position but remain invisible
+to the DAG. `IngressBoundary` records top-level Commit/Abort and subtransaction
+Abort. Commit opens the publication gate and advances feedback with its
+`end_lsn`. StreamAbort has no end LSN, so it is recorded durably but waits for a
+later Commit to advance feedback; Abort leaves no effect for the DAG.
 
 Run:
 

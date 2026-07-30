@@ -85,7 +85,6 @@ enum ParsedTupleValue {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParseContext {
     NonStreaming,
-    #[cfg(test)]
     Streaming,
 }
 
@@ -140,7 +139,6 @@ fn parse_transactional(
 ) -> Result<Message, &'static str> {
     match context {
         ParseContext::NonStreaming => parser(input, 1, None),
-        #[cfg(test)]
         ParseContext::Streaming => {
             let xid = read_u32(input, 1)?;
             if xid == 0 {
@@ -153,22 +151,27 @@ fn parse_transactional(
 
 fn parse_stream_start(input: &[u8]) -> Result<Message, &'static str> {
     require_exact_len(input, 6, "invalid stream start message length")?;
+    let xid = read_u32(input, 1)?;
+    if xid == 0 {
+        return Err("invalid transaction ID in stream start");
+    }
     let first_segment = match input[5] {
         0 => false,
         1 => true,
         _ => return Err("invalid stream start first-segment flag"),
     };
-    Ok(Message::StreamStart {
-        xid: read_u32(input, 1)?,
-        first_segment,
-    })
+    Ok(Message::StreamStart { xid, first_segment })
 }
 
 fn parse_stream_commit(input: &[u8]) -> Result<Message, &'static str> {
     require_exact_len(input, 30, "invalid stream commit message length")?;
     require_zero_flag(input, 5, "invalid stream commit flags")?;
+    let xid = read_u32(input, 1)?;
+    if xid == 0 {
+        return Err("invalid transaction ID in stream commit");
+    }
     Ok(Message::StreamCommit {
-        xid: read_u32(input, 1)?,
+        xid,
         flags: input[5],
         commit_lsn: read_u64(input, 6)?,
         end_lsn: read_u64(input, 14)?,
@@ -178,10 +181,12 @@ fn parse_stream_commit(input: &[u8]) -> Result<Message, &'static str> {
 
 fn parse_stream_abort(input: &[u8]) -> Result<Message, &'static str> {
     require_exact_len(input, 9, "invalid stream abort message length")?;
-    Ok(Message::StreamAbort {
-        xid: read_u32(input, 1)?,
-        subxid: read_u32(input, 5)?,
-    })
+    let xid = read_u32(input, 1)?;
+    let subxid = read_u32(input, 5)?;
+    if xid == 0 || subxid == 0 {
+        return Err("invalid transaction ID in stream abort");
+    }
+    Ok(Message::StreamAbort { xid, subxid })
 }
 
 fn parse_relation(
@@ -1085,6 +1090,24 @@ mod tests {
             assert_eq!(
                 parse_with_context(&message, ParseContext::Streaming),
                 Err("invalid transaction ID in streamed replication transaction")
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_zero_xid_in_stream_boundaries() {
+        assert_eq!(
+            parse(&stream_start(0, 1)),
+            Err("invalid transaction ID in stream start")
+        );
+        assert_eq!(
+            parse(&stream_commit(0, 0, 1, 2, 3)),
+            Err("invalid transaction ID in stream commit")
+        );
+        for (xid, subxid) in [(0, 1), (1, 0), (0, 0)] {
+            assert_eq!(
+                parse(&stream_abort(xid, subxid)),
+                Err("invalid transaction ID in stream abort")
             );
         }
     }

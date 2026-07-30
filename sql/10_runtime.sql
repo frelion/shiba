@@ -111,7 +111,7 @@ BEGIN
         FROM shiba_internal.ingress_transactions AS txn
         JOIN shiba_internal.ingress_replay_state AS replay
           ON replay.slot_generation = txn.slot_generation
-        WHERE txn.status = 'committed'
+        WHERE txn.status IN ('committed', 'aborted')
           AND txn.finalized_at < clock_timestamp()
               - pg_catalog.current_setting('shiba.ingress_retention')::interval
           AND replay.replay_safe_lsn >= txn.end_lsn

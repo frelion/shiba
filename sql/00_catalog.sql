@@ -80,6 +80,8 @@ CREATE TABLE shiba_internal.ingress_replay_state (
     published_lsn pg_lsn,
     confirmed_lsn pg_lsn,
     replay_safe_lsn pg_lsn,
+    open_payload_bytes bigint NOT NULL DEFAULT 0
+      CHECK (open_payload_bytes >= 0),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     retired_at timestamptz,
@@ -97,17 +99,19 @@ CREATE UNIQUE INDEX ingress_active_slot_idx
   ON shiba_internal.ingress_replay_state(database_oid, slot_name)
   WHERE state = 'active';
 
--- With pgoutput streaming disabled, Begin.final_lsn is available before its
--- row messages and equals the later Commit.commit_lsn.
+-- The first Begin/StreamStart WAL position plus xid is the replay identity.
+-- An aborted header records where Abort was observed for ordering, but only a
+-- Commit/StreamCommit end_lsn is eligible to advance replication feedback.
 CREATE TABLE shiba_internal.ingress_transactions (
     ingress_txn_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     slot_generation bigint NOT NULL
       REFERENCES shiba_internal.ingress_replay_state(slot_generation)
       ON DELETE RESTRICT,
     source_xid bigint NOT NULL CHECK (source_xid BETWEEN 0 AND 4294967295),
-    final_lsn pg_lsn NOT NULL,
+    transaction_start_lsn pg_lsn NOT NULL,
+    final_lsn pg_lsn,
     status text NOT NULL DEFAULT 'open'
-      CHECK (status IN ('open', 'committed')),
+      CHECK (status IN ('open', 'committed', 'aborted')),
     commit_lsn pg_lsn,
     end_lsn pg_lsn,
     event_count bigint NOT NULL DEFAULT 0 CHECK (event_count >= 0),
@@ -117,11 +121,10 @@ CREATE TABLE shiba_internal.ingress_transactions (
       CHECK (pending_publications >= 0),
     opened_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     finalized_at timestamptz,
-    UNIQUE (slot_generation, source_xid, final_lsn),
-    UNIQUE (ingress_txn_id, final_lsn),
     CHECK (
       (
         status = 'open'
+        AND final_lsn IS NULL
         AND commit_lsn IS NULL
         AND end_lsn IS NULL
         AND finalized_at IS NULL
@@ -135,6 +138,14 @@ CREATE TABLE shiba_internal.ingress_transactions (
         AND final_lsn = commit_lsn
         AND commit_lsn <= end_lsn
       )
+      OR
+      (
+        status = 'aborted'
+        AND final_lsn IS NOT NULL
+        AND commit_lsn IS NULL
+        AND end_lsn = final_lsn
+        AND finalized_at IS NOT NULL
+      )
     )
 );
 
@@ -142,8 +153,13 @@ CREATE UNIQUE INDEX ingress_commit_lsn_idx
   ON shiba_internal.ingress_transactions(commit_lsn)
   WHERE status = 'committed';
 
-CREATE INDEX ingress_open_txn_idx
-  ON shiba_internal.ingress_transactions(slot_generation, source_xid, final_lsn)
+CREATE UNIQUE INDEX ingress_transaction_identity_idx
+  ON shiba_internal.ingress_transactions(
+    slot_generation, source_xid, transaction_start_lsn
+  );
+
+CREATE UNIQUE INDEX ingress_open_txn_idx
+  ON shiba_internal.ingress_transactions(slot_generation, source_xid)
   WHERE status = 'open';
 
 CREATE INDEX ingress_publication_order_idx
@@ -164,6 +180,8 @@ CREATE TABLE shiba_internal.change_log (
     change_lsn pg_lsn NOT NULL,
     change_ordinal bigint NOT NULL CHECK (change_ordinal >= 0),
     image_ordinal integer NOT NULL CHECK (image_ordinal >= 0),
+    source_subxid bigint NOT NULL
+      CHECK (source_subxid BETWEEN 0 AND 4294967295),
     input_seq bigint NOT NULL CHECK (input_seq > 0),
     source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
     weight bigint NOT NULL CHECK (weight IN (-1, 1)),
@@ -177,6 +195,16 @@ CREATE TABLE shiba_internal.change_log (
 
 CREATE INDEX change_log_source_batch_idx
   ON shiba_internal.change_log(ingress_txn_id, source_oid, input_seq);
+
+CREATE TABLE shiba_internal.ingress_aborted_subtransactions (
+    ingress_txn_id bigint NOT NULL
+      REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
+      ON DELETE CASCADE,
+    source_subxid bigint NOT NULL
+      CHECK (source_subxid BETWEEN 0 AND 4294967295),
+    aborted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (ingress_txn_id, source_subxid)
+);
 
 -- Each bounded prefix admitted by ingress is independently publishable.
 CREATE TABLE shiba_internal.ingress_apply_batches (

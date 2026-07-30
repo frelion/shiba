@@ -39,6 +39,10 @@ const DEFAULT_INGRESS_BATCH_BYTES: i32 = 16 * 1024 * 1024;
 const MIN_INGRESS_BATCH_BYTES: i32 = 1;
 const MAX_INGRESS_BATCH_BYTES: i32 = i32::MAX;
 
+const DEFAULT_INGRESS_STAGING_LIMIT_KB: i32 = 64 * 1024 * 1024;
+const MIN_INGRESS_STAGING_LIMIT_KB: i32 = 1024;
+const MAX_INGRESS_STAGING_LIMIT_KB: i32 = i32::MAX;
+
 const DEFAULT_MAX_CACHED_RELATIONS: i32 = 4_096;
 const MIN_MAX_CACHED_RELATIONS: i32 = 1;
 const MAX_MAX_CACHED_RELATIONS: i32 = 65_536;
@@ -58,6 +62,8 @@ static STAGE_ADMISSION_BYTES: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_STAGE_ADMISSION_BYTES);
 static INGRESS_BATCH_ROWS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_BATCH_ROWS);
 static INGRESS_BATCH_BYTES: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_BATCH_BYTES);
+static INGRESS_STAGING_LIMIT_KB: GucSetting<i32> =
+    GucSetting::<i32>::new(DEFAULT_INGRESS_STAGING_LIMIT_KB);
 static MAX_CACHED_RELATIONS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_CACHED_RELATIONS);
 static INGRESS_RETENTION_MS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_INGRESS_RETENTION_MS);
 static REPLICATION_CONNINFO: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
@@ -152,6 +158,16 @@ pub fn init() {
         MAX_INGRESS_BATCH_BYTES,
         GucContext::Sighup,
         GucFlags::UNIT_BYTE,
+    );
+    GucRegistry::define_int_guc(
+        c"shiba.ingress_staging_limit",
+        c"Maximum decoded payload bytes retained by open source transactions.",
+        c"Shiba stops safely and retains WAL for replay instead of accepting an unbounded transaction.",
+        &INGRESS_STAGING_LIMIT_KB,
+        MIN_INGRESS_STAGING_LIMIT_KB,
+        MAX_INGRESS_STAGING_LIMIT_KB,
+        GucContext::Sighup,
+        GucFlags::UNIT_KB,
     );
     GucRegistry::define_int_guc(
         c"shiba.max_cached_relations",
@@ -282,6 +298,10 @@ mod tests {
         );
         assert!((MIN_INGRESS_BATCH_BYTES..=MAX_INGRESS_BATCH_BYTES)
             .contains(&DEFAULT_INGRESS_BATCH_BYTES));
+        assert!(
+            (MIN_INGRESS_STAGING_LIMIT_KB..=MAX_INGRESS_STAGING_LIMIT_KB)
+                .contains(&DEFAULT_INGRESS_STAGING_LIMIT_KB)
+        );
         assert!((MIN_MAX_CACHED_RELATIONS..=MAX_MAX_CACHED_RELATIONS)
             .contains(&DEFAULT_MAX_CACHED_RELATIONS));
         assert!((MIN_INGRESS_RETENTION_MS..=MAX_INGRESS_RETENTION_MS)

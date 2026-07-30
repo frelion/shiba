@@ -76,12 +76,14 @@ pgrx-only code must meet the same lint level as the extension library.
 cases include:
 
 - INSERT, DELETE, and UPDATE as weighted row images;
-- rollback never reaching ingress;
+- streamed top-level rollback remaining invisible and replaying after restart;
 - a large source transaction admitted in many bounded batches;
-- source chunks committed and consumed before the trailing pgoutput `Commit`;
+- streamed batches hidden from source streams until pgoutput `Commit`;
+- top-level and subtransaction aborts producing no DAG effects;
 - header-only Commit finalization;
 - source publication crash before and after commit;
-- an open or pending early transaction blocking a later global frontier;
+- open transactions not blocking known commits, while pending sealed
+  transactions still block the global frontier;
 - replay-safe feedback and bounded metadata/payload GC;
 - shared source-stream fanout;
 - unchanged TOAST values surviving an update that changes only another column;

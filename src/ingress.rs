@@ -12,40 +12,46 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct IngressEvent {
     pub change_lsn: u64,
     pub change_ordinal: u64,
     pub image_ordinal: u32,
+    pub source_subxid: u32,
     pub source_oid: u32,
     pub weight: i64,
     pub payload: Value,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum IngressFinalization {
+pub(crate) enum IngressBoundary {
     Commit { commit_lsn: u64, end_lsn: u64 },
+    AbortTransaction { abort_lsn: u64 },
+    AbortSubtransaction { source_subxid: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct IngressBatch {
     pub source_xid: u32,
-    pub final_lsn: u64,
+    pub transaction_start_lsn: u64,
     pub decode_end_lsn: u64,
     pub events: Vec<IngressEvent>,
-    pub finalization: Option<IngressFinalization>,
+    pub boundary: Option<IngressBoundary>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IngressBudget {
     pub max_events: usize,
     pub max_wire_bytes: usize,
+    pub max_poll_time: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IngressPoll {
     Batch(IngressBatch),
+    Yield { reply_requested: bool },
     Pending { reply_requested: bool },
     End,
 }
@@ -89,30 +95,31 @@ impl From<ReplicationError> for IngressError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveTransaction {
     xid: u32,
-    final_lsn: u64,
+    start_lsn: u64,
+    expected_commit_lsn: Option<u64>,
 }
 
 struct PendingBatch {
     source_xid: u32,
-    final_lsn: u64,
+    transaction_start_lsn: u64,
     decode_end_lsn: u64,
     wire_bytes: u64,
     events: Vec<IngressEvent>,
-    finalization: Option<IngressFinalization>,
+    boundary: Option<IngressBoundary>,
 }
 
 impl PendingBatch {
     fn new(transaction: ActiveTransaction) -> Self {
         Self {
             source_xid: transaction.xid,
-            final_lsn: transaction.final_lsn,
+            transaction_start_lsn: transaction.start_lsn,
             // This is the greatest wire position actually observed in this
             // batch. Begin.final_lsn identifies the whole transaction and
             // must never be treated as durable progress for a prefix batch.
             decode_end_lsn: 0,
             wire_bytes: 0,
             events: Vec::new(),
-            finalization: None,
+            boundary: None,
         }
     }
 
@@ -131,10 +138,10 @@ impl PendingBatch {
     fn finish(self) -> IngressBatch {
         IngressBatch {
             source_xid: self.source_xid,
-            final_lsn: self.final_lsn,
+            transaction_start_lsn: self.transaction_start_lsn,
             decode_end_lsn: self.decode_end_lsn,
             events: self.events,
-            finalization: self.finalization,
+            boundary: self.boundary,
         }
     }
 }
@@ -144,6 +151,7 @@ pub(crate) struct ReplicationIngress {
     relations: HashMap<u32, Vec<String>>,
     max_cached_relations: usize,
     active_transaction: Option<ActiveTransaction>,
+    streamed_transaction: Option<ActiveTransaction>,
     last_change_lsn: HashMap<u32, (u64, u64)>,
     pending: Option<PendingBatch>,
     reply_requested: bool,
@@ -157,6 +165,7 @@ impl ReplicationIngress {
             relations: HashMap::new(),
             max_cached_relations,
             active_transaction: None,
+            streamed_transaction: None,
             last_change_lsn: HashMap::new(),
             pending: None,
             reply_requested: false,
@@ -171,12 +180,13 @@ impl ReplicationIngress {
         &mut self,
         budget: IngressBudget,
     ) -> Result<IngressPoll, IngressError> {
-        if budget.max_events == 0 || budget.max_wire_bytes == 0 {
+        if budget.max_events == 0 || budget.max_wire_bytes == 0 || budget.max_poll_time.is_zero() {
             return Err(IngressError::State(
                 "ingress budgets must be greater than zero".into(),
             ));
         }
 
+        let started = Instant::now();
         loop {
             match self.transport.poll_copy_data()? {
                 CopyDataPoll::Pending => {
@@ -232,14 +242,31 @@ impl ReplicationIngress {
                                 .finish(),
                         ));
                     }
+                    if started.elapsed() >= budget.max_poll_time {
+                        // The batch stays in memory so a busy stream does not
+                        // turn every scheduler quantum into a tiny SPI write.
+                        // Yield is still work: Runtime must poll again instead
+                        // of sleeping without a replication-socket latch.
+                        return Ok(IngressPoll::Yield {
+                            reply_requested: std::mem::take(&mut self.reply_requested),
+                        });
+                    }
                 }
             }
         }
     }
 
     fn process_pgoutput(&mut self, wal_start: u64, payload: &[u8]) -> Result<bool, IngressError> {
-        let message = pgoutput::parse_with_context(payload, ParseContext::NonStreaming)
-            .map_err(IngressError::Protocol)?;
+        let context = if self
+            .active_transaction
+            .is_some_and(|transaction| transaction.expected_commit_lsn.is_none())
+        {
+            ParseContext::Streaming
+        } else {
+            ParseContext::NonStreaming
+        };
+        let message =
+            pgoutput::parse_with_context(payload, context).map_err(IngressError::Protocol)?;
 
         let mut boundary = false;
         match message {
@@ -251,21 +278,110 @@ impl ReplicationIngress {
                 }
                 let transaction = ActiveTransaction {
                     xid,
-                    // Begin.final_lsn is the stable transaction identity.
-                    // XLogData.wal_start is only an envelope position.
-                    final_lsn,
+                    start_lsn: wal_start,
+                    expected_commit_lsn: Some(final_lsn),
                 };
                 self.active_transaction = Some(transaction);
                 self.ensure_pending(transaction)?;
             }
-            Message::StreamStart { .. }
-            | Message::StreamStop
-            | Message::StreamCommit { .. }
-            | Message::StreamAbort { .. } => {
-                return Err(IngressError::State(
-                    "received a streamed-transaction message while pgoutput streaming is disabled"
-                        .into(),
-                ));
+            Message::StreamStart { xid, first_segment } => {
+                if self.active_transaction.is_some() {
+                    return Err(IngressError::State(
+                        "StreamStart arrived inside another transaction segment".into(),
+                    ));
+                }
+                let transaction = if first_segment {
+                    if self.streamed_transaction.is_some() {
+                        return Err(IngressError::State(
+                            "first StreamStart repeated for an open transaction".into(),
+                        ));
+                    }
+                    ActiveTransaction {
+                        xid,
+                        start_lsn: wal_start,
+                        expected_commit_lsn: None,
+                    }
+                } else {
+                    let transaction = self.streamed_transaction.ok_or_else(|| {
+                        IngressError::State("later StreamStart has no first segment".into())
+                    })?;
+                    if transaction.xid != xid {
+                        return Err(IngressError::State(
+                            "later StreamStart changed transaction xid".into(),
+                        ));
+                    }
+                    transaction
+                };
+                self.streamed_transaction = Some(transaction);
+                self.active_transaction = Some(transaction);
+                self.ensure_pending(transaction)?;
+            }
+            Message::StreamStop => {
+                let transaction = self.require_active_transaction("StreamStop")?;
+                if transaction.expected_commit_lsn.is_some()
+                    || self.streamed_transaction != Some(transaction)
+                {
+                    return Err(IngressError::State(
+                        "StreamStop has no matching streamed transaction".into(),
+                    ));
+                }
+                self.active_transaction = None;
+                boundary = true;
+            }
+            Message::StreamCommit {
+                xid,
+                commit_lsn,
+                end_lsn,
+                ..
+            } => {
+                if self.active_transaction.is_some() {
+                    return Err(IngressError::State(
+                        "StreamCommit arrived inside a transaction segment".into(),
+                    ));
+                }
+                let transaction = self.streamed_transaction.take().ok_or_else(|| {
+                    IngressError::State("StreamCommit has no matching transaction".into())
+                })?;
+                if transaction.xid != xid {
+                    return Err(IngressError::State(
+                        "StreamCommit changed transaction xid".into(),
+                    ));
+                }
+                let pending = self.ensure_pending(transaction)?;
+                pending.decode_end_lsn = end_lsn;
+                pending.boundary = Some(IngressBoundary::Commit {
+                    commit_lsn,
+                    end_lsn,
+                });
+                self.last_change_lsn.remove(&xid);
+                boundary = true;
+            }
+            Message::StreamAbort { xid, subxid } => {
+                if self.active_transaction.is_some() {
+                    return Err(IngressError::State(
+                        "StreamAbort arrived inside a transaction segment".into(),
+                    ));
+                }
+                let transaction = self.streamed_transaction.ok_or_else(|| {
+                    IngressError::State("StreamAbort has no matching transaction".into())
+                })?;
+                if transaction.xid != xid {
+                    return Err(IngressError::State(
+                        "StreamAbort changed transaction xid".into(),
+                    ));
+                }
+                self.ensure_pending(transaction)?.boundary = if xid == subxid {
+                    self.streamed_transaction = None;
+                    self.last_change_lsn.remove(&xid);
+                    Some(IngressBoundary::AbortTransaction {
+                        abort_lsn: wal_start,
+                    })
+                } else {
+                    Some(IngressBoundary::AbortSubtransaction {
+                        source_subxid: subxid,
+                    })
+                };
+                boundary = true;
             }
             Message::Relation {
                 source_xid,
@@ -316,8 +432,8 @@ impl ReplicationIngress {
                 relid,
                 row,
             } => {
-                self.validate_message_xid(source_xid, "Insert")?;
-                self.push_change(wal_start, relid, &[(0, 1, row)])?;
+                let source_subxid = self.validate_message_xid(source_xid, "Insert")?;
+                self.push_change(wal_start, source_subxid, relid, &[(0, 1, row)])?;
             }
             Message::Update {
                 source_xid,
@@ -325,16 +441,21 @@ impl ReplicationIngress {
                 old,
                 new,
             } => {
-                self.validate_message_xid(source_xid, "Update")?;
-                self.push_change(wal_start, relid, &[(0, -1, old), (1, 1, new)])?;
+                let source_subxid = self.validate_message_xid(source_xid, "Update")?;
+                self.push_change(
+                    wal_start,
+                    source_subxid,
+                    relid,
+                    &[(0, -1, old), (1, 1, new)],
+                )?;
             }
             Message::Delete {
                 source_xid,
                 relid,
                 old,
             } => {
-                self.validate_message_xid(source_xid, "Delete")?;
-                self.push_change(wal_start, relid, &[(0, -1, old)])?;
+                let source_subxid = self.validate_message_xid(source_xid, "Delete")?;
+                self.push_change(wal_start, source_subxid, relid, &[(0, -1, old)])?;
             }
             Message::Truncate { .. } => {
                 return Err(IngressError::State(
@@ -347,9 +468,14 @@ impl ReplicationIngress {
                 end_lsn,
             } => {
                 let transaction = self.require_active_transaction("COMMIT")?;
+                if transaction.expected_commit_lsn != Some(commit_lsn) {
+                    return Err(IngressError::State(
+                        "Commit LSN differs from Begin final LSN".into(),
+                    ));
+                }
                 let pending = self.ensure_pending(transaction)?;
                 pending.decode_end_lsn = end_lsn;
-                pending.finalization = Some(IngressFinalization::Commit {
+                pending.boundary = Some(IngressBoundary::Commit {
                     commit_lsn,
                     end_lsn,
                 });
@@ -361,7 +487,8 @@ impl ReplicationIngress {
 
         let transaction = self.pending.as_ref().map(|pending| ActiveTransaction {
             xid: pending.source_xid,
-            final_lsn: pending.final_lsn,
+            start_lsn: pending.transaction_start_lsn,
+            expected_commit_lsn: None,
         });
         if let Some(transaction) = transaction {
             let pending = self.ensure_pending(transaction)?;
@@ -373,6 +500,7 @@ impl ReplicationIngress {
     fn push_change(
         &mut self,
         wal_start: u64,
+        source_subxid: u32,
         relid: u32,
         images: &[(u32, i64, Tuple)],
     ) -> Result<(), IngressError> {
@@ -400,6 +528,7 @@ impl ReplicationIngress {
                 change_lsn: wal_start,
                 change_ordinal,
                 image_ordinal: *image_ordinal,
+                source_subxid,
                 source_oid: relid,
                 weight: *weight,
                 payload: tuple_to_json(tuple, columns)?,
@@ -413,14 +542,17 @@ impl ReplicationIngress {
         &self,
         source_xid: Option<u32>,
         message: &'static str,
-    ) -> Result<(), IngressError> {
-        self.require_active_transaction(message)?;
-        if source_xid.is_none() {
-            Ok(())
-        } else {
-            Err(IngressError::State(format!(
-                "{message} carried a streamed xid while pgoutput streaming is disabled"
-            )))
+    ) -> Result<u32, IngressError> {
+        let transaction = self.require_active_transaction(message)?;
+        match (transaction.expected_commit_lsn, source_xid) {
+            (Some(_), None) => Ok(transaction.xid),
+            (None, Some(subxid)) => Ok(subxid),
+            (Some(_), Some(_)) => Err(IngressError::State(format!(
+                "{message} carried a streamed xid outside a stream segment"
+            ))),
+            (None, None) => Err(IngressError::State(format!(
+                "{message} omitted its xid inside a stream segment"
+            ))),
         }
     }
 
@@ -429,7 +561,9 @@ impl ReplicationIngress {
         transaction: ActiveTransaction,
     ) -> Result<&mut PendingBatch, IngressError> {
         if let Some(pending) = self.pending.as_ref() {
-            if pending.source_xid != transaction.xid || pending.final_lsn != transaction.final_lsn {
+            if pending.source_xid != transaction.xid
+                || pending.transaction_start_lsn != transaction.start_lsn
+            {
                 return Err(IngressError::State(
                     "one ingress batch crossed source transactions".into(),
                 ));

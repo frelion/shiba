@@ -7,7 +7,7 @@ DAG，最后由 Sink 修改结果表。读取结果表时不会重新执行原�
 
 ```mermaid
 flowchart LR
-    A["已经提交的<br/>source DML"] --> B["pgoutput"]
+    A["source transaction<br/>仍可能 open"] --> B["pgoutput streaming"]
     B --> C["Rust ingress<br/>读一个有界 batch"]
     C --> D[("change_log")]
     D --> E["source publisher<br/>发布一个有界前缀"]
@@ -52,7 +52,7 @@ flowchart LR
 
 | 边界 | Shiba 保证什么 |
 | --- | --- |
-| source transaction | pgoutput 只发送已经提交的数据，但这笔事务不会作为结果表的原子可见单位 |
+| source transaction | open 时只暂存；Commit 后各 batch 可独立进入 DAG，不保证整笔事务同时出现在结果表 |
 | operator step | state、cursor、continuation、output 和 checkpoint 中本 step 改动的部分在一个 PostgreSQL transaction 中提交；这是内部恢复单位 |
 | Sink step | 一个有界结果前缀的 DML 与对应 input cursor、continuation、checkpoint 同时提交；这是用户可见的 exactly-once 边界 |
 
@@ -70,9 +70,9 @@ FROM generate_series(1, 10000000);
 COMMIT;
 ```
 
-Shiba 使用 `pgoutput`，并设置 `streaming 'off'`。walsender 开始发送这笔事务的
-`Begin` 和行变化时，应用事务已经提交。应用提交和 Shiba 稍后从复制连接读到
-pgoutput `Commit` 是两个不同的时刻。
+Shiba 使用 pgoutput protocol v2，并设置 `streaming 'on'`。大事务尚未提交时，
+walsender 就可以发送多个 `StreamStart ... StreamStop` 段；最后发送
+`StreamCommit` 或 `StreamAbort`。
 
 ### 1. ingress 保存一个 batch
 
@@ -87,12 +87,19 @@ UPDATE old → new => (-1, old), (+1, new)
 ```
 
 [`persist_ingress_batch`](../src/worker.rs) 用一个短 PostgreSQL transaction 写入
-source transaction header、`change_log`、publication cursor 和 batch 计数。这个
+source transaction header、`change_log`、publication cursor 和 batch 计数。header
+用首次 `Begin/StreamStart` 的 WAL 位置标识，不能只用会复用的 xid。这个
 transaction 失败时全部回滚，logical replication slot 会保留尚未确认的 WAL。
 
 如果 1000 万行超过 batch 目标，`ReplicationIngress::poll_batch` 会在仍未读到
 pgoutput `Commit` 时返回。下一批以后再读；不需要把整笔 source transaction 放进
 一个 Rust 对象或一个 PostgreSQL transaction。
+
+open transaction 的 batch 对 DAG 不可见。每条变更还记录当前 subxid：
+`StreamAbort(xid, subxid)` 只标记并跳过对应子事务；顶层 Abort 把 header 封存为
+`aborted`，不在复制热路径执行一次无界删除。只有 Commit 消息带有可安全确认的
+`end_lsn`；Abort 不推进 replication feedback，而是等待后续 Commit 带着位置前进。
+因此崩溃后可能重放已记录的 Abort，但不会从 StreamAbort 中间开始。
 
 ### 2. publisher 追加一个 source chunk
 
@@ -102,14 +109,13 @@ row/byte 限制的前缀，写入 source stream 的 typed payload relation，再
 chunk metadata。payload、metadata 和 publication cursor 在同一个 transaction
 提交。
 
-source chunk 一旦提交，Scan 就可以读取它，不需要等 pgoutput `Commit`。`Commit`
-只封口这笔 source transaction：它记录 commit/end LSN，并允许 durable ingress
-LSN 在安全时前进。
+publisher 只选择 `committed` header。`Commit` 封口后，各个已暂存 batch 可以依次
+变成 source chunk；不需要等同一 source transaction 的所有 batch 一起发布。这样
+既不会把最终 Abort 的数据送进 DAG，也不会恢复 source-commit 级原子可见性。
 
-source frontier 的条件更严格。只有协议 `Commit` 已持久化、这笔事务的所有
-publication work 已完成，并且前面没有更早的 open/pending transaction 时，
-generation-wide source frontier 才能推进。数据可以提前流动，完整进度不能提前
-声明。
+source frontier 的条件更严格。它按已经出现的 Commit/Abort LSN 排序；只有最早的
+sealed transaction 完成全部 publication work 后才能推进。open transaction
+尚未产生终止 WAL 位置，因此不会阻塞已有的 Commit/Abort。
 
 ### 3. DAG 一次运行一个 stage step
 

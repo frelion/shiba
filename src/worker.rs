@@ -25,6 +25,7 @@ const GC_MAX_EFFECT_STREAMS_PER_ROUND: i32 = 64;
 const GC_MAX_EFFECT_CHUNKS_PER_STREAM: i32 = 64;
 const GC_INTERVAL: Duration = Duration::from_millis(250);
 const REPLICATION_STATUS_INTERVAL: Duration = Duration::from_millis(250);
+const INGRESS_POLL_TIME_BUDGET: Duration = Duration::from_millis(50);
 const LAUNCH_TRANSACTION_WAIT: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
 const PROC_ARRAY_LWLOCK_INDEX_PG17: usize = 4;
@@ -397,6 +398,7 @@ fn ingest_and_publish_once(runtime: &mut IngressRuntime) -> RuntimePhase {
     let budget = ingress::IngressBudget {
         max_events: config::ingress_batch_rows(),
         max_wire_bytes: config::ingress_batch_bytes(),
+        max_poll_time: INGRESS_POLL_TIME_BUDGET,
     };
     let ingested = match runtime
         .ingress
@@ -433,6 +435,12 @@ fn ingest_and_publish_once(runtime: &mut IngressRuntime) -> RuntimePhase {
                 maintain_ingress_feedback(runtime, true);
             }
             0
+        }
+        ingress::IngressPoll::Yield { reply_requested } => {
+            if reply_requested {
+                maintain_ingress_feedback(runtime, true);
+            }
+            1
         }
         ingress::IngressPoll::End => {
             panic!("Shiba replication connection ended unexpectedly")
@@ -660,12 +668,12 @@ fn record_ingress_feedback(generation: i64, feedback_lsn: u64) {
 }
 
 fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> Option<u64> {
-    let final_lsn = format_lsn(batch.final_lsn);
+    let transaction_start_lsn = format_lsn(batch.transaction_start_lsn);
     let claim_arguments = unsafe {
         [
             DatumWithOid::new(generation, pg_sys::INT8OID),
             DatumWithOid::new(i64::from(batch.source_xid), pg_sys::INT8OID),
-            DatumWithOid::new(final_lsn.as_str(), pg_sys::TEXTOID),
+            DatumWithOid::new(transaction_start_lsn.as_str(), pg_sys::TEXTOID),
         ]
     };
     let ingress_txn_id = Spi::get_one_with_args::<i64>(
@@ -685,6 +693,7 @@ fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> Opti
                     "change_lsn": format_lsn(event.change_lsn),
                     "change_ordinal": event.change_ordinal,
                     "image_ordinal": event.image_ordinal,
+                    "source_subxid": event.source_subxid,
                     "source_oid": event.source_oid,
                     "weight": event.weight,
                     "payload": event.payload,
@@ -705,15 +714,14 @@ fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> Opti
     )
     .expect("Shiba could not persist a bounded ingress event batch");
 
-    let feedback_lsn = batch
-        .finalization
-        .as_ref()
-        .map(|finalization| match finalization {
-            ingress::IngressFinalization::Commit { end_lsn, .. } => *end_lsn,
-        });
+    let feedback_lsn = batch.boundary.as_ref().and_then(|boundary| match boundary {
+        ingress::IngressBoundary::Commit { end_lsn, .. } => Some(*end_lsn),
+        ingress::IngressBoundary::AbortTransaction { .. }
+        | ingress::IngressBoundary::AbortSubtransaction { .. } => None,
+    });
 
-    match &batch.finalization {
-        Some(ingress::IngressFinalization::Commit {
+    match &batch.boundary {
+        Some(ingress::IngressBoundary::Commit {
             commit_lsn,
             end_lsn,
         }) => {
@@ -733,6 +741,33 @@ fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> Opti
                 &arguments,
             )
             .expect("Shiba could not finalize a committed ingress transaction");
+        }
+        Some(ingress::IngressBoundary::AbortTransaction { abort_lsn }) => {
+            let abort_lsn = format_lsn(*abort_lsn);
+            let arguments = unsafe {
+                [
+                    DatumWithOid::new(ingress_txn_id, pg_sys::INT8OID),
+                    DatumWithOid::new(abort_lsn.as_str(), pg_sys::TEXTOID),
+                ]
+            };
+            Spi::run_with_args(
+                "SELECT shiba_internal.abort_ingress_transaction($1, $2::pg_lsn)",
+                &arguments,
+            )
+            .expect("Shiba could not finalize an aborted ingress transaction");
+        }
+        Some(ingress::IngressBoundary::AbortSubtransaction { source_subxid }) => {
+            let arguments = unsafe {
+                [
+                    DatumWithOid::new(ingress_txn_id, pg_sys::INT8OID),
+                    DatumWithOid::new(i64::from(*source_subxid), pg_sys::INT8OID),
+                ]
+            };
+            Spi::run_with_args(
+                "SELECT shiba_internal.abort_ingress_subtransaction($1, $2)",
+                &arguments,
+            )
+            .expect("Shiba could not record an aborted source subtransaction");
         }
         None => {}
     }

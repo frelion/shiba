@@ -555,6 +555,15 @@ mod tests {
             .expect("max_cached_dataflows should be readable"),
             Some(128)
         );
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT pg_size_bytes(
+                    current_setting('shiba.ingress_staging_limit', true)
+                 )",
+            )
+            .expect("ingress_staging_limit should be readable"),
+            Some(64_i64 * 1024 * 1024 * 1024)
+        );
         worker::configure_runtime_session();
 
         let settings = Spi::get_three::<String, String, String>(
@@ -612,16 +621,165 @@ mod tests {
         .expect("duplicate ingress claim should execute");
         let claims = Spi::get_one::<i64>(
             "SELECT count(*)
-               FROM shiba_internal.ingress_transactions
+              FROM shiba_internal.ingress_transactions
               WHERE slot_generation=1
                 AND source_xid=42
-                AND final_lsn='0/123456'",
+                AND transaction_start_lsn='0/123456'
+                AND final_lsn IS NULL",
         )
         .expect("ingress claims should be queryable");
 
         assert_eq!(first, Some(true));
         assert_eq!(second, Some(false));
         assert_eq!(claims, Some(1));
+    }
+
+    #[pg_test]
+    fn streamed_ingress_is_hidden_until_commit_and_abort_is_durable() {
+        install_test_ingress_generation();
+        Spi::run(
+            r#"
+            CREATE TABLE tests.pg_streamed_ingress_source (
+                id integer NOT NULL
+            );
+
+            WITH claimed AS (
+                SELECT ingress_txn_id
+                  FROM shiba_internal.claim_ingress_transaction(
+                       1, 42, '0/100'
+                  )
+            )
+            SELECT shiba_internal.insert_ingress_events(
+                claimed.ingress_txn_id,
+                jsonb_build_array(
+                    jsonb_build_object(
+                        'change_lsn', '0/110',
+                        'change_ordinal', 0,
+                        'image_ordinal', 0,
+                        'source_subxid', 42,
+                        'source_oid',
+                            'tests.pg_streamed_ingress_source'::regclass::oid::bigint,
+                        'weight', 1,
+                        'payload', jsonb_build_object('id', '1')
+                    ),
+                    jsonb_build_object(
+                        'change_lsn', '0/120',
+                        'change_ordinal', 0,
+                        'image_ordinal', 0,
+                        'source_subxid', 43,
+                        'source_oid',
+                            'tests.pg_streamed_ingress_source'::regclass::oid::bigint,
+                        'weight', 1,
+                        'payload', jsonb_build_object('id', '2')
+                    )
+                )
+            )
+            FROM claimed;
+            "#,
+        )
+        .expect("streamed ingress rows should stage");
+
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT outcome
+                   FROM shiba_internal.publish_source_batch(1)"
+            )
+            .expect("open publication check should execute")
+            .as_deref(),
+            Some("idle")
+        );
+        assert!(
+            Spi::get_one::<i64>(
+                "SELECT open_payload_bytes
+                   FROM shiba_internal.ingress_replay_state
+                  WHERE slot_generation = 1"
+            )
+            .expect("open payload counter should be readable")
+            .unwrap_or(0)
+                > 0
+        );
+
+        Spi::run(
+            r#"
+            SELECT shiba_internal.abort_ingress_subtransaction(
+                ingress_txn_id, 43
+            )
+            FROM shiba_internal.ingress_transactions
+            WHERE slot_generation = 1
+              AND transaction_start_lsn = '0/100';
+
+            SELECT shiba_internal.commit_ingress_transaction(
+                ingress_txn_id, '0/130', '0/140'
+            )
+            FROM shiba_internal.ingress_transactions
+            WHERE slot_generation = 1
+              AND transaction_start_lsn = '0/100';
+            "#,
+        )
+        .expect("streamed transaction should finalize");
+
+        let (status, open_payload_bytes) = Spi::get_two::<String, i64>(
+            "SELECT txn.status, replay.open_payload_bytes
+               FROM shiba_internal.ingress_transactions AS txn
+               JOIN shiba_internal.ingress_replay_state AS replay
+                 USING (slot_generation)
+              WHERE txn.transaction_start_lsn = '0/100'",
+        )
+        .expect("committed streamed transaction should be readable");
+        assert_eq!(status.as_deref(), Some("committed"));
+        assert_eq!(open_payload_bytes, Some(0));
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT count(*)
+                   FROM shiba_internal.change_log AS event
+                  WHERE event.source_subxid = 43
+                    AND EXISTS (
+                        SELECT 1
+                          FROM shiba_internal.ingress_aborted_subtransactions
+                               AS aborted
+                         WHERE aborted.ingress_txn_id = event.ingress_txn_id
+                           AND aborted.source_subxid = event.source_subxid
+                    )"
+            )
+            .expect("aborted subtransaction marker should be queryable"),
+            Some(1)
+        );
+
+        Spi::run(
+            r#"
+            WITH claimed AS (
+                SELECT ingress_txn_id
+                  FROM shiba_internal.claim_ingress_transaction(
+                       1, 42, '0/200'
+                  )
+            )
+            SELECT shiba_internal.abort_ingress_transaction(
+                claimed.ingress_txn_id, '0/210'
+            )
+            FROM claimed
+            "#,
+        )
+        .expect("top-level stream abort should finalize");
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT status
+                   FROM shiba_internal.ingress_transactions
+                  WHERE transaction_start_lsn = '0/200'"
+            )
+            .expect("aborted transaction should be readable")
+            .as_deref(),
+            Some("aborted")
+        );
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT coalesce(persisted_lsn::text, 'none')
+                   FROM shiba_internal.ingress_replay_state
+                  WHERE slot_generation = 1"
+            )
+            .expect("abort feedback position should be readable")
+            .as_deref(),
+            Some("0/140")
+        );
     }
 
     #[pg_test]
