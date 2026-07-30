@@ -14,7 +14,7 @@ use crate::logical::model::{
     AggregateExpr, AggregateSpec, DataflowPlan, DataflowStage, OperatorSpec, SortGroupExpr,
 };
 use crate::logical::{StepExecution, WorkBudget};
-use crate::postgres::{format_lsn, quote_identifier};
+use crate::postgres::{format_lsn, parse_lsn, quote_identifier};
 use crate::scalar_sql::compile_scalar_expression;
 
 use super::aggregate_capability::{
@@ -27,7 +27,7 @@ use super::register::{
 use super::{
     advance_input, append_frontier, attribute_matches_slot, canonical_row_key_sql, chunk,
     compile_stage_bindings, next_chunk, payload_facts, AttributeRef, BindingInput, ChunkKind,
-    ProducerKind, RelationRef, StepTxn, TypeRef, WorkUsage,
+    OutputAppendTarget, ProducerKind, RelationRef, StepTxn, TypeRef, WorkUsage,
 };
 
 const APPLY_PHASE: i16 = 1;
@@ -752,6 +752,30 @@ pub(crate) fn execute(
         }
     }
     AggregateMachine::new(spec.aggregates.len() as u32)?.action(stored.value)?;
+    if let AggregatePhase::DrainRebuild {
+        aggregate_ordinal: 1,
+        ..
+    } = stored.value.phase
+    {
+        if let Some(page) = measure_group_page(
+            &mut transaction,
+            plan,
+            stage,
+            spec,
+            &continuation_relation,
+            stored,
+        )? {
+            return execute_group_page(
+                transaction,
+                plan,
+                stage,
+                spec,
+                &continuation_relation,
+                stored,
+                page,
+            );
+        }
+    }
     match stored.value.phase {
         AggregatePhase::Apply => step_apply(
             transaction,
@@ -1640,6 +1664,607 @@ fn step_apply(
         return Err("Aggregate continuation mutation disagrees with Apply facts".into());
     }
     transaction.finish(has_continuation, facts.usage)
+}
+
+#[derive(Clone, Debug)]
+struct GroupPage {
+    last_queue_id: i64,
+    causal_lsn: u64,
+    input_rows: u64,
+    input_bytes: u64,
+    output_rows: u64,
+    output_bytes: u64,
+    desired_ctes: String,
+    action_rows: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_group_page(
+    transaction: &mut StepTxn<'_, '_>,
+    plan: &DataflowPlan,
+    stage: &DataflowStage,
+    spec: &AggregateSpec,
+    _continuation_relation: &RelationRef,
+    stored: StoredAggregate,
+) -> Result<Option<GroupPage>, String> {
+    let AggregatePhase::DrainRebuild { group_queue_id, .. } = stored.value.phase else {
+        return Ok(None);
+    };
+    for aggregate_index in 0..spec.aggregates.len() {
+        let work = transaction.state_storage(
+            i32::try_from(2 + aggregate_index)
+                .map_err(|_| "Aggregate work slot exceeds integer")?,
+        )?;
+        let dirty = transaction.state_storage(2000)?;
+        let existing = transaction.read(
+            &format!(
+                "SELECT EXISTS(
+                   SELECT 1 FROM {work} AS work
+                   JOIN {dirty} AS dirty USING(group_state_id)
+                   WHERE dirty.queue_id=$1
+                 )",
+                work = work.sql(),
+                dirty = dirty.sql(),
+            ),
+            &unsafe { [DatumWithOid::new(group_queue_id, pg_sys::INT8OID)] },
+        )?;
+        if execute_required::<bool>(&existing.first(), 1, "Aggregate page work state")? {
+            return Ok(None);
+        }
+    }
+
+    let bag = transaction.state_storage(0)?;
+    let dirty = transaction.state_storage(2000)?;
+    let budget = transaction.budget();
+    let max_rows = i64::try_from(budget.max_input_rows)
+        .map_err(|_| "Aggregate page row budget exceeds bigint")?;
+    let max_bytes = i64::try_from(budget.max_input_bytes)
+        .map_err(|_| "Aggregate page byte budget exceeds bigint")?;
+    let max_groups = i64::try_from(budget.max_output_rows.max(1))
+        .map_err(|_| "Aggregate page output budget exceeds bigint")?;
+    let selected = transaction.read(
+        &format!(
+            r#"
+            WITH costs AS MATERIALIZED (
+              SELECT dirty.queue_id,dirty.causal_lsn,
+                     coalesce(sum(bag.multiplicity),0)::bigint AS input_rows,
+                     coalesce(sum(
+                       bag.multiplicity
+                         * shiba_internal.effect_row_bytes(bag.row_value)
+                     ),0)::bigint AS input_bytes
+              FROM {dirty} AS dirty
+              LEFT JOIN {bag} AS bag USING(group_state_id)
+              WHERE dirty.queue_id >= $1
+              GROUP BY dirty.queue_id,dirty.causal_lsn
+              ORDER BY dirty.queue_id
+              LIMIT $4
+            ),
+            measured AS (
+              SELECT costs.*,
+                     row_number() OVER (ORDER BY queue_id) AS page_group,
+                     sum(input_rows) OVER (ORDER BY queue_id) AS running_rows,
+                     sum(input_bytes) OVER (ORDER BY queue_id) AS running_bytes
+              FROM costs
+            ),
+            selected AS (
+              SELECT * FROM measured
+              WHERE page_group=1
+                 OR (running_rows <= $2 AND running_bytes <= $3)
+            )
+            SELECT max(queue_id)::bigint,
+                   coalesce(sum(input_rows),0)::bigint,
+                   coalesce(sum(input_bytes),0)::bigint,
+                   max(causal_lsn)::text
+            FROM selected
+            "#,
+            dirty = dirty.sql(),
+            bag = bag.sql(),
+        ),
+        &unsafe {
+            [
+                DatumWithOid::new(group_queue_id, pg_sys::INT8OID),
+                DatumWithOid::new(max_rows, pg_sys::INT8OID),
+                DatumWithOid::new(max_bytes, pg_sys::INT8OID),
+                DatumWithOid::new(max_groups, pg_sys::INT8OID),
+            ]
+        },
+    )?;
+    if selected.len() != 1 {
+        return Err("Aggregate group page returned no selection summary".into());
+    }
+    let selected = selected.first();
+    let Some(last_queue_id) = selected.get::<i64>(1).map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let input_rows =
+        aggregate_nonnegative(execute_required(&selected, 2, "Aggregate page input rows")?)?;
+    let input_bytes = aggregate_nonnegative(execute_required(
+        &selected,
+        3,
+        "Aggregate page input bytes",
+    )?)?;
+    if input_rows > budget.max_input_rows as u64 || input_bytes > budget.max_input_bytes as u64 {
+        return Ok(None);
+    }
+    let causal_lsn = parse_lsn(
+        selected
+            .get::<String>(4)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Aggregate page omitted its causal LSN".to_string())?
+            .as_str(),
+    )?;
+    let (desired_ctes, action_rows) = build_group_page_sql(transaction, plan, stage, spec)?;
+    let actions = transaction.read(
+        &format!(
+            "WITH {desired_ctes}, actions AS MATERIALIZED ({action_rows})
+             SELECT count(*)::bigint,
+                    coalesce(sum(
+                      shiba_internal.effect_row_bytes(row_value)
+                    ),0)::bigint
+             FROM actions"
+        ),
+        &unsafe {
+            [
+                DatumWithOid::new(group_queue_id, pg_sys::INT8OID),
+                DatumWithOid::new(last_queue_id, pg_sys::INT8OID),
+            ]
+        },
+    )?;
+    if actions.len() != 1 {
+        return Err("Aggregate page action measurement returned no summary".into());
+    }
+    let actions = actions.first();
+    let output_rows =
+        aggregate_nonnegative(execute_required(&actions, 1, "Aggregate page output rows")?)?;
+    let output_bytes = aggregate_nonnegative(execute_required(
+        &actions,
+        2,
+        "Aggregate page output bytes",
+    )?)?;
+    if output_rows > budget.max_output_rows as u64 || output_bytes > budget.max_output_bytes as u64
+    {
+        return Ok(None);
+    }
+    Ok(Some(GroupPage {
+        last_queue_id,
+        causal_lsn,
+        input_rows,
+        input_bytes,
+        output_rows,
+        output_bytes,
+        desired_ctes,
+        action_rows,
+    }))
+}
+
+fn build_group_page_sql(
+    transaction: &mut StepTxn<'_, '_>,
+    plan: &DataflowPlan,
+    stage: &DataflowStage,
+    spec: &AggregateSpec,
+) -> Result<(String, String), String> {
+    let input = transaction.input(0)?.clone();
+    let input_storage = transaction.payload_storage(input.stream_id)?;
+    let output = transaction.output()?.clone();
+    let output_storage = transaction.payload_storage(output.stream_id)?;
+    let groups = transaction.state_storage(1)?;
+    let bag = transaction.state_storage(0)?;
+    let dirty = transaction.state_storage(2000)?;
+    let bindings = compile_stage_bindings(
+        transaction,
+        plan,
+        stage,
+        &[BindingInput {
+            row_type: &input_storage.row_type,
+            alias: "bag",
+        }],
+    )?;
+    let (mut values, representative_join) = if spec.groups.is_empty() {
+        (Vec::new(), String::new())
+    } else {
+        let representative_bindings = compile_stage_bindings(
+            transaction,
+            plan,
+            stage,
+            &[BindingInput {
+                row_type: &input_storage.row_type,
+                alias: "representative",
+            }],
+        )?;
+        (
+            spec.groups
+                .iter()
+                .map(|group| compile_scalar_expression(&group.key.expr, &representative_bindings))
+                .collect::<Result<Vec<_>, _>>()?,
+            format!(
+                " LEFT JOIN LATERAL (
+                    SELECT bag.row_value
+                    FROM {bag} AS bag
+                    WHERE bag.group_state_id=groups.group_state_id
+                    ORDER BY bag.row_id
+                    LIMIT 1
+                  ) AS representative ON true",
+                bag = bag.sql(),
+            ),
+        )
+    };
+    for (aggregate_index, aggregate) in spec.aggregates.iter().enumerate() {
+        let function = aggregate_function_sql(transaction, aggregate.function_oid)?;
+        let arguments = aggregate
+            .args
+            .iter()
+            .map(|argument| compile_scalar_expression(argument, &bindings))
+            .collect::<Result<Vec<_>, _>>()?;
+        let call_arguments = if arguments.is_empty() {
+            "*".into()
+        } else {
+            format!(
+                "{}{}",
+                if aggregate.distinct.is_empty() {
+                    ""
+                } else {
+                    "DISTINCT "
+                },
+                arguments.join(",")
+            )
+        };
+        let order = if aggregate.order_by.is_empty() {
+            String::new()
+        } else {
+            let mut order = aggregate
+                .order_by
+                .iter()
+                .enumerate()
+                .map(|(index, expression)| {
+                    let capability = resolve_btree_step(transaction, expression, "Aggregate")?;
+                    Ok(format!(
+                        "bag.{} USING {} NULLS {}",
+                        quote_identifier(&format!(
+                            "agg_{}_order_{}",
+                            aggregate_index + 1,
+                            index + 1
+                        )),
+                        capability.sort_operator,
+                        if expression.nulls_first {
+                            "FIRST"
+                        } else {
+                            "LAST"
+                        }
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            // DISTINCT aggregate ordering may only name DISTINCT arguments.
+            // Equal DISTINCT tuples are the same aggregate input, so no
+            // physical row tie-breaker is needed.
+            if aggregate.distinct.is_empty() {
+                order.push("bag.row_id".into());
+            }
+            format!(" ORDER BY {}", order.join(","))
+        };
+        let filter = aggregate
+            .filter
+            .as_ref()
+            .map(|filter| compile_scalar_expression(filter, &bindings))
+            .transpose()?
+            .map_or_else(String::new, |filter| format!(" FILTER (WHERE {filter})"));
+        values.push(format!(
+            "(SELECT {function}({call_arguments}{order}){filter}
+              FROM {bag_sql} AS bag
+              CROSS JOIN LATERAL
+                generate_series(1,bag.multiplicity) AS repetition(ordinal)
+              WHERE bag.group_state_id=groups.group_state_id)",
+            bag_sql = bag.sql(),
+        ));
+    }
+    let present = if spec.groups.is_empty() {
+        "true".into()
+    } else {
+        format!(
+            "EXISTS(SELECT 1 FROM {bag_sql} AS present_bag
+                    WHERE present_bag.group_state_id=groups.group_state_id)",
+            bag_sql = bag.sql(),
+        )
+    };
+    let output_row = format!(
+        "ROW({})::{}",
+        values.join(","),
+        output_storage.row_type.sql()
+    );
+    let output_key = canonical_row_key_sql("desired_base.row_value", &output_storage.row_type);
+    let desired_ctes = format!(
+        r#"
+        selected_dirty AS MATERIALIZED (
+          SELECT * FROM {dirty}
+          WHERE queue_id BETWEEN $1 AND $2
+        ),
+        desired_base AS MATERIALIZED (
+          SELECT selected_dirty.queue_id,selected_dirty.group_state_id,
+                 groups.published_present,groups.published_key,
+                 groups.published_output,
+                 {present} AS present,
+                 {output_row} AS row_value
+          FROM selected_dirty
+          JOIN {groups} AS groups USING(group_state_id)
+          {representative_join}
+        ),
+        desired AS MATERIALIZED (
+          SELECT desired_base.*,
+                 CASE WHEN present THEN {output_key} ELSE NULL::bytea END
+                   AS row_key
+          FROM desired_base
+        ),
+        decisions AS MATERIALIZED (
+          SELECT desired.*,
+                 CASE
+                   WHEN published_present=present
+                    AND (NOT present OR published_key=row_key) THEN 'unchanged'
+                   WHEN NOT published_present AND present THEN 'insert'
+                   WHEN published_present AND NOT present THEN 'delete'
+                   ELSE 'replace'
+                 END AS decision
+          FROM desired
+        )
+        "#,
+        dirty = dirty.sql(),
+        groups = groups.sql(),
+        representative_join = representative_join,
+    );
+    let action_rows = "
+        SELECT queue_id,0::smallint AS leg,-1::bigint AS weight,
+               published_output AS row_value
+        FROM decisions
+        WHERE decision IN ('delete','replace')
+        UNION ALL
+        SELECT queue_id,1::smallint AS leg,1::bigint AS weight,row_value
+        FROM decisions
+        WHERE decision IN ('insert','replace')
+    "
+    .into();
+    Ok((desired_ctes, action_rows))
+}
+
+fn aggregate_function_sql(
+    transaction: &mut StepTxn<'_, '_>,
+    function_oid: u32,
+) -> Result<String, String> {
+    let rows = transaction.read(
+        "SELECT format('%I.%I',namespace.nspname,function.proname)
+         FROM pg_catalog.pg_proc AS function
+         JOIN pg_catalog.pg_namespace AS namespace
+           ON namespace.oid=function.pronamespace
+         WHERE function.oid=$1 AND function.prokind='a'",
+        &unsafe {
+            [DatumWithOid::new(
+                pg_sys::Oid::from_u32(function_oid),
+                pg_sys::OIDOID,
+            )]
+        },
+    )?;
+    if rows.len() != 1 {
+        return Err(format!(
+            "Aggregate function OID {function_oid} has no unique catalog row"
+        ));
+    }
+    execute_required(&rows.first(), 1, "Aggregate function SQL name")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_group_page(
+    mut transaction: StepTxn<'_, '_>,
+    _plan: &DataflowPlan,
+    _stage: &DataflowStage,
+    spec: &AggregateSpec,
+    continuation_relation: &RelationRef,
+    stored: StoredAggregate,
+    page: GroupPage,
+) -> Result<StepExecution, String> {
+    let AggregatePhase::DrainRebuild { after, .. } = stored.value.phase else {
+        return Err("Aggregate group page received another phase".into());
+    };
+    let first_queue_id = match stored.value.phase {
+        AggregatePhase::DrainRebuild { group_queue_id, .. } => group_queue_id,
+        _ => unreachable!(),
+    };
+    let output = transaction.output()?.clone();
+    let output_storage = transaction.payload_storage(output.stream_id)?;
+    if page.output_rows > 0 {
+        let append_target =
+            transaction.output_append_target(page.output_rows, page.output_bytes)?;
+        let (target_sequence, row_offset) = match append_target {
+            OutputAppendTarget::New { sequence } => (sequence, 0),
+            OutputAppendTarget::Extend {
+                sequence,
+                row_offset,
+                ..
+            } => (sequence, row_offset),
+        };
+        let inserted = transaction.write(
+            &format!(
+                r#"
+                WITH {desired_ctes},
+                actions AS MATERIALIZED ({action_rows}),
+                numbered AS MATERIALIZED (
+                  SELECT row_number() OVER (ORDER BY queue_id,leg)-1
+                           AS page_ordinal,
+                         weight,row_value
+                  FROM actions
+                ),
+                stored AS (
+                  INSERT INTO {output_payload}(
+                    stream_id,chunk_seq,row_ordinal,weight,row_value
+                  )
+                  SELECT $3,$4,$5+page_ordinal,weight,row_value
+                  FROM numbered
+                  ORDER BY page_ordinal
+                  RETURNING shiba_internal.effect_row_bytes(row_value)
+                    AS row_bytes
+                )
+                SELECT count(*)::bigint,
+                       coalesce(sum(row_bytes),0)::bigint
+                FROM stored
+                "#,
+                desired_ctes = page.desired_ctes,
+                action_rows = page.action_rows,
+                output_payload = output_storage.relation.sql(),
+            ),
+            &unsafe {
+                [
+                    DatumWithOid::new(first_queue_id, pg_sys::INT8OID),
+                    DatumWithOid::new(page.last_queue_id, pg_sys::INT8OID),
+                    DatumWithOid::new(output.stream_id, pg_sys::INT8OID),
+                    DatumWithOid::new(target_sequence, pg_sys::INT8OID),
+                    DatumWithOid::new(
+                        i64::try_from(row_offset)
+                            .map_err(|_| "Aggregate page row offset exceeds bigint")?,
+                        pg_sys::INT8OID,
+                    ),
+                ]
+            },
+        )?;
+        if inserted.len() != 1 {
+            return Err("Aggregate page append returned no summary".into());
+        }
+        let inserted = inserted.first();
+        if aggregate_nonnegative(execute_required(
+            &inserted,
+            1,
+            "Aggregate page inserted rows",
+        )?)? != page.output_rows
+            || aggregate_nonnegative(execute_required(
+                &inserted,
+                2,
+                "Aggregate page inserted bytes",
+            )?)? != page.output_bytes
+        {
+            return Err("Aggregate page append disagrees with its measurement".into());
+        }
+        transaction.record_output_append(
+            append_target,
+            page.output_rows,
+            page.output_bytes,
+            page.causal_lsn,
+        )?;
+    }
+
+    let groups = transaction.state_storage(1)?;
+    let bag = transaction.state_storage(0)?;
+    let dirty = transaction.state_storage(2000)?;
+    let updated = transaction.write(
+        &format!(
+            r#"
+            WITH {desired_ctes},
+            changed AS (
+              UPDATE {groups} AS groups
+              SET published_present=desired.present,
+                  published_key=desired.row_key,
+                  published_output=CASE WHEN desired.present
+                                        THEN desired.row_value
+                                        ELSE NULL END,
+                  pending_present=false,
+                  pending_key=NULL,
+                  pending_output=NULL
+              FROM desired
+              WHERE groups.group_state_id=desired.group_state_id
+              RETURNING groups.group_state_id
+            )
+            SELECT count(*)::bigint FROM changed
+            "#,
+            desired_ctes = page.desired_ctes,
+            groups = groups.sql(),
+        ),
+        &unsafe {
+            [
+                DatumWithOid::new(first_queue_id, pg_sys::INT8OID),
+                DatumWithOid::new(page.last_queue_id, pg_sys::INT8OID),
+            ]
+        },
+    )?;
+    let updated = aggregate_nonnegative(execute_required::<i64>(
+        &updated.first(),
+        1,
+        "Aggregate page updated groups",
+    )?)?;
+    let removed = transaction.write(
+        &format!(
+            "DELETE FROM {dirty}
+             WHERE queue_id BETWEEN $1 AND $2
+             RETURNING group_state_id",
+            dirty = dirty.sql(),
+        ),
+        &unsafe {
+            [
+                DatumWithOid::new(first_queue_id, pg_sys::INT8OID),
+                DatumWithOid::new(page.last_queue_id, pg_sys::INT8OID),
+            ]
+        },
+    )?;
+    if updated
+        != u64::try_from(removed.len()).map_err(|_| "Aggregate page dirty count exceeds bigint")?
+    {
+        return Err("Aggregate page did not finish every selected group".into());
+    }
+    if !spec.groups.is_empty() {
+        transaction.write(
+            &format!(
+                "DELETE FROM {groups} AS groups
+                 WHERE NOT groups.published_present
+                   AND NOT groups.pending_present
+                   AND NOT EXISTS(
+                     SELECT 1 FROM {bag} AS bag
+                     WHERE bag.group_state_id=groups.group_state_id
+                   )
+                 RETURNING 1",
+                groups = groups.sql(),
+                bag = bag.sql(),
+            ),
+            &[],
+        )?;
+    }
+    let next_dirty = transaction.read(
+        &format!("SELECT min(queue_id)::bigint FROM {}", dirty.sql()),
+        &[],
+    )?;
+    let next_queue = next_dirty
+        .first()
+        .get::<i64>(1)
+        .map_err(|error| error.to_string())?;
+    let next = match next_queue {
+        Some(group_queue_id) => Some(AggregateContinuation {
+            input_stream_id: stored.value.input_stream_id,
+            input: None,
+            phase: AggregatePhase::DrainRebuild {
+                group_queue_id,
+                aggregate_ordinal: 1,
+                after,
+            },
+        }),
+        None => match after {
+            AfterDrain::Apply(input) => Some(AggregateContinuation {
+                input_stream_id: stored.value.input_stream_id,
+                input: Some(input),
+                phase: AggregatePhase::Apply,
+            }),
+            AfterDrain::Idle => None,
+            AfterDrain::Frontier(input) => Some(AggregateContinuation {
+                input_stream_id: stored.value.input_stream_id,
+                input: Some(input),
+                phase: AggregatePhase::Frontier,
+            }),
+        },
+    };
+    if let Some(next) = next {
+        AggregateMachine::new(spec.aggregates.len() as u32)?.action(next)?;
+    }
+    replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
+    transaction.finish(
+        next.is_some(),
+        WorkUsage {
+            input_rows: page.input_rows,
+            input_bytes: page.input_bytes,
+            output_rows: page.output_rows,
+            output_bytes: page.output_bytes,
+        },
+    )
 }
 
 fn step_rebuild(
