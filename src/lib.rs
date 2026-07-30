@@ -35,8 +35,9 @@ mod publication;
 mod query_lowering;
 #[cfg_attr(test, allow(dead_code))]
 mod replication;
-mod scalar_sql;
 #[cfg_attr(test, allow(dead_code))]
+mod runtime;
+mod scalar_sql;
 mod worker;
 
 ::pgrx::pg_module_magic!();
@@ -603,7 +604,7 @@ mod tests {
             .expect("ingress_staging_limit should be readable"),
             Some(64_i64 * 1024 * 1024 * 1024)
         );
-        worker::configure_runtime_session();
+        runtime::scheduler::configure_runtime_session();
 
         let settings = Spi::get_three::<String, String, String>(
             "SELECT current_setting('work_mem'),
