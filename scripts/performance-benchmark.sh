@@ -36,23 +36,34 @@ case "${profile}" in
     # The matrix executes a smoke workload four times (one warm-up plus
     # three samples). Keep this deliberately small: it checks the complete
     # measurement path without turning an artifact job into a long benchmark.
-    ingress_rows=500
+    ingress_rows=10000
     fanout_width=64
     complex_fact_rows=200
     complex_keys=16
-    stage_chunk_rows=64
-    ingress_batch_rows=64
+    stage_chunk_rows=16384
+    ingress_batch_rows=16384
     ;;
   full)
     ingress_rows=1000000
     fanout_width=20000
     complex_fact_rows=500000
     complex_keys=256
-    stage_chunk_rows=1024
-    ingress_batch_rows=1024
+    stage_chunk_rows=16384
+    ingress_batch_rows=16384
     ;;
   *) printf 'profile must be smoke or full, got: %s\n' "${profile}" >&2; exit 2 ;;
 esac
+
+# Explicit overrides are for controlled A/B experiments. Matrix profiles keep
+# fixed defaults when these variables are absent.
+stage_chunk_rows="${SHIBA_BENCH_STAGE_CHUNK_ROWS:-${stage_chunk_rows}}"
+stage_chunk_bytes="${SHIBA_BENCH_STAGE_CHUNK_BYTES:-16MB}"
+ingress_batch_rows="${SHIBA_BENCH_INGRESS_BATCH_ROWS:-${ingress_batch_rows}}"
+ingress_batch_bytes="${SHIBA_BENCH_INGRESS_BATCH_BYTES:-16MB}"
+ingress_rows="${SHIBA_BENCH_INGRESS_ROWS:-${ingress_rows}}"
+fanout_width="${SHIBA_BENCH_FANOUT_WIDTH:-${fanout_width}}"
+complex_fact_rows="${SHIBA_BENCH_COMPLEX_FACT_ROWS:-${complex_fact_rows}}"
+complex_keys="${SHIBA_BENCH_COMPLEX_KEYS:-${complex_keys}}"
 
 pg_bin_dir="$("${pg_config_path}" --bindir)"
 pg_data_dir="$(mktemp -d /tmp/shiba-benchmark-data.XXXXXX)"
@@ -163,13 +174,28 @@ result_stats() {
 
 record_metric() {
   local scenario="$1" input_rows="$2" expected_rows="$3" started="$4" result_name="$5" sample_start="$6" source_name="$7"
-  local ended elapsed actual_rows result_oid stats source_chunks chunks buffered_bytes state_bytes checkpoint_advances db_bytes peak_bytes peak_buffered peak_rows
+  local ended elapsed actual_rows result_oid stats source_chunks chunks buffered_bytes state_bytes checkpoint_advances checkpoint_profile db_bytes peak_bytes peak_buffered peak_rows
   ended="$(now_seconds)"
   elapsed="$(number_subtract "${ended}" "${started}")"
   actual_rows="$(psql_bench -Atqc "SELECT count(*) FROM ${result_name}")"
   result_oid="$(psql_bench -Atqc "SELECT '${result_name}'::regclass::oid::integer")"
   stats="$(result_stats "${result_oid}")"
   IFS='|' read -r chunks buffered_bytes state_bytes checkpoint_advances <<<"${stats}"
+  checkpoint_profile="$(psql_bench -Atqc "
+    SELECT string_agg(
+             checkpoint.stage_id::text || ':' ||
+             (stage.value->'spec'->>'operator') || '=' ||
+             checkpoint.revision::text,
+             ';' ORDER BY checkpoint.stage_id
+           )
+    FROM shiba_internal.operator_checkpoints AS checkpoint
+    JOIN shiba_internal.dataflows AS dataflow
+      ON dataflow.result_oid=checkpoint.result_oid
+    JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+      WITH ORDINALITY AS stage(value,ordinality)
+      ON stage.ordinality-1=checkpoint.stage_id
+    WHERE checkpoint.result_oid=${result_oid}::oid")"
+  printf '%s checkpoint profile: %s\n' "${scenario}" "${checkpoint_profile}" >&2
   source_chunks="$(psql_bench -Atqc "
     SELECT coalesce(sum(next_chunk_seq - 1), 0)
     FROM shiba_internal.effect_streams
@@ -204,9 +230,9 @@ cargo pgrx install --release --pg-config "${pg_config_path}"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
   printf "shiba.ingress_batch_rows = %s\n" "${ingress_batch_rows}"
-  printf "shiba.ingress_batch_bytes = '1MB'\n"
+  printf "shiba.ingress_batch_bytes = '%s'\n" "${ingress_batch_bytes}"
   printf "shiba.stage_chunk_rows = %s\n" "${stage_chunk_rows}"
-  printf "shiba.stage_chunk_bytes = '1MB'\n"
+  printf "shiba.stage_chunk_bytes = '%s'\n" "${stage_chunk_bytes}"
   printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s connect_timeout=5'\n" \
     "${pg_socket_dir}" "${pg_port}" "${database_name}" "${database_user}"
 } >>"${pg_data_dir}/postgresql.conf"
@@ -235,7 +261,7 @@ psql_bench -qc "INSERT INTO public.bench_ingress
 ingress_started="$(now_seconds)"
 wait_for_query "${ingress_rows}" 'SELECT count(*) FROM shiba.bench_ingress_result' 'large transaction Sink visibility'
 assert_query 0 "WITH d AS ((SELECT id,payload FROM public.bench_ingress EXCEPT ALL SELECT id,payload FROM shiba.bench_ingress_result) UNION ALL (SELECT id,payload FROM shiba.bench_ingress_result EXCEPT ALL SELECT id,payload FROM public.bench_ingress)) SELECT count(*) FROM d"
-record_metric ingress_large_transaction "${ingress_rows}" "${ingress_rows}" "${ingress_started}" shiba.bench_ingress_result "${ingress_sample_start}" public.bench_ingress
+record_metric ingress_transaction "${ingress_rows}" "${ingress_rows}" "${ingress_started}" shiba.bench_ingress_result "${ingress_sample_start}" public.bench_ingress
 
 # 2. One left row fans out to a large persisted right arrangement.
 psql_bench -qc "

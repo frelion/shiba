@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(
             Spi::get_one::<i32>("SELECT current_setting('shiba.stage_chunk_rows', true)::integer")
                 .expect("stage_chunk_rows should be readable"),
-            Some(2_048)
+            Some(16 * 1024)
         );
         assert_eq!(
             Spi::get_one::<i64>(

@@ -403,6 +403,11 @@ sink_stage_id="$(psql_gate -Atqc "
   ) WITH ORDINALITY AS stage(value, ordinality)
   WHERE dataflow.result_oid = ${result_oid}::oid
     AND stage.value -> 'spec' ->> 'operator' = 'sink'")"
+sink_revision_before="$(psql_gate -Atqc "
+  SELECT revision
+  FROM shiba_internal.operator_checkpoints
+  WHERE result_oid=${result_oid}::oid
+    AND stage_id=${sink_stage_id}")"
 psql_gate -qc "
   DELETE FROM public.shiba_runtime_failpoints
   WHERE kind = 'operator_step_after_commit'"
@@ -428,6 +433,11 @@ wait_for_query "t" "
   "the post-checkpoint crash"
 wait_for_runtime_replacement "${runtime_pid}"
 wait_for_query "0" "${base_difference}" "post-crash exact recovery"
+assert_query "t" "
+  SELECT revision-${sink_revision_before} <= 8
+  FROM shiba_internal.operator_checkpoints
+  WHERE result_oid=${result_oid}::oid
+    AND stage_id=${sink_stage_id}"
 
 # Multiple active dataflows deliberately use different generated composite
 # types. Sink keeps each typed row inside its dynamic statement, so switching

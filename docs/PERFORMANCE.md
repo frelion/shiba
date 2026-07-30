@@ -53,7 +53,7 @@ arbitrary identifying details belong in `metadata`:
   },
   "metadata": {
     "source_rows": 300000,
-    "stage_chunk_rows": 1024,
+    "stage_chunk_rows": 16384,
     "environment_fingerprint": "postgres=17.5;shiba=<build>;gucs=<hash>"
   }
 }

@@ -1,20 +1,20 @@
 //! Transactional Sink execution.
 //!
-//! One step selects one effect row and applies a bounded number of its copies
-//! with one set-valued SQL statement. The arbitrary composite remains inside
-//! PostgreSQL; Rust carries only its stream position, signed weight, measured
-//! byte size, and live catalog mapping.
+//! One transaction quantum walks a bounded prefix of effect rows and applies
+//! each row's bounded weight page. The arbitrary composite remains inside
+//! PostgreSQL; Rust carries only stream positions, signed weights, measured
+//! byte sizes, and the shared quantum budget.
 
 use std::collections::BTreeMap;
 
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
-use pgrx::spi::SpiTupleTable;
+use pgrx::spi::{SpiHeapTupleData, SpiTupleTable};
 
 use crate::logical::model::{
     BindingId, DataflowPlan, DataflowStage, OperatorSpec, SlotId, SlotType,
 };
-use crate::logical::{StepExecution, WorkBudget};
+use crate::logical::{StepExecution, WorkBudget, WorkQuantum};
 use crate::postgres::quote_identifier;
 
 use super::{
@@ -31,8 +31,15 @@ struct SinkContinuation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EffectHead {
+    row_ordinal: i64,
     weight: i64,
     row_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SinkAction {
+    row_ordinal: i64,
+    applied_weight: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +54,7 @@ struct SinkMapping {
     insert_columns: String,
     select_columns: String,
     delete_predicate: String,
+    effect_equality: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,73 +141,121 @@ fn consume_data(
     chunk: &ChunkMeta,
     payload: &PayloadLayout,
 ) -> Result<StepExecution, String> {
-    let ordinal = continuation.position.row_ordinal;
-    let ordinal_u64 = u64::try_from(ordinal).map_err(|_| "Sink continuation has a negative row")?;
-    if ordinal_u64 >= chunk.rows {
+    let first_ordinal = continuation.position.row_ordinal;
+    let first_ordinal_u64 =
+        u64::try_from(first_ordinal).map_err(|_| "Sink continuation has a negative row")?;
+    if first_ordinal_u64 >= chunk.rows {
         return Err("Sink continuation is outside its data chunk".into());
     }
-    if ordinal == 0 {
+    if first_ordinal == 0 {
         validate_payload_metadata(&mut transaction, payload, chunk)?;
     }
 
     let result = transaction.result_storage()?;
     let result_attributes = transaction.relation_attributes(result.oid())?;
     let mapping = sink_mapping(plan, stage, &payload.attributes, &result_attributes)?;
-    let effect = effect_head(&mut transaction, payload, chunk, ordinal)?;
-    let page = plan_weight_page(
-        effect.weight,
-        continuation.remaining_weight,
-        effect.row_bytes,
-        transaction.budget(),
+    let quantum_budget = transaction.budget();
+    let heads = effect_heads(
+        &mut transaction,
+        payload,
+        chunk,
+        first_ordinal,
+        quantum_budget.max_input_rows,
     )?;
-    page.usage.validate(transaction.budget())?;
+    let mut quantum = WorkQuantum::new(quantum_budget, quantum_budget.max_input_rows);
+    let mut actions = Vec::with_capacity(heads.len());
+    let mut next = Some(continuation);
+    for head in heads {
+        let current =
+            next.ok_or_else(|| "Sink page continued after its chunk ended".to_string())?;
+        if current.position.row_ordinal != head.row_ordinal {
+            return Err("Sink page continuation skipped an effect row".into());
+        }
+        let remaining = quantum
+            .remaining()
+            .ok_or_else(|| "Sink quantum exhausted before its first effect".to_string())?;
+        if !quantum.usage().is_empty()
+            && (head.row_bytes
+                > u64::try_from(remaining.max_input_bytes)
+                    .map_err(|_| "Sink input byte budget exceeds u64")?
+                || head.row_bytes
+                    > u64::try_from(remaining.max_output_bytes)
+                        .map_err(|_| "Sink output byte budget exceeds u64")?)
+        {
+            break;
+        }
+        let page = plan_weight_page(
+            head.weight,
+            current.remaining_weight,
+            head.row_bytes,
+            remaining,
+        )?;
+        quantum.record(page.usage)?;
+        actions.push(SinkAction {
+            row_ordinal: head.row_ordinal,
+            applied_weight: page.applied_weight,
+        });
 
-    let mutated = mutate_result(
+        if let Some(remaining_weight) = page.remaining_weight {
+            next = Some(SinkContinuation {
+                position: InputPosition::new(
+                    continuation.position.stream_id,
+                    continuation.position.chunk_seq,
+                    head.row_ordinal,
+                )?,
+                remaining_weight: Some(remaining_weight),
+                persisted: true,
+            });
+            break;
+        }
+
+        let next_ordinal = head
+            .row_ordinal
+            .checked_add(1)
+            .ok_or_else(|| "Sink row ordinal exhausted bigint".to_string())?;
+        if u64::try_from(next_ordinal).map_err(|_| "Sink row ordinal became negative")?
+            == chunk.rows
+        {
+            next = None;
+            break;
+        }
+        next = Some(SinkContinuation {
+            position: InputPosition::new(
+                continuation.position.stream_id,
+                continuation.position.chunk_seq,
+                next_ordinal,
+            )?,
+            remaining_weight: None,
+            persisted: true,
+        });
+        if quantum.remaining().is_none() {
+            break;
+        }
+    }
+    if actions.is_empty() {
+        return Err("Sink page selected no effect rows".into());
+    }
+    let mutated = mutate_result_page(
         &mut transaction,
         &result,
         payload,
         &mapping,
         chunk,
-        ordinal,
-        page.applied_weight,
+        &actions,
     )?;
-    if mutated != page.usage.output_rows {
+    if mutated != quantum.usage().output_rows {
         return Err(format!(
             "Sink expected {} result mutations, database returned {mutated}",
-            page.usage.output_rows
+            quantum.usage().output_rows
         ));
     }
-
-    let next = if let Some(remaining_weight) = page.remaining_weight {
-        Some(SinkContinuation {
-            position: continuation.position,
-            remaining_weight: Some(remaining_weight),
-            persisted: true,
-        })
-    } else {
-        let next_ordinal = ordinal
-            .checked_add(1)
-            .ok_or_else(|| "Sink row ordinal exhausted bigint".to_string())?;
-        if u64::try_from(next_ordinal).map_err(|_| "Sink row ordinal became negative")? < chunk.rows
-        {
-            Some(SinkContinuation {
-                position: InputPosition::new(
-                    continuation.position.stream_id,
-                    continuation.position.chunk_seq,
-                    next_ordinal,
-                )?,
-                remaining_weight: None,
-                persisted: true,
-            })
-        } else {
-            let frontier = transaction.input(0)?.consumed_frontier_lsn;
-            advance_completed_chunk(&mut transaction, chunk, frontier)?;
-            None
-        }
-    };
+    if next.is_none() {
+        let frontier = transaction.input(0)?.consumed_frontier_lsn;
+        advance_completed_chunk(&mut transaction, chunk, frontier)?;
+    }
     let has_continuation = next.is_some();
     replace_continuation(&mut transaction, continuation_relation, continuation, next)?;
-    transaction.finish(has_continuation, page.usage)
+    transaction.finish(has_continuation, quantum.usage())
 }
 
 fn sink_stage(plan: &DataflowPlan, stage_id: u32) -> Result<&DataflowStage, String> {
@@ -477,42 +533,61 @@ fn validate_payload_metadata(
     Ok(())
 }
 
-fn effect_head(
+fn effect_heads(
     transaction: &mut StepTxn<'_, '_>,
     payload: &PayloadLayout,
     chunk: &ChunkMeta,
-    row_ordinal: i64,
-) -> Result<EffectHead, String> {
+    first_row_ordinal: i64,
+    max_rows: usize,
+) -> Result<Vec<EffectHead>, String> {
     let query = format!(
         r#"
-        SELECT weight,
+        SELECT row_ordinal,weight,
                shiba_internal.effect_row_bytes(row_value)::bigint
         FROM {}
-        WHERE stream_id=$1 AND chunk_seq=$2 AND row_ordinal=$3
+        WHERE stream_id=$1
+          AND chunk_seq=$2
+          AND row_ordinal >= $3
+        ORDER BY row_ordinal
+        LIMIT $4
         "#,
         payload.relation.sql()
     );
+    let max_rows = i64::try_from(max_rows).map_err(|_| "Sink page row limit exceeds bigint")?;
     let arguments = unsafe {
         [
             DatumWithOid::new(chunk.stream_id, pg_sys::INT8OID),
             DatumWithOid::new(chunk.sequence, pg_sys::INT8OID),
-            DatumWithOid::new(row_ordinal, pg_sys::INT8OID),
+            DatumWithOid::new(first_row_ordinal, pg_sys::INT8OID),
+            DatumWithOid::new(max_rows, pg_sys::INT8OID),
         ]
     };
     let rows = transaction.read(&query, &arguments)?;
-    if rows.len() != 1 {
-        return Err("Sink effect position has no unique payload row".into());
+    if rows.is_empty() {
+        return Err("Sink effect position has no payload suffix".into());
     }
-    let row = rows.first();
-    let weight = required::<i64>(&row, 1, "effect weight")?;
-    let row_bytes = nonnegative(
-        required::<i64>(&row, 2, "effect row bytes")?,
-        "effect row bytes",
-    )?;
-    if weight == 0 || row_bytes == 0 {
-        return Err("Sink effect contains invalid weight or size".into());
+    let mut heads = Vec::with_capacity(rows.len());
+    let mut expected_ordinal = first_row_ordinal;
+    for row in rows {
+        let row_ordinal = required_row::<i64>(&row, 1, "effect row ordinal")?;
+        let weight = required_row::<i64>(&row, 2, "effect weight")?;
+        let row_bytes = nonnegative(
+            required_row::<i64>(&row, 3, "effect row bytes")?,
+            "effect row bytes",
+        )?;
+        if row_ordinal != expected_ordinal || weight == 0 || row_bytes == 0 {
+            return Err("Sink effect page is non-contiguous or invalid".into());
+        }
+        heads.push(EffectHead {
+            row_ordinal,
+            weight,
+            row_bytes,
+        });
+        expected_ordinal = expected_ordinal
+            .checked_add(1)
+            .ok_or_else(|| "Sink effect ordinal exhausted bigint".to_string())?;
     }
-    Ok(EffectHead { weight, row_bytes })
+    Ok(heads)
 }
 
 fn sink_mapping(
@@ -559,6 +634,7 @@ fn sink_mapping(
     let mut insert_columns = Vec::with_capacity(target.len());
     let mut select_columns = Vec::with_capacity(target.len());
     let mut delete_predicate = Vec::with_capacity(target.len());
+    let mut effect_equality = Vec::with_capacity(payload.len());
     for (ordinal, (input_slot, target_attribute)) in
         sink.schema.inputs.iter().zip(target).enumerate()
     {
@@ -588,11 +664,16 @@ fn sink_mapping(
         delete_predicate.push(format!(
             "target.{target_name} IS NOT DISTINCT FROM (effect.row_value).{payload_name}"
         ));
+        effect_equality.push(format!(
+            "(previous_effect.row_value).{payload_name} \
+             IS NOT DISTINCT FROM (effect.row_value).{payload_name}"
+        ));
     }
     Ok(SinkMapping {
         insert_columns: insert_columns.join(","),
         select_columns: select_columns.join(","),
         delete_predicate: delete_predicate.join(" AND "),
+        effect_equality: effect_equality.join(" AND "),
     })
 }
 
@@ -602,83 +683,98 @@ fn same_type(expected: &SlotType, actual: &AttributeRef) -> bool {
         && actual.collation_oid.to_u32() == expected.collation_oid
 }
 
-fn mutate_result(
+fn mutate_result_page(
     transaction: &mut StepTxn<'_, '_>,
     result: &RelationRef,
     payload: &PayloadLayout,
     mapping: &SinkMapping,
     chunk: &ChunkMeta,
-    row_ordinal: i64,
-    applied_weight: i64,
+    actions: &[SinkAction],
 ) -> Result<u64, String> {
-    if applied_weight == 0 {
-        return Err("Sink result mutation has zero weight".into());
+    if actions.is_empty() || actions.iter().any(|action| action.applied_weight == 0) {
+        return Err("Sink result page is empty or contains a zero weight".into());
     }
-    let copies = applied_weight.unsigned_abs();
-    let copies = i64::try_from(copies).map_err(|_| "Sink mutation count exceeds bigint")?;
+    let action_values = actions
+        .iter()
+        .map(|action| format!("({},{})", action.row_ordinal, action.applied_weight))
+        .collect::<Vec<_>>()
+        .join(",");
     let arguments = unsafe {
         [
             DatumWithOid::new(chunk.stream_id, pg_sys::INT8OID),
             DatumWithOid::new(chunk.sequence, pg_sys::INT8OID),
-            DatumWithOid::new(row_ordinal, pg_sys::INT8OID),
-            DatumWithOid::new(copies, pg_sys::INT8OID),
         ]
     };
-    let query = if applied_weight > 0 {
-        format!(
-            r#"
-            WITH effect AS MATERIALIZED (
-              SELECT row_value
-              FROM {payload}
-              WHERE stream_id=$1 AND chunk_seq=$2 AND row_ordinal=$3
-            ),
-            inserted AS (
-              INSERT INTO {result}({columns})
-              SELECT {values}
-              FROM effect
-              CROSS JOIN pg_catalog.generate_series(1,$4::bigint) AS copy(ordinal)
-              RETURNING 1
-            )
-            SELECT count(*)::bigint FROM inserted
-            "#,
-            payload = payload.relation.sql(),
-            result = result.sql(),
-            columns = mapping.insert_columns,
-            values = mapping.select_columns,
+    let query = format!(
+        r#"
+        WITH action_values(row_ordinal,applied_weight) AS (
+          VALUES {action_values}
+        ),
+        effects AS MATERIALIZED (
+          SELECT action.row_ordinal,action.applied_weight,payload.row_value
+          FROM action_values AS action
+          JOIN {payload} AS payload
+            ON payload.stream_id=$1
+           AND payload.chunk_seq=$2
+           AND payload.row_ordinal=action.row_ordinal
+        ),
+        inserted AS (
+          INSERT INTO {result}({columns})
+          SELECT {values}
+          FROM effects AS effect
+          CROSS JOIN LATERAL pg_catalog.generate_series(
+            1,effect.applied_weight
+          ) AS copy(ordinal)
+          WHERE effect.applied_weight > 0
+          RETURNING 1
+        ),
+        negative_actions AS MATERIALIZED (
+          SELECT effect.*,
+                 (
+                   SELECT coalesce(
+                     sum(-previous_effect.applied_weight),0
+                   )::bigint
+                   FROM effects AS previous_effect
+                   WHERE previous_effect.applied_weight < 0
+                     AND previous_effect.row_ordinal < effect.row_ordinal
+                     AND {effect_equality}
+                 ) AS copies_before
+          FROM effects AS effect
+          WHERE effect.applied_weight < 0
+        ),
+        victims AS MATERIALIZED (
+          SELECT victim.ctid
+          FROM negative_actions AS effect
+          CROSS JOIN LATERAL (
+            SELECT target.ctid
+            FROM {result} AS target
+            WHERE {predicate}
+            ORDER BY target.ctid
+            OFFSET effect.copies_before
+            LIMIT -effect.applied_weight
+            FOR UPDATE OF target
+          ) AS victim
+        ),
+        deleted AS (
+          DELETE FROM {result} AS target
+          USING victims
+          WHERE target.ctid=victims.ctid
+          RETURNING 1
         )
-    } else {
-        format!(
-            r#"
-            WITH effect AS MATERIALIZED (
-              SELECT row_value
-              FROM {payload}
-              WHERE stream_id=$1 AND chunk_seq=$2 AND row_ordinal=$3
-            ),
-            victims AS MATERIALIZED (
-              SELECT target.ctid
-              FROM {result} AS target
-              CROSS JOIN effect
-              WHERE {predicate}
-              ORDER BY target.ctid
-              LIMIT $4
-              FOR UPDATE OF target
-            ),
-            deleted AS (
-              DELETE FROM {result} AS target
-              USING victims
-              WHERE target.ctid=victims.ctid
-              RETURNING 1
-            )
-            SELECT count(*)::bigint FROM deleted
-            "#,
-            payload = payload.relation.sql(),
-            result = result.sql(),
-            predicate = mapping.delete_predicate,
-        )
-    };
+        SELECT (SELECT count(*)::bigint FROM inserted) +
+               (SELECT count(*)::bigint FROM deleted)
+        "#,
+        action_values = action_values,
+        payload = payload.relation.sql(),
+        result = result.sql(),
+        columns = mapping.insert_columns,
+        values = mapping.select_columns,
+        effect_equality = mapping.effect_equality,
+        predicate = mapping.delete_predicate,
+    );
     let rows = transaction.write(&query, &arguments)?;
     if rows.len() != 1 {
-        return Err("Sink set mutation returned no summary".into());
+        return Err("Sink set page returned no summary".into());
     }
     nonnegative(
         required::<i64>(&rows.first(), 1, "Sink mutation count")?,
@@ -783,6 +879,16 @@ fn required<T: FromDatum + IntoDatum>(
 ) -> Result<T, String> {
     table
         .get::<T>(ordinal)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("database returned NULL {name}"))
+}
+
+fn required_row<T: FromDatum + IntoDatum>(
+    row: &SpiHeapTupleData<'_>,
+    ordinal: usize,
+    name: &str,
+) -> Result<T, String> {
+    row.get::<T>(ordinal)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("database returned NULL {name}"))
 }
