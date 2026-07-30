@@ -5,9 +5,9 @@
 [![License: PostgreSQL](https://img.shields.io/badge/license-PostgreSQL-blue.svg)](LICENSE)
 
 Shiba is a PostgreSQL 17 extension for continuously maintained SQL result
-tables. It reads committed WAL changes, propagates typed row effects through a
-stateful dataflow, and applies the final effects to an ordinary PostgreSQL
-table.
+tables. It stages streamed WAL in bounded batches, publishes only committed
+source transactions into a stateful dataflow, and applies the final effects to
+an ordinary PostgreSQL table.
 
 Status: experimental v0.1. Shiba is single-node and asynchronous.
 
@@ -15,8 +15,9 @@ Status: experimental v0.1. Shiba is single-node and asynchronous.
 
 ```mermaid
 flowchart LR
-    WAL["committed WAL"] --> IN["bounded ingress"]
-    IN --> SRC[("shared source stream")]
+    WAL["pgoutput WAL<br/>open or sealed transaction"] --> IN["bounded ingress"]
+    IN --> C["Commit gate"]
+    C --> SRC[("shared source stream")]
     SRC --> S["Scan"]
     S --> O["generic Rust kernels<br/>bounded typed SQL"]
     O --> K["Sink"]
@@ -40,11 +41,12 @@ DELETE old       => (-1, old)
 UPDATE old → new => (-1, old), (+1, new)
 ```
 
-Ingress persists and publishes bounded prefixes of a large source transaction
-without waiting for the trailing pgoutput `Commit` record. Operators consume
-bounded row-and-byte prefixes and persist a continuation when more work
-remains. A high-fanout Join therefore produces bounded chunks instead of
-materializing its full output in one transaction.
+Ingress persists bounded batches of a large source transaction before the
+trailing pgoutput `Commit` record, but those batches remain invisible to the
+DAG. After Commit, the publisher releases them as bounded source chunks.
+Operators consume bounded row-and-byte prefixes and persist a continuation
+when more work remains. A high-fanout Join therefore produces bounded chunks
+instead of materializing its full output in one transaction.
 
 Aggregate, Window, and TopN separate input Apply from output Drain. Apply
 advances consumed chunks and records dirty state; Drain later rebuilds and

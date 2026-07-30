@@ -203,9 +203,10 @@ unsupported construct or catalog capability.
 
 ## Visibility and progress
 
-Only committed source WAL reaches Shiba, but a source transaction is not a
-result-visibility boundary. A large source transaction is persisted,
-published, processed, and applied in bounded prefixes.
+Streaming WAL from an open source transaction is staged in bounded batches but
+does not enter a source EffectStream. Commit opens the publication gate; the
+staged batches are then published, processed, and applied in bounded prefixes.
+The source transaction is therefore not a result-visibility boundary.
 
 Each successful Sink step commits its result-table DML and the corresponding
 input cursor, continuation, and checkpoint in one PostgreSQL transaction. A

@@ -10,7 +10,7 @@ flowchart LR
     A["source transaction<br/>仍可能 open"] --> B["pgoutput streaming"]
     B --> C["Rust ingress<br/>读一个有界 batch"]
     C --> D[("change_log")]
-    D --> E["source publisher<br/>发布一个有界前缀"]
+    D -->|"只选择 committed header"| E["source publisher<br/>发布一个有界前缀"]
     E --> F[("source EffectStream")]
     F --> G["Scan"]
     G --> H[("operator EffectStream")]
@@ -142,6 +142,12 @@ flowchart TD
 [`StepContext`](../src/kernel/step.rs)、执行公共锁与 backpressure 检查，再调用算子
 的一个有界 `step`。算子只能返回 `KernelTransition`，不能自行提交 checkpoint。
 Runner 最后发布 pending output 并条件更新 checkpoint revision。
+
+`operator_checkpoints.revision` 是 step commit 的 CAS guard 和递增序列；
+`has_continuation` 是 continuation 是否存在的权威 bit；typed continuation row
+保存权威的 phase 和恢复 cursor。`StepContext` 读取时要求 presence bit 与 row
+是否存在一致。公共 replacement 会对旧 typed fields 做 CAS，并在 context 中记录
+新的 presence；transition 和最终 commit 再次校验它。三者各管一层，不会分叉。
 
 因此新增算子只增加四样东西：`OperatorSpec`、自己的 typed state/continuation、
 一个 `step` 算法和 dispatcher 中的一条注册。它不能另建 transaction、checkpoint
@@ -449,16 +455,17 @@ capacity 选择 runnable result 和 stage。cache 淘汰或 Runtime 重启后仍
 | ingress LSN、source transaction、ordered effects、publication cursor | `ingress_replay_state`, `ingress_transactions`, `change_log`, `source_publications` |
 | 查询计划 | `dataflows.plan` |
 | stream chunks、payload、每个 input cursor | EffectStream catalog 和 generated payload relation |
-| step revision、admission、phase、下一页 cursor | checkpoint 和 generated continuation relation |
+| step revision、admission、continuation presence authority | `operator_checkpoints` |
+| operator phase、下一页 cursor | generated continuation relation |
 | Join/Aggregate/Window/TopN 等计算状态 | generated typed state relations |
 | 用户当前可见结果 | Shiba-managed result table |
 
 恢复规则只取决于 transaction 是否提交：
 
 - ingress 提交前失败：当前 batch 没有 durable row，slot 重放；
-- 已发布部分 source chunks、但尚未读到 pgoutput `Commit` 时失败：slot 重放这笔
-  source transaction，稳定 transaction/event identity 和 publication cursor
-  避免重复发布已经提交的 chunks；
+- 已持久化部分 ingress batches、但尚未读到 pgoutput `Commit` 时失败：这些 batch
+  仍对 DAG 不可见；slot 重放这笔 source transaction，稳定 transaction/event
+  identity 避免重复写入；
 - source publication 提交前失败：payload、metadata 和 cursor 一起回滚；
 - source publication 提交后失败：cursor 已前进，从下一个前缀继续；
 - operator step 提交前失败：state、output、cursor、continuation 和 checkpoint

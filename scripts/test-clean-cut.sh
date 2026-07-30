@@ -107,6 +107,10 @@ reject_matches \
   "operator algorithms must return KernelTransition through KernelRunner" \
   src/kernel/linear.rs src/kernel/sink.rs src/kernel/distinct.rs \
   src/kernel/join.rs src/kernel/aggregate.rs src/kernel/window.rs src/kernel/topn.rs
+reject_matches \
+  'StepTxn|linear/join/distinct/aggregate/window/topn/sink::execute|LoadedDataflow::step\b|without waiting for the trailing pgoutput|Only committed source WAL reaches|已发布部分 source chunks.*Commit|peak_queued_bytes|queue high-water' \
+  "documentation must describe the current streaming and KernelRunner architecture" \
+  README.md docs
 
 for removed_file in \
   src/query_analysis.rs \

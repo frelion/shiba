@@ -10,8 +10,8 @@ The matrix measures a streaming system, not only a source-table query. A
 useful workload records the input size and measures at least one of:
 
 - ingress rows or bytes per second, plus time until its first stream chunk;
-- operator actions per second, checkpoint advances, and peak queued
-  chunks/bytes under fanout;
+- operator actions per second, checkpoint advances, and peak buffered stream
+  rows/bytes under fanout;
 - end-to-end source-commit-to-Sink latency and result rows per second;
 - maximum step work (rows, bytes, or continuation pages) for large groups,
   partitions, and `WITH TIES`.
@@ -49,7 +49,7 @@ arbitrary identifying details belong in `metadata`:
   "metrics": {
     "sink_rows_per_second": 125000.0,
     "end_to_end_seconds": 2.4,
-    "peak_queued_bytes": 524288
+    "peak_buffered_bytes": 524288
   },
   "metadata": {
     "source_rows": 300000,
@@ -155,7 +155,7 @@ workload definition before becoming a number people compare.
 | Case | Status | Primary measurements | Why it exists |
 | --- | --- | --- |
 | Large ingress transaction | **present** | rows/s, source chunks, post-commit convergence, stream-pressure peak | validates bounded ingress publication and drain |
-| High-fanout Join | **present** | rows/s, output chunks, queue high-water | validates bounded output and backpressure |
+| High-fanout Join | **present** | rows/s, output chunks, stream-pressure high-water | validates bounded output and backpressure |
 | Complex DAG | **present** | post-commit convergence, Sink rows/s, stream/state/database growth | measures `Join → Join → Aggregate → Window → TopN → Sink` as a stream |
 | Aggregate/Distinct hot key | roadmap | rows/s, Apply/Drain pages, peak state | catches per-row rebuilds |
 | Window/TopN large partition | roadmap | rows/s, continuation pages, max step time | catches unbounded fold or diff work |

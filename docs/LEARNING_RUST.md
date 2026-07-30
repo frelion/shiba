@@ -27,30 +27,33 @@ typed relations, set operations, locks, and transaction commit.
 Read [`ARCHITECTURE.md`](ARCHITECTURE.md) first if the execution path itself is
 not yet clear.
 
-For one live ingress batch, this is the function-level path to keep in view:
+For one Runtime loop, this is the function-level path to keep in view:
 
 ```text
 shiba_runtime_main
 ├── ingest_and_publish_once
 │   ├── publish_source_once
-│   │     publishes work persisted by an earlier Runtime loop
+│   │     publishes committed work persisted by an earlier Runtime loop
 │   ├── ReplicationIngress::poll_batch
 │   └── persist_ingress_batch
 │         makes the new publication work durable
 └── step_ready_operators_bounded
     └── step_one_operator
-        └── LoadedDataflow::step
-            └── execute_operator_step
-                └── crate::kernel::execute_step (dispatcher.rs)
-                    └── linear/join/distinct/aggregate/window/topn/sink::execute
-                        └── StepTxn::finish
+        └── LoadedDataflow::step_quantum
+            └── crate::kernel::execute_step (dispatcher.rs)
+                └── KernelRunner::run
+                    ├── StepContext::begin
+                    ├── linear/join/distinct/aggregate/window/topn/sink::step
+                    │   └── KernelTransition
+                    └── StepContext::commit
 ```
 
-`ingest_and_publish_once` tries pending publication before reading more WAL, so
-a batch persisted near the bottom of one loop is normally published near the
-top of the next. A committed output chunk then makes a downstream stage
-runnable; the call tree is repeated once per bounded stage step until Sink
-commits the corresponding result effects.
+`ingest_and_publish_once` tries pending publication before reading more WAL.
+An open transaction's persisted batch remains staged; after Commit, its
+publication work is normally picked up near the top of the next loop. A
+committed output chunk then makes a downstream stage runnable; the call tree is
+repeated once per bounded stage step until Sink commits the corresponding
+result effects.
 
 ## 1. Small pure-Rust helpers
 
@@ -244,6 +247,13 @@ The kernel uses `read`, `lock`, and `write` through the context, then returns a
 checkpoint. The Runner publishes pending output and updates the checkpoint only
 if its revision still equals the value locked at step start.
 
+The checkpoint revision is the step commit's CAS guard and sequence, while its
+continuation flag is the authoritative presence bit. The typed continuation
+row owns the phase and resume cursor. Loading it requires the bit and row
+presence to agree; replacement compares the old typed fields and records the
+new presence in the context. Transition creation and final commit both reject
+a mismatch.
+
 Important invariant: after a kernel performs durable writes, it may finish
 with `Progress`/`Yield` or return an error. It does not return `Idle`/`Blocked`
 and commit partial work.
@@ -288,7 +298,7 @@ types represent:
 - match counters;
 - continuation transition results.
 
-Then follow `execute`. A high-fanout input row is not expanded into a Rust
+Then follow `step`. A high-fanout input row is not expanded into a Rust
 `Vec` of all matches. Each step asks PostgreSQL for one bounded keyset prefix,
 appends one output chunk, and persists the next cursor.
 
@@ -306,7 +316,7 @@ After Join, compare:
 
 For Aggregate, Window, and TopN, a completed input chunk may advance before
 Drain starts. The durable Drain continuation therefore refers to typed state,
-not to a consumed chunk. `StepTxn` keeps their common admitted row/byte count;
+not to a consumed chunk. `StepContext` keeps their common admitted row/byte count;
 Aggregate keeps causal LSNs with dirty groups, Window with dirty partitions,
 and TopN in its singleton control row. The counters are cumulative since the
 last output frontier. Drain thresholds grow as `Q, 2Q, 4Q, ...` up to a fixed
