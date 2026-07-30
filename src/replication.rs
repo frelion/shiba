@@ -343,10 +343,20 @@ impl ReplicationTransport {
     /// frame without blocking.
     pub fn poll_copy_data(&mut self) -> Result<CopyDataPoll, ReplicationError> {
         self.require_streaming()?;
+        // Drain libpq's already-buffered CopyData before reading the socket.
+        // Calling PQconsumeInput for every frame makes libpq repeatedly move
+        // the unread tail of a large replication stream.
+        let poll = self.read_copy_data()?;
+        if !matches!(poll, CopyDataPoll::Pending) {
+            return Ok(poll);
+        }
         if unsafe { PQconsumeInput(self.conn.as_ptr()) } == 0 {
             return Err(ReplicationError::ConsumeInput(self.connection_error()));
         }
+        self.read_copy_data()
+    }
 
+    fn read_copy_data(&mut self) -> Result<CopyDataPoll, ReplicationError> {
         let mut buffer = ptr::null_mut();
         let length = unsafe { PQgetCopyData(self.conn.as_ptr(), &mut buffer, 1) };
         match length {

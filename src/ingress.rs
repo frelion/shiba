@@ -194,9 +194,6 @@ impl ReplicationIngress {
         loop {
             match self.transport.poll_copy_data()? {
                 CopyDataPoll::Pending => {
-                    if let Some(batch) = self.pending.take() {
-                        return Ok(IngressPoll::Batch(batch.finish()));
-                    }
                     let reply_requested = std::mem::take(&mut self.reply_requested);
                     return Ok(IngressPoll::NoBatch {
                         reply_requested,
