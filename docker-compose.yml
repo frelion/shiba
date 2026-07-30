@@ -1,0 +1,31 @@
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    environment:
+      POSTGRES_DB: shiba
+      POSTGRES_PASSWORD: shiba
+    ports:
+      - "5432:5432"
+    command:
+      - postgres
+      - -c
+      - session_preload_libraries=shiba
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=4
+      - -c
+      - shiba.replication_conninfo=host=/var/run/postgresql dbname=shiba user=postgres
+    volumes:
+      - shiba-pgdata:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d shiba"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  shiba-pgdata:

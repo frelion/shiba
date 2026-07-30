@@ -60,3 +60,4 @@ jobs:
           files: |
             shiba-${{ github.ref_name }}-postgresql17.tar.gz
             shiba-${{ github.ref_name }}-postgresql17.tar.gz.sha256
+            install.sh

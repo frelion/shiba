@@ -74,6 +74,37 @@ TopN DAG with its streams, state, recovery, and backpressure.
 
 ## Quick start
 
+### Fast install on Linux x86_64
+
+For a Debian/Ubuntu PostgreSQL 17 installation, download the installer from
+the repository and pin the release you want to install:
+
+```bash
+curl --fail --location --proto '=https' --tlsv1.2 \
+  https://raw.githubusercontent.com/frelion/shiba/main/install.sh \
+  --output install-shiba.sh
+bash install-shiba.sh --version v0.1.0
+```
+
+The installer verifies the release checksum and installs the extension files.
+It does not change `postgresql.conf` or restart PostgreSQL. Complete the
+server configuration below, then run `CREATE EXTENSION shiba` and
+`SELECT shiba.activate()` in the target database.
+
+### Docker quickstart
+
+To try Shiba in an isolated PostgreSQL 17 container:
+
+```bash
+docker compose up --build
+```
+
+The Compose setup configures logical replication and activates Shiba in the
+`shiba` database. It is intended for local development and evaluation, not as
+a production deployment.
+
+### Install from source
+
 Requirements:
 
 - PostgreSQL 17 and its development headers;
