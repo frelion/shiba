@@ -43,6 +43,7 @@ pub unsafe fn install_runtime_wakeup_callback() {
 
 #[cfg_attr(not(test), unsafe(no_mangle))]
 #[cfg_attr(not(test), pg_guard)]
+#[cfg_attr(test, allow(dead_code))]
 pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGINT);
     // Use PostgreSQL's normal backend SIGTERM handler. The pgrx deferred
