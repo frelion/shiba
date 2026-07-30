@@ -16,7 +16,16 @@ static_require() {
   fi
 }
 
-for kernel in src/kernel/window.rs src/kernel/topn.rs; do
+static_require src/execution/window/output.rs \
+  'bounded_prefix AS MATERIALIZED' \
+  'Window does not page the primary comparison relation first'
+static_require src/execution/window/output.rs \
+  'input_rows: compared_rows' \
+  'Window does not account compared rows as input work'
+static_require src/execution/window/step.rs \
+  'cursor_repeat' \
+  'Window has no durable huge-multiplicity residual cursor'
+for kernel in src/execution/topn/runtime.rs; do
   static_require "${kernel}" \
     'bounded_prefix AS MATERIALIZED' \
     "${kernel} does not page the primary comparison relation first"
@@ -27,42 +36,44 @@ for kernel in src/kernel/window.rs src/kernel/topn.rs; do
     'cursor_repeat' \
     "${kernel} has no durable huge-multiplicity residual cursor"
 done
-static_require src/kernel/window.rs \
+static_require src/execution/window/provision.rs \
   'window_dirty_partitions_' \
   'Window has no partial dirty-partition index'
-static_require src/kernel/window.rs \
+static_require src/execution/window/provision.rs \
   'window_candidate_page_' \
   'Window has no partition/candidate page index'
-static_require src/kernel/window.rs \
+static_require src/execution/window/provision.rs \
   'window_visible_page_' \
   'Window has no partition/visible page index'
-static_require src/kernel/window.rs \
+static_require src/execution/window/mod.rs \
   'WINDOW_FOLD_WORK_ITEM_CAP' \
   'Window aggregate Fold has no explicit empty-frame work-item cap'
-static_require src/kernel/window.rs \
+static_require src/execution/window/provision.rs \
   'fold_ready' \
   'Window aggregate Fold has no durable ready-to-finalize state'
-static_require src/kernel/window.rs \
+static_require src/execution/window/primitives.rs \
   'scalar_work_bytes_sql' \
   'Window aggregate Fold does not account materialized function bytes'
-static_require src/kernel/window.rs \
+static_require src/execution/window/primitives.rs \
   'missing_frame' \
   'Window aggregate Fold treats a missing frame as an empty frame'
 for interval in 1 2 3; do
-  static_require src/kernel/window.rs \
+  static_require src/execution/window/primitives.rs \
     "interval_${interval} AS MATERIALIZED" \
     "Window aggregate frame interval ${interval} is not independently bounded"
 done
 if grep -Eq 'pg_catalog\.record_send' \
-  "${project_root}/src/kernel/window.rs" \
-  "${project_root}/src/kernel/topn.rs"; then
+  "${project_root}/src/execution/window/output.rs" \
+  "${project_root}/src/execution/window/primitives.rs" \
+  "${project_root}/src/execution/topn/runtime.rs"; then
   printf '%s\n' \
     'Window/TopN static gate failed: raw record_send identity remains' >&2
   exit 1
 fi
 if grep -Eq \
   'OR \(ordered\.ordinal BETWEEN frame\.start_2' \
-  "${project_root}/src/kernel/window.rs"; then
+  "${project_root}/src/execution/window/output.rs" \
+  "${project_root}/src/execution/window/primitives.rs"; then
   printf '%s\n' \
     'Window/TopN static gate failed: aggregate frame still uses one OR range scan' >&2
   exit 1

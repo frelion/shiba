@@ -454,6 +454,7 @@ DECLARE
     v_slot_generation bigint;
     v_status text;
     v_existing_abort_lsn pg_lsn;
+    v_transaction_start_lsn pg_lsn;
     v_payload_bytes bigint;
 BEGIN
     IF p_ingress_txn_id IS NULL OR p_abort_lsn IS NULL THEN
@@ -483,16 +484,24 @@ BEGIN
 
     SELECT txn.status,
            txn.final_lsn,
+           txn.transaction_start_lsn,
            txn.payload_bytes
       INTO STRICT v_status,
                   v_existing_abort_lsn,
+                  v_transaction_start_lsn,
                   v_payload_bytes
       FROM shiba_internal.ingress_transactions AS txn
      WHERE txn.ingress_txn_id = p_ingress_txn_id
      FOR UPDATE;
 
     IF v_status = 'aborted' THEN
-        IF v_existing_abort_lsn IS DISTINCT FROM p_abort_lsn THEN
+        -- Crash reconciliation uses transaction_start_lsn as a deterministic
+        -- local identity because PostgreSQL may omit StreamAbort after a
+        -- postmaster crash.  Some PostgreSQL versions nevertheless replay a
+        -- matching StreamAbort while the slot catches up.  Treat that record
+        -- as the same durable abort; an unrelated LSN remains corruption.
+        IF v_existing_abort_lsn IS DISTINCT FROM p_abort_lsn
+           AND v_existing_abort_lsn IS DISTINCT FROM v_transaction_start_lsn THEN
             RAISE EXCEPTION USING
                 ERRCODE = 'XX001',
                 MESSAGE = format(

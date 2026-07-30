@@ -137,9 +137,9 @@ flowchart TD
     G --> H["COMMIT"]
 ```
 
-[`KernelRunner`](../src/kernel/runner.rs) 是唯一的 step 生命周期入口。每个算子先
+[`KernelRunner`](../src/execution/runner.rs) 是唯一的 step 生命周期入口。每个算子先
 声明物理 input 和 output contract；Runner 创建
-[`StepContext`](../src/kernel/step.rs)、执行公共锁与 backpressure 检查，再调用算子
+[`StepContext`](../src/execution/step.rs)、执行公共锁与 backpressure 检查，再调用算子
 的一个有界 `step`。算子只能返回 `KernelTransition`，不能自行提交 checkpoint。
 Runner 最后发布 pending output 并条件更新 checkpoint revision。
 
@@ -172,7 +172,7 @@ exactly-once 单位，不是整笔 source transaction。
 ## 复杂 SQL 如何变成 DAG
 
 PostgreSQL 完成语法分析和名称解析后，
-[`src/query_lowering.rs`](../src/query_lowering.rs) 把 `Query` 转成唯一的
+[`src/planner/lowering.rs`](../src/planner/lowering.rs) 把 `Query` 转成唯一的
 `DataflowPlan`。例如下面这条查询包含三个 source、两个 Join、Aggregate、Window
 和 TopN：
 
@@ -487,7 +487,7 @@ capacity 选择 runnable result 和 stage。cache 淘汰或 Runtime 重启后仍
 Rust 负责 pgoutput 解析、Query lowering、operator phase、continuation、预算、
 恢复判断和调度。SQL 只负责 catalog、typed relation、必要的集合运算和事务性
 读写。所有 operator 都从
-[`src/kernel/dispatcher.rs`](../src/kernel/dispatcher.rs) 进入；不存在 PL/pgSQL
+[`src/execution/dispatcher.rs`](../src/execution/dispatcher.rs) 进入；不存在 PL/pgSQL
 kernel、wrapper 或 fallback。
 
 plan 保存 PostgreSQL 已解析的 function、operator、type、collation 和 sort
@@ -501,18 +501,18 @@ identity 的 kernel 使用统一的 named-composite text roundtrip 和 binary en
 | 内容 | 文件 |
 | --- | --- |
 | Runtime 主循环和 ingress transaction | `src/worker.rs` |
-| pgoutput transport/parser | `src/replication.rs`, `src/pgoutput.rs` |
+| pgoutput transport/parser | `src/replication/transport.rs`, `src/replication/pgoutput.rs` |
 | ingress Rust state machine | `src/ingress.rs` |
-| Query → `DataflowPlan` | `src/query_lowering.rs` |
-| plan model和校验 | `src/logical/model.rs`, `src/logical/validate.rs` |
-| work budget和plan cache | `src/logical/dataflow.rs`, `src/logical/runtime.rs` |
+| Query → `DataflowPlan` | `src/planner/lowering.rs` |
+| plan model和校验 | `src/planner/model.rs`, `src/planner/validate.rs` |
+| work budget和plan cache | `src/planner/dataflow.rs`, `src/planner/runtime.rs` |
 | 唯一 runnable 查询 | `src/worker.rs` |
-| kernel contract 和唯一 Runner | `src/kernel/runner.rs` |
-| step transaction context | `src/kernel/step.rs` |
-| typed storage/OID 校验 | `src/kernel/storage.rs`, `src/kernel/register.rs` |
-| EffectStream 公共操作 | `src/kernel/stream.rs`, `sql/12_effect_stream.sql` |
-| operator dispatcher | `src/kernel/dispatcher.rs` |
-| operator kernels | `src/kernel/linear.rs`, `join.rs`, `distinct.rs`, `aggregate.rs`, `window.rs`, `topn.rs`, `sink.rs` |
+| kernel contract 和唯一 Runner | `src/execution/runner.rs` |
+| step transaction context | `src/execution/step.rs` |
+| typed storage/OID 校验 | `src/execution/storage.rs`, `src/execution/register.rs` |
+| EffectStream 公共操作 | `src/execution/stream.rs`, `sql/12_effect_stream.sql` |
+| operator dispatcher | `src/execution/dispatcher.rs` |
+| operator kernels | `src/execution/{linear,sink,distinct,join,aggregate,window,topn}/mod.rs` plus each operator's machine/runtime/provision modules |
 | catalog | `sql/00_catalog.sql` |
 | ingress admission transaction | `src/admission.rs` |
 | ingress header/finalization primitives | `sql/11_ingress.sql` |

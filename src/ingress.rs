@@ -4,12 +4,12 @@
 //! complete CopyData frames into one bounded, single-source-transaction batch;
 //! the Runtime persists that batch in a separate short transaction.
 
-use crate::pgoutput::{self, Message, ParseContext, Tuple};
+use crate::replication::pgoutput::{self, Message, ParseContext, Tuple};
 use crate::replication::{
     CopyDataPoll, ReplicationError, ReplicationMessage, ReplicationTransport,
 };
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -155,9 +155,9 @@ pub(crate) struct ReplicationIngress {
     relations: HashMap<u32, Vec<String>>,
     max_cached_relations: usize,
     active_transaction: Option<ActiveTransaction>,
-    streamed_transaction: Option<ActiveTransaction>,
+    streamed_transactions: BTreeMap<u32, ActiveTransaction>,
     last_change_lsn: HashMap<u32, (u64, u64)>,
-    pending: Option<PendingBatch>,
+    pending: BTreeMap<u32, PendingBatch>,
     reply_requested: bool,
 }
 
@@ -169,9 +169,9 @@ impl ReplicationIngress {
             relations: HashMap::new(),
             max_cached_relations,
             active_transaction: None,
-            streamed_transaction: None,
+            streamed_transactions: BTreeMap::new(),
             last_change_lsn: HashMap::new(),
-            pending: None,
+            pending: BTreeMap::new(),
             reply_requested: false,
         }
     }
@@ -201,7 +201,11 @@ impl ReplicationIngress {
                     });
                 }
                 CopyDataPoll::End => {
-                    if let Some(batch) = self.pending.take() {
+                    if let Some(xid) = self.pending.keys().next().copied() {
+                        let batch = self
+                            .pending
+                            .remove(&xid)
+                            .expect("pending batch key disappeared");
                         return Ok(IngressPoll::Batch(batch.finish()));
                     }
                     return Ok(IngressPoll::End);
@@ -211,7 +215,7 @@ impl ReplicationIngress {
                     ..
                 }) => {
                     self.reply_requested |= reply_requested;
-                    if self.pending.is_none() && self.reply_requested {
+                    if self.pending.is_empty() && self.reply_requested {
                         return Ok(IngressPoll::NoBatch {
                             reply_requested: std::mem::take(&mut self.reply_requested),
                             progressed: false,
@@ -224,25 +228,32 @@ impl ReplicationIngress {
                     ..
                 }) => {
                     let boundary = self.process_pgoutput(wal_start, &pgoutput)?;
-                    if self.pending.is_none() {
+                    if let Some(xid) = boundary {
+                        let batch = self.pending.remove(&xid).ok_or_else(|| {
+                            IngressError::State(
+                                "pgoutput boundary has no pending source batch".into(),
+                            )
+                        })?;
+                        return Ok(IngressPoll::Batch(batch.finish()));
+                    }
+                    let Some(transaction) = self.active_transaction else {
                         // Non-transactional logical messages are deliberately
                         // outside Shiba's source-row contract.  They acquire no
                         // ingress transaction and are acknowledged only when a
                         // later durable source transaction advances feedback.
                         continue;
-                    }
-                    let pending = self.pending.as_ref().ok_or_else(|| {
+                    };
+                    let pending = self.pending.get(&transaction.xid).ok_or_else(|| {
                         IngressError::State(
                             "pgoutput frame did not acquire a source transaction".into(),
                         )
                     })?;
-                    if boundary
-                        || pending.events.len() >= budget.max_events
+                    if pending.events.len() >= budget.max_events
                         || pending.wire_bytes as usize >= budget.max_wire_bytes
                     {
                         return Ok(IngressPoll::Batch(
                             self.pending
-                                .take()
+                                .remove(&transaction.xid)
                                 .expect("pending batch checked above")
                                 .finish(),
                         ));
@@ -262,7 +273,11 @@ impl ReplicationIngress {
         }
     }
 
-    fn process_pgoutput(&mut self, wal_start: u64, payload: &[u8]) -> Result<bool, IngressError> {
+    fn process_pgoutput(
+        &mut self,
+        wal_start: u64,
+        payload: &[u8],
+    ) -> Result<Option<u32>, IngressError> {
         let context = if self
             .active_transaction
             .is_some_and(|transaction| transaction.expected_commit_lsn.is_none())
@@ -274,7 +289,8 @@ impl ReplicationIngress {
         let message =
             pgoutput::parse_with_context(payload, context).map_err(IngressError::Protocol)?;
 
-        let mut boundary = false;
+        let mut boundary = None;
+        let mut observed_transaction = self.active_transaction;
         match message {
             Message::Begin { final_lsn, xid } => {
                 if self.active_transaction.is_some() {
@@ -289,6 +305,7 @@ impl ReplicationIngress {
                 };
                 self.active_transaction = Some(transaction);
                 self.ensure_pending(transaction)?;
+                observed_transaction = Some(transaction);
             }
             Message::StreamStart { xid, first_segment } => {
                 if self.active_transaction.is_some() {
@@ -297,7 +314,7 @@ impl ReplicationIngress {
                     ));
                 }
                 let transaction = if first_segment {
-                    if self.streamed_transaction.is_some() {
+                    if self.streamed_transactions.contains_key(&xid) {
                         return Err(IngressError::State(
                             "first StreamStart repeated for an open transaction".into(),
                         ));
@@ -308,31 +325,33 @@ impl ReplicationIngress {
                         expected_commit_lsn: None,
                     }
                 } else {
-                    let transaction = self.streamed_transaction.ok_or_else(|| {
-                        IngressError::State("later StreamStart has no first segment".into())
-                    })?;
-                    if transaction.xid != xid {
-                        return Err(IngressError::State(
-                            "later StreamStart changed transaction xid".into(),
-                        ));
-                    }
+                    let transaction =
+                        self.streamed_transactions
+                            .get(&xid)
+                            .copied()
+                            .ok_or_else(|| {
+                                IngressError::State("later StreamStart has no first segment".into())
+                            })?;
                     transaction
                 };
-                self.streamed_transaction = Some(transaction);
+                self.streamed_transactions.insert(xid, transaction);
                 self.active_transaction = Some(transaction);
                 self.ensure_pending(transaction)?;
+                observed_transaction = Some(transaction);
             }
             Message::StreamStop => {
                 let transaction = self.require_active_transaction("StreamStop")?;
                 if transaction.expected_commit_lsn.is_some()
-                    || self.streamed_transaction != Some(transaction)
+                    || self.streamed_transactions.get(&transaction.xid).copied()
+                        != Some(transaction)
                 {
                     return Err(IngressError::State(
                         "StreamStop has no matching streamed transaction".into(),
                     ));
                 }
                 self.active_transaction = None;
-                boundary = true;
+                boundary = Some(transaction.xid);
+                observed_transaction = Some(transaction);
             }
             Message::StreamCommit {
                 xid,
@@ -345,14 +364,9 @@ impl ReplicationIngress {
                         "StreamCommit arrived inside a transaction segment".into(),
                     ));
                 }
-                let transaction = self.streamed_transaction.take().ok_or_else(|| {
+                let transaction = self.streamed_transactions.remove(&xid).ok_or_else(|| {
                     IngressError::State("StreamCommit has no matching transaction".into())
                 })?;
-                if transaction.xid != xid {
-                    return Err(IngressError::State(
-                        "StreamCommit changed transaction xid".into(),
-                    ));
-                }
                 let pending = self.ensure_pending(transaction)?;
                 pending.decode_end_lsn = end_lsn;
                 pending.boundary = Some(IngressBoundary::Commit {
@@ -360,7 +374,8 @@ impl ReplicationIngress {
                     end_lsn,
                 });
                 self.last_change_lsn.remove(&xid);
-                boundary = true;
+                boundary = Some(xid);
+                observed_transaction = Some(transaction);
             }
             Message::StreamAbort { xid, subxid } => {
                 if self.active_transaction.is_some() {
@@ -368,16 +383,16 @@ impl ReplicationIngress {
                         "StreamAbort arrived inside a transaction segment".into(),
                     ));
                 }
-                let transaction = self.streamed_transaction.ok_or_else(|| {
-                    IngressError::State("StreamAbort has no matching transaction".into())
-                })?;
-                if transaction.xid != xid {
-                    return Err(IngressError::State(
-                        "StreamAbort changed transaction xid".into(),
-                    ));
-                }
+                let transaction =
+                    self.streamed_transactions
+                        .get(&xid)
+                        .copied()
+                        .ok_or_else(|| {
+                            IngressError::State("StreamAbort has no matching transaction".into())
+                        })?;
+                observed_transaction = Some(transaction);
                 self.ensure_pending(transaction)?.boundary = if xid == subxid {
-                    self.streamed_transaction = None;
+                    self.streamed_transactions.remove(&xid);
                     self.last_change_lsn.remove(&xid);
                     Some(IngressBoundary::AbortTransaction {
                         abort_lsn: wal_start,
@@ -387,7 +402,7 @@ impl ReplicationIngress {
                         source_subxid: subxid,
                     })
                 };
-                boundary = true;
+                boundary = Some(xid);
             }
             Message::Relation {
                 source_xid,
@@ -406,15 +421,18 @@ impl ReplicationIngress {
                     )));
                 }
                 self.relations.insert(relid, columns);
+                observed_transaction = Some(transaction);
             }
             Message::Type { source_xid, .. } => {
                 let transaction = self.require_active_transaction("Type")?;
                 self.validate_message_xid(source_xid, "Type")?;
                 self.ensure_pending(transaction)?;
+                observed_transaction = Some(transaction);
             }
             Message::Origin { .. } => {
                 let transaction = self.require_active_transaction("Origin")?;
                 self.ensure_pending(transaction)?;
+                observed_transaction = Some(transaction);
             }
             Message::Logical {
                 source_xid,
@@ -426,6 +444,7 @@ impl ReplicationIngress {
                         self.require_active_transaction("transactional logical Message")?;
                     self.validate_message_xid(source_xid, "logical Message")?;
                     self.ensure_pending(transaction)?;
+                    observed_transaction = Some(transaction);
                 } else if self.active_transaction.is_some() {
                     return Err(IngressError::State(
                         "non-transactional logical Message arrived inside a source transaction"
@@ -487,16 +506,12 @@ impl ReplicationIngress {
                 });
                 self.active_transaction = None;
                 self.last_change_lsn.remove(&transaction.xid);
-                boundary = true;
+                boundary = Some(transaction.xid);
+                observed_transaction = Some(transaction);
             }
         }
 
-        let transaction = self.pending.as_ref().map(|pending| ActiveTransaction {
-            xid: pending.source_xid,
-            start_lsn: pending.transaction_start_lsn,
-            expected_commit_lsn: None,
-        });
-        if let Some(transaction) = transaction {
+        if let Some(transaction) = observed_transaction {
             let pending = self.ensure_pending(transaction)?;
             pending.observe_frame(wal_start, payload)?;
         }
@@ -566,18 +581,16 @@ impl ReplicationIngress {
         &mut self,
         transaction: ActiveTransaction,
     ) -> Result<&mut PendingBatch, IngressError> {
-        if let Some(pending) = self.pending.as_ref() {
-            if pending.source_xid != transaction.xid
-                || pending.transaction_start_lsn != transaction.start_lsn
-            {
-                return Err(IngressError::State(
-                    "one ingress batch crossed source transactions".into(),
-                ));
-            }
-        } else {
-            self.pending = Some(PendingBatch::new(transaction));
+        let pending = self
+            .pending
+            .entry(transaction.xid)
+            .or_insert_with(|| PendingBatch::new(transaction));
+        if pending.transaction_start_lsn != transaction.start_lsn {
+            return Err(IngressError::State(
+                "one ingress transaction changed its start LSN".into(),
+            ));
         }
-        Ok(self.pending.as_mut().expect("pending batch initialized"))
+        Ok(pending)
     }
 
     fn require_active_transaction(

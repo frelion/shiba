@@ -10,7 +10,7 @@ use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
 
 use crate::database::{optional, require_count, required as required_table};
-use crate::kernel::resolve_payload_storage;
+use crate::execution::resolve_payload_storage;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SourcePublicationOutcome {

@@ -1,6 +1,6 @@
 //! ProcessUtility hook that reserves `shiba` CTAS declarations.
 
-use crate::query_lowering::{self, LoweredQuery, LoweringError};
+use crate::planner::lowering::{LoweredQuery, LoweringError};
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
@@ -32,7 +32,7 @@ unsafe fn inspect_ctas(
     if (*statement).query.is_null() || (*(*statement).query).type_ != pg_sys::NodeTag::T_Query {
         return None;
     }
-    Some(query_lowering::lower((*statement).query.cast()))
+    Some(crate::planner::lowering::lower((*statement).query.cast()))
 }
 
 #[pg_guard]

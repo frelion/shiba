@@ -40,7 +40,7 @@ shiba_runtime_main
 └── step_ready_operators_bounded
     └── step_one_operator
         └── LoadedDataflow::step_quantum
-            └── crate::kernel::execute_step (dispatcher.rs)
+            └── crate::execution::execute_step (dispatcher.rs)
                 └── KernelRunner::run
                     ├── StepContext::begin
                     ├── linear/join/distinct/aggregate/window/topn/sink::step
@@ -75,8 +75,8 @@ cargo test --lib postgres::tests
 
 ## 2. Parsing untrusted protocol bytes
 
-Read [`src/pgoutput.rs`](../src/pgoutput.rs), then
-[`src/replication.rs`](../src/replication.rs).
+Read [`src/replication/pgoutput.rs`](../src/replication/pgoutput.rs), then
+[`src/replication/transport.rs`](../src/replication/transport.rs).
 
 `pgoutput.rs` turns a borrowed byte slice into message enums.
 `replication.rs` handles the libpq replication envelope and connection
@@ -141,9 +141,9 @@ cargo test --lib ingress::tests
 Read these files together:
 
 1. [`src/ddl.rs`](../src/ddl.rs), starting at `inspect_ctas`
-2. [`src/query_lowering.rs`](../src/query_lowering.rs)
-3. [`src/logical/model.rs`](../src/logical/model.rs)
-4. [`src/logical/validate.rs`](../src/logical/validate.rs)
+2. [`src/planner/lowering.rs`](../src/planner/lowering.rs)
+3. [`src/planner/model.rs`](../src/planner/model.rs)
+4. [`src/planner/validate.rs`](../src/planner/validate.rs)
 
 `ddl.rs` receives PostgreSQL-owned `pg_sys::Query` pointers.
 `query_lowering.rs` converts them immediately into owned Rust values:
@@ -178,7 +178,7 @@ cargo test --lib logical::
 
 ## 5. Compiling typed scalar SQL
 
-Read [`src/scalar_sql.rs`](../src/scalar_sql.rs).
+Read [`src/planner/scalar_sql.rs`](../src/planner/scalar_sql.rs).
 
 The persisted plan contains an AST and catalog OIDs, not user-provided SQL
 fragments. The compiler:
@@ -199,8 +199,8 @@ use a deterministic fake implementation.
 
 Read:
 
-1. [`src/logical/dataflow.rs`](../src/logical/dataflow.rs)
-2. [`src/logical/runtime.rs`](../src/logical/runtime.rs)
+1. [`src/planner/dataflow.rs`](../src/planner/dataflow.rs)
+2. [`src/planner/runtime.rs`](../src/planner/runtime.rs)
 
 `dataflow.rs` contains the small bounded-work values shared by Runtime and
 kernels:
@@ -227,8 +227,8 @@ cargo test --lib logical::dataflow::tests
 
 ## 7. The common kernel protocol
 
-Read [`src/kernel/runner.rs`](../src/kernel/runner.rs), then
-[`src/kernel/step.rs`](../src/kernel/step.rs).
+Read [`src/execution/runner.rs`](../src/execution/runner.rs), then
+[`src/execution/step.rs`](../src/execution/step.rs).
 
 Every operator registers one `KernelContract` and one bounded `step` function.
 `KernelRunner` is the only code allowed to open a `StepContext` or commit its
@@ -258,13 +258,14 @@ Important invariant: after a kernel performs durable writes, it may finish
 with `Progress`/`Yield` or return an error. It does not return `Idle`/`Blocked`
 and commit partial work.
 
-Read [`src/kernel/stream.rs`](../src/kernel/stream.rs) next. It contains the
+Read [`src/execution/stream.rs`](../src/execution/stream.rs) next. It contains the
 shared chunk lookup, payload facts, output append, frontier append, and input
 cursor advance operations.
 
 ## 8. Start with a stateless kernel
 
-Read [`src/kernel/linear.rs`](../src/kernel/linear.rs).
+Read [`src/execution/linear/mod.rs`](../src/execution/linear/mod.rs), then its
+`machine.rs`, `runtime.rs`, and `storage.rs` siblings.
 
 The entry point handles Scan, Filter, and Project using the same control path.
 Follow:
@@ -280,13 +281,15 @@ Follow:
 This file shows the intended kernel boundary: Rust has the phase and validates
 database facts; SQL performs typed set work over a bounded prefix.
 
-Then read [`src/kernel/sink.rs`](../src/kernel/sink.rs). Sink has no output
+Then read [`src/execution/sink/mod.rs`](../src/execution/sink/mod.rs) and its
+`machine.rs`/`runtime.rs` siblings. Sink has no output
 stream. Its result-table DML and cursor/checkpoint changes still use the same
 step transaction, which is the exactly-once boundary.
 
 ## 9. Read one high-fanout state machine
 
-Read [`src/kernel/join.rs`](../src/kernel/join.rs).
+Read [`src/execution/join/mod.rs`](../src/execution/join/mod.rs), then compare
+`planner.rs`, `runtime.rs`, and `provision.rs`.
 
 Start with the Rust enums and structs, then inspect the generated SQL. The Rust
 types represent:
@@ -304,14 +307,14 @@ appends one output chunk, and persists the next cursor.
 
 After Join, compare:
 
-- [`distinct.rs`](../src/kernel/distinct.rs): exact SQL-key group state,
+- [`distinct/mod.rs`](../src/execution/distinct/mod.rs): exact SQL-key group state,
   a typed bag of physical representatives, then an immediate bounded Drain of
   the durable `-old,+new` effect queue;
-- [`aggregate.rs`](../src/kernel/aggregate.rs): Apply into an input bag and
+- [`aggregate/mod.rs`](../src/execution/aggregate/mod.rs): Apply into an input bag and
   dirty groups, then Drain rebuild and output replacement;
-- [`window.rs`](../src/kernel/window.rs): Apply into partition state, then
+- [`window/mod.rs`](../src/execution/window/mod.rs): Apply into partition state, then
   Drain through partition/frame/function phases;
-- [`topn.rs`](../src/kernel/topn.rs): Apply into ordered state, then Drain its
+- [`topn/mod.rs`](../src/execution/topn/mod.rs): Apply into ordered state, then Drain its
   boundary and output diff.
 
 For Aggregate, Window, and TopN, a completed input chunk may advance before
@@ -338,7 +341,7 @@ neither admits later input or a frontier in between.
 
 ## 10. Registration and generated storage
 
-Read [`src/kernel/register.rs`](../src/kernel/register.rs).
+Read [`src/execution/register.rs`](../src/execution/register.rs).
 
 Registration walks the already validated `DataflowPlan` and creates:
 

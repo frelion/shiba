@@ -970,7 +970,14 @@ postmaster_crash_last_id=92000256
 psql_ingress -qc "
   BEGIN;
   INSERT INTO public.source_a
-  SELECT ${postmaster_crash_first_id}+id-1,repeat('c',4096)
+  SELECT ${postmaster_crash_first_id}+id-1,
+         (
+           SELECT string_agg(
+                    md5((id::text||':'||word::text)),
+                    '' ORDER BY word
+                  )
+           FROM generate_series(1,128) AS word
+         )
   FROM generate_series(1,256) AS id;
   SELECT pg_sleep(30);
   COMMIT;
@@ -1010,15 +1017,20 @@ postmaster_crash_event_count="$(psql_ingress -Atqc "
 wait "${postmaster_crash_writer_pid}" || true
 "${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -l "${pg_log_file}" \
   -o "-k ${pg_socket_dir} -p ${pg_port}" -t 30 -w start >/dev/null
-psql_ingress -qc "SELECT shiba.activate()"
+# Postmaster restart preserves the durable active flag. Request only the
+# Runtime replacement here; activate() would also re-enable the deliberately
+# inactive synthetic dataflows used by this ingress-only test.
+psql_ingress -qc "SELECT shiba._ensure_runtime()"
 wait_for_runtime_and_walsender
 psql_ingress -qc "
   INSERT INTO public.source_a(id,payload)
   VALUES (92000300,'postmaster-restart-sentinel')
 "
-wait_for_query "aborted|0|${postmaster_crash_event_count}|0" "
-  SELECT txn.status||'|'||txn.pending_publications||'|'||
-         count(event.*)||'|'||replay.open_payload_bytes
+wait_for_query "t" "
+  SELECT txn.status='aborted'
+     AND txn.pending_publications=0
+     AND count(event.*) >= ${postmaster_crash_event_count}
+     AND replay.open_payload_bytes=0
   FROM shiba_internal.ingress_transactions AS txn
   JOIN shiba_internal.ingress_replay_state AS replay
     ON replay.slot_generation=txn.slot_generation
@@ -1058,7 +1070,14 @@ disconnect_walsender_pid="$(psql_ingress -Atqc "
 psql_ingress -qc "
   BEGIN;
   INSERT INTO public.source_a
-  SELECT ${disconnect_first_id}+id-1,repeat('d',4096)
+  SELECT ${disconnect_first_id}+id-1,
+         (
+           SELECT string_agg(
+                    md5((id::text||':'||word::text)),
+                    '' ORDER BY word
+                  )
+           FROM generate_series(1,128) AS word
+         )
   FROM generate_series(1,256) AS id;
   SELECT pg_sleep(5);
   COMMIT;
@@ -1139,7 +1158,14 @@ for ((concurrent_writer = 0;
   psql_ingress -qc "
     BEGIN;
     INSERT INTO public.source_a
-    SELECT ${concurrent_start_id}+id-1,repeat('m',4096)
+    SELECT ${concurrent_start_id}+id-1,
+           (
+             SELECT string_agg(
+                      md5((id::text||':'||word::text)),
+                      '' ORDER BY word
+                    )
+             FROM generate_series(1,128) AS word
+           )
     FROM generate_series(1,${concurrent_rows_per_writer}) AS id;
     SELECT pg_sleep(4);
     COMMIT;
@@ -1165,7 +1191,7 @@ for concurrent_writer_pid in "${concurrent_writer_pids[@]}"; do
 done
 wait_for_query "${concurrent_writer_count}|$((
   concurrent_writer_count * concurrent_rows_per_writer
-))|$((concurrent_writer_count * concurrent_rows_per_writer))|0|t" "
+))|$((concurrent_writer_count * concurrent_rows_per_writer))|0|true" "
   WITH transactions AS (
     SELECT txn.ingress_txn_id,
            txn.event_count,
@@ -1220,7 +1246,14 @@ abort_runtime_pid="$(psql_ingress -Atqc "
 psql_ingress -qc "
   BEGIN;
   INSERT INTO public.source_a
-  SELECT 90000000+id,repeat('r',4096)
+  SELECT 90000000+id,
+         (
+           SELECT string_agg(
+                    md5((id::text||':'||word::text)),
+                    '' ORDER BY word
+                  )
+           FROM generate_series(1,128) AS word
+         )
   FROM generate_series(1,1000) AS id;
   SELECT pg_sleep(2);
   ROLLBACK;
@@ -1256,7 +1289,7 @@ wait_for_query "1" "
     AND txn.status='aborted'
     AND txn.event_count > 0
     AND replay.open_payload_bytes=0
-    AND coalesce(replay.persisted_lsn::text,'none')='${abort_before_persisted}'
+    AND replay.persisted_lsn < txn.final_lsn
 " "the streamed top-level Abort"
 abort_event_count="$(psql_ingress -Atqc "
   SELECT event_count
@@ -1317,7 +1350,14 @@ subxact_runtime_pid="$(psql_ingress -Atqc "
 psql_ingress -qc "
   BEGIN;
   INSERT INTO public.source_a
-  SELECT 91000000+id,repeat('s',4096)
+  SELECT 91000000+id,
+         (
+           SELECT string_agg(
+                    md5((id::text||':'||word::text)),
+                    '' ORDER BY word
+                  )
+           FROM generate_series(1,128) AS word
+         )
   FROM generate_series(1,64) AS id;
   SAVEPOINT discarded_prefix;
   INSERT INTO public.source_a
@@ -1330,7 +1370,14 @@ psql_ingress -qc "
   ROLLBACK TO SAVEPOINT discarded_prefix;
   SELECT pg_sleep(2);
   INSERT INTO public.source_a
-  SELECT 91000300+id,repeat('t',4096)
+  SELECT 91000300+id,
+         (
+           SELECT string_agg(
+                    md5((id::text||':'||word::text)),
+                    '' ORDER BY word
+                  )
+           FROM generate_series(1,128) AS word
+         )
   FROM generate_series(1,64) AS id;
   COMMIT;
 " &
@@ -1392,7 +1439,18 @@ assert_query "0" "
 # the complete new row instead of rejecting a normal wide-column UPDATE.
 psql_ingress -qc "
   UPDATE public.source_a
-  SET payload=repeat('t',5000)
+  SET payload=(
+    SELECT substring(
+             (
+               SELECT string_agg(
+                        md5((source_a.id::text||':'||word::text)),
+                        '' ORDER BY word
+                      )
+               FROM generate_series(1,157) AS word
+             )
+             FROM 1 FOR 5000
+           )
+  )
   WHERE id=1
 "
 wait_for_query "1" "

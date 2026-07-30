@@ -15,6 +15,8 @@ run_gate() {
 
 run_gate "Clean-cut architecture guard" \
   "${project_root}/scripts/test-clean-cut.sh"
+run_gate "Public and persistence contract guard" \
+  "${project_root}/scripts/test-contract-surface.sh"
 run_gate "Rust formatting" cargo fmt --all -- --check
 run_gate "Rust lints" cargo clippy --all-targets -- -D warnings
 run_gate "Rust unit and pgrx integration tests" cargo test --lib

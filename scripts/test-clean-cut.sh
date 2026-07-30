@@ -65,27 +65,27 @@ reject_matches \
 reject_matches \
   'own\.row_value|existing\.row_value' \
   "Join own-row identity must use its indexed binary row_key" \
-  src/kernel/join.rs
+  src/execution/join
 reject_matches \
   'record_send\(input_row\.row_value\)' \
   "Join input identity must canonicalize through canonical_row_key_sql" \
-  src/kernel/join.rs
+  src/execution/join
 reject_matches \
   'aggregate_seen|Aggregate DISTINCT.*seen state' \
   "Aggregate DISTINCT must use its ordered durable tuple cursor, not an unbounded seen relation" \
-  src/kernel
+  src/execution
 reject_matches \
   'IS NOT DISTINCT FROM' \
   "Distinct SQL keys must use their resolved exact B-tree equality" \
-  src/kernel/distinct.rs
+  src/execution/distinct
 reject_matches \
   'pg_catalog\.record_send' \
   "kernel row identity must use the shared canonical_row_key_sql helper" \
-  src/kernel ':(exclude)src/kernel/storage.rs'
+  src/execution ':(exclude)src/execution/storage.rs'
 reject_matches \
   'jsonb_populate_record|to_jsonb' \
   "canonical row identity must use one named-composite text roundtrip" \
-  src/kernel/storage.rs
+  src/execution/storage.rs
 reject_matches \
   'pg_catalog\.to_jsonb' \
   "ingress must retain original per-column pgoutput text JSON" \
@@ -97,16 +97,21 @@ reject_matches \
 reject_matches \
   'fn (topn_index_order|window_index_order|resolve_order|resolve_window_order|resolve_binary_operator|resolve_window_binary_operator)\b' \
   "ordered kernels must use the shared B-tree capability resolver" \
-  src/kernel
+  src/execution
 reject_matches \
   '#\[cfg\(any\(\)\)\]|\bobsolete\b' \
   "disabled or obsolete kernel paths must be deleted, not retained" \
-  src/kernel
+  src/execution
 reject_matches \
   'StepTxn|StepExecution|StepOutcome|StepContext::begin|\.commit\(' \
   "operator algorithms must return KernelTransition through KernelRunner" \
-  src/kernel/linear.rs src/kernel/sink.rs src/kernel/distinct.rs \
-  src/kernel/join.rs src/kernel/aggregate.rs src/kernel/window.rs src/kernel/topn.rs
+  src/execution/linear src/execution/sink src/execution/distinct \
+  src/execution/join src/execution/aggregate src/execution/window src/execution/topn
+reject_matches \
+  'KernelTransition::new|KernelTransition \{|BackgroundWorker::transaction|StartTransaction|CommitTransaction|AbortOutOfAnyTransaction' \
+  "operator algorithms must not forge transitions or manage PostgreSQL transactions" \
+  src/execution/linear src/execution/sink src/execution/distinct \
+  src/execution/join src/execution/aggregate src/execution/window src/execution/topn
 reject_matches \
   'StepTxn|linear/join/distinct/aggregate/window/topn/sink::execute|LoadedDataflow::step\b|without waiting for the trailing pgoutput|Only committed source WAL reaches|已发布部分 source chunks.*Commit|peak_queued_bytes|queue high-water' \
   "documentation must describe the current streaming and KernelRunner architecture" \
@@ -115,9 +120,9 @@ reject_matches \
 for removed_file in \
   src/query_analysis.rs \
   src/query_tree.rs \
-  src/logical/compile.rs \
-  src/logical/persist.rs \
-  src/logical/physical.rs \
+  src/planner/compile.rs \
+  src/planner/persist.rs \
+  src/planner/physical.rs \
   sql/20_operator_filters.sql \
   sql/21_operator_aggregate.sql \
   sql/22_operator_unary_batches.sql \

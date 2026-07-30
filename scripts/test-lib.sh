@@ -58,7 +58,7 @@ wait_for_query() {
     fi
     sleep "${test_wait_sleep}"
   done
-  fail "timed out waiting for ${description}; last value was [${actual}]"
+  fail "timed out waiting for ${description}; expected [${expected}], last value was [${actual}]"
 }
 
 wait_for_log() {

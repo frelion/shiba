@@ -5,10 +5,10 @@
 //! 1. `postgres` contains tiny, round-tripped PostgreSQL text encodings.
 //! 2. `pgoutput` decodes PostgreSQL WAL messages.
 //! 3. `ingress` turns WAL transaction fragments into bounded source chunks.
-//! 4. `query_lowering` builds the one dataflow plan; `logical` validates it.
+//! 4. `planner::lowering` builds the one dataflow plan; `planner` validates it.
 //! 5. `worker` runs the single database-scoped event loop.
 //!
-//! Operator state machines live in `kernel`; SQL files define the durable
+//! Operator state machines live in `execution`; SQL files define the durable
 //! catalog and shared transactional primitives. Start with `README.md`, then
 //! follow `docs/LEARNING_RUST.md` for a guided code tour.
 
@@ -22,22 +22,18 @@ mod admission;
 mod config;
 mod database;
 mod ddl;
+mod execution;
 mod index_management;
 #[cfg_attr(test, allow(dead_code))]
 mod ingress;
-mod kernel;
 mod lifecycle;
-#[cfg_attr(test, allow(dead_code))]
-mod logical;
-mod pgoutput;
+mod planner;
 mod postgres;
 mod publication;
-mod query_lowering;
 #[cfg_attr(test, allow(dead_code))]
 mod replication;
 #[cfg_attr(test, allow(dead_code))]
 mod runtime;
-mod scalar_sql;
 mod worker;
 
 ::pgrx::pg_module_magic!();
@@ -83,11 +79,11 @@ pgrx::extension_sql_file!(
     name = "shiba_registration",
     requires = [
         "shiba_introspection",
-        kernel::register::create_effect_stream_payload,
-        kernel::register::lock_dataflow_sources,
-        kernel::register::prepare_dataflow_source,
-        kernel::register::register_dataflow,
-        kernel::register::validate_effect_stream_payload
+        execution::register::create_effect_stream_payload,
+        execution::register::lock_dataflow_sources,
+        execution::register::prepare_dataflow_source,
+        execution::register::register_dataflow,
+        execution::register::validate_effect_stream_payload
     ],
 );
 
@@ -219,7 +215,7 @@ mod tests {
         .unwrap();
 
         let plan = unsafe {
-            crate::query_lowering::lower_select_for_test(
+            crate::planner::lowering::lower_select_for_test(
                 r#"
                 SELECT a.region, count(*) AS row_count, sum(p.amount) AS total
                 FROM tests.lowering_accounts a
@@ -233,7 +229,7 @@ mod tests {
         }
         .unwrap();
 
-        use crate::logical::model::{OperatorKind, ScalarExpr};
+        use crate::planner::model::{OperatorKind, ScalarExpr};
         let kinds = plan
             .stages
             .iter()
@@ -314,7 +310,7 @@ mod tests {
         )
         .unwrap();
         let plan = unsafe {
-            crate::query_lowering::lower_select_for_test(
+            crate::planner::lowering::lower_select_for_test(
                 r#"
                 SELECT q.id
                 FROM (
@@ -327,7 +323,7 @@ mod tests {
             )
         }
         .unwrap();
-        use crate::logical::model::OperatorKind;
+        use crate::planner::model::OperatorKind;
         let kinds = plan
             .stages
             .iter()
@@ -369,7 +365,7 @@ mod tests {
         )
         .unwrap();
         let plan = unsafe {
-            crate::query_lowering::lower_select_for_test(
+            crate::planner::lowering::lower_select_for_test(
                 r#"
                 SELECT max(amount ORDER BY group_id)
                 FROM tests.lowering_aggregate_order
@@ -381,7 +377,7 @@ mod tests {
             .stages
             .iter()
             .find_map(|stage| match &stage.spec {
-                crate::logical::model::OperatorSpec::Aggregate(spec) => Some(&spec.aggregates[0]),
+                crate::planner::model::OperatorSpec::Aggregate(spec) => Some(&spec.aggregates[0]),
                 _ => None,
             })
             .expect("query should contain an Aggregate stage");
@@ -403,7 +399,7 @@ mod tests {
         .unwrap();
 
         let aggregate_plan = unsafe {
-            crate::query_lowering::lower_select_for_test(
+            crate::planner::lowering::lower_select_for_test(
                 r#"
                 SELECT group_id, count(DISTINCT amount ORDER BY amount)
                 FROM tests.lowering_sort_group
@@ -416,7 +412,7 @@ mod tests {
             .stages
             .iter()
             .find_map(|stage| match &stage.spec {
-                crate::logical::model::OperatorSpec::Aggregate(spec) => Some(spec),
+                crate::planner::model::OperatorSpec::Aggregate(spec) => Some(spec),
                 _ => None,
             })
             .expect("query should contain an Aggregate stage");
@@ -426,7 +422,7 @@ mod tests {
         assert_ne!(aggregate.aggregates[0].order_by[0].sort_operator_oid, 0);
 
         let window_plan = unsafe {
-            crate::query_lowering::lower_select_for_test(
+            crate::planner::lowering::lower_select_for_test(
                 r#"
                 SELECT sum(amount) OVER (
                          PARTITION BY group_id
@@ -442,7 +438,7 @@ mod tests {
             .stages
             .iter()
             .find_map(|stage| match &stage.spec {
-                crate::logical::model::OperatorSpec::Window(spec) => Some(spec),
+                crate::planner::model::OperatorSpec::Window(spec) => Some(spec),
                 _ => None,
             })
             .expect("query should contain a Window stage");
@@ -451,7 +447,7 @@ mod tests {
         assert!(window.frame.start_in_range_function_oid.is_some());
 
         let topn_plan = unsafe {
-            crate::query_lowering::lower_select_for_test(
+            crate::planner::lowering::lower_select_for_test(
                 r#"
                 SELECT group_id, amount
                 FROM tests.lowering_sort_group
@@ -465,7 +461,7 @@ mod tests {
             .stages
             .iter()
             .find_map(|stage| match &stage.spec {
-                crate::logical::model::OperatorSpec::TopN(spec) => Some(spec),
+                crate::planner::model::OperatorSpec::TopN(spec) => Some(spec),
                 _ => None,
             })
             .expect("query should contain a TopN stage");
@@ -489,7 +485,7 @@ mod tests {
         .unwrap();
 
         let one = unsafe {
-            crate::query_lowering::lower_select_for_test(
+            crate::planner::lowering::lower_select_for_test(
                 r#"
                 SELECT id, row_number() OVER (ORDER BY val, id) AS rn
                 FROM tests.lowering_window_source
@@ -502,7 +498,7 @@ mod tests {
             .stages
             .iter()
             .find_map(|stage| match &stage.spec {
-                crate::logical::model::OperatorSpec::Window(spec) => Some((stage, spec)),
+                crate::planner::model::OperatorSpec::Window(spec) => Some((stage, spec)),
                 _ => None,
             })
             .expect("query should contain one Window stage");
@@ -521,7 +517,7 @@ mod tests {
         );
 
         let three = unsafe {
-            crate::query_lowering::lower_select_for_test(
+            crate::planner::lowering::lower_select_for_test(
                 r#"
                 SELECT id,
                        row_number() OVER ordered AS rn,
@@ -538,7 +534,7 @@ mod tests {
             .stages
             .iter()
             .find_map(|stage| match &stage.spec {
-                crate::logical::model::OperatorSpec::Window(spec) => Some((stage, spec)),
+                crate::planner::model::OperatorSpec::Window(spec) => Some((stage, spec)),
                 _ => None,
             })
             .expect("query should contain one Window stage");
@@ -562,7 +558,7 @@ mod tests {
     fn reports_the_specific_unsupported_scalar_capability() {
         Spi::run("CREATE TABLE tests.lowering_array_source (id integer NOT NULL)").unwrap();
         let error = unsafe {
-            crate::query_lowering::lower_select_for_test(
+            crate::planner::lowering::lower_select_for_test(
                 "SELECT ARRAY[source.id] FROM tests.lowering_array_source source",
             )
         }

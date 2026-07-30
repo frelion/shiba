@@ -1,7 +1,7 @@
 //! Runtime scheduler and operator execution.
 
 use crate::runtime::{gc, ingress};
-use crate::{config, logical};
+use crate::{config, planner};
 use pgrx::bgworkers::*;
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
@@ -27,7 +27,7 @@ pub(crate) fn run(database_name: &str, launch_xid: &str, launch_generation: i64)
     let mut ingress_runtime = ingress::initialize();
 
     log!("Shiba Runtime started for database {database_name}");
-    let mut loaded_dataflows = DeterministicLru::<pg_sys::Oid, logical::LoadedDataflow>::new(
+    let mut loaded_dataflows = DeterministicLru::<pg_sys::Oid, planner::LoadedDataflow>::new(
         config::max_cached_dataflows(),
     );
     let mut result_cursor = None;
@@ -105,7 +105,7 @@ pub(crate) fn current_database_name() -> String {
 }
 
 fn step_ready_operators_bounded(
-    loaded_dataflows: &mut DeterministicLru<pg_sys::Oid, logical::LoadedDataflow>,
+    loaded_dataflows: &mut DeterministicLru<pg_sys::Oid, planner::LoadedDataflow>,
     result_cursor: &mut Option<pg_sys::Oid>,
     mut ready_results: Vec<pg_sys::Oid>,
 ) -> Option<usize> {
@@ -136,7 +136,7 @@ fn step_ready_operators_bounded(
         let (outcome, has_more) = step_one_operator(loaded_dataflows, result_oid)?;
         if matches!(
             outcome,
-            logical::StepOutcome::Progress | logical::StepOutcome::Yield
+            planner::StepOutcome::Progress | planner::StepOutcome::Yield
         ) {
             worked += 1;
         }
@@ -149,9 +149,9 @@ fn step_ready_operators_bounded(
 }
 
 fn step_one_operator(
-    loaded_dataflows: &mut DeterministicLru<pg_sys::Oid, logical::LoadedDataflow>,
+    loaded_dataflows: &mut DeterministicLru<pg_sys::Oid, planner::LoadedDataflow>,
     result_oid: pg_sys::Oid,
-) -> Option<(logical::StepOutcome, bool)> {
+) -> Option<(planner::StepOutcome, bool)> {
     // A panic terminates this single-threaded worker, so its backend-local
     // cache cannot be observed in a partially updated state.
     let committed = BackgroundWorker::transaction(AssertUnwindSafe(|| {
@@ -170,7 +170,7 @@ fn step_one_operator(
             .expect("Shiba could not load a dataflow from durable operator state")
             .and_then(|dataflow| next_ready_stage(result_oid, dataflow.stage_cursor()));
         let step = stage_id.map(|stage_id| {
-            let budget = logical::WorkBudget::new(
+            let budget = planner::WorkBudget::new(
                 config::batch_rows(),
                 config::batch_bytes(),
                 config::batch_rows(),
@@ -223,7 +223,7 @@ fn step_one_operator(
 
     let (outcome, has_more, committed_stage) = committed;
     let Some(outcome) = outcome else {
-        return Some((logical::StepOutcome::Idle, has_more));
+        return Some((planner::StepOutcome::Idle, has_more));
     };
 
     #[cfg(any(test, feature = "pg_test"))]
@@ -397,13 +397,13 @@ where
     }
 }
 
-impl DeterministicLru<pg_sys::Oid, logical::LoadedDataflow> {
+impl DeterministicLru<pg_sys::Oid, planner::LoadedDataflow> {
     fn get_or_load(
         &mut self,
         result_oid: pg_sys::Oid,
-    ) -> Result<Option<&mut logical::LoadedDataflow>, String> {
+    ) -> Result<Option<&mut planner::LoadedDataflow>, String> {
         if !self.contains_key(&result_oid) {
-            let dataflow = logical::LoadedDataflow::load(result_oid)?;
+            let dataflow = planner::LoadedDataflow::load(result_oid)?;
             let _ = self.insert(result_oid, dataflow);
         }
         Ok(self.get_mut(&result_oid))
