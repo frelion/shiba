@@ -1662,6 +1662,11 @@ mod execution {
         if transaction.checkpoint_had_continuation() != continuation.is_some() {
             return Err("Join checkpoint disagrees with its typed continuation".into());
         }
+        if continuation.is_none() && spec.kind == JoinKind::Inner {
+            if let Some(page) = measure_inner_page(&mut transaction, &layout)? {
+                return execute_inner_page(transaction, &layout, page);
+            }
+        }
 
         // A quantum publishes at most one immutable output chunk. Clamp the
         // shared budget to that stream's chunk target before any phase runs.
@@ -1970,6 +1975,438 @@ mod execution {
             budget.max_output_rows.min(output_rows),
             budget.max_output_bytes.min(output_bytes),
         ))
+    }
+
+    #[derive(Clone, Debug)]
+    struct InnerPage {
+        side: InputSide,
+        chunk: ChunkMeta,
+        output_rows: u64,
+        output_bytes: u64,
+    }
+
+    /// Measures one complete inner-join input chunk. The persisted row cursor
+    /// remains the continuation for chunks whose fanout exceeds the quantum.
+    fn measure_inner_page(
+        transaction: &mut StepTxn<'_, '_>,
+        layout: &Layout,
+    ) -> Result<Option<InnerPage>, String> {
+        let left = next_chunk(transaction, 0)?;
+        let right = next_chunk(transaction, 1)?;
+        let (side, head) = match (left, right) {
+            (Some(left), Some(right)) => {
+                if (left.lsn, 0_u16) <= (right.lsn, 1_u16) {
+                    (InputSide::Left, left)
+                } else {
+                    (InputSide::Right, right)
+                }
+            }
+            (Some(left), None) => (InputSide::Left, left),
+            (None, Some(right)) => (InputSide::Right, right),
+            (None, None) => return Ok(None),
+        };
+        if head.kind != ChunkKind::Data {
+            return Ok(None);
+        }
+        let budget = effective_budget(transaction)?;
+        if head.rows > usize_to_u64(budget.max_input_rows, "Join page input row budget")?
+            || head.bytes > usize_to_u64(budget.max_input_bytes, "Join page input byte budget")?
+        {
+            return Ok(None);
+        }
+        let current_payload = layout.input_payload(side);
+        payload_facts(transaction, &current_payload.relation, &head)?;
+
+        let current_alias = side_alias(side);
+        let opposite_alias = side_alias(side.opposite());
+        let output_row = format!(
+            "ROW({})::{}",
+            layout.outputs,
+            layout.output_payload.row_type.sql()
+        );
+        let page_predicate =
+            format!("{current_alias}.stream_id=$1 AND {current_alias}.chunk_seq=$2");
+        let measured = transaction.read(
+            &format!(
+                r#"
+                SELECT count(*)::bigint,
+                       coalesce(sum(
+                         shiba_internal.effect_row_bytes({output_row})
+                       ),0)::bigint
+                FROM {current_payload} AS {current_alias}
+                JOIN {opposite_state} AS {opposite_alias}
+                  ON ({condition}) IS TRUE
+                WHERE {page_predicate}
+                "#,
+                current_payload = current_payload.relation.sql(),
+                opposite_state = layout.state(side.opposite()).sql(),
+                condition = layout.condition,
+            ),
+            &unsafe {
+                [
+                    DatumWithOid::new(head.stream_id, pg_sys::INT8OID),
+                    DatumWithOid::new(head.sequence, pg_sys::INT8OID),
+                ]
+            },
+        )?;
+        if measured.len() != 1 {
+            return Err("Join page measurement returned no summary".into());
+        }
+        let measured = measured.first();
+        let output_rows = nonnegative(
+            required_table(&measured, 1, "Join page output rows")?,
+            "Join page output rows",
+        )?;
+        let output_bytes = nonnegative(
+            required_table(&measured, 2, "Join page output bytes")?,
+            "Join page output bytes",
+        )?;
+        if output_rows > usize_to_u64(budget.max_output_rows, "Join page output row budget")?
+            || output_bytes > usize_to_u64(budget.max_output_bytes, "Join page output byte budget")?
+        {
+            return Ok(None);
+        }
+        Ok(Some(InnerPage {
+            side,
+            chunk: head,
+            output_rows,
+            output_bytes,
+        }))
+    }
+
+    fn execute_inner_page(
+        mut transaction: StepTxn<'_, '_>,
+        layout: &Layout,
+        page: InnerPage,
+    ) -> Result<StepExecution, String> {
+        let input = transaction.input(page.side.code() as u16)?.clone();
+        let output_facts = append_inner_page(
+            &mut transaction,
+            layout,
+            page.side,
+            &page.chunk,
+            page.output_rows,
+            page.output_bytes,
+        )?;
+        update_inner_page_candidates(&mut transaction, layout, page.side, &page.chunk)?;
+        apply_inner_page_own_state(&mut transaction, layout, page.side, &page.chunk)?;
+        advance_input(
+            &mut transaction,
+            input.port,
+            input
+                .next_chunk_seq
+                .checked_add(1)
+                .ok_or_else(|| "Join page input cursor overflow".to_string())?,
+            input.consumed_frontier_lsn,
+            WorkUsage {
+                input_rows: page.chunk.rows,
+                input_bytes: page.chunk.bytes,
+                ..WorkUsage::default()
+            },
+        )?;
+        if page.output_rows == 0 && !matches!(output_facts, OutputFacts::None) {
+            return Err("empty Join page unexpectedly published output".into());
+        }
+        transaction.finish(
+            false,
+            WorkUsage {
+                input_rows: page.chunk.rows,
+                input_bytes: page.chunk.bytes,
+                output_rows: page.output_rows,
+                output_bytes: page.output_bytes,
+            },
+        )
+    }
+
+    fn append_inner_page(
+        transaction: &mut StepTxn<'_, '_>,
+        layout: &Layout,
+        side: InputSide,
+        chunk: &ChunkMeta,
+        expected_rows: u64,
+        expected_bytes: u64,
+    ) -> Result<OutputFacts, String> {
+        if expected_rows == 0 {
+            if expected_bytes != 0 {
+                return Err("empty Join page measured nonzero output bytes".into());
+            }
+            return Ok(OutputFacts::None);
+        }
+        let append_target = transaction.output_append_target(expected_rows, expected_bytes)?;
+        let output = transaction.output()?.clone();
+        let (target_sequence, row_offset) = match append_target {
+            OutputAppendTarget::New { sequence } => (sequence, 0),
+            OutputAppendTarget::Extend {
+                sequence,
+                row_offset,
+                ..
+            } => (sequence, row_offset),
+        };
+        let current_alias = side_alias(side);
+        let opposite_alias = side_alias(side.opposite());
+        let output_row = format!(
+            "ROW({})::{}",
+            layout.outputs,
+            layout.output_payload.row_type.sql()
+        );
+        let inserted = transaction.write(
+            &format!(
+                r#"
+                WITH joined AS MATERIALIZED (
+                  SELECT row_number() OVER (
+                           ORDER BY {current_alias}.row_ordinal,
+                                    {opposite_alias}.row_id
+                         ) - 1 AS page_ordinal,
+                         {current_alias}.weight
+                           * {opposite_alias}.multiplicity AS weight,
+                         {output_row} AS row_value
+                  FROM {current_payload} AS {current_alias}
+                  JOIN {opposite_state} AS {opposite_alias}
+                    ON ({condition}) IS TRUE
+                  WHERE {current_alias}.stream_id=$1
+                    AND {current_alias}.chunk_seq=$2
+                ),
+                stored AS (
+                  INSERT INTO {output_payload}(
+                    stream_id,chunk_seq,row_ordinal,weight,row_value
+                  )
+                  SELECT $3,$4,$5+page_ordinal,weight,row_value
+                  FROM joined
+                  ORDER BY page_ordinal
+                  RETURNING shiba_internal.effect_row_bytes(row_value) AS row_bytes
+                )
+                SELECT count(*)::bigint,
+                       coalesce(sum(row_bytes),0)::bigint
+                FROM stored
+                "#,
+                current_payload = layout.input_payload(side).relation.sql(),
+                opposite_state = layout.state(side.opposite()).sql(),
+                condition = layout.condition,
+                output_payload = layout.output_payload.relation.sql(),
+            ),
+            &unsafe {
+                [
+                    DatumWithOid::new(chunk.stream_id, pg_sys::INT8OID),
+                    DatumWithOid::new(chunk.sequence, pg_sys::INT8OID),
+                    DatumWithOid::new(output.stream_id, pg_sys::INT8OID),
+                    DatumWithOid::new(target_sequence, pg_sys::INT8OID),
+                    DatumWithOid::new(i64_from_u64(row_offset)?, pg_sys::INT8OID),
+                ]
+            },
+        )?;
+        if inserted.len() != 1 {
+            return Err("Join page append returned no summary".into());
+        }
+        let inserted = inserted.first();
+        if nonnegative(
+            required_table(&inserted, 1, "Join page inserted rows")?,
+            "Join page inserted rows",
+        )? != expected_rows
+            || nonnegative(
+                required_table(&inserted, 2, "Join page inserted bytes")?,
+                "Join page inserted bytes",
+            )? != expected_bytes
+        {
+            return Err("Join page append disagrees with its measurement".into());
+        }
+        transaction.record_output_append(
+            append_target,
+            expected_rows,
+            expected_bytes,
+            chunk.lsn,
+        )?;
+        Ok(OutputFacts::Data {
+            chunk_seq: target_sequence,
+        })
+    }
+
+    fn update_inner_page_candidates(
+        transaction: &mut StepTxn<'_, '_>,
+        layout: &Layout,
+        side: InputSide,
+        chunk: &ChunkMeta,
+    ) -> Result<(), String> {
+        let current_alias = side_alias(side);
+        let opposite_alias = side_alias(side.opposite());
+        let updated = transaction.write(
+            &format!(
+                r#"
+                WITH deltas AS MATERIALIZED (
+                  SELECT {opposite_alias}.row_id,
+                         coalesce(sum({current_alias}.weight)
+                           FILTER (WHERE ({condition}) IS TRUE),0)::bigint
+                           AS matched_delta,
+                         coalesce(sum({current_alias}.weight)
+                           FILTER (WHERE ({condition}) IS NULL),0)::bigint
+                           AS unknown_delta
+                  FROM {opposite_state} AS {opposite_alias}
+                  CROSS JOIN {current_payload} AS {current_alias}
+                  WHERE {current_alias}.stream_id=$1
+                    AND {current_alias}.chunk_seq=$2
+                  GROUP BY {opposite_alias}.row_id
+                ),
+                changed AS (
+                  UPDATE {opposite_state} AS candidate
+                  SET match_count=candidate.match_count+deltas.matched_delta,
+                      unknown_count=candidate.unknown_count+deltas.unknown_delta
+                  FROM deltas
+                  WHERE candidate.row_id=deltas.row_id
+                    AND candidate.match_count+deltas.matched_delta >= 0
+                    AND candidate.unknown_count+deltas.unknown_delta >= 0
+                    AND (
+                      deltas.matched_delta <> 0
+                      OR deltas.unknown_delta <> 0
+                    )
+                  RETURNING candidate.row_id
+                )
+                SELECT count(*) FILTER (
+                         WHERE matched_delta <> 0 OR unknown_delta <> 0
+                       )::bigint,
+                       (SELECT count(*)::bigint FROM changed)
+                FROM deltas
+                "#,
+                current_payload = layout.input_payload(side).relation.sql(),
+                opposite_state = layout.state(side.opposite()).sql(),
+                condition = layout.condition,
+            ),
+            &unsafe {
+                [
+                    DatumWithOid::new(chunk.stream_id, pg_sys::INT8OID),
+                    DatumWithOid::new(chunk.sequence, pg_sys::INT8OID),
+                ]
+            },
+        )?;
+        if updated.len() != 1 {
+            return Err("Join page candidate update returned no summary".into());
+        }
+        let updated = updated.first();
+        let expected = required_table::<i64>(&updated, 1, "Join page candidate changes")?;
+        let actual = required_table::<i64>(&updated, 2, "Join page changed candidates")?;
+        if expected != actual {
+            return Err("Join page candidate counts would underflow".into());
+        }
+        Ok(())
+    }
+
+    fn apply_inner_page_own_state(
+        transaction: &mut StepTxn<'_, '_>,
+        layout: &Layout,
+        side: InputSide,
+        chunk: &ChunkMeta,
+    ) -> Result<(), String> {
+        let current_alias = side_alias(side);
+        let opposite_alias = side_alias(side.opposite());
+        let state = layout.state(side);
+        let row_key = canonical_row_key_sql("effect.row_value", layout.input_type(side));
+        let changed = transaction.write(
+            &format!(
+                r#"
+                WITH incoming AS MATERIALIZED (
+                  SELECT effect.row_ordinal,effect.row_value,effect.weight,
+                         {row_key} AS row_key,
+                         sum(effect.weight) OVER (
+                           PARTITION BY {row_key}
+                           ORDER BY effect.row_ordinal
+                           ROWS UNBOUNDED PRECEDING
+                         ) AS prefix
+                  FROM {current_payload} AS effect
+                  WHERE effect.stream_id=$1 AND effect.chunk_seq=$2
+                ),
+                collapsed AS MATERIALIZED (
+                  SELECT row_key,
+                         (array_agg(row_value ORDER BY row_ordinal))[1]
+                           AS row_value,
+                         sum(weight)::bigint AS net_weight,
+                         min(prefix)::bigint AS min_prefix
+                  FROM incoming
+                  GROUP BY row_key
+                ),
+                desired AS MATERIALIZED (
+                  SELECT collapsed.*,
+                         own.row_id,
+                         coalesce(own.multiplicity,0)::bigint AS old_multiplicity,
+                         coalesce((
+                           SELECT sum({opposite_alias}.multiplicity)::bigint
+                           FROM {opposite_state} AS {opposite_alias}
+                           CROSS JOIN LATERAL (
+                             SELECT collapsed.row_value
+                           ) AS {current_alias}
+                           WHERE ({condition}) IS TRUE
+                         ),0)::bigint AS match_count,
+                         coalesce((
+                           SELECT sum({opposite_alias}.multiplicity)::bigint
+                           FROM {opposite_state} AS {opposite_alias}
+                           CROSS JOIN LATERAL (
+                             SELECT collapsed.row_value
+                           ) AS {current_alias}
+                           WHERE ({condition}) IS NULL
+                         ),0)::bigint AS unknown_count
+                  FROM collapsed
+                  LEFT JOIN {state} AS own USING(row_key)
+                ),
+                valid AS MATERIALIZED (
+                  SELECT *,old_multiplicity+net_weight AS new_multiplicity
+                  FROM desired
+                  WHERE old_multiplicity+min_prefix >= 0
+                    AND old_multiplicity+net_weight >= 0
+                ),
+                removed AS (
+                  DELETE FROM {state} AS own
+                  USING valid
+                  WHERE own.row_id=valid.row_id
+                    AND valid.new_multiplicity=0
+                  RETURNING own.row_id
+                ),
+                updated AS (
+                  UPDATE {state} AS own
+                  SET multiplicity=valid.new_multiplicity,
+                      match_count=valid.match_count,
+                      unknown_count=valid.unknown_count
+                  FROM valid
+                  WHERE own.row_id=valid.row_id
+                    AND valid.new_multiplicity>0
+                  RETURNING own.row_id
+                ),
+                inserted AS (
+                  INSERT INTO {state}(
+                    row_key,row_value,multiplicity,match_count,unknown_count
+                  )
+                  SELECT row_key,row_value,new_multiplicity,
+                         match_count,unknown_count
+                  FROM valid
+                  WHERE row_id IS NULL AND new_multiplicity>0
+                  ON CONFLICT (row_key) DO NOTHING
+                  RETURNING row_id
+                )
+                SELECT (SELECT count(*)::bigint FROM collapsed),
+                       (SELECT count(*)::bigint FROM valid),
+                       (SELECT count(*)::bigint FROM removed)
+                         +(SELECT count(*)::bigint FROM updated)
+                         +(SELECT count(*)::bigint FROM inserted)
+                "#,
+                current_payload = layout.input_payload(side).relation.sql(),
+                opposite_state = layout.state(side.opposite()).sql(),
+                condition = layout.condition,
+                state = state.sql(),
+            ),
+            &unsafe {
+                [
+                    DatumWithOid::new(chunk.stream_id, pg_sys::INT8OID),
+                    DatumWithOid::new(chunk.sequence, pg_sys::INT8OID),
+                ]
+            },
+        )?;
+        if changed.len() != 1 {
+            return Err("Join page own-state mutation returned no summary".into());
+        }
+        let changed = changed.first();
+        let collapsed = required_table::<i64>(&changed, 1, "Join page collapsed rows")?;
+        let valid = required_table::<i64>(&changed, 2, "Join page valid rows")?;
+        let mutations = required_table::<i64>(&changed, 3, "Join page state mutations")?;
+        if collapsed != valid || valid != mutations {
+            return Err("Join page own multiplicity would underflow".into());
+        }
+        Ok(())
     }
 
     fn load_continuation(
