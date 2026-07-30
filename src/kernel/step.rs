@@ -6,8 +6,11 @@ use crate::logical::model::ExecutionSettings;
 use crate::logical::{StepExecution, StepOutcome, WorkBudget};
 use crate::postgres::parse_lsn;
 
+use super::runner::LifecyclePermit;
 use super::storage::{self, AttributeRef, PayloadStorage, RelationRef, TypeRef};
-use super::{AdmissionProgress, WorkUsage};
+use super::{
+    nonnegative, required_row, required_table, AdmissionProgress, KernelTransition, WorkUsage,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProducerKind {
@@ -69,18 +72,18 @@ pub(crate) enum OutputAppendTarget {
     },
 }
 
-pub(crate) enum StepStart<'client, 'conn> {
+pub(crate) enum StepContextStart<'client, 'conn> {
     Blocked,
     Idle,
-    Ready(Box<StepTxn<'client, 'conn>>),
+    Ready(Box<StepContext<'client, 'conn>>),
 }
 
 /// The only mutable database context for one operator step.
 ///
 /// The background worker owns the surrounding PostgreSQL transaction.
-/// `StepTxn` owns its deterministic lock order, the checkpoint revision, and
+/// `StepContext` owns its deterministic lock order, the checkpoint revision, and
 /// the distinction between locking reads and state-changing statements.
-pub(crate) struct StepTxn<'client, 'conn> {
+pub(crate) struct StepContext<'client, 'conn> {
     client: &'client mut SpiClient<'conn>,
     result_oid: pg_sys::Oid,
     stage_id: i32,
@@ -88,13 +91,15 @@ pub(crate) struct StepTxn<'client, 'conn> {
     transition_budget: WorkBudget,
     expected_revision: i64,
     checkpoint_had_continuation: bool,
+    continuation_presence: Option<bool>,
     admission: AdmissionProgress,
     inputs: Vec<InputState>,
     output: Option<OutputState>,
 }
 
-impl<'client, 'conn> StepTxn<'client, 'conn> {
-    pub(crate) fn begin(
+impl<'client, 'conn> StepContext<'client, 'conn> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn begin(
         client: &'client mut SpiClient<'conn>,
         result_oid: pg_sys::Oid,
         stage_id: u32,
@@ -102,7 +107,8 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
         expects_output: bool,
         settings: &ExecutionSettings,
         budget: WorkBudget,
-    ) -> Result<StepStart<'client, 'conn>, String> {
+        _permit: LifecyclePermit,
+    ) -> Result<StepContextStart<'client, 'conn>, String> {
         if result_oid == pg_sys::InvalidOid {
             return Err("operator step has an invalid result OID".into());
         }
@@ -131,7 +137,7 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "dataflow state returned NULL".to_string())?;
         if !active {
-            return Ok(StepStart::Idle);
+            return Ok(StepContextStart::Idle);
         }
 
         apply_execution_settings(client, settings)?;
@@ -313,7 +319,7 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
             }
             let output = output.first();
             if required_table::<bool>(&output, 7, "output backpressure")? {
-                return Ok(StepStart::Blocked);
+                return Ok(StepContextStart::Blocked);
             }
             Some(OutputState {
                 stream_id: required_table(&output, 1, "output stream ID")?,
@@ -329,10 +335,10 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
         };
 
         if !checkpoint_had_continuation && !inputs.iter().any(InputState::has_pending) {
-            return Ok(StepStart::Idle);
+            return Ok(StepContextStart::Idle);
         }
 
-        Ok(StepStart::Ready(Box::new(Self {
+        Ok(StepContextStart::Ready(Box::new(Self {
             client,
             result_oid,
             stage_id,
@@ -340,6 +346,7 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
             transition_budget: budget,
             expected_revision,
             checkpoint_had_continuation,
+            continuation_presence: None,
             admission,
             inputs,
             output,
@@ -362,8 +369,28 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
         self.transition_budget = budget;
     }
 
-    pub(crate) const fn checkpoint_had_continuation(&self) -> bool {
-        self.checkpoint_had_continuation
+    pub(crate) fn bind_continuation_authority(&mut self, persisted: bool) -> Result<(), String> {
+        if self.checkpoint_had_continuation != persisted {
+            return Err("checkpoint and typed continuation authority disagree".into());
+        }
+        match self.continuation_presence {
+            None => self.continuation_presence = Some(persisted),
+            Some(current) if current == persisted => {}
+            Some(_) => return Err("typed continuation authority was bound twice".into()),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_continuation_replace(&self, expected: bool) -> Result<(), String> {
+        match self.continuation_presence {
+            Some(current) if current == expected => Ok(()),
+            Some(_) => Err("typed continuation replacement used stale authority".into()),
+            None => Err("typed continuation was mutated before it was bound".into()),
+        }
+    }
+
+    pub(crate) fn record_continuation_replace(&mut self, present: bool) {
+        self.continuation_presence = Some(present);
     }
 
     pub(crate) const fn admission_progress(&self) -> AdmissionProgress {
@@ -373,10 +400,10 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
     pub(crate) fn record_admission(&mut self, usage: WorkUsage) -> Result<bool, String> {
         let (progress, drain) = self.admission.record(
             usage,
-            crate::config::stage_admission_rows(),
-            crate::config::stage_admission_row_interval_cap(),
-            crate::config::stage_admission_bytes(),
-            crate::config::stage_admission_byte_interval_cap(),
+            crate::config::admission_rows(),
+            crate::config::admission_row_interval_cap(),
+            crate::config::admission_bytes(),
+            crate::config::admission_byte_interval_cap(),
         )?;
         self.admission = progress;
         Ok(drain)
@@ -599,16 +626,35 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) fn transition(
+        &self,
+        has_continuation: bool,
+        usage: WorkUsage,
+    ) -> Result<KernelTransition, String> {
+        usage.validate(self.quantum_budget)?;
+        if self.continuation_presence != Some(has_continuation) {
+            return Err("kernel transition disagrees with typed continuation authority".into());
+        }
+        Ok(KernelTransition::new(has_continuation, usage))
+    }
+
     /// Commits the logical step by advancing its single CAS authority.
     ///
     /// The operator derives `has_continuation` from the validated typed
     /// continuation mutation performed in this transaction.
-    pub(crate) fn finish(
+    pub(super) fn commit(
         mut self,
-        has_continuation: bool,
-        usage: WorkUsage,
+        transition: KernelTransition,
+        _permit: LifecyclePermit,
     ) -> Result<StepExecution, String> {
+        let KernelTransition {
+            has_continuation,
+            usage,
+        } = transition;
         usage.validate(self.quantum_budget)?;
+        if self.continuation_presence != Some(has_continuation) {
+            return Err("kernel transition disagrees with typed continuation authority".into());
+        }
         self.publish_pending_output()?;
         let admitted_rows =
             i64::try_from(self.admission.rows()).map_err(|_| "admitted rows exceed bigint")?;
@@ -687,31 +733,6 @@ fn apply_execution_settings(
         return Err("dataflow execution settings returned no row".into());
     }
     Ok(())
-}
-
-fn required_table<T: FromDatum + IntoDatum>(
-    table: &SpiTupleTable<'_>,
-    ordinal: usize,
-    name: &str,
-) -> Result<T, String> {
-    table
-        .get::<T>(ordinal)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("database returned NULL {name}"))
-}
-
-fn required_row<T: FromDatum + IntoDatum>(
-    row: &pgrx::spi::SpiHeapTupleData<'_>,
-    ordinal: usize,
-    name: &str,
-) -> Result<T, String> {
-    row.get::<T>(ordinal)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("database returned NULL {name}"))
-}
-
-fn nonnegative(value: i64, name: &str) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| format!("{name} is negative"))
 }
 
 fn parse_lsn_column(

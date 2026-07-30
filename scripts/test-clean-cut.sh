@@ -34,6 +34,35 @@ reject_matches \
   src sql scripts docs README.md CONTRIBUTING.md \
   ':(exclude)scripts/test-clean-cut.sh'
 reject_matches \
+  'shiba\.(ingress_batch_rows|ingress_batch_bytes|stage_chunk_rows|stage_chunk_bytes|stage_admission_rows|stage_admission_bytes)\b|shiba_internal\.(ingress_apply_batches|effect_stream_payloads)\b' \
+  "removed batching GUCs and payload catalog tables must not re-enter the clean-cut architecture" \
+  src sql scripts docs README.md CONTRIBUTING.md \
+  ':(exclude)scripts/test-clean-cut.sh'
+reject_matches \
+  'CREATE FUNCTION shiba\.(activate|deactivate|_ensure_runtime|_ensure_logical_slot)\(' \
+  "database lifecycle control has one Rust implementation, not a PL/pgSQL wrapper or fallback" \
+  sql
+reject_matches \
+  'CREATE FUNCTION shiba_internal\.publish_source_batch\(' \
+  "source publication control flow has one Rust implementation" \
+  sql
+reject_matches \
+  'shiba_internal\.publish_source_batch' \
+  "the Runtime must call the Rust source publisher directly" \
+  src/worker.rs
+reject_matches \
+  'CREATE FUNCTION shiba_internal\.insert_ingress_events\(' \
+  "bounded ingress admission has one Rust implementation" \
+  sql
+reject_matches \
+  'shiba_internal\.insert_ingress_events' \
+  "the Runtime must call Rust ingress admission directly" \
+  src/worker.rs
+reject_matches \
+  'CREATE FUNCTION (shiba\._prepare_dataflow_drops|shiba_internal\._lock_all_dataflows_for_utility)\(' \
+  "dataflow DROP lock planning has one Rust implementation" \
+  sql
+reject_matches \
   'own\.row_value|existing\.row_value' \
   "Join own-row identity must use its indexed binary row_key" \
   src/kernel/join.rs
@@ -73,6 +102,11 @@ reject_matches \
   '#\[cfg\(any\(\)\)\]|\bobsolete\b' \
   "disabled or obsolete kernel paths must be deleted, not retained" \
   src/kernel
+reject_matches \
+  'StepTxn|StepExecution|StepOutcome|StepContext::begin|\.commit\(' \
+  "operator algorithms must return KernelTransition through KernelRunner" \
+  src/kernel/linear.rs src/kernel/sink.rs src/kernel/distinct.rs \
+  src/kernel/join.rs src/kernel/aggregate.rs src/kernel/window.rs src/kernel/topn.rs
 
 for removed_file in \
   src/query_analysis.rs \

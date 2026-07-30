@@ -6,16 +6,20 @@
 
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
-use pgrx::spi::{SpiClient, SpiTupleTable};
+use pgrx::spi::SpiClient;
 
+use crate::kernel::KernelTransition;
 use crate::kernel::{
     advance_input, append_frontier, attribute_matches_slot, canonical_row_key_sql, chunk,
-    compile_named_outputs, compile_stage_bindings, next_chunk, payload_facts,
-    validate_output_attributes, AttributeRef, BindingInput, ChunkKind, InputPosition, OutputFacts,
-    PageFacts, PhaseCode, PrimitiveFacts, ProducerKind, RelationRef, StepTxn, TypeRef, WorkUsage,
+    compile_named_outputs, compile_stage_bindings, database_nonnegative as nonnegative, next_chunk,
+    payload_facts, replace_continuation_cas, required_table as required,
+    validate_continuation_abi as validate_typed_continuation_abi, validate_output_attributes,
+    AttributeRef, BindingInput, ChunkKind, ContinuationColumn, InputPosition, OutputFacts,
+    PageFacts, PhaseCode, PrimitiveFacts, ProducerKind, RelationRef, StepContext, TypeRef,
+    WorkUsage,
 };
 use crate::logical::model::{DataflowPlan, DataflowStage, OperatorSpec, TopNSpec};
-use crate::logical::{StepExecution, WorkBudget};
+use crate::logical::WorkBudget;
 use crate::postgres::{format_lsn, quote_identifier};
 use crate::scalar_sql::compile_scalar_expression;
 
@@ -31,6 +35,24 @@ const SELECT_PHASE: i16 = 2;
 const DIFF_PHASE: i16 = 3;
 const CLEANUP_PHASE: i16 = 4;
 const FRONTIER_PHASE: i16 = 5;
+
+const CONTINUATION_COLUMNS: &[ContinuationColumn] = &[
+    ContinuationColumn::required("singleton", pg_sys::BOOLOID),
+    ContinuationColumn::required("phase", pg_sys::INT2OID),
+    ContinuationColumn::required("input_stream_id", pg_sys::INT8OID),
+    ContinuationColumn::nullable("input_chunk_seq", pg_sys::INT8OID),
+    ContinuationColumn::nullable("input_row_ordinal", pg_sys::INT8OID),
+    ContinuationColumn::nullable("generation_id", pg_sys::INT8OID),
+    ContinuationColumn::nullable("cursor_row_id", pg_sys::INT8OID),
+    ContinuationColumn::required("cursor_repeat", pg_sys::BOOLOID),
+    ContinuationColumn::nullable_as("offset_remaining", pg_sys::NUMERICOID, "numeric"),
+    ContinuationColumn::nullable_as("limit_remaining", pg_sys::NUMERICOID, "numeric"),
+    ContinuationColumn::nullable("tie_boundary_row_id", pg_sys::INT8OID),
+    ContinuationColumn::nullable("diff_leg", pg_sys::INT2OID),
+    ContinuationColumn::nullable("after_kind", pg_sys::INT2OID),
+    ContinuationColumn::nullable("after_chunk_seq", pg_sys::INT8OID),
+    ContinuationColumn::nullable("after_row_ordinal", pg_sys::INT8OID),
+];
 
 /// What follows one pure candidate/visible Drain epoch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1149,11 +1171,19 @@ fn create_topn_relation(
 
 /// Execute one TopN checkpoint. Every action performs one bounded set
 /// primitive; typed rows and ordering values remain in PostgreSQL.
-pub(crate) fn execute(
-    mut transaction: StepTxn<'_, '_>,
+pub(crate) const KERNEL: super::KernelFn = super::KernelFn::new(
+    super::KernelContract::new(
+        &[super::InputContract::Operator],
+        super::OutputContract::EffectStream,
+    ),
+    step,
+);
+
+pub(crate) fn step(
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "TopN stage ID exceeds usize")?)
@@ -1170,23 +1200,21 @@ pub(crate) fn execute(
     }
 
     let machine = TopNMachine::new(spec.limit, spec.offset, spec.with_ties);
-    let storage = load_topn_storage(&mut transaction, stage, spec)?;
-    validate_topn_control_state(&mut transaction, &storage)?;
+    let storage = load_topn_storage(transaction, stage, spec)?;
+    validate_topn_control_state(transaction, &storage)?;
     let expressions = compile_topn_expressions(
-        &mut transaction,
+        transaction,
         plan,
         stage,
         spec,
         &storage.input_type,
         &storage.output_type,
     )?;
-    let durable = load_topn_continuation(&mut transaction, &storage.continuation)?;
-    if transaction.checkpoint_had_continuation() != durable.is_some() {
-        return Err("TopN checkpoint disagrees with its typed continuation".into());
-    }
+    let durable = load_topn_continuation(transaction, &storage.continuation)?;
+    super::validate_continuation_authority(transaction, durable.is_some())?;
     let current = match durable {
         Some(durable) => durable,
-        None => start_topn_continuation(&mut transaction, &storage, machine)?,
+        None => start_topn_continuation(transaction, &storage, machine)?,
     };
     if current.continuation.input_stream_id != transaction.input(0)?.stream_id {
         return Err("TopN continuation changed its input stream".into());
@@ -1202,7 +1230,7 @@ pub(crate) fn execute(
     let action = machine.action(current.continuation)?;
     let result = match action {
         TopNAction::Admit { input } => TopNActionResult::Admitted(run_topn_admission(
-            &mut transaction,
+            transaction,
             &storage,
             &expressions,
             input,
@@ -1211,7 +1239,7 @@ pub(crate) fn execute(
             generation_id,
             progress,
         } => TopNActionResult::Selected(run_topn_selection(
-            &mut transaction,
+            transaction,
             &storage,
             &expressions,
             spec,
@@ -1223,7 +1251,7 @@ pub(crate) fn execute(
             leg,
             cursor,
         } => TopNActionResult::Diffed(run_topn_diff(
-            &mut transaction,
+            transaction,
             &storage,
             generation_id,
             leg,
@@ -1234,15 +1262,10 @@ pub(crate) fn execute(
             cursor,
         } => {
             let after_drain = phase_after_drain(current.continuation.phase)?;
-            let mut page = run_topn_cleanup(
-                &mut transaction,
-                &storage,
-                generation_id,
-                cursor,
-                after_drain,
-            )?;
+            let mut page =
+                run_topn_cleanup(transaction, &storage, generation_id, cursor, after_drain)?;
             if page.complete {
-                let finalized = finish_topn_drain(&mut transaction, &storage)?;
+                let finalized = finish_topn_drain(transaction, &storage)?;
                 page.facts.state_rows = page
                     .facts
                     .state_rows
@@ -1252,7 +1275,7 @@ pub(crate) fn execute(
             TopNActionResult::Cleaned(page)
         }
         TopNAction::ForwardFrontier { input } => {
-            TopNActionResult::FrontierForwarded(run_topn_frontier(&mut transaction, input)?)
+            TopNActionResult::FrontierForwarded(run_topn_frontier(transaction, input)?)
         }
     };
     let transition = machine.apply(current.continuation, result, transaction.budget())?;
@@ -1265,16 +1288,16 @@ pub(crate) fn execute(
         return Err("TopN continuation mutation disagrees with primitive facts".into());
     }
     replace_topn_continuation(
-        &mut transaction,
+        transaction,
         &storage.continuation,
         current.persisted.then_some(current.continuation),
         next,
     )?;
-    transaction.finish(has_continuation, facts.usage)
+    transaction.transition(has_continuation, facts.usage)
 }
 
 fn start_topn_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &TopNStorage,
     machine: TopNMachine,
 ) -> Result<DurableTopN, String> {
@@ -1300,7 +1323,7 @@ fn start_topn_continuation(
 }
 
 fn initial_topn_drain_phase(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     machine: TopNMachine,
     after_drain: AfterDrain,
 ) -> Result<TopNPhase, String> {
@@ -1322,7 +1345,7 @@ fn initial_topn_drain_phase(
 }
 
 fn load_topn_storage(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     stage: &DataflowStage,
     spec: &TopNSpec,
 ) -> Result<TopNStorage, String> {
@@ -1346,7 +1369,7 @@ fn load_topn_storage(
 }
 
 fn validate_topn_storage(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &TopNStorage,
     stage: &DataflowStage,
     spec: &TopNSpec,
@@ -1412,7 +1435,7 @@ fn validate_topn_storage(
 }
 
 fn validate_topn_control_state(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &TopNStorage,
 ) -> Result<(), String> {
     let rows = transaction.read(
@@ -1434,7 +1457,10 @@ fn validate_topn_control_state(
     Ok(())
 }
 
-fn topn_is_dirty(transaction: &mut StepTxn<'_, '_>, storage: &TopNStorage) -> Result<bool, String> {
+fn topn_is_dirty(
+    transaction: &mut StepContext<'_, '_>,
+    storage: &TopNStorage,
+) -> Result<bool, String> {
     let rows = transaction.read(
         &format!(
             "SELECT dirty FROM {} WHERE singleton",
@@ -1449,42 +1475,14 @@ fn topn_is_dirty(transaction: &mut StepTxn<'_, '_>, storage: &TopNStorage) -> Re
 }
 
 fn validate_topn_continuation_abi(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
 ) -> Result<(), String> {
-    let attributes = transaction.relation_attributes(relation.oid())?;
-    let expected = [
-        ("singleton", pg_sys::BOOLOID, true),
-        ("phase", pg_sys::INT2OID, true),
-        ("input_stream_id", pg_sys::INT8OID, true),
-        ("input_chunk_seq", pg_sys::INT8OID, false),
-        ("input_row_ordinal", pg_sys::INT8OID, false),
-        ("generation_id", pg_sys::INT8OID, false),
-        ("cursor_row_id", pg_sys::INT8OID, false),
-        ("cursor_repeat", pg_sys::BOOLOID, true),
-        ("offset_remaining", pg_sys::NUMERICOID, false),
-        ("limit_remaining", pg_sys::NUMERICOID, false),
-        ("tie_boundary_row_id", pg_sys::INT8OID, false),
-        ("diff_leg", pg_sys::INT2OID, false),
-        ("after_kind", pg_sys::INT2OID, false),
-        ("after_chunk_seq", pg_sys::INT8OID, false),
-        ("after_row_ordinal", pg_sys::INT8OID, false),
-    ];
-    if attributes.len() != expected.len()
-        || attributes
-            .iter()
-            .zip(expected)
-            .any(|(actual, (name, type_oid, not_null))| {
-                !attribute_is(actual, name, type_oid, not_null)
-            })
-    {
-        return Err("TopN continuation relation has an invalid ABI".into());
-    }
-    Ok(())
+    validate_typed_continuation_abi(transaction, relation, CONTINUATION_COLUMNS, "TopN")
 }
 
 fn compile_topn_expressions(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     spec: &TopNSpec,
@@ -1625,7 +1623,7 @@ struct TopNFields {
 }
 
 fn load_topn_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
 ) -> Result<Option<DurableTopN>, String> {
     let query = format!(
@@ -1888,75 +1886,23 @@ fn encode_after(fields: &mut TopNFields, after: AfterDrain) {
 }
 
 fn replace_topn_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     old: Option<TopNContinuation>,
     next: Option<TopNContinuation>,
 ) -> Result<(), String> {
-    if let Some(old) = old {
-        delete_topn_continuation(transaction, relation, &encode_topn_fields(old))?;
-    }
-    if let Some(next) = next {
-        insert_topn_continuation(transaction, relation, &encode_topn_fields(next))?;
-    }
-    Ok(())
-}
-
-fn delete_topn_continuation(
-    transaction: &mut StepTxn<'_, '_>,
-    relation: &RelationRef,
-    fields: &TopNFields,
-) -> Result<(), String> {
-    let query = format!(
-        r#"
-        DELETE FROM {}
-        WHERE singleton AND phase=$1 AND input_stream_id=$2
-          AND input_chunk_seq IS NOT DISTINCT FROM $3
-          AND input_row_ordinal IS NOT DISTINCT FROM $4
-          AND generation_id IS NOT DISTINCT FROM $5
-          AND cursor_row_id IS NOT DISTINCT FROM $6
-          AND cursor_repeat=$7
-          AND offset_remaining IS NOT DISTINCT FROM $8::numeric
-          AND limit_remaining IS NOT DISTINCT FROM $9::numeric
-          AND tie_boundary_row_id IS NOT DISTINCT FROM $10
-          AND diff_leg IS NOT DISTINCT FROM $11
-          AND after_kind IS NOT DISTINCT FROM $12
-          AND after_chunk_seq IS NOT DISTINCT FROM $13
-          AND after_row_ordinal IS NOT DISTINCT FROM $14
-        RETURNING singleton
-        "#,
-        relation.sql()
-    );
-    let arguments = topn_field_arguments(fields);
-    if transaction.write(&query, &arguments)?.len() != 1 {
-        return Err("TopN continuation compare-and-set failed".into());
-    }
-    Ok(())
-}
-
-fn insert_topn_continuation(
-    transaction: &mut StepTxn<'_, '_>,
-    relation: &RelationRef,
-    fields: &TopNFields,
-) -> Result<(), String> {
-    let query = format!(
-        r#"
-        INSERT INTO {}(
-          singleton,phase,input_stream_id,input_chunk_seq,input_row_ordinal,
-          generation_id,cursor_row_id,cursor_repeat,offset_remaining,limit_remaining,
-          tie_boundary_row_id,diff_leg,after_kind,after_chunk_seq,
-          after_row_ordinal
-        )
-        VALUES(true,$1,$2,$3,$4,$5,$6,$7,$8::numeric,$9::numeric,$10,$11,$12,$13,$14)
-        RETURNING singleton
-        "#,
-        relation.sql()
-    );
-    let arguments = topn_field_arguments(fields);
-    if transaction.write(&query, &arguments)?.len() != 1 {
-        return Err("TopN continuation insert failed".into());
-    }
-    Ok(())
+    let old_fields = old.map(encode_topn_fields);
+    let next_fields = next.map(encode_topn_fields);
+    let old_arguments = old_fields.as_ref().map(topn_field_arguments);
+    let next_arguments = next_fields.as_ref().map(topn_field_arguments);
+    replace_continuation_cas(
+        transaction,
+        relation,
+        CONTINUATION_COLUMNS,
+        old_arguments.as_ref().map(|arguments| &arguments[..]),
+        next_arguments.as_ref().map(|arguments| &arguments[..]),
+        "TopN",
+    )
 }
 
 fn topn_field_arguments<'a>(fields: &'a TopNFields) -> [DatumWithOid<'a>; 14] {
@@ -1987,21 +1933,6 @@ fn parse_u64_numeric(value: Option<&str>, label: &str) -> Result<u64, String> {
         .map_err(|_| format!("{label} continuation value is not an unsigned integer"))
 }
 
-fn required<T: FromDatum + IntoDatum>(
-    table: &SpiTupleTable<'_>,
-    ordinal: usize,
-    name: &str,
-) -> Result<T, String> {
-    table
-        .get::<T>(ordinal)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("database returned NULL {name}"))
-}
-
-fn nonnegative(value: i64, name: &str) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| format!("database returned negative {name}"))
-}
-
 fn i64_from_usize(value: usize, name: &str) -> Result<i64, String> {
     i64::try_from(value).map_err(|_| format!("{name} exceeds bigint"))
 }
@@ -2016,7 +1947,7 @@ fn attribute_is(
 }
 
 fn run_topn_admission(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &TopNStorage,
     expressions: &TopNExpressions,
     input: InputPosition,
@@ -2323,7 +2254,7 @@ fn run_topn_admission(
     })
 }
 
-fn next_generation_id(transaction: &mut StepTxn<'_, '_>) -> Result<i64, String> {
+fn next_generation_id(transaction: &mut StepContext<'_, '_>) -> Result<i64, String> {
     let arguments = unsafe {
         [
             DatumWithOid::new(transaction.result_oid(), pg_sys::OIDOID),
@@ -2347,7 +2278,7 @@ fn next_generation_id(transaction: &mut StepTxn<'_, '_>) -> Result<i64, String> 
 }
 
 fn run_topn_selection(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &TopNStorage,
     expressions: &TopNExpressions,
     spec: &TopNSpec,
@@ -2648,7 +2579,7 @@ fn run_topn_selection(
 }
 
 fn run_topn_diff(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &TopNStorage,
     generation_id: i64,
     leg: DiffLeg,
@@ -2957,7 +2888,7 @@ fn run_topn_diff(
 }
 
 fn run_topn_cleanup(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &TopNStorage,
     generation_id: i64,
     cursor: TopNCursor,
@@ -3052,7 +2983,7 @@ fn run_topn_cleanup(
 }
 
 fn finish_topn_drain(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &TopNStorage,
 ) -> Result<u64, String> {
     let candidate_rows = transaction.read(
@@ -3083,7 +3014,7 @@ fn finish_topn_drain(
 }
 
 fn run_topn_frontier(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     input: InputPosition,
 ) -> Result<PrimitiveFacts, String> {
     if input.row_ordinal != 0 {

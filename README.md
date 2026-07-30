@@ -63,8 +63,8 @@ input position commit together. A source transaction is deliberately not a
 result-visibility boundary.
 
 There is one Shiba Runtime process per active database. Its in-memory plan
-cache and ready queue are disposable; PostgreSQL relations contain all
-recovery authority.
+cache and fair stage cursor are disposable; PostgreSQL relations contain all
+readiness and recovery authority.
 
 The detailed [architecture](docs/ARCHITECTURE.md) follows an INSERT from WAL to
 the result table, then shows a real multi-source Join → Aggregate → Window →
@@ -161,21 +161,18 @@ maintenance.
 
 The main bounds are:
 
-- `shiba.ingress_batch_rows`
-- `shiba.ingress_batch_bytes`
-- `shiba.stage_chunk_rows`
-- `shiba.stage_chunk_bytes`
-- `shiba.stage_admission_rows`
-- `shiba.stage_admission_bytes`
+- `shiba.batch_rows`
+- `shiba.batch_bytes`
 - `shiba.max_cached_dataflows`
 - `shiba.max_cached_relations`
 - `shiba.runtime_work_mem`
 - `shiba.runtime_temp_file_limit`
 
-Ingress targets are checked after a complete pgoutput message, so one message
-(including both effects of an UPDATE) may cross them. Operator row targets are
-hard. One indivisible typed work item may exceed only the byte target and
-occupy one step; other work is split at a durable continuation.
+Ingress and operators use the same batch target. Ingress checks it after a
+complete pgoutput message, so one message (including both effects of an UPDATE)
+may cross it. Operator row targets are hard. One indivisible typed work item
+may exceed only the byte target and occupy one step; other work is split at a
+durable continuation. Stateful drain thresholds are derived from this budget.
 
 ## Development
 

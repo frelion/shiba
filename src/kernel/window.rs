@@ -9,17 +9,20 @@ use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiTupleTable};
 
+use crate::kernel::KernelTransition;
 use crate::kernel::{
     advance_input, append_frontier, attribute_matches_slot, canonical_row_key_sql, chunk,
-    compile_named_outputs, compile_stage_bindings, next_chunk, payload_facts,
-    scalar_work_bytes_sql, validate_output_attributes, AttributeRef, BindingInput, ChunkKind,
+    compile_named_outputs, compile_stage_bindings, database_nonnegative as window_nonnegative,
+    next_chunk, payload_facts, replace_continuation_cas, required_table as window_required,
+    scalar_work_bytes_sql, validate_continuation_abi as validate_typed_continuation_abi,
+    validate_output_attributes, AttributeRef, BindingInput, ChunkKind, ContinuationColumn,
     InputPosition, OutputFacts, PageFacts, PhaseCode, PrimitiveFacts, ProducerKind, RelationRef,
-    StepTxn, TypeRef, WorkUsage,
+    StepContext, TypeRef, WorkUsage,
 };
 use crate::logical::model::{
     DataflowPlan, DataflowStage, OperatorSpec, OutputSlot, SlotType, WindowExpr, WindowSpec,
 };
-use crate::logical::{StepExecution, WorkBudget};
+use crate::logical::WorkBudget;
 use crate::postgres::{format_lsn, quote_identifier};
 use crate::scalar_sql::{compile_scalar_expression, SqlBinding};
 
@@ -42,6 +45,25 @@ const EVALUATE_PHASE: i16 = 6;
 const DIFF_PHASE: i16 = 7;
 const CLEANUP_PHASE: i16 = 8;
 const FRONTIER_PHASE: i16 = 9;
+
+const CONTINUATION_COLUMNS: &[ContinuationColumn] = &[
+    ContinuationColumn::required("singleton", pg_sys::BOOLOID),
+    ContinuationColumn::required("phase", pg_sys::INT2OID),
+    ContinuationColumn::required("input_stream_id", pg_sys::INT8OID),
+    ContinuationColumn::nullable("input_chunk_seq", pg_sys::INT8OID),
+    ContinuationColumn::nullable("input_row_ordinal", pg_sys::INT8OID),
+    ContinuationColumn::nullable("partition_queue_id", pg_sys::INT8OID),
+    ContinuationColumn::nullable("function_ordinal", pg_sys::INT4OID),
+    ContinuationColumn::nullable("output_ordinal", pg_sys::INT8OID),
+    ContinuationColumn::nullable("cursor_row_id", pg_sys::INT8OID),
+    ContinuationColumn::required("fold_ready", pg_sys::BOOLOID),
+    ContinuationColumn::required("cursor_repeat", pg_sys::BOOLOID),
+    ContinuationColumn::nullable("diff_leg", pg_sys::INT2OID),
+    ContinuationColumn::nullable("cleanup_ordinal", pg_sys::INT4OID),
+    ContinuationColumn::nullable("after_kind", pg_sys::INT2OID),
+    ContinuationColumn::nullable("after_chunk_seq", pg_sys::INT8OID),
+    ContinuationColumn::nullable("after_row_ordinal", pg_sys::INT8OID),
+];
 
 /// Caps aggregate-frame control work even when every frame is empty.
 ///
@@ -1919,11 +1941,19 @@ fn decode_native_window(
 }
 
 /// Execute exactly one durable Window action.
-pub(crate) fn execute(
-    mut transaction: StepTxn<'_, '_>,
+pub(crate) const KERNEL: super::KernelFn = super::KernelFn::new(
+    super::KernelContract::new(
+        &[super::InputContract::Operator],
+        super::OutputContract::EffectStream,
+    ),
+    step,
+);
+
+pub(crate) fn step(
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "Window stage ID exceeds usize")?)
@@ -1941,11 +1971,11 @@ pub(crate) fn execute(
     let capabilities = spec
         .functions
         .iter()
-        .map(|function| resolve_window_function(&mut transaction, function))
+        .map(|function| resolve_window_function(transaction, function))
         .collect::<Result<Vec<_>, _>>()?;
-    let storage = load_window_storage(&mut transaction, stage, spec, &capabilities)?;
+    let storage = load_window_storage(transaction, stage, spec, &capabilities)?;
     let expressions = compile_window_expressions(
-        &mut transaction,
+        transaction,
         plan,
         stage,
         spec,
@@ -1963,13 +1993,11 @@ pub(crate) fn execute(
             })
             .collect(),
     )?;
-    let durable = load_window_continuation(&mut transaction, &storage.continuation)?;
-    if transaction.checkpoint_had_continuation() != durable.is_some() {
-        return Err("Window checkpoint disagrees with its typed continuation".into());
-    }
+    let durable = load_window_continuation(transaction, &storage.continuation)?;
+    super::validate_continuation_authority(transaction, durable.is_some())?;
     let current = match durable {
         Some(durable) => durable,
-        None => start_window_continuation(&mut transaction, &storage)?,
+        None => start_window_continuation(transaction, &storage)?,
     };
     if current.continuation.input_stream_id != transaction.input(0)?.stream_id {
         return Err("Window continuation changed its input stream".into());
@@ -1984,7 +2012,7 @@ pub(crate) fn execute(
     let action = machine.action(current.continuation)?;
     let result = match action {
         WindowAction::Admit { input } => WindowActionResult::Admitted(run_window_admission(
-            &mut transaction,
+            transaction,
             &storage,
             &expressions,
             input,
@@ -1993,7 +2021,7 @@ pub(crate) fn execute(
             partition_queue_id,
             cursor,
         } => WindowActionResult::Enumerated(run_window_enumeration(
-            &mut transaction,
+            transaction,
             &storage,
             &expressions,
             partition_queue_id,
@@ -2003,7 +2031,7 @@ pub(crate) fn execute(
             partition_queue_id,
             cursor,
         } => WindowActionResult::PeersBuilt(run_window_peers(
-            &mut transaction,
+            transaction,
             &storage,
             &expressions,
             partition_queue_id,
@@ -2013,7 +2041,7 @@ pub(crate) fn execute(
             partition_queue_id,
             cursor,
         } => WindowActionResult::FramesBuilt(run_window_frames(
-            &mut transaction,
+            transaction,
             &storage,
             &expressions,
             spec,
@@ -2025,7 +2053,7 @@ pub(crate) fn execute(
             function_ordinal,
             cursor,
         } => WindowActionResult::AggregateFolded(run_window_aggregate_fold(
-            &mut transaction,
+            transaction,
             &storage,
             &expressions,
             partition_queue_id,
@@ -2037,7 +2065,7 @@ pub(crate) fn execute(
             function_ordinal,
             cursor,
         } => WindowActionResult::Evaluated(run_window_evaluate(
-            &mut transaction,
+            transaction,
             &storage,
             &expressions,
             partition_queue_id,
@@ -2049,7 +2077,7 @@ pub(crate) fn execute(
             leg,
             cursor,
         } => WindowActionResult::Diffed(run_window_diff(
-            &mut transaction,
+            transaction,
             &storage,
             partition_queue_id,
             leg,
@@ -2061,7 +2089,7 @@ pub(crate) fn execute(
         } => {
             let after = phase_after_partitions(current.continuation.phase)?;
             let cleanup = run_window_cleanup(
-                &mut transaction,
+                transaction,
                 &storage,
                 &expressions,
                 partition_queue_id,
@@ -2071,7 +2099,7 @@ pub(crate) fn execute(
             WindowActionResult::Cleaned(cleanup)
         }
         WindowAction::ForwardFrontier { input } => {
-            WindowActionResult::FrontierForwarded(run_window_frontier(&mut transaction, input)?)
+            WindowActionResult::FrontierForwarded(run_window_frontier(transaction, input)?)
         }
     };
     let transition = machine.apply(current.continuation, result, transaction.budget())?;
@@ -2084,16 +2112,16 @@ pub(crate) fn execute(
         return Err("Window continuation mutation disagrees with primitive facts".into());
     }
     replace_window_continuation(
-        &mut transaction,
+        transaction,
         &storage.continuation,
         current.persisted.then_some(current.continuation),
         next,
     )?;
-    transaction.finish(has_continuation, facts.usage)
+    transaction.transition(has_continuation, facts.usage)
 }
 
 fn start_window_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
 ) -> Result<DurableWindow, String> {
     let chunk = next_chunk(transaction, 0)?
@@ -2141,7 +2169,7 @@ fn start_window_continuation(
 }
 
 fn load_window_storage(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     stage: &DataflowStage,
     spec: &WindowSpec,
     capabilities: &[WindowFunctionCapability],
@@ -2205,7 +2233,7 @@ fn load_window_storage(
 }
 
 fn validate_window_storage(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     stage: &DataflowStage,
     spec: &WindowSpec,
@@ -2364,7 +2392,7 @@ fn validate_window_storage(
 }
 
 fn validate_window_output_state(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     identity: &str,
     output_type: &TypeRef,
@@ -2386,36 +2414,14 @@ fn validate_window_output_state(
 }
 
 fn validate_window_continuation_abi(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
 ) -> Result<(), String> {
-    validate_exact_window_attributes(
-        transaction,
-        relation,
-        &[
-            ("singleton", pg_sys::BOOLOID, true),
-            ("phase", pg_sys::INT2OID, true),
-            ("input_stream_id", pg_sys::INT8OID, true),
-            ("input_chunk_seq", pg_sys::INT8OID, false),
-            ("input_row_ordinal", pg_sys::INT8OID, false),
-            ("partition_queue_id", pg_sys::INT8OID, false),
-            ("function_ordinal", pg_sys::INT4OID, false),
-            ("output_ordinal", pg_sys::INT8OID, false),
-            ("cursor_row_id", pg_sys::INT8OID, false),
-            ("fold_ready", pg_sys::BOOLOID, true),
-            ("cursor_repeat", pg_sys::BOOLOID, true),
-            ("diff_leg", pg_sys::INT2OID, false),
-            ("cleanup_ordinal", pg_sys::INT4OID, false),
-            ("after_kind", pg_sys::INT2OID, false),
-            ("after_chunk_seq", pg_sys::INT8OID, false),
-            ("after_row_ordinal", pg_sys::INT8OID, false),
-        ],
-        "continuation",
-    )
+    validate_typed_continuation_abi(transaction, relation, CONTINUATION_COLUMNS, "Window")
 }
 
 fn validate_exact_window_attributes(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     expected: &[(&str, pg_sys::Oid, bool)],
     label: &str,
@@ -2435,7 +2441,7 @@ fn validate_exact_window_attributes(
 }
 
 fn compile_window_expressions(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     spec: &WindowSpec,
@@ -2641,7 +2647,7 @@ fn compile_window_outputs(
 }
 
 fn resolve_window_type_sql(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     type_: &SlotType,
 ) -> Result<String, String> {
     let arguments = unsafe {
@@ -2731,7 +2737,7 @@ fn window_keys_equal_sql(orders: &[BtreeOrder], left: &str, right: &str) -> Stri
 }
 
 fn resolve_window_function(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     function: &WindowExpr,
 ) -> Result<WindowFunctionCapability, String> {
     if function.aggregate {
@@ -2791,7 +2797,7 @@ fn resolve_window_function(
 }
 
 fn load_window_aggregate(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     function: &WindowExpr,
 ) -> Result<AggregateCapability, String> {
     let arguments = unsafe {
@@ -2818,21 +2824,6 @@ fn window_attribute_is(
     attribute.name == name && attribute.type_oid == type_oid && attribute.not_null == not_null
 }
 
-fn window_required<T: FromDatum + IntoDatum>(
-    table: &SpiTupleTable<'_>,
-    ordinal: usize,
-    name: &str,
-) -> Result<T, String> {
-    table
-        .get::<T>(ordinal)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("database returned NULL {name}"))
-}
-
-fn window_nonnegative(value: i64, name: &str) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| format!("database returned negative {name}"))
-}
-
 fn window_i64_budget(value: usize, name: &str) -> Result<i64, String> {
     i64::try_from(value).map_err(|_| format!("{name} exceeds bigint"))
 }
@@ -2857,7 +2848,7 @@ struct WindowFields {
 }
 
 fn load_window_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
 ) -> Result<Option<DurableWindow>, String> {
     let query = format!(
@@ -3210,66 +3201,23 @@ fn encode_window_after(fields: &mut WindowFields, after: AfterPartitions) {
 }
 
 fn replace_window_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     old: Option<WindowContinuation>,
     next: Option<WindowContinuation>,
 ) -> Result<(), String> {
-    if let Some(old) = old {
-        let fields = encode_window_fields(old)?;
-        let query = format!(
-            r#"
-            DELETE FROM {}
-            WHERE singleton AND phase=$1 AND input_stream_id=$2
-              AND input_chunk_seq IS NOT DISTINCT FROM $3
-              AND input_row_ordinal IS NOT DISTINCT FROM $4
-              AND partition_queue_id IS NOT DISTINCT FROM $5
-              AND function_ordinal IS NOT DISTINCT FROM $6
-              AND output_ordinal IS NOT DISTINCT FROM $7
-              AND cursor_row_id IS NOT DISTINCT FROM $8
-              AND fold_ready=$9
-              AND cursor_repeat=$10
-              AND diff_leg IS NOT DISTINCT FROM $11
-              AND cleanup_ordinal IS NOT DISTINCT FROM $12
-              AND after_kind IS NOT DISTINCT FROM $13
-              AND after_chunk_seq IS NOT DISTINCT FROM $14
-              AND after_row_ordinal IS NOT DISTINCT FROM $15
-            RETURNING singleton
-            "#,
-            relation.sql()
-        );
-        if transaction
-            .write(&query, &window_field_arguments(&fields))?
-            .len()
-            != 1
-        {
-            return Err("Window continuation compare-and-set failed".into());
-        }
-    }
-    if let Some(next) = next {
-        let fields = encode_window_fields(next)?;
-        let query = format!(
-            r#"
-            INSERT INTO {}(
-              singleton,phase,input_stream_id,input_chunk_seq,input_row_ordinal,
-              partition_queue_id,function_ordinal,output_ordinal,cursor_row_id,
-              fold_ready,cursor_repeat,diff_leg,
-              cleanup_ordinal,after_kind,after_chunk_seq,after_row_ordinal
-            )
-            VALUES(true,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-            RETURNING singleton
-            "#,
-            relation.sql()
-        );
-        if transaction
-            .write(&query, &window_field_arguments(&fields))?
-            .len()
-            != 1
-        {
-            return Err("Window continuation insert failed".into());
-        }
-    }
-    Ok(())
+    let old_fields = old.map(encode_window_fields).transpose()?;
+    let next_fields = next.map(encode_window_fields).transpose()?;
+    let old_arguments = old_fields.as_ref().map(window_field_arguments);
+    let next_arguments = next_fields.as_ref().map(window_field_arguments);
+    replace_continuation_cas(
+        transaction,
+        relation,
+        CONTINUATION_COLUMNS,
+        old_arguments.as_ref().map(|arguments| &arguments[..]),
+        next_arguments.as_ref().map(|arguments| &arguments[..]),
+        "Window",
+    )
 }
 
 fn window_field_arguments(fields: &WindowFields) -> [DatumWithOid<'_>; 15] {
@@ -3295,7 +3243,7 @@ fn window_field_arguments(fields: &WindowFields) -> [DatumWithOid<'_>; 15] {
 }
 
 fn run_window_admission(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     expressions: &WindowExpressions,
     input: InputPosition,
@@ -3692,7 +3640,7 @@ fn window_admission_evaluated_sql(
 }
 
 fn run_window_enumeration(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     expressions: &WindowExpressions,
     partition_queue_id: i64,
@@ -3895,7 +3843,7 @@ fn window_internal_page(
 }
 
 fn run_window_peers(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     expressions: &WindowExpressions,
     partition_queue_id: i64,
@@ -4049,7 +3997,7 @@ fn run_window_peers(
 }
 
 fn run_window_frames(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     expressions: &WindowExpressions,
     spec: &WindowSpec,
@@ -4391,7 +4339,7 @@ fn validate_window_finalize_decision(
 }
 
 fn run_window_aggregate_fold(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     expressions: &WindowExpressions,
     partition_queue_id: i64,
@@ -4668,7 +4616,7 @@ fn run_window_aggregate_fold(
 
 #[allow(clippy::too_many_arguments)]
 fn window_fold_page(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     accumulator: &RelationRef,
     function: &WindowFunctionPlan,
@@ -4922,7 +4870,7 @@ fn window_fold_page(
 
 #[allow(clippy::too_many_arguments)]
 fn window_finalize_fold(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     expressions: &WindowExpressions,
     accumulator: &RelationRef,
@@ -5129,7 +5077,7 @@ fn window_finalize_fold(
 }
 
 fn run_window_evaluate(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     expressions: &WindowExpressions,
     partition_queue_id: i64,
@@ -5591,7 +5539,7 @@ fn window_target_value(
 }
 
 fn run_window_diff(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     partition_queue_id: i64,
     leg: DiffLeg,
@@ -5893,7 +5841,7 @@ fn run_window_diff(
 }
 
 fn run_window_cleanup(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     expressions: &WindowExpressions,
     partition_queue_id: i64,
@@ -6016,7 +5964,7 @@ fn run_window_cleanup(
 }
 
 fn run_window_cleanup_relation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     identity: &str,
     predicate: &str,
@@ -6101,7 +6049,7 @@ fn run_window_cleanup_relation(
 }
 
 fn run_window_frontier(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     input: InputPosition,
 ) -> Result<PrimitiveFacts, String> {
     if input.row_ordinal != 0 {

@@ -51,8 +51,12 @@ pub(crate) struct IngressBudget {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IngressPoll {
     Batch(IngressBatch),
-    Yield { reply_requested: bool },
-    Pending { reply_requested: bool },
+    /// No durable batch is ready. `progressed` prevents Runtime from sleeping
+    /// while it retains an in-memory partial batch after its poll quantum.
+    NoBatch {
+        reply_requested: bool,
+        progressed: bool,
+    },
     End,
 }
 
@@ -194,7 +198,10 @@ impl ReplicationIngress {
                         return Ok(IngressPoll::Batch(batch.finish()));
                     }
                     let reply_requested = std::mem::take(&mut self.reply_requested);
-                    return Ok(IngressPoll::Pending { reply_requested });
+                    return Ok(IngressPoll::NoBatch {
+                        reply_requested,
+                        progressed: false,
+                    });
                 }
                 CopyDataPoll::End => {
                     if let Some(batch) = self.pending.take() {
@@ -208,8 +215,9 @@ impl ReplicationIngress {
                 }) => {
                     self.reply_requested |= reply_requested;
                     if self.pending.is_none() && self.reply_requested {
-                        return Ok(IngressPoll::Pending {
+                        return Ok(IngressPoll::NoBatch {
                             reply_requested: std::mem::take(&mut self.reply_requested),
+                            progressed: false,
                         });
                     }
                 }
@@ -247,8 +255,9 @@ impl ReplicationIngress {
                         // turn every scheduler quantum into a tiny SPI write.
                         // Yield is still work: Runtime must poll again instead
                         // of sleeping without a replication-socket latch.
-                        return Ok(IngressPoll::Yield {
+                        return Ok(IngressPoll::NoBatch {
                             reply_requested: std::mem::take(&mut self.reply_requested),
+                            progressed: true,
                         });
                     }
                 }

@@ -548,7 +548,7 @@ unsafe fn scalar(
                         capability,
                         node,
                         "unknown PostgreSQL boolean operation",
-                    ))
+                    ));
                 }
             };
             let args = list_items((*boolean).args)
@@ -582,7 +582,7 @@ unsafe fn scalar(
                         capability,
                         node,
                         "unknown PostgreSQL NULL test",
-                    ))
+                    ));
                 }
             };
             Ok(ScalarExpr::NullTest {
@@ -604,7 +604,7 @@ unsafe fn scalar(
                         capability,
                         node,
                         "unknown PostgreSQL boolean test",
-                    ))
+                    ));
                 }
             };
             Ok(ScalarExpr::BooleanTest {
@@ -1642,7 +1642,7 @@ unsafe fn lower_in(
                 "subquery.in",
                 (*link).testexpr,
                 "IN must compare one outer expression with one subquery parameter",
-            ))
+            ));
         }
     };
     let inner_query = (*link).subselect.cast::<pg_sys::Query>();
@@ -2413,16 +2413,16 @@ unsafe fn integer_constant(
     }
     match (*node).type_ {
         pg_sys::NodeTag::T_RelabelType => {
-            return integer_constant((*node.cast::<pg_sys::RelabelType>()).arg.cast(), capability)
+            return integer_constant((*node.cast::<pg_sys::RelabelType>()).arg.cast(), capability);
         }
         pg_sys::NodeTag::T_CoerceViaIO => {
-            return integer_constant((*node.cast::<pg_sys::CoerceViaIO>()).arg.cast(), capability)
+            return integer_constant((*node.cast::<pg_sys::CoerceViaIO>()).arg.cast(), capability);
         }
         pg_sys::NodeTag::T_CoerceToDomain => {
             return integer_constant(
                 (*node.cast::<pg_sys::CoerceToDomain>()).arg.cast(),
                 capability,
-            )
+            );
         }
         pg_sys::NodeTag::T_FuncExpr => {
             let function = node.cast::<pg_sys::FuncExpr>();
@@ -2453,7 +2453,7 @@ unsafe fn integer_constant(
                 capability,
                 node,
                 "LIMIT/OFFSET must be a nonnegative integer constant",
-            ))
+            ));
         }
     }
     let constant = node.cast::<pg_sys::Const>();

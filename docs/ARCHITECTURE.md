@@ -45,7 +45,7 @@ flowchart LR
 | checkpoint | step revision、是否有 continuation，以及 admission 计数 |
 | operator state | Join arrangement、Aggregate group、Window partition 等持久计算状态 |
 
-这些状态都在 PostgreSQL relation 中。Rust 内存里的 plan cache 和 ready queue
+这些状态都在 PostgreSQL relation 中。Rust 内存里的 plan cache 和公平轮转游标
 可以丢弃；它们不是恢复依据。
 
 还需要区分三种语义：
@@ -77,7 +77,7 @@ walsender 就可以发送多个 `StreamStart ... StreamStop` 段；最后发送
 ### 1. ingress 保存一个 batch
 
 [`src/ingress.rs`](../src/ingress.rs) 按
-`shiba.ingress_batch_rows` 和 `shiba.ingress_batch_bytes` 读取一个 batch，并把
+`shiba.batch_rows` 和 `shiba.batch_bytes` 读取一个 batch，并把
 DML 转成 weighted rows：
 
 ```text
@@ -86,10 +86,11 @@ DELETE old       => (-1, old)
 UPDATE old → new => (-1, old), (+1, new)
 ```
 
-[`persist_ingress_batch`](../src/worker.rs) 用一个短 PostgreSQL transaction 写入
+[`persist_ingress_batch`](../src/worker.rs) 调用 Rust 的
+[`admission`](../src/admission.rs) 协议，在一个短 PostgreSQL transaction 中原子写入
 source transaction header、`change_log`、publication cursor 和 batch 计数。header
-用首次 `Begin/StreamStart` 的 WAL 位置标识，不能只用会复用的 xid。这个
-transaction 失败时全部回滚，logical replication slot 会保留尚未确认的 WAL。
+用首次 `Begin/StreamStart` 的 WAL 位置标识，不能只用会复用的 xid。这个 transaction
+失败时全部回滚，logical replication slot 会保留尚未确认的 WAL。
 
 如果 1000 万行超过 batch 目标，`ReplicationIngress::poll_batch` 会在仍未读到
 pgoutput `Commit` 时返回。下一批以后再读；不需要把整笔 source transaction 放进
@@ -104,7 +105,7 @@ open transaction 的 batch 对 DAG 不可见。每条变更还记录当前 subxi
 ### 2. publisher 追加一个 source chunk
 
 Runtime 总是先处理已经持久化的 publication work。
-[`publish_source_batch`](../sql/11_ingress.sql) 从 `change_log` 读取一个受
+Rust 的 [`publication`](../src/publication.rs) 协议从 `change_log` 读取一个受
 row/byte 限制的前缀，写入 source stream 的 typed payload relation，再追加对应的
 chunk metadata。payload、metadata 和 publication cursor 在同一个 transaction
 提交。
@@ -136,9 +137,16 @@ flowchart TD
     G --> H["COMMIT"]
 ```
 
-[`StepTxn`](../src/kernel/step.rs) 实现公共的锁、cursor 和 checkpoint 协议。
-Rust kernel 决定 phase、预算和恢复位置；PostgreSQL 执行 typed 集合运算并提交
-transaction。
+[`KernelRunner`](../src/kernel/runner.rs) 是唯一的 step 生命周期入口。每个算子先
+声明物理 input 和 output contract；Runner 创建
+[`StepContext`](../src/kernel/step.rs)、执行公共锁与 backpressure 检查，再调用算子
+的一个有界 `step`。算子只能返回 `KernelTransition`，不能自行提交 checkpoint。
+Runner 最后发布 pending output 并条件更新 checkpoint revision。
+
+因此新增算子只增加四样东西：`OperatorSpec`、自己的 typed state/continuation、
+一个 `step` 算法和 dispatcher 中的一条注册。它不能另建 transaction、checkpoint
+或 outcome 协议。Rust 算法决定 phase 和恢复位置；PostgreSQL 只执行 bounded typed
+集合运算。
 
 一个 stage 追加 output chunk 后，它的下游会在本轮或后续 Runtime 轮次变为
 runnable。一个 step 没完成当前页时会保存 continuation；重启后读取同一条
@@ -293,10 +301,10 @@ LSN；重复 heartbeat 不会重写同一个 replay-state row。
 
 | 层 | 配置 |
 | --- | --- |
-| ingress 读取 batch | `shiba.ingress_batch_rows`, `shiba.ingress_batch_bytes` |
+| ingress 读取 batch | `shiba.batch_rows`, `shiba.batch_bytes` |
 | source publication chunk | 复用 ingress row/byte 目标，但按 source stream 独立切分 |
-| operator transaction quantum | `shiba.stage_chunk_rows`, `shiba.stage_chunk_bytes` |
-| Aggregate/Window/TopN Drain 调度 | `shiba.stage_admission_rows`, `shiba.stage_admission_bytes` |
+| operator transaction quantum | `shiba.batch_rows`, `shiba.batch_bytes` |
+| Aggregate/Window/TopN Drain 调度 | 从 batch 预算推导 |
 
 一个 ingress batch 不对应一个 source chunk，也不对应一个 operator transaction。
 每层按自己的预算提交和恢复。ingress 在完整 pgoutput message 之后检查目标，因此
@@ -429,9 +437,9 @@ PostgreSQL 的另一个 backend，不是第二个 Shiba Runtime。
 定期 GC change_log 和 EffectStream
 ```
 
-一轮可以运行多个 stage steps，但每次只提交一个 stage。ready queue 只缓存
-operator ID；每轮 runnable 状态来自 PostgreSQL 中的 checkpoint、consumer cursor、
-continuation 和 stream capacity。cache 淘汰或 Runtime 重启后会重新读取这些状态。
+一轮可以运行多个 stage steps，但每次只提交一个 stage。Runtime 没有内存 ready
+queue；同一条数据库谓词从 checkpoint、consumer cursor、continuation 和 stream
+capacity 选择 runnable result 和 stage。cache 淘汰或 Runtime 重启后仍执行这条查询。
 
 恢复位置按职责分布：
 
@@ -485,15 +493,20 @@ identity 的 kernel 使用统一的 named-composite text roundtrip 和 binary en
 | ingress Rust state machine | `src/ingress.rs` |
 | Query → `DataflowPlan` | `src/query_lowering.rs` |
 | plan model和校验 | `src/logical/model.rs`, `src/logical/validate.rs` |
-| ready queue和持久状态读取 | `src/logical/dataflow.rs`, `src/logical/runtime.rs` |
-| step 公共 transaction 协议 | `src/kernel/step.rs` |
+| work budget和plan cache | `src/logical/dataflow.rs`, `src/logical/runtime.rs` |
+| 唯一 runnable 查询 | `src/worker.rs` |
+| kernel contract 和唯一 Runner | `src/kernel/runner.rs` |
+| step transaction context | `src/kernel/step.rs` |
 | typed storage/OID 校验 | `src/kernel/storage.rs`, `src/kernel/register.rs` |
 | EffectStream 公共操作 | `src/kernel/stream.rs`, `sql/12_effect_stream.sql` |
 | operator dispatcher | `src/kernel/dispatcher.rs` |
 | operator kernels | `src/kernel/linear.rs`, `join.rs`, `distinct.rs`, `aggregate.rs`, `window.rs`, `topn.rs`, `sink.rs` |
 | catalog | `sql/00_catalog.sql` |
-| ingress persistence/publication | `sql/11_ingress.sql` |
-| introspection和生命周期 | `sql/25_introspection.sql`, `sql/40_lifecycle.sql` |
+| ingress admission transaction | `src/admission.rs` |
+| ingress header/finalization primitives | `sql/11_ingress.sql` |
+| source publication transaction | `src/publication.rs` |
+| database lifecycle | `src/lifecycle.rs` |
+| introspection和generated-object cleanup | `sql/25_introspection.sql`, `sql/40_lifecycle.sql` |
 
 查看已注册 dataflow 的 plan、stream cursor 和 checkpoint：
 

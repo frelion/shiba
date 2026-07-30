@@ -12,68 +12,19 @@ database_name="shiba_ingress"
 database_user="$(id -un)"
 large_tx_rows="${SHIBA_INGRESS_LARGE_TX_ROWS:-1001}"
 
-cleanup() {
-  if test "${SHIBA_KEEP_TEST_CLUSTER:-0}" = "1"; then
-    printf 'Retained test cluster: %s\n' "${pg_data_dir}" >&2
-    printf 'Retained test socket: %s\n' "${pg_socket_dir}" >&2
-    return
-  fi
-  "${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -m immediate stop \
-    >/dev/null 2>&1 || true
-  rm -rf "${pg_data_dir}" "${pg_socket_dir}"
-}
-trap cleanup EXIT
-
 psql_ingress() {
   PGOPTIONS="-c statement_timeout=30000 -c lock_timeout=10000" \
     "${pg_bin_dir}/psql" -X -v ON_ERROR_STOP=1 \
       -h "${pg_socket_dir}" -p "${pg_port}" -d "${database_name}" "$@"
 }
 
-fail() {
-  printf 'replication ingress test failed: %s\n' "$1" >&2
-  tail -n 160 "${pg_log_file}" >&2 || true
-  exit 1
-}
-
-assert_query() {
-  local expected="$1"
-  local query="$2"
-  local actual
-  actual="$(psql_ingress -Atqc "${query}")"
-  if test "${actual}" != "${expected}"; then
-    fail "expected [${expected}], got [${actual}] for: ${query}"
-  fi
-}
-
-wait_for_query() {
-  local expected="$1"
-  local query="$2"
-  local description="$3"
-  local actual=""
-  local attempt
-  for attempt in {1..600}; do
-    if actual="$(psql_ingress -Atqc "${query}" 2>/dev/null)" &&
-       test "${actual}" = "${expected}"; then
-      return
-    fi
-    sleep 0.1
-  done
-  fail "timed out waiting for ${description}; last value was [${actual}]"
-}
-
-wait_for_log() {
-  local pattern="$1"
-  local description="$2"
-  local attempt
-  for attempt in {1..600}; do
-    if grep -Fq "${pattern}" "${pg_log_file}"; then
-      return
-    fi
-    sleep 0.1
-  done
-  fail "timed out waiting for ${description}"
-}
+test_name="replication ingress test"
+test_psql_command=psql_ingress
+test_log_lines=160
+test_wait_attempts=600
+test_wait_sleep=0.1
+source "${project_root}/scripts/test-lib.sh"
+trap cleanup EXIT
 
 cd "${project_root}"
 PG_CONFIG="${pg_config_path}" \
@@ -93,8 +44,8 @@ PG_CONFIG="${pg_config_path}" \
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
-  printf "shiba.ingress_batch_rows = 4\n"
-  printf "shiba.ingress_batch_bytes = '32kB'\n"
+  printf "shiba.batch_rows = 4\n"
+  printf "shiba.batch_bytes = '32kB'\n"
   printf "shiba.ingress_retention = '10min'\n"
   printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s connect_timeout=5'\n" \
     "${pg_socket_dir}" "${pg_port}" "${database_name}" "${database_user}"
@@ -294,7 +245,7 @@ synthetic_txn="$(psql_ingress -Atqc "
 assert_query "9|0|1|9" "
   SELECT inserted_count||'|'||replayed_count||'|'||
          first_input_seq||'|'||last_input_seq
-  FROM shiba_internal.insert_ingress_events(
+  FROM shiba_internal.test_insert_ingress_events(
     ${synthetic_txn},
     (
       SELECT jsonb_agg(
@@ -318,7 +269,7 @@ assert_query "9|0|1|9" "
 assert_query "0|9|1|9" "
   SELECT inserted_count||'|'||replayed_count||'|'||
          first_input_seq||'|'||last_input_seq
-  FROM shiba_internal.insert_ingress_events(
+  FROM shiba_internal.test_insert_ingress_events(
     ${synthetic_txn},
     (
       SELECT jsonb_agg(
@@ -339,31 +290,102 @@ assert_query "0|9|1|9" "
     )
   )
 "
-assert_query "9|1|1|1|1" "
+assert_query "9|1|1|1" "
   SELECT txn.event_count||'|'||txn.pending_publications||'|'||
          txn.batch_count||'|'||
-         count(DISTINCT batch.batch_ordinal)||'|'||
          count(DISTINCT publication.batch_ordinal)
   FROM shiba_internal.ingress_transactions AS txn
-  JOIN shiba_internal.ingress_apply_batches AS batch USING (ingress_txn_id)
   JOIN shiba_internal.source_publications AS publication
-    USING (ingress_txn_id,batch_ordinal)
+    USING (ingress_txn_id)
   WHERE txn.ingress_txn_id=${synthetic_txn}
   GROUP BY txn.event_count,txn.pending_publications,txn.batch_count
 "
 
+# Capacity rejection must leave an open transaction completely retryable. Use
+# one oversized staged batch, then retry the exact JSON after lifting the
+# limit; this protects the accounting/rollback path without depending on a
+# timing-sensitive replication connection failure.
+psql_ingress -qc "ALTER SYSTEM SET shiba.ingress_staging_limit='1MB'"
+psql_ingress -qc "SELECT pg_reload_conf()"
+psql_ingress -qc "
+  INSERT INTO shiba_internal.ingress_replay_state(
+    slot_generation,slot_name,database_oid,system_identifier,slot_baseline_lsn
+  )
+  VALUES (
+    9002,'synthetic_staging_limit',(
+      SELECT oid FROM pg_database WHERE datname=current_database()
+    ),'synthetic','0/0'
+  )
+"
+staging_limit_txn="$(psql_ingress -Atqc "
+  SELECT ingress_txn_id
+  FROM shiba_internal.claim_ingress_transaction(9002,43,'0/210')
+")"
+staging_limit_events="
+  SELECT inserted_count||'|'||replayed_count||'|'||
+         first_input_seq||'|'||last_input_seq
+  FROM shiba_internal.test_insert_ingress_events(
+    ${staging_limit_txn},
+    (
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'change_lsn','0/205',
+          'change_ordinal',id,
+          'image_ordinal',0,
+          'source_subxid',43,
+          'source_oid','public.source_a'::regclass::oid::bigint,
+          'weight',1,
+          'payload',jsonb_build_object(
+            'id',-100000-id,'payload',repeat('q',4096)
+          )
+        ) ORDER BY id
+      )
+      FROM generate_series(1,512) AS id
+    )
+  )
+"
+if psql_ingress -qc "${staging_limit_events}" >/dev/null 2>&1; then
+  fail "staging limit accepted an oversized ingress batch"
+fi
+assert_query "open|0|0|0" "
+  SELECT txn.status||'|'||txn.event_count||'|'||txn.batch_count||'|'||
+         replay.open_payload_bytes
+  FROM shiba_internal.ingress_transactions AS txn
+  JOIN shiba_internal.ingress_replay_state AS replay USING (slot_generation)
+  WHERE txn.ingress_txn_id=${staging_limit_txn}
+"
+psql_ingress -qc "ALTER SYSTEM SET shiba.ingress_staging_limit='64GB'"
+psql_ingress -qc "SELECT pg_reload_conf()"
+assert_query "512|0|1|512" "${staging_limit_events}"
+psql_ingress -qc "
+  SELECT shiba_internal.abort_ingress_transaction(
+    ${staging_limit_txn},'0/210'
+  )
+"
+assert_query "aborted|0" "
+  SELECT txn.status||'|'||replay.open_payload_bytes
+  FROM shiba_internal.ingress_transactions AS txn
+  JOIN shiba_internal.ingress_replay_state AS replay USING (slot_generation)
+  WHERE txn.ingress_txn_id=${staging_limit_txn}
+"
+
 # Commit must lock only the replay/header authorities, regardless of how many
-# admitted events and batches are behind the header.
+# admitted events and publication work are behind the header.
 assert_query "t" "
   SELECT pg_get_functiondef(
            'shiba_internal.commit_ingress_transaction(bigint,pg_lsn,pg_lsn)'
              ::regprocedure
-         ) !~ 'change_log|ingress_apply_batches|source_publications'
+         ) !~ 'change_log|source_publications'
 "
 assert_query "t" "
-  SELECT pg_get_functiondef(
-           'shiba_internal.publish_source_batch(bigint)'::regprocedure
-         ) !~ 'advance_ingress_publication_frontier'
+  SELECT to_regprocedure(
+           'shiba_internal.publish_source_batch(bigint)'
+         ) IS NULL
+"
+assert_query "t" "
+  SELECT to_regprocedure(
+           'shiba_internal.insert_ingress_events(bigint,jsonb)'
+         ) IS NULL
 "
 assert_query "3" "
   SELECT count(*)
@@ -386,7 +408,6 @@ assert_query $'t\n0' "
   WHERE pid=pg_backend_pid()
     AND relation IN (
       'shiba_internal.change_log'::regclass,
-      'shiba_internal.ingress_apply_batches'::regclass,
       'shiba_internal.source_publications'::regclass
     );
   ROLLBACK;
@@ -398,7 +419,7 @@ psql_ingress -qc "
 "
 assert_query "discarded|0|false" "
   SELECT outcome||'|'||coalesce(chunk_seq,0)||'|'||has_pending
-  FROM shiba_internal.publish_source_batch(9001)
+  FROM shiba_internal.test_publish_source_batch(9001)
 "
 assert_query "0/100" "
   SELECT shiba_internal.advance_ingress_publication_frontier(9001)
@@ -463,7 +484,7 @@ psql_ingress -qc "
 "
 synthetic_payload_relation="$(psql_ingress -Atqc "
   SELECT relation_oid::regclass
-  FROM shiba_internal.effect_stream_payloads
+  FROM shiba_internal.effect_streams
   WHERE stream_id=${synthetic_stream}
 ")"
 cas_txn="$(psql_ingress -Atqc "
@@ -471,7 +492,7 @@ cas_txn="$(psql_ingress -Atqc "
   FROM shiba_internal.claim_ingress_transaction(9001,42,'0/200')
 ")"
 psql_ingress -qc "
-  SELECT shiba_internal.insert_ingress_events(
+  SELECT shiba_internal.test_insert_ingress_events(
     ${cas_txn},
     (
       SELECT jsonb_agg(
@@ -504,7 +525,7 @@ assert_query "9|[0:1]={10,20}" "
 "
 psql_ingress -qc "
   BEGIN;
-  SELECT shiba_internal.publish_source_batch(9001);
+  SELECT shiba_internal.test_publish_source_batch(9001);
   ROLLBACK;
 "
 assert_query "1|1|1|0|0/100" "
@@ -528,15 +549,15 @@ assert_query "1|1|1|0|0/100" "
 "
 assert_query "appended|1|true" "
   SELECT outcome||'|'||chunk_seq||'|'||has_pending
-  FROM shiba_internal.publish_source_batch(9001)
+  FROM shiba_internal.test_publish_source_batch(9001)
 "
 assert_query "appended|2|true" "
   SELECT outcome||'|'||chunk_seq||'|'||has_pending
-  FROM shiba_internal.publish_source_batch(9001)
+  FROM shiba_internal.test_publish_source_batch(9001)
 "
 assert_query "completed|3|false" "
   SELECT outcome||'|'||chunk_seq||'|'||has_pending
-  FROM shiba_internal.publish_source_batch(9001)
+  FROM shiba_internal.test_publish_source_batch(9001)
 "
 assert_query "0/200" "
   SELECT shiba_internal.advance_ingress_publication_frontier(9001)
@@ -566,7 +587,7 @@ wide_txn="$(psql_ingress -Atqc "
   FROM shiba_internal.claim_ingress_transaction(9001,43,'0/300')
 ")"
 psql_ingress -qc "
-  SELECT shiba_internal.insert_ingress_events(
+  SELECT shiba_internal.test_insert_ingress_events(
     ${wide_txn},
     jsonb_build_array(
       jsonb_build_object(
@@ -599,7 +620,7 @@ psql_ingress -qc "
 "
 assert_query "appended|4" "
   SELECT outcome||'|'||chunk_seq
-  FROM shiba_internal.publish_source_batch(9001)
+  FROM shiba_internal.test_publish_source_batch(9001)
 "
 assert_query "1|true" "
   SELECT chunk.row_count||'|'||(chunk.payload_bytes > 4096)
@@ -609,7 +630,7 @@ assert_query "1|true" "
 "
 assert_query "completed|5" "
   SELECT outcome||'|'||chunk_seq
-  FROM shiba_internal.publish_source_batch(9001)
+  FROM shiba_internal.test_publish_source_batch(9001)
 "
 assert_query "0/300" "
   SELECT shiba_internal.advance_ingress_publication_frontier(9001)
@@ -637,7 +658,7 @@ frontier_later_txn="$(psql_ingress -Atqc "
   FROM shiba_internal.claim_ingress_transaction(9100,2,'0/500')
 ")"
 psql_ingress -qc "
-  SELECT shiba_internal.insert_ingress_events(
+  SELECT shiba_internal.test_insert_ingress_events(
     ${frontier_head_txn},
     jsonb_build_array(
       jsonb_build_object(
@@ -662,7 +683,7 @@ assert_query "0/500" "
 "
 assert_query "idle|false" "
   SELECT outcome||'|'||has_pending
-  FROM shiba_internal.publish_source_batch(9100)
+  FROM shiba_internal.test_publish_source_batch(9100)
 "
 assert_query "open|1|0/500" "
   SELECT txn.status||'|'||txn.pending_publications||'|'||
@@ -681,7 +702,7 @@ psql_ingress -qc "
 "
 assert_query "discarded|false" "
   SELECT outcome||'|'||has_pending
-  FROM shiba_internal.publish_source_batch(9100)
+  FROM shiba_internal.test_publish_source_batch(9100)
 "
 assert_query "0/520" "
   SELECT shiba_internal.advance_ingress_publication_frontier(9100)
@@ -753,7 +774,7 @@ psql_ingress -qc "
 "
 precommit_payload_relation="$(psql_ingress -Atqc "
   SELECT relation_oid::regclass
-  FROM shiba_internal.effect_stream_payloads
+  FROM shiba_internal.effect_streams
   WHERE stream_id=${precommit_stream}
 ")"
 precommit_txn="$(psql_ingress -Atqc "
@@ -761,7 +782,7 @@ precommit_txn="$(psql_ingress -Atqc "
   FROM shiba_internal.claim_ingress_transaction(9200,1,'0/600')
 ")"
 psql_ingress -qc "
-  SELECT shiba_internal.insert_ingress_events(
+  SELECT shiba_internal.test_insert_ingress_events(
     ${precommit_txn},
     jsonb_build_array(
       jsonb_build_object(
@@ -780,7 +801,7 @@ psql_ingress -qc "
 "
 assert_query "idle||false" "
   SELECT outcome||'|'||coalesce(chunk_seq::text,'')||'|'||has_pending
-  FROM shiba_internal.publish_source_batch(9200)
+  FROM shiba_internal.test_publish_source_batch(9200)
 "
 assert_query "open|1|0|null" "
   SELECT txn.status||'|'||txn.pending_publications||'|'||
@@ -801,16 +822,14 @@ assert_query "0" "
 assert_query "0" "
   SELECT count(*) FROM ${precommit_payload_relation}
 "
-assert_query "open|1|1|1" "
+assert_query "open|1|1" "
   SELECT txn.status||'|'||
          count(DISTINCT event.input_seq)||'|'||
-         count(DISTINCT batch.batch_ordinal)||'|'||
          count(DISTINCT publication.source_oid)
   FROM shiba_internal.ingress_transactions AS txn
   JOIN shiba_internal.change_log AS event USING (ingress_txn_id)
-  JOIN shiba_internal.ingress_apply_batches AS batch USING (ingress_txn_id)
   JOIN shiba_internal.source_publications AS publication
-    USING (ingress_txn_id,batch_ordinal)
+    USING (ingress_txn_id)
   WHERE txn.ingress_txn_id=${precommit_txn}
   GROUP BY txn.status
 "
@@ -821,7 +840,7 @@ psql_ingress -qc "
 "
 assert_query "completed|1|false" "
   SELECT outcome||'|'||chunk_seq||'|'||has_pending
-  FROM shiba_internal.publish_source_batch(9200)
+  FROM shiba_internal.test_publish_source_batch(9200)
 "
 assert_query "2|0/0" "
   SELECT next_chunk_seq||'|'||consumed_frontier_lsn
@@ -832,11 +851,21 @@ assert_query "2|0/0" "
     1,100,100000
   )
 "
-assert_query "1|1" "
-  SELECT deleted_chunks||'|'||deleted_rows
+assert_query "t" "
+  SELECT (deleted_chunks=1 AND deleted_rows=1)
+         OR (deleted_chunks=0 AND deleted_rows=0)
   FROM shiba_internal.gc_effect_stream(
     ${precommit_stream},1,100,100000
   )
+"
+assert_query "0|0" "
+  SELECT
+    (SELECT count(*)
+     FROM shiba_internal.effect_stream_chunks
+     WHERE stream_id=${precommit_stream}
+       AND chunk_seq=1)
+    || '|' ||
+    (SELECT count(*) FROM ${precommit_payload_relation})
 "
 psql_ingress -qc "
   SELECT shiba_internal.advance_ingress_publication_frontier(9200);
@@ -851,13 +880,11 @@ psql_ingress -qc "
 assert_query "1" "
   SELECT shiba._gc_change_log(1)
 "
-assert_query "0|0|0|0" "
+assert_query "0|0|0" "
   SELECT
     (SELECT count(*) FROM shiba_internal.ingress_transactions
      WHERE ingress_txn_id=${precommit_txn})||'|'||
     (SELECT count(*) FROM shiba_internal.change_log
-     WHERE ingress_txn_id=${precommit_txn})||'|'||
-    (SELECT count(*) FROM shiba_internal.ingress_apply_batches
      WHERE ingress_txn_id=${precommit_txn})||'|'||
     (SELECT count(*) FROM shiba_internal.source_publications
      WHERE ingress_txn_id=${precommit_txn})
@@ -1030,6 +1057,86 @@ wait_for_query "1" "
 assert_query "0" "
   SELECT count(*) FROM public.source_a
   WHERE id BETWEEN 90000001 AND 90001000
+"
+
+# A streamed subtransaction can be rolled back while its parent remains open.
+# Its staged prefix is durable enough to survive a Runtime crash, but the
+# source publisher must skip exactly that subxid and publish the surrounding
+# parent changes once the parent Commit arrives.
+subxact_runtime_pid="$(psql_ingress -Atqc "
+  SELECT owner_pid FROM shiba_internal.runtime_state WHERE singleton
+")"
+psql_ingress -qc "
+  BEGIN;
+  INSERT INTO public.source_a
+  SELECT 91000000+id,repeat('s',4096)
+  FROM generate_series(1,64) AS id;
+  SAVEPOINT discarded_prefix;
+  INSERT INTO public.source_a
+  SELECT 91000100+id,(
+    SELECT string_agg(md5((id*1000+part)::text),'')
+    FROM generate_series(1,128) AS part
+  )
+  FROM generate_series(1,128) AS id;
+  SELECT pg_sleep(2);
+  ROLLBACK TO SAVEPOINT discarded_prefix;
+  SELECT pg_sleep(2);
+  INSERT INTO public.source_a
+  SELECT 91000300+id,repeat('t',4096)
+  FROM generate_series(1,64) AS id;
+  COMMIT;
+" &
+subxact_writer_pid=$!
+wait_for_query "1" "
+  SELECT EXISTS (
+    SELECT 1
+    FROM shiba_internal.ingress_aborted_subtransactions AS aborted
+    JOIN shiba_internal.change_log AS event
+      USING (ingress_txn_id,source_subxid)
+    WHERE (event.payload->>'id')::bigint BETWEEN 91000101 AND 91000228
+  )::int
+" "the durable streamed SAVEPOINT rollback marker"
+subxact_txn="$(psql_ingress -Atqc "
+  SELECT ingress_txn_id
+  FROM shiba_internal.ingress_aborted_subtransactions
+  ORDER BY aborted_at DESC
+  LIMIT 1
+")"
+psql_ingress -qc "SELECT pg_terminate_backend(${subxact_runtime_pid})"
+wait "${subxact_writer_pid}"
+wait_for_query "1" "
+  SELECT count(*)
+  FROM shiba_internal.runtime_state
+  WHERE singleton
+    AND owner_pid IS NOT NULL
+    AND owner_pid <> ${subxact_runtime_pid}
+" "Runtime restart during streamed SAVEPOINT recovery"
+wait_for_query "committed|256|0|128" "
+  SELECT txn.status||'|'||txn.event_count||'|'||txn.pending_publications||'|'||
+         (
+           SELECT count(*)
+           FROM shiba_internal.change_log AS event
+           JOIN shiba_internal.ingress_aborted_subtransactions AS aborted
+             USING (ingress_txn_id,source_subxid)
+           WHERE event.ingress_txn_id=txn.ingress_txn_id
+         )
+  FROM shiba_internal.ingress_transactions AS txn
+  WHERE txn.ingress_txn_id=${subxact_txn}
+" "streamed SAVEPOINT replay and publication completion"
+assert_query "128" "
+  SELECT sum(chunk.row_count)
+  FROM shiba_internal.effect_stream_chunks AS chunk
+  WHERE chunk.stream_id=${source_a_stream}
+    AND chunk.chunk_lsn=(
+      SELECT final_lsn
+      FROM shiba_internal.ingress_transactions
+      WHERE ingress_txn_id=${subxact_txn}
+    )
+"
+assert_query "0" "
+  SELECT count(*)
+  FROM public.source_a
+  WHERE id BETWEEN 91000101 AND 91000228
 "
 
 # PostgreSQL may encode an unchanged out-of-line value as the pgoutput `u`

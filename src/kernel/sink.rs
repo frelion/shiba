@@ -9,18 +9,28 @@ use std::collections::BTreeMap;
 
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
-use pgrx::spi::{SpiHeapTupleData, SpiTupleTable};
 
+use crate::kernel::KernelTransition;
 use crate::logical::model::{
     BindingId, DataflowPlan, DataflowStage, OperatorSpec, SlotId, SlotType,
 };
-use crate::logical::{StepExecution, WorkBudget, WorkQuantum};
+use crate::logical::{WorkBudget, WorkQuantum};
 use crate::postgres::quote_identifier;
 
 use super::{
-    advance_input, next_chunk, AttributeRef, ChunkKind, ChunkMeta, InputPosition, RelationRef,
-    StepTxn, WorkUsage,
+    advance_input, lock_continuation, next_chunk, nonnegative, replace_continuation_cas,
+    required_row, required_table as required,
+    validate_continuation_abi as validate_typed_continuation_abi, AttributeRef, ChunkKind,
+    ChunkMeta, ContinuationColumn, InputPosition, RelationRef, StepContext, WorkUsage,
 };
+
+const CONTINUATION_COLUMNS: &[ContinuationColumn] = &[
+    ContinuationColumn::required("singleton", pg_sys::BOOLOID),
+    ContinuationColumn::required("input_stream_id", pg_sys::INT8OID),
+    ContinuationColumn::required("input_chunk_seq", pg_sys::INT8OID),
+    ContinuationColumn::required("row_ordinal", pg_sys::INT8OID),
+    ContinuationColumn::nullable("remaining_weight", pg_sys::INT8OID),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SinkContinuation {
@@ -68,11 +78,19 @@ struct PayloadLayout {
 /// The caller must turn every returned error into a transaction-aborting
 /// PostgreSQL ERROR. In particular, an error after result DML must never be
 /// converted into an ordinary `Blocked` or `Idle` outcome.
-pub(crate) fn execute(
-    mut transaction: StepTxn<'_, '_>,
+pub(crate) const KERNEL: super::KernelFn = super::KernelFn::new(
+    super::KernelContract::new(
+        &[super::InputContract::Operator],
+        super::OutputContract::Sink,
+    ),
+    step,
+);
+
+pub(crate) fn step(
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let stage = sink_stage(plan, stage_id)?;
     if transaction.inputs().len() != 1 {
         return Err("Sink must have exactly one input".into());
@@ -82,17 +100,14 @@ pub(crate) fn execute(
         return Err("Sink input is not an operator effect stream".into());
     }
     let continuation_relation = transaction.continuation_storage()?;
-    validate_continuation_abi(&mut transaction, &continuation_relation)?;
-    let continuation =
-        load_continuation(&mut transaction, &continuation_relation, input.stream_id)?;
-    if transaction.checkpoint_had_continuation() != continuation.persisted {
-        return Err("Sink checkpoint disagrees with its typed continuation".into());
-    }
+    validate_continuation_abi(transaction, &continuation_relation)?;
+    let continuation = load_continuation(transaction, &continuation_relation, input.stream_id)?;
+    super::validate_continuation_authority(transaction, continuation.persisted)?;
     if continuation.position.chunk_seq != input.next_chunk_seq {
         return Err("Sink continuation is not at its input cursor".into());
     }
 
-    let chunk = next_chunk(&mut transaction, 0)?
+    let chunk = next_chunk(transaction, 0)?
         .ok_or_else(|| "Sink continuation or pending input references no chunk".to_string())?;
     let payload_storage = transaction.payload_storage(input.stream_id)?;
     let payload = PayloadLayout {
@@ -116,31 +131,31 @@ pub(crate) fn execute(
 }
 
 fn consume_frontier(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     continuation_relation: &RelationRef,
     continuation: SinkContinuation,
     chunk: &ChunkMeta,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     if continuation.position.row_ordinal != 0 || continuation.remaining_weight.is_some() {
         return Err("Sink frontier has an invalid continuation".into());
     }
     if chunk.rows != 0 || chunk.bytes != 0 {
         return Err("Sink frontier contains payload".into());
     }
-    advance_completed_chunk(&mut transaction, chunk, chunk.lsn)?;
-    clear_continuation(&mut transaction, continuation_relation, continuation)?;
-    transaction.finish(false, WorkUsage::default())
+    advance_completed_chunk(transaction, chunk, chunk.lsn)?;
+    replace_continuation(transaction, continuation_relation, continuation, None)?;
+    transaction.transition(false, WorkUsage::default())
 }
 
 fn consume_data(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     continuation_relation: &RelationRef,
     continuation: SinkContinuation,
     chunk: &ChunkMeta,
     payload: &PayloadLayout,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let first_ordinal = continuation.position.row_ordinal;
     let first_ordinal_u64 =
         u64::try_from(first_ordinal).map_err(|_| "Sink continuation has a negative row")?;
@@ -148,7 +163,7 @@ fn consume_data(
         return Err("Sink continuation is outside its data chunk".into());
     }
     if first_ordinal == 0 {
-        validate_payload_metadata(&mut transaction, payload, chunk)?;
+        validate_payload_metadata(transaction, payload, chunk)?;
     }
 
     let result = transaction.result_storage()?;
@@ -156,7 +171,7 @@ fn consume_data(
     let mapping = sink_mapping(plan, stage, &payload.attributes, &result_attributes)?;
     let quantum_budget = transaction.budget();
     let heads = effect_heads(
-        &mut transaction,
+        transaction,
         payload,
         chunk,
         first_ordinal,
@@ -235,14 +250,7 @@ fn consume_data(
     if actions.is_empty() {
         return Err("Sink page selected no effect rows".into());
     }
-    let mutated = mutate_result_page(
-        &mut transaction,
-        &result,
-        payload,
-        &mapping,
-        chunk,
-        &actions,
-    )?;
+    let mutated = mutate_result_page(transaction, &result, payload, &mapping, chunk, &actions)?;
     if mutated != quantum.usage().output_rows {
         return Err(format!(
             "Sink expected {} result mutations, database returned {mutated}",
@@ -251,11 +259,11 @@ fn consume_data(
     }
     if next.is_none() {
         let frontier = transaction.input(0)?.consumed_frontier_lsn;
-        advance_completed_chunk(&mut transaction, chunk, frontier)?;
+        advance_completed_chunk(transaction, chunk, frontier)?;
     }
     let has_continuation = next.is_some();
-    replace_continuation(&mut transaction, continuation_relation, continuation, next)?;
-    transaction.finish(has_continuation, quantum.usage())
+    replace_continuation(transaction, continuation_relation, continuation, next)?;
+    transaction.transition(has_continuation, quantum.usage())
 }
 
 fn sink_stage(plan: &DataflowPlan, stage_id: u32) -> Result<&DataflowStage, String> {
@@ -274,30 +282,16 @@ fn sink_stage(plan: &DataflowPlan, stage_id: u32) -> Result<&DataflowStage, Stri
 }
 
 fn load_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     input_stream_id: i64,
 ) -> Result<SinkContinuation, String> {
-    let query = format!(
-        r#"
-        SELECT input_stream_id, input_chunk_seq, row_ordinal, remaining_weight
-        FROM {}
-        WHERE singleton
-        FOR UPDATE
-        "#,
-        relation.sql()
-    );
-    let rows = transaction.lock(&query, &[])?;
-    match rows.len() {
-        0 => {
-            let input = transaction.input(0)?;
-            Ok(SinkContinuation {
-                position: InputPosition::new(input_stream_id, input.next_chunk_seq, 0)?,
-                remaining_weight: None,
-                persisted: false,
-            })
-        }
-        1 => {
+    let value = lock_continuation(
+        transaction,
+        relation,
+        "input_stream_id,input_chunk_seq,row_ordinal,remaining_weight",
+        "Sink",
+        |rows| {
             let row = rows.first();
             let stream_id = required::<i64>(&row, 1, "Sink continuation stream")?;
             let chunk_seq = required::<i64>(&row, 2, "Sink continuation chunk")?;
@@ -311,112 +305,46 @@ fn load_continuation(
                 remaining_weight,
                 persisted: true,
             })
+        },
+    )?;
+    match value {
+        None => {
+            let input = transaction.input(0)?;
+            Ok(SinkContinuation {
+                position: InputPosition::new(input_stream_id, input.next_chunk_seq, 0)?,
+                remaining_weight: None,
+                persisted: false,
+            })
         }
-        _ => Err("Sink continuation relation contains more than one row".into()),
+        Some(value) => Ok(value),
     }
 }
 
 fn replace_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     expected: SinkContinuation,
     next: Option<SinkContinuation>,
 ) -> Result<(), String> {
-    match (expected.persisted, next) {
-        (false, Some(next)) => {
-            let arguments = unsafe {
-                [
-                    DatumWithOid::new(next.position.stream_id, pg_sys::INT8OID),
-                    DatumWithOid::new(next.position.chunk_seq, pg_sys::INT8OID),
-                    DatumWithOid::new(next.position.row_ordinal, pg_sys::INT8OID),
-                    optional_i64(next.remaining_weight),
-                ]
-            };
-            let query = format!(
-                r#"
-                INSERT INTO {}(
-                  singleton,input_stream_id,input_chunk_seq,
-                  row_ordinal,remaining_weight
-                )
-                VALUES(true,$1,$2,$3,$4)
-                RETURNING singleton
-                "#,
-                relation.sql()
-            );
-            require_one_mutation(transaction.write(&query, &arguments)?, "insert")?;
-        }
-        (true, Some(next)) => {
-            let arguments = continuation_cas_arguments(expected, Some(next));
-            let query = format!(
-                r#"
-                UPDATE {} AS continuation
-                SET input_stream_id=$5,
-                    input_chunk_seq=$6,
-                    row_ordinal=$7,
-                    remaining_weight=$8
-                WHERE continuation.singleton
-                  AND continuation.input_stream_id=$1
-                  AND continuation.input_chunk_seq=$2
-                  AND continuation.row_ordinal=$3
-                  AND continuation.remaining_weight IS NOT DISTINCT FROM $4
-                RETURNING continuation.singleton
-                "#,
-                relation.sql()
-            );
-            require_one_mutation(transaction.write(&query, &arguments)?, "update")?;
-        }
-        (true, None) => clear_continuation(transaction, relation, expected)?,
-        (false, None) => {}
-    }
-    Ok(())
+    let old = expected.persisted.then(|| continuation_arguments(expected));
+    let next = next.map(continuation_arguments);
+    replace_continuation_cas(
+        transaction,
+        relation,
+        CONTINUATION_COLUMNS,
+        old.as_ref().map(|arguments| &arguments[..]),
+        next.as_ref().map(|arguments| &arguments[..]),
+        "Sink",
+    )
 }
 
-fn clear_continuation(
-    transaction: &mut StepTxn<'_, '_>,
-    relation: &RelationRef,
-    expected: SinkContinuation,
-) -> Result<(), String> {
-    if !expected.persisted {
-        return Ok(());
-    }
-    let arguments = unsafe {
-        [
-            DatumWithOid::new(expected.position.stream_id, pg_sys::INT8OID),
-            DatumWithOid::new(expected.position.chunk_seq, pg_sys::INT8OID),
-            DatumWithOid::new(expected.position.row_ordinal, pg_sys::INT8OID),
-            optional_i64(expected.remaining_weight),
-        ]
-    };
-    let query = format!(
-        r#"
-        DELETE FROM {} AS continuation
-        WHERE continuation.singleton
-          AND continuation.input_stream_id=$1
-          AND continuation.input_chunk_seq=$2
-          AND continuation.row_ordinal=$3
-          AND continuation.remaining_weight IS NOT DISTINCT FROM $4
-        RETURNING continuation.singleton
-        "#,
-        relation.sql()
-    );
-    require_one_mutation(transaction.write(&query, &arguments)?, "delete")
-}
-
-fn continuation_cas_arguments(
-    expected: SinkContinuation,
-    next: Option<SinkContinuation>,
-) -> [DatumWithOid<'static>; 8] {
-    let next = next.expect("Sink continuation update has a successor");
+fn continuation_arguments(continuation: SinkContinuation) -> [DatumWithOid<'static>; 4] {
     unsafe {
         [
-            DatumWithOid::new(expected.position.stream_id, pg_sys::INT8OID),
-            DatumWithOid::new(expected.position.chunk_seq, pg_sys::INT8OID),
-            DatumWithOid::new(expected.position.row_ordinal, pg_sys::INT8OID),
-            optional_i64(expected.remaining_weight),
-            DatumWithOid::new(next.position.stream_id, pg_sys::INT8OID),
-            DatumWithOid::new(next.position.chunk_seq, pg_sys::INT8OID),
-            DatumWithOid::new(next.position.row_ordinal, pg_sys::INT8OID),
-            optional_i64(next.remaining_weight),
+            DatumWithOid::new(continuation.position.stream_id, pg_sys::INT8OID),
+            DatumWithOid::new(continuation.position.chunk_seq, pg_sys::INT8OID),
+            DatumWithOid::new(continuation.position.row_ordinal, pg_sys::INT8OID),
+            optional_i64(continuation.remaining_weight),
         ]
     }
 }
@@ -430,37 +358,11 @@ fn optional_i64(value: Option<i64>) -> DatumWithOid<'static> {
     }
 }
 
-fn require_one_mutation(rows: SpiTupleTable<'_>, operation: &str) -> Result<(), String> {
-    if rows.len() != 1 {
-        return Err(format!(
-            "Sink continuation {operation} did not compare-and-set one row"
-        ));
-    }
-    Ok(())
-}
-
 fn validate_continuation_abi(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
 ) -> Result<(), String> {
-    let attributes = transaction.relation_attributes(relation.oid())?;
-    let expected = [
-        ("singleton", pg_sys::BOOLOID, true),
-        ("input_stream_id", pg_sys::INT8OID, true),
-        ("input_chunk_seq", pg_sys::INT8OID, true),
-        ("row_ordinal", pg_sys::INT8OID, true),
-        ("remaining_weight", pg_sys::INT8OID, false),
-    ];
-    if attributes.len() != expected.len()
-        || attributes
-            .iter()
-            .zip(expected)
-            .any(|(actual, (name, type_oid, not_null))| {
-                actual.name != name || actual.type_oid != type_oid || actual.not_null != not_null
-            })
-    {
-        return Err("Sink continuation relation has an invalid ABI".into());
-    }
+    validate_typed_continuation_abi(transaction, relation, CONTINUATION_COLUMNS, "Sink")?;
     let arguments = unsafe { [DatumWithOid::new(relation.oid(), pg_sys::OIDOID)] };
     let constraints = transaction.read(
         r#"
@@ -495,7 +397,7 @@ fn validate_continuation_abi(
 }
 
 fn validate_payload_metadata(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     payload: &PayloadLayout,
     chunk: &ChunkMeta,
 ) -> Result<(), String> {
@@ -534,7 +436,7 @@ fn validate_payload_metadata(
 }
 
 fn effect_heads(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     payload: &PayloadLayout,
     chunk: &ChunkMeta,
     first_row_ordinal: i64,
@@ -684,7 +586,7 @@ fn same_type(expected: &SlotType, actual: &AttributeRef) -> bool {
 }
 
 fn mutate_result_page(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     result: &RelationRef,
     payload: &PayloadLayout,
     mapping: &SinkMapping,
@@ -844,7 +746,7 @@ fn plan_weight_page(
 }
 
 fn advance_completed_chunk(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     chunk: &ChunkMeta,
     new_frontier_lsn: u64,
 ) -> Result<(), String> {
@@ -870,31 +772,6 @@ fn advance_completed_chunk(
             ..WorkUsage::default()
         },
     )
-}
-
-fn required<T: FromDatum + IntoDatum>(
-    table: &SpiTupleTable<'_>,
-    ordinal: usize,
-    name: &str,
-) -> Result<T, String> {
-    table
-        .get::<T>(ordinal)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("database returned NULL {name}"))
-}
-
-fn required_row<T: FromDatum + IntoDatum>(
-    row: &SpiHeapTupleData<'_>,
-    ordinal: usize,
-    name: &str,
-) -> Result<T, String> {
-    row.get::<T>(ordinal)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("database returned NULL {name}"))
-}
-
-fn nonnegative(value: i64, name: &str) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| format!("{name} is negative"))
 }
 
 #[cfg(test)]

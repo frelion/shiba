@@ -14,19 +14,6 @@ pg_port="${SHIBA_STATELESS_TEST_PORT:-$((60000 + $$ % 3000))}"
 database_name="shiba_stateless"
 wait_attempts="${SHIBA_STATELESS_WAIT_ATTEMPTS:-600}"
 
-cleanup() {
-  if test "${SHIBA_KEEP_TEST_CLUSTER:-0}" = "1"; then
-    printf 'Retained test cluster: %s\n' "${pg_data_dir}" >&2
-    printf 'Retained test socket: %s\n' "${pg_socket_dir}" >&2
-    printf 'PostgreSQL log: %s\n' "${pg_log_file}" >&2
-    return
-  fi
-  "${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -m immediate stop \
-    >/dev/null 2>&1 || true
-  rm -rf "${pg_data_dir}" "${pg_socket_dir}"
-}
-trap cleanup EXIT
-
 psql_gate() {
   PGOPTIONS="-c statement_timeout=30000 -c lock_timeout=10000" \
     "${pg_bin_dir}/psql" \
@@ -34,63 +21,14 @@ psql_gate() {
       -h "${pg_socket_dir}" -p "${pg_port}" -d "${database_name}" "$@"
 }
 
-fail() {
-  printf 'stateless kernel gate failed: %s\n' "$1" >&2
-  tail -n 160 "${pg_log_file}" >&2 || true
-  exit 1
-}
-
-assert_query() {
-  local expected="$1"
-  local query="$2"
-  local actual
-  actual="$(psql_gate -Atqc "${query}")"
-  if test "${actual}" != "${expected}"; then
-    fail "expected [${expected}], got [${actual}] for: ${query}"
-  fi
-}
-
-expect_failure() {
-  local expected_message="$1"
-  local query="$2"
-  local output
-  if output="$(psql_gate -qc "${query}" 2>&1)"; then
-    fail "query unexpectedly succeeded: ${query}"
-  fi
-  if [[ "${output}" != *"${expected_message}"* ]]; then
-    fail "expected error containing [${expected_message}], got: ${output}"
-  fi
-}
-
-wait_for_query() {
-  local expected="$1"
-  local query="$2"
-  local description="$3"
-  local actual=""
-  local attempt
-  for ((attempt = 1; attempt <= wait_attempts; attempt++)); do
-    if actual="$(psql_gate -Atqc "${query}" 2>/dev/null)" &&
-       test "${actual}" = "${expected}"; then
-      return
-    fi
-    sleep 0.1
-  done
-  fail "timed out waiting for ${description}; last value was [${actual}]"
-}
-
-wait_for_runtime_replacement() {
-  local failed_pid="$1"
-  wait_for_query "1" "
-    SELECT count(*)
-    FROM shiba_internal.runtime_state AS state
-    JOIN pg_stat_activity AS activity
-      ON activity.pid = state.owner_pid
-     AND activity.backend_type = 'shiba runtime'
-    WHERE state.singleton
-      AND state.active
-      AND state.owner_pid <> ${failed_pid}" \
-    "the singleton Runtime to restart"
-}
+test_name="stateless kernel gate"
+test_psql_command=psql_gate
+test_log_lines=160
+test_wait_attempts="${wait_attempts}"
+test_wait_sleep=0.1
+test_retain_log=1
+source "${project_root}/scripts/test-lib.sh"
+trap cleanup EXIT
 
 base_difference="
 WITH expected AS (
@@ -130,10 +68,8 @@ cargo pgrx install \
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
-  printf "shiba.ingress_batch_rows = 2\n"
-  printf "shiba.ingress_batch_bytes = 512\n"
-  printf "shiba.stage_chunk_rows = 2\n"
-  printf "shiba.stage_chunk_bytes = 512\n"
+  printf "shiba.batch_rows = 2\n"
+  printf "shiba.batch_bytes = 512\n"
   printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s'\n" \
     "${pg_socket_dir}" "${pg_port}" "${database_name}" "$(id -un)"
 } >>"${pg_data_dir}/postgresql.conf"
@@ -545,10 +481,10 @@ assert_query "0|0" "
     || '|' ||
     (
       SELECT count(*)
-      FROM shiba_internal.effect_stream_payloads AS payload
-      JOIN shiba_internal.effect_streams AS stream USING (stream_id)
+      FROM shiba_internal.effect_streams AS stream
       WHERE stream.producer_kind = 'source'
         AND stream.source_oid = 'public.stateless_source'::regclass
+        AND stream.relation_oid IS NOT NULL
     )"
 psql_gate -qc "
   ALTER TABLE public.stateless_source

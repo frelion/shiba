@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use crate::logical::model::{DataflowPlan, DataflowStage, NamedExpr, OutputSlot, SlotType};
 use crate::scalar_sql::{compile_scalar_expression, SqlBinding};
 
-use super::{AttributeRef, StepTxn, TypeRef};
+use super::{AttributeRef, StepContext, TypeRef};
 
 pub(crate) struct BindingInput<'a> {
     pub(crate) row_type: &'a TypeRef,
@@ -13,7 +13,7 @@ pub(crate) struct BindingInput<'a> {
 }
 
 pub(crate) fn compile_stage_bindings(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     inputs: &[BindingInput<'_>],

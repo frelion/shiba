@@ -14,20 +14,24 @@
 
 use pgrx::prelude::*;
 
+mod admission;
 // A plain Rust unit-test binary is not loaded by PostgreSQL. Keep the
 // extension-only runtime graph unexported there so Linux can discard its
 // unresolved PostgreSQL server symbols at link time.
 #[cfg_attr(test, allow(dead_code))]
 mod config;
+mod database;
 mod ddl;
 mod index_management;
 #[cfg_attr(test, allow(dead_code))]
 mod ingress;
 mod kernel;
+mod lifecycle;
 #[cfg_attr(test, allow(dead_code))]
 mod logical;
 mod pgoutput;
 mod postgres;
+mod publication;
 mod query_lowering;
 #[cfg_attr(test, allow(dead_code))]
 mod replication;
@@ -154,6 +158,41 @@ mod tests {
     #[pg_test]
     fn version_is_available() {
         assert_eq!(version(), "0.1.0");
+    }
+
+    #[pg_test]
+    fn deactivation_retires_generation_and_runtime_state() {
+        install_test_ingress_generation();
+        Spi::run("UPDATE shiba_internal.runtime_state SET active=true WHERE singleton")
+            .expect("lifecycle fixture should activate Runtime state");
+        Spi::run("SELECT shiba.deactivate()").expect("Rust lifecycle deactivation should succeed");
+        assert_eq!(
+            Spi::get_one::<bool>(
+                "SELECT active
+                   FROM shiba_internal.runtime_state
+                  WHERE singleton"
+            )
+            .expect("Runtime state should be readable"),
+            Some(false)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT count(*)
+                   FROM pg_replication_slots
+                  WHERE slot_name=shiba_internal.slot_name()::text"
+            )
+            .expect("logical slots should be readable"),
+            Some(0)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT count(*)
+                   FROM shiba_internal.ingress_replay_state
+                  WHERE state='active'"
+            )
+            .expect("ingress replay state should be readable"),
+            Some(0)
+        );
     }
 
     #[pg_test]
@@ -535,17 +574,17 @@ mod tests {
     #[pg_test]
     fn runtime_resource_gucs_are_registered_and_apply_to_the_session() {
         assert_eq!(
-            Spi::get_one::<i32>("SELECT current_setting('shiba.stage_chunk_rows', true)::integer")
-                .expect("stage_chunk_rows should be readable"),
+            Spi::get_one::<i32>("SELECT current_setting('shiba.batch_rows', true)::integer")
+                .expect("batch_rows should be readable"),
             Some(16 * 1024)
         );
         assert_eq!(
             Spi::get_one::<i64>(
                 "SELECT pg_size_bytes(
-                    current_setting('shiba.stage_chunk_bytes', true)
+                    current_setting('shiba.batch_bytes', true)
                  )",
             )
-            .expect("stage_chunk_bytes should be readable"),
+            .expect("batch_bytes should be readable"),
             Some(16 * 1024 * 1024)
         );
         assert_eq!(
@@ -649,7 +688,7 @@ mod tests {
                        1, 42, '0/100'
                   )
             )
-            SELECT shiba_internal.insert_ingress_events(
+            SELECT shiba_internal.test_insert_ingress_events(
                 claimed.ingress_txn_id,
                 jsonb_build_array(
                     jsonb_build_object(
@@ -680,13 +719,10 @@ mod tests {
         .expect("streamed ingress rows should stage");
 
         assert_eq!(
-            Spi::get_one::<String>(
-                "SELECT outcome
-                   FROM shiba_internal.publish_source_batch(1)"
-            )
-            .expect("open publication check should execute")
-            .as_deref(),
-            Some("idle")
+            crate::publication::publish_source_batch(1)
+                .expect("open publication check should execute")
+                .outcome,
+            crate::publication::SourcePublicationOutcome::Idle
         );
         assert!(
             Spi::get_one::<i64>(

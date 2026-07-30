@@ -10,67 +10,19 @@ pg_log_file="${pg_data_dir}/postgresql.log"
 pg_port="${SHIBA_EFFECT_CORE_TEST_PORT:-$((60000 + $$ % 3000))}"
 database_name="shiba_effect_core"
 
-cleanup() {
-  if test "${SHIBA_KEEP_TEST_CLUSTER:-0}" = "1"; then
-    printf 'Retained test cluster: %s\n' "${pg_data_dir}" >&2
-    printf 'Retained test socket: %s\n' "${pg_socket_dir}" >&2
-    return
-  fi
-  "${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -m immediate stop \
-    >/dev/null 2>&1 || true
-  rm -rf "${pg_data_dir}" "${pg_socket_dir}"
-}
-trap cleanup EXIT
-
 psql_core() {
   PGOPTIONS="-c statement_timeout=10000 -c lock_timeout=5000" \
     "${pg_bin_dir}/psql" -X -v ON_ERROR_STOP=1 \
       -h "${pg_socket_dir}" -p "${pg_port}" -d "${database_name}" "$@"
 }
 
-fail() {
-  printf 'effect stream core test failed: %s\n' "$1" >&2
-  tail -n 120 "${pg_log_file}" >&2 || true
-  exit 1
-}
-
-assert_query() {
-  local expected="$1"
-  local query="$2"
-  local actual
-  actual="$(psql_core -Atqc "${query}")"
-  if test "${actual}" != "${expected}"; then
-    fail "expected [${expected}], got [${actual}] for: ${query}"
-  fi
-}
-
-expect_failure() {
-  local expected_message="$1"
-  local query="$2"
-  local output
-  if output="$(psql_core -qc "${query}" 2>&1)"; then
-    fail "query unexpectedly succeeded: ${query}"
-  fi
-  if [[ "${output}" != *"${expected_message}"* ]]; then
-    fail "expected error containing [${expected_message}], got: ${output}"
-  fi
-}
-
-wait_for_query() {
-  local expected="$1"
-  local query="$2"
-  local description="$3"
-  local actual=""
-  local attempt
-  for attempt in {1..100}; do
-    if actual="$(psql_core -Atqc "${query}" 2>/dev/null)" &&
-       test "${actual}" = "${expected}"; then
-      return
-    fi
-    sleep 0.05
-  done
-  fail "timed out waiting for ${description}; last value was [${actual}]"
-}
+test_name="effect stream core test"
+test_psql_command=psql_core
+test_log_lines=120
+test_wait_attempts=100
+test_wait_sleep=0.05
+source "${project_root}/scripts/test-lib.sh"
+trap cleanup EXIT
 
 cd "${project_root}"
 cargo pgrx install \
@@ -434,12 +386,12 @@ psql_core -qc "
 "
 assert_query "stream_id,chunk_seq,row_ordinal,weight,row_value" "
   SELECT string_agg(attribute.attname,',' ORDER BY attribute.attnum)
-  FROM shiba_internal.effect_stream_payloads AS payload
+  FROM shiba_internal.effect_streams AS stream
   JOIN pg_attribute AS attribute
-    ON attribute.attrelid=payload.relation_oid
+    ON attribute.attrelid=stream.relation_oid
    AND attribute.attnum>0
    AND NOT attribute.attisdropped
-  WHERE payload.stream_id=${unwatched_stream_id}
+  WHERE stream.stream_id=${unwatched_stream_id}
 "
 
 # Operator output, typed payload, continuation and checkpoint commit together.

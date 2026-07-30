@@ -1,8 +1,10 @@
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
-use pgrx::spi::{SpiClient, SpiHeapTupleData, SpiTupleTable};
+use pgrx::spi::{SpiClient, SpiTupleTable};
 
 use crate::postgres::quote_identifier;
+
+use super::{required_row, required_table as required};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RelationRef {
@@ -99,7 +101,7 @@ pub(crate) fn payload(
                    row_type.oid,
                    type_namespace.nspname::text,
                    row_type.typname::text
-            FROM shiba_internal.effect_stream_payloads AS payload
+            FROM shiba_internal.effect_streams AS payload
             JOIN pg_catalog.pg_class AS relation
               ON relation.oid = payload.relation_oid
              AND relation.relkind = 'r'
@@ -469,26 +471,6 @@ fn load_attributes(
         });
     }
     Ok(attributes)
-}
-
-fn required<T: FromDatum + IntoDatum>(
-    row: &SpiTupleTable<'_>,
-    ordinal: usize,
-    name: &str,
-) -> Result<T, String> {
-    row.get::<T>(ordinal)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("database returned NULL {name}"))
-}
-
-fn required_row<T: FromDatum + IntoDatum>(
-    row: &SpiHeapTupleData<'_>,
-    ordinal: usize,
-    name: &str,
-) -> Result<T, String> {
-    row.get::<T>(ordinal)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("database returned NULL {name}"))
 }
 
 #[cfg(test)]

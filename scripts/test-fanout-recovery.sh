@@ -14,19 +14,6 @@ database_name="shiba_fanout"
 fanout_width="${SHIBA_FANOUT_WIDTH:-16}"
 wait_attempts="${SHIBA_FANOUT_WAIT_ATTEMPTS:-1200}"
 
-cleanup() {
-  if test "${SHIBA_KEEP_TEST_CLUSTER:-0}" = "1"; then
-    printf 'Retained test cluster: %s\n' "${pg_data_dir}" >&2
-    printf 'Retained test socket: %s\n' "${pg_socket_dir}" >&2
-    printf 'PostgreSQL log: %s\n' "${pg_log_file}" >&2
-    return
-  fi
-  "${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -m immediate stop \
-    >/dev/null 2>&1 || true
-  rm -rf "${pg_data_dir}" "${pg_socket_dir}"
-}
-trap cleanup EXIT
-
 psql_fanout() {
   PGOPTIONS="-c statement_timeout=60000 -c lock_timeout=10000" \
     "${pg_bin_dir}/psql" \
@@ -34,86 +21,14 @@ psql_fanout() {
       -h "${pg_socket_dir}" -p "${pg_port}" -d "${database_name}" "$@"
 }
 
-fail() {
-  printf 'fanout/recovery gate failed: %s\n' "$1" >&2
-  tail -n 200 "${pg_log_file}" >&2 || true
-  exit 1
-}
-
-assert_query() {
-  local expected="$1"
-  local query="$2"
-  local actual
-  actual="$(psql_fanout -Atqc "${query}")"
-  if test "${actual}" != "${expected}"; then
-    fail "expected [${expected}], got [${actual}] for: ${query}"
-  fi
-}
-
-wait_for_query() {
-  local expected="$1"
-  local query="$2"
-  local description="$3"
-  local actual=""
-  local attempt
-  for ((attempt = 1; attempt <= wait_attempts; attempt++)); do
-    if actual="$(psql_fanout -Atqc "${query}" 2>/dev/null)" &&
-       test "${actual}" = "${expected}"; then
-      return
-    fi
-    sleep 0.05
-  done
-  fail "timed out waiting for ${description}; last value was [${actual}]"
-}
-
-wait_for_log() {
-  local pattern="$1"
-  local description="$2"
-  local attempt
-  for ((attempt = 1; attempt <= wait_attempts; attempt++)); do
-    if grep -Fq "${pattern}" "${pg_log_file}"; then
-      return
-    fi
-    sleep 0.05
-  done
-  fail "timed out waiting for ${description}"
-}
-
-runtime_pid() {
-  psql_fanout -Atqc "
-    SELECT pid
-    FROM pg_stat_activity
-    WHERE backend_type='shiba runtime'"
-}
-
-wait_for_runtime_replacement() {
-  local failed_pid="$1"
-  wait_for_query "1" "
-    SELECT count(*)
-    FROM shiba_internal.runtime_state AS state
-    JOIN pg_stat_activity AS activity
-      ON activity.pid=state.owner_pid
-     AND activity.backend_type='shiba runtime'
-    WHERE state.singleton
-      AND state.active
-      AND state.owner_pid<>${failed_pid}" \
-    "the singleton Runtime replacement"
-}
-
-assert_bag_equal() {
-  local expected_sql="$1"
-  local actual_sql="$2"
-  local description="$3"
-  wait_for_query "0" "
-    WITH expected AS (${expected_sql}),
-    actual AS (${actual_sql}),
-    difference AS (
-      (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
-      UNION ALL
-      (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
-    )
-    SELECT count(*) FROM difference" "${description}"
-}
+test_name="fanout/recovery gate"
+test_psql_command=psql_fanout
+test_log_lines=200
+test_wait_attempts="${wait_attempts}"
+test_wait_sleep=0.05
+test_retain_log=1
+source "${project_root}/scripts/test-lib.sh"
+trap cleanup EXIT
 
 if ! [[ "${fanout_width}" =~ ^[1-9][0-9]*$ ]] ||
    test "${fanout_width}" -lt 8; then
@@ -138,10 +53,8 @@ cargo pgrx install \
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
-  printf "shiba.ingress_batch_rows = 2\n"
-  printf "shiba.ingress_batch_bytes = 512\n"
-  printf "shiba.stage_chunk_rows = 4\n"
-  printf "shiba.stage_chunk_bytes = 512\n"
+  printf "shiba.batch_rows = 4\n"
+  printf "shiba.batch_bytes = 512\n"
   printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s'\n" \
     "${pg_socket_dir}" "${pg_port}" "${database_name}" "$(id -un)"
 } >>"${pg_data_dir}/postgresql.conf"
@@ -361,10 +274,10 @@ first_join_stream="$(psql_fanout -Atqc "
     AND producer_stage_id=${first_join_stage}")"
 first_join_payload="$(psql_fanout -Atqc "
   SELECT format('%I.%I',namespace.nspname,relation.relname)
-  FROM shiba_internal.effect_stream_payloads AS payload
-  JOIN pg_class AS relation ON relation.oid=payload.relation_oid
+  FROM shiba_internal.effect_streams AS stream
+  JOIN pg_class AS relation ON relation.oid=stream.relation_oid
   JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
-  WHERE payload.stream_id=${first_join_stream}")"
+  WHERE stream.stream_id=${first_join_stream}")"
 
 # One appended row is enough to cross the first Join's high watermark. The
 # shared stream keeps one payload regardless of how many downstream consumers.
@@ -1145,10 +1058,10 @@ left_join_continuation="$(psql_fanout -Atqc "
     AND catalog.stage_id=${left_join_stage}")"
 left_join_payload="$(psql_fanout -Atqc "
   SELECT format('%I.%I',namespace.nspname,relation.relname)
-  FROM shiba_internal.effect_stream_payloads AS payload
-  JOIN pg_class AS relation ON relation.oid=payload.relation_oid
+  FROM shiba_internal.effect_streams AS stream
+  JOIN pg_class AS relation ON relation.oid=stream.relation_oid
   JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
-  WHERE payload.stream_id=${left_join_stream}")"
+  WHERE stream.stream_id=${left_join_stream}")"
 wait_for_query "0" "
   SELECT count(*)
   FROM shiba_internal.operator_checkpoints AS checkpoint
@@ -1793,6 +1706,100 @@ psql_fanout -qc "
 assert_bag_equal "${complex_expected}" \
   "SELECT first_key,joined_rows,rank FROM shiba.complex_ranked" \
   "the complete generic DAG live retraction"
+
+# Crash the full Join -> Join -> Aggregate -> Window -> TopN chain before an
+# Aggregate step commits. The source mutation is already durable; recovery
+# must replay its pending effect rather than expose a half-committed operator
+# state to the downstream Window, TopN, or Sink.
+complex_aggregate_stage="$(psql_fanout -Atqc "
+  SELECT stage.ordinality-1
+  FROM shiba_internal.dataflows AS dataflow
+  CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+    WITH ORDINALITY AS stage(value,ordinality)
+  WHERE dataflow.result_oid=${complex_result_oid}::oid
+    AND stage.value->'spec'->>'operator'='aggregate'
+")"
+complex_sink_stage="$(psql_fanout -Atqc "
+  SELECT stage.ordinality-1
+  FROM shiba_internal.dataflows AS dataflow
+  CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+    WITH ORDINALITY AS stage(value,ordinality)
+  WHERE dataflow.result_oid=${complex_result_oid}::oid
+    AND stage.value->'spec'->>'operator'='sink'
+")"
+complex_operator_runtime="$(runtime_pid)"
+psql_fanout -qc "
+  DELETE FROM public.shiba_runtime_failpoints;
+  INSERT INTO public.shiba_runtime_failpoints(
+    kind,runtime_pid,result_oid,stage_id,pause_ms
+  )
+  VALUES(
+    'operator_step_before_commit',
+    ${complex_operator_runtime},
+    ${complex_result_oid}::oid,
+    ${complex_aggregate_stage},
+    1200
+  );
+  INSERT INTO public.complex_fact VALUES (4,2,40)
+"
+wait_for_log \
+  "operator_step_before_commit result ${complex_result_oid} stage ${complex_aggregate_stage}" \
+  "the complex Aggregate pre-commit crash"
+wait_for_runtime_replacement "${complex_operator_runtime}"
+psql_fanout -qc "
+  DELETE FROM public.shiba_runtime_failpoints
+  WHERE kind='operator_step_before_commit'
+"
+assert_bag_equal "${complex_expected}" \
+  "SELECT first_key,joined_rows,rank FROM shiba.complex_ranked" \
+  "the complex DAG after Aggregate pre-commit recovery"
+
+# Now crash after the real Sink commits. This is the opposite authority
+# boundary: the result write and Sink cursor are durable, while the Runtime
+# dies before scheduling the next work item. A fresh SQL evaluation remains
+# the oracle after restart.
+complex_sink_runtime="$(runtime_pid)"
+psql_fanout -qc "
+  DELETE FROM public.shiba_runtime_failpoints;
+  INSERT INTO public.shiba_runtime_failpoints(
+    kind,runtime_pid,result_oid,stage_id,pause_ms
+  )
+  VALUES(
+    'operator_step_after_commit',
+    ${complex_sink_runtime},
+    ${complex_result_oid}::oid,
+    ${complex_sink_stage},
+    1200
+  );
+  INSERT INTO public.complex_first VALUES (4,2,20)
+"
+wait_for_query "t" "
+  SELECT fired
+  FROM public.shiba_runtime_failpoints
+  WHERE kind='operator_step_after_commit'
+" "the complex Sink post-commit crash"
+wait_for_runtime_replacement "${complex_sink_runtime}"
+psql_fanout -qc "
+  DELETE FROM public.shiba_runtime_failpoints
+  WHERE kind='operator_step_after_commit'
+"
+assert_bag_equal "${complex_expected}" \
+  "SELECT first_key,joined_rows,rank FROM shiba.complex_ranked" \
+  "the complex DAG after Sink post-commit recovery"
+wait_for_query "0|0" "
+  SELECT
+    (SELECT count(*)
+     FROM shiba_internal.operator_checkpoints AS checkpoint
+     WHERE checkpoint.result_oid=${complex_result_oid}::oid
+       AND checkpoint.has_continuation)
+    || '|' ||
+    (SELECT count(*)
+     FROM shiba_internal.effect_stream_consumers AS consumer
+     JOIN shiba_internal.effect_streams AS input
+       ON input.stream_id=consumer.stream_id
+     WHERE consumer.result_oid=${complex_result_oid}::oid
+       AND consumer.next_chunk_seq<input.next_chunk_seq)
+" "the complex DAG continuation and pending-effect convergence"
 
 # Every completed Join frontier is the minimum of its two durable input
 # frontiers. A pending continuation may hold it back, never move it ahead.

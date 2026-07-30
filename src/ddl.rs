@@ -3,6 +3,7 @@
 use crate::query_lowering::{self, LoweredQuery, LoweringError};
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
+use pgrx::spi::SpiClient;
 use std::ffi::CStr;
 
 static mut PREVIOUS_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
@@ -266,14 +267,11 @@ unsafe fn prepare_dataflow_drops(pstmt: *mut pg_sys::PlannedStmt) {
         result_oids.push(result_oid);
     }
     if !result_oids.is_empty() {
-        let oid_list = result_oids
-            .iter()
-            .map(i32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        Spi::run(&format!(
-            "SELECT shiba._prepare_dataflow_drops(ARRAY[{oid_list}]::oid[])"
-        ))
+        let arguments = unsafe { [DatumWithOid::new(result_oids, pg_sys::OIDARRAYOID)] };
+        Spi::run_with_args(
+            "SELECT shiba._prepare_dataflow_drops($1::oid[])",
+            &arguments,
+        )
         .expect("Shiba failed to quiesce result DAGs before DROP");
     }
 }
@@ -306,6 +304,111 @@ fn lock_all_dataflows_before_indirect_drop() {
     }
     Spi::run("SELECT shiba_internal._lock_all_dataflows_for_utility()")
         .expect("Shiba failed to serialize indirect DROP with dataflow execution");
+}
+
+fn prepare_dataflow_drop_state(result_oids: &mut Vec<pg_sys::Oid>) -> Result<(), String> {
+    result_oids.sort_unstable_by_key(|oid| oid.to_u32());
+    result_oids.dedup();
+    Spi::connect_mut(|client| {
+        for result_oid in result_oids.iter().copied() {
+            lock_dataflow(client, result_oid)?;
+        }
+        let arguments = unsafe { [DatumWithOid::new(result_oids.clone(), pg_sys::OIDARRAYOID)] };
+        client
+            .update(
+                "UPDATE shiba_internal.dataflows SET active=false WHERE result_oid=ANY($1::oid[])",
+                None,
+                &arguments,
+            )
+            .map_err(|error| error.to_string())?;
+        let sources = client
+            .select(
+                "SELECT DISTINCT source.source_oid, namespace.nspname::text, relation.relname::text
+               FROM shiba_internal.dataflow_sources AS source
+               JOIN pg_class AS relation ON relation.oid=source.source_oid
+               JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+              WHERE source.result_oid=ANY($1::oid[])
+              ORDER BY source.source_oid",
+                None,
+                &arguments,
+            )
+            .map_err(|error| error.to_string())?;
+        for row in sources {
+            let schema = row
+                .get::<String>(2)
+                .map_err(|error| error.to_string())?
+                .ok_or("source schema is NULL")?;
+            let relation = row
+                .get::<String>(3)
+                .map_err(|error| error.to_string())?
+                .ok_or("source relation is NULL")?;
+            client
+                .update(
+                    &format!(
+                        "LOCK TABLE {}.{} IN SHARE ROW EXCLUSIVE MODE",
+                        crate::postgres::quote_identifier(&schema),
+                        crate::postgres::quote_identifier(&relation)
+                    ),
+                    None,
+                    &[],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok::<(), String>(())
+    })
+}
+
+#[pg_extern(name = "_prepare_dataflow_drops", security_definer, volatile, requires = ["shiba_catalog"])]
+#[search_path(pg_catalog, shiba_internal)]
+pub(crate) fn prepare_dataflow_drops_sql(mut result_oids: Vec<pg_sys::Oid>) {
+    prepare_dataflow_drop_state(&mut result_oids)
+        .unwrap_or_else(|error| error!("Shiba failed to quiesce result DAGs before DROP: {error}"));
+}
+
+fn lock_all_dataflow_state() -> Result<(), String> {
+    Spi::connect_mut(|client| {
+        let rows = client
+            .select(
+                "SELECT result_oid FROM shiba_internal.dataflows ORDER BY result_oid",
+                None,
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let oid = row
+                .get::<pg_sys::Oid>(1)
+                .map_err(|error| error.to_string())?
+                .ok_or("result OID is NULL")?;
+            lock_dataflow(client, oid)?;
+        }
+        Ok::<(), String>(())
+    })
+}
+
+#[pg_extern(
+    schema = "shiba_internal",
+    name = "_lock_all_dataflows_for_utility",
+    security_definer,
+    volatile,
+    requires = ["shiba_catalog"]
+)]
+#[search_path(pg_catalog, shiba_internal)]
+pub(crate) fn lock_all_dataflows_sql() {
+    lock_all_dataflow_state().unwrap_or_else(|error| {
+        error!("Shiba failed to serialize indirect DROP with dataflow execution: {error}")
+    });
+}
+
+fn lock_dataflow(client: &mut SpiClient<'_>, result_oid: pg_sys::Oid) -> Result<(), String> {
+    let arguments = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
+    client
+        .update(
+            "SELECT pg_advisory_xact_lock(shiba_internal.dataflow_lock_key($1::oid))",
+            None,
+            &arguments,
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 unsafe fn guard_extension_drop_ast(drop_statement: *mut pg_sys::DropStmt) {

@@ -3,17 +3,35 @@ use std::collections::HashSet;
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 
+use crate::kernel::KernelTransition;
 use crate::logical::model::{DataflowPlan, DataflowStage, OperatorSpec, ScanSpec};
-use crate::logical::StepExecution;
 use crate::postgres::{format_lsn, parse_lsn, quote_identifier};
 use crate::scalar_sql::compile_scalar_expression;
 
 use super::{
-    advance_input, append_frontier, attribute_matches_slot, compile_named_outputs,
-    compile_stage_bindings, next_chunk, payload_facts, validate_output_attributes, BindingInput,
-    ChunkKind, ChunkMeta, OutputFacts, PhaseCode, PrimitiveFacts, ProducerKind, RelationRef,
-    StepTxn, TypeRef, WorkUsage,
+    advance_input, append_frontier, attribute_matches_slot, clear_continuation_locked,
+    compile_named_outputs, compile_stage_bindings, lock_continuation, next_chunk, nonnegative,
+    payload_facts, replace_continuation_cas, required_table,
+    validate_continuation_abi as validate_typed_continuation_abi, validate_output_attributes,
+    BindingInput, ChunkKind, ChunkMeta, ContinuationColumn, OutputFacts, PhaseCode, PrimitiveFacts,
+    ProducerKind, RelationRef, StepContext, TypeRef, WorkUsage,
 };
+
+const SCAN_COLUMNS: &[ContinuationColumn] = &[
+    ContinuationColumn::required("singleton", pg_sys::BOOLOID),
+    ContinuationColumn::required("phase", pg_sys::INT2OID),
+    ContinuationColumn::required("input_stream_id", pg_sys::INT8OID),
+    ContinuationColumn::nullable("input_chunk_seq", pg_sys::INT8OID),
+    ContinuationColumn::nullable("next_row_ordinal", pg_sys::INT8OID),
+    ContinuationColumn::nullable("next_bootstrap_seq", pg_sys::INT8OID),
+    ContinuationColumn::nullable_as("pending_frontier_lsn", pg_sys::PG_LSNOID, "pg_lsn"),
+];
+const TRANSFORM_COLUMNS: &[ContinuationColumn] = &[
+    ContinuationColumn::required("singleton", pg_sys::BOOLOID),
+    ContinuationColumn::required("input_stream_id", pg_sys::INT8OID),
+    ContinuationColumn::required("input_chunk_seq", pg_sys::INT8OID),
+    ContinuationColumn::required("next_row_ordinal", pg_sys::INT8OID),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinearKind {
@@ -75,11 +93,26 @@ struct BootstrapFacts {
     output: OutputFacts,
 }
 
-pub(crate) fn execute(
-    mut transaction: StepTxn<'_, '_>,
+pub(crate) const SCAN_KERNEL: super::KernelFn = super::KernelFn::new(
+    super::KernelContract::new(
+        &[super::InputContract::Source],
+        super::OutputContract::EffectStream,
+    ),
+    step,
+);
+pub(crate) const TRANSFORM_KERNEL: super::KernelFn = super::KernelFn::new(
+    super::KernelContract::new(
+        &[super::InputContract::Operator],
+        super::OutputContract::EffectStream,
+    ),
+    step,
+);
+
+pub(crate) fn step(
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "stage ID exceeds usize")?)
@@ -109,11 +142,11 @@ pub(crate) fn execute(
 }
 
 fn execute_scan(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     continuation_relation: RelationRef,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let OperatorSpec::Scan(spec) = &stage.spec else {
         return Err("Scan kernel received another operator".into());
     };
@@ -121,24 +154,9 @@ fn execute_scan(
     if input.source_oid.map(pg_sys::Oid::to_u32) != Some(spec.source_oid) {
         return Err("Scan source OID does not match its source stream".into());
     }
-    validate_continuation_abi(
-        &mut transaction,
-        &continuation_relation,
-        &[
-            ("singleton", pg_sys::BOOLOID, true),
-            ("phase", pg_sys::INT2OID, true),
-            ("input_stream_id", pg_sys::INT8OID, true),
-            ("input_chunk_seq", pg_sys::INT8OID, false),
-            ("next_row_ordinal", pg_sys::INT8OID, false),
-            ("next_bootstrap_seq", pg_sys::INT8OID, false),
-            ("pending_frontier_lsn", pg_sys::PG_LSNOID, false),
-        ],
-    )?;
-    let continuation = load_scan_continuation(&mut transaction, &continuation_relation)?;
-    validate_authority(
-        transaction.checkpoint_had_continuation(),
-        continuation.is_some(),
-    )?;
+    validate_typed_continuation_abi(transaction, &continuation_relation, SCAN_COLUMNS, "Scan")?;
+    let continuation = load_scan_continuation(transaction, &continuation_relation)?;
+    super::validate_continuation_authority(transaction, continuation.is_some())?;
     if let Some(continuation) = &continuation {
         if continuation.input_stream_id != input.stream_id {
             return Err("Scan continuation references another input stream".into());
@@ -167,7 +185,7 @@ fn execute_scan(
                 .as_ref()
                 .and_then(|state| state.next_row_ordinal)
                 .unwrap_or(0);
-            let chunk = next_chunk(&mut transaction, 0)?;
+            let chunk = next_chunk(transaction, 0)?;
             let Some(chunk) = chunk else {
                 if continuation.is_some() {
                     return Err("Scan continuation references a missing input chunk".into());
@@ -198,32 +216,25 @@ fn execute_scan(
 }
 
 fn execute_transform(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     kind: LinearKind,
     continuation_relation: RelationRef,
-) -> Result<StepExecution, String> {
-    validate_continuation_abi(
-        &mut transaction,
+) -> Result<KernelTransition, String> {
+    validate_typed_continuation_abi(
+        transaction,
         &continuation_relation,
-        &[
-            ("singleton", pg_sys::BOOLOID, true),
-            ("input_stream_id", pg_sys::INT8OID, true),
-            ("input_chunk_seq", pg_sys::INT8OID, true),
-            ("next_row_ordinal", pg_sys::INT8OID, true),
-        ],
+        TRANSFORM_COLUMNS,
+        "linear",
     )?;
-    let continuation = load_transform_continuation(&mut transaction, &continuation_relation)?;
-    validate_authority(
-        transaction.checkpoint_had_continuation(),
-        continuation.is_some(),
-    )?;
+    let continuation = load_transform_continuation(transaction, &continuation_relation)?;
+    super::validate_continuation_authority(transaction, continuation.is_some())?;
     let input = transaction.input(0)?.clone();
     if continuation.is_some_and(|state| state.input_stream_id != input.stream_id) {
         return Err("linear continuation references another input stream".into());
     }
-    let chunk = next_chunk(&mut transaction, 0)?
+    let chunk = next_chunk(transaction, 0)?
         .ok_or_else(|| "runnable linear stage has no input chunk".to_string())?;
     if continuation.is_some_and(|state| state.input_chunk_seq != chunk.sequence) {
         return Err("linear continuation is not at its input cursor".into());
@@ -236,20 +247,16 @@ fn execute_transform(
         if row_ordinal != 0 {
             return Err("frontier continuation has a row offset".into());
         }
-        append_frontier(&mut transaction, chunk.lsn)?;
+        append_frontier(transaction, chunk.lsn)?;
         advance_input(
-            &mut transaction,
+            transaction,
             0,
             chunk.sequence + 1,
             chunk.lsn,
             WorkUsage::default(),
         )?;
-        delete_continuation(
-            &mut transaction,
-            &continuation_relation,
-            continuation.is_some(),
-        )?;
-        return transaction.finish(false, WorkUsage::default());
+        delete_continuation(transaction, &continuation_relation, continuation.is_some())?;
+        return transaction.transition(false, WorkUsage::default());
     }
     let scan_placeholder = ScanSpec {
         source_oid: 0,
@@ -269,15 +276,15 @@ fn execute_transform(
 }
 
 fn step_bootstrap(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     continuation_relation: &RelationRef,
     continuation: &ScanContinuation,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let next_sequence = continuation
         .next_bootstrap_seq
         .ok_or_else(|| "Scan bootstrap continuation omitted its cursor".to_string())?;
     let bootstrap = transaction.state_storage(0)?;
-    validate_bootstrap_abi(&mut transaction, &bootstrap)?;
+    validate_bootstrap_abi(transaction, &bootstrap)?;
     let output = transaction.output()?.clone();
     let output_storage = transaction.payload_storage(output.stream_id)?;
     let bootstrap_attributes = transaction.relation_attributes(bootstrap.oid())?;
@@ -286,7 +293,7 @@ fn step_bootstrap(
     }
     let activation_lsn = transaction.input(0)?.activation_lsn;
     let facts = run_bootstrap_primitive(
-        &mut transaction,
+        transaction,
         &bootstrap,
         &output_storage.relation,
         next_sequence,
@@ -299,7 +306,7 @@ fn step_bootstrap(
             if first == next_sequence
                 && last == next_sequence + i64_from_u64(facts.usage.input_rows)? - 1 =>
         {
-            let remaining = first_bootstrap_sequence(&mut transaction, &bootstrap, last + 1)?;
+            let remaining = first_bootstrap_sequence(transaction, &bootstrap, last + 1)?;
             if let Some(remaining) = remaining {
                 if remaining != last + 1 {
                     return Err("Scan bootstrap relation has a sequence gap".into());
@@ -309,7 +316,7 @@ fn step_bootstrap(
                     ..continuation.clone()
                 };
                 replace_scan_continuation(
-                    &mut transaction,
+                    transaction,
                     continuation_relation,
                     Some(continuation),
                     &next,
@@ -323,7 +330,7 @@ fn step_bootstrap(
     };
     if completed {
         replace_scan_continuation(
-            &mut transaction,
+            transaction,
             continuation_relation,
             Some(continuation),
             &ScanContinuation {
@@ -343,14 +350,14 @@ fn step_bootstrap(
         output: facts.output,
     }
     .validate(transaction.budget())?;
-    transaction.finish(true, facts.usage)
+    transaction.transition(true, facts.usage)
 }
 
 fn step_snapshot_frontier(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     continuation_relation: &RelationRef,
     continuation: &ScanContinuation,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let input = transaction.input(0)?.clone();
     let frontier = continuation
         .pending_frontier_lsn
@@ -358,36 +365,44 @@ fn step_snapshot_frontier(
     if frontier != input.activation_lsn || input.consumed_frontier_lsn != input.activation_lsn {
         return Err("Scan snapshot frontier does not match its activation boundary".into());
     }
-    append_frontier(&mut transaction, frontier)?;
-    delete_scan_continuation(&mut transaction, continuation_relation, continuation)?;
-    transaction.finish(false, WorkUsage::default())
+    append_frontier(transaction, frontier)?;
+    let expected = scan_arguments(continuation);
+    replace_continuation_cas(
+        transaction,
+        continuation_relation,
+        SCAN_COLUMNS,
+        Some(&expected),
+        None,
+        "Scan",
+    )?;
+    transaction.transition(false, WorkUsage::default())
 }
 
 fn step_available_source_frontier(
-    mut transaction: StepTxn<'_, '_>,
-) -> Result<StepExecution, String> {
+    transaction: &mut StepContext<'_, '_>,
+) -> Result<KernelTransition, String> {
     let input = transaction.input(0)?.clone();
     let frontier = input
         .available_source_frontier_lsn
         .filter(|frontier| *frontier > input.consumed_frontier_lsn)
         .ok_or_else(|| "runnable Scan has neither a chunk nor a source frontier".to_string())?;
-    assert_frontier_skips_no_source_chunk(&mut transaction, frontier)?;
-    append_frontier(&mut transaction, frontier)?;
+    assert_frontier_skips_no_source_chunk(transaction, frontier)?;
+    append_frontier(transaction, frontier)?;
     advance_input(
-        &mut transaction,
+        transaction,
         0,
         input.next_chunk_seq,
         frontier,
         WorkUsage::default(),
     )?;
-    transaction.finish(false, WorkUsage::default())
+    transaction.transition(false, WorkUsage::default())
 }
 
 fn step_scan_frontier(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     continuation_relation: &RelationRef,
     frontier: u64,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let input = transaction.input(0)?.clone();
     if frontier <= input.consumed_frontier_lsn
         || input
@@ -396,22 +411,22 @@ fn step_scan_frontier(
     {
         return Err("Scan frontier continuation is outside the published frontier".into());
     }
-    assert_frontier_skips_no_source_chunk(&mut transaction, frontier)?;
-    append_frontier(&mut transaction, frontier)?;
+    assert_frontier_skips_no_source_chunk(transaction, frontier)?;
+    append_frontier(transaction, frontier)?;
     advance_input(
-        &mut transaction,
+        transaction,
         0,
         input.next_chunk_seq,
         frontier,
         WorkUsage::default(),
     )?;
-    delete_continuation(&mut transaction, continuation_relation, true)?;
-    transaction.finish(false, WorkUsage::default())
+    delete_continuation(transaction, continuation_relation, true)?;
+    transaction.transition(false, WorkUsage::default())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn step_data_transform(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     kind: LinearKind,
@@ -420,7 +435,7 @@ fn step_data_transform(
     had_continuation: bool,
     chunk: ChunkMeta,
     row_ordinal: i64,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     if row_ordinal < 0 || u64::try_from(row_ordinal).map_or(true, |row| row >= chunk.rows) {
         return Err("linear continuation row is outside its input chunk".into());
     }
@@ -430,12 +445,12 @@ fn step_data_transform(
     }
     let input_storage = transaction.payload_storage(input.stream_id)?;
     if row_ordinal == 0 {
-        payload_facts(&mut transaction, &input_storage.relation, &chunk)?;
+        payload_facts(transaction, &input_storage.relation, &chunk)?;
     }
     let output = transaction.output()?.clone();
     let output_storage = transaction.payload_storage(output.stream_id)?;
     let (predicate, expressions) = compile_transform(
-        &mut transaction,
+        transaction,
         plan,
         stage,
         kind,
@@ -445,7 +460,7 @@ fn step_data_transform(
     )?;
     let emit_rows = kind != LinearKind::Scan || chunk.lsn > input.activation_lsn;
     let facts = run_transform_primitive(
-        &mut transaction,
+        transaction,
         &input_storage.relation,
         &output_storage.relation,
         output_storage.row_type.sql(),
@@ -466,7 +481,7 @@ fn step_data_transform(
     let has_continuation = if next_row < chunk_rows {
         match kind {
             LinearKind::Scan => replace_scan_continuation(
-                &mut transaction,
+                transaction,
                 continuation_relation,
                 had_continuation.then_some(&ScanContinuation {
                     phase: ScanPhase::Data,
@@ -486,7 +501,7 @@ fn step_data_transform(
                 },
             )?,
             LinearKind::Filter | LinearKind::Project => replace_transform_continuation(
-                &mut transaction,
+                transaction,
                 continuation_relation,
                 had_continuation.then_some(TransformContinuation {
                     input_stream_id: input.stream_id,
@@ -502,12 +517,12 @@ fn step_data_transform(
         }
         true
     } else if next_row == chunk_rows {
-        delete_continuation(&mut transaction, continuation_relation, had_continuation)?;
+        delete_continuation(transaction, continuation_relation, had_continuation)?;
         let mut has_continuation = false;
         if kind == LinearKind::Scan {
-            if let Some(frontier) = source_frontier_after_chunk(&mut transaction, &chunk)? {
+            if let Some(frontier) = source_frontier_after_chunk(transaction, &chunk)? {
                 replace_scan_continuation(
-                    &mut transaction,
+                    transaction,
                     continuation_relation,
                     None,
                     &ScanContinuation {
@@ -523,7 +538,7 @@ fn step_data_transform(
             }
         }
         advance_input(
-            &mut transaction,
+            transaction,
             0,
             chunk.sequence + 1,
             input.consumed_frontier_lsn,
@@ -545,12 +560,12 @@ fn step_data_transform(
         ..PrimitiveFacts::default()
     }
     .validate(transaction.budget())?;
-    transaction.finish(has_continuation, facts.usage)
+    transaction.transition(has_continuation, facts.usage)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_transform_primitive(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     input_relation: &RelationRef,
     output_relation: &RelationRef,
     output_type: &str,
@@ -791,7 +806,7 @@ fn run_transform_primitive(
 }
 
 fn run_bootstrap_primitive(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     bootstrap: &RelationRef,
     output_relation: &RelationRef,
     next_sequence: i64,
@@ -965,7 +980,7 @@ fn run_bootstrap_primitive(
 }
 
 fn compile_transform(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     kind: LinearKind,
@@ -1069,27 +1084,15 @@ fn compile_transform(
 }
 
 fn load_scan_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
 ) -> Result<Option<ScanContinuation>, String> {
-    let query = format!(
-        r#"
-        SELECT phase,
-               input_stream_id,
-               input_chunk_seq,
-               next_row_ordinal,
-               next_bootstrap_seq,
-               pending_frontier_lsn::text
-        FROM {}
-        WHERE singleton
-        FOR UPDATE
-        "#,
-        relation.sql()
-    );
-    let table = transaction.lock(&query, &[])?;
-    match table.len() {
-        0 => Ok(None),
-        1 => {
+    lock_continuation(
+        transaction,
+        relation,
+        "phase,input_stream_id,input_chunk_seq,next_row_ordinal,next_bootstrap_seq,pending_frontier_lsn::text",
+        "Scan",
+        |table| {
             let table = table.first();
             let frontier = table
                 .get::<String>(6)
@@ -1099,130 +1102,73 @@ fn load_scan_continuation(
                         .map_err(|error| format!("invalid Scan continuation LSN: {error}"))
                 })
                 .transpose()?;
-            Ok(Some(ScanContinuation {
+            Ok(ScanContinuation {
                 phase: ScanPhase::decode(required_table(&table, 1, "Scan phase")?)?,
                 input_stream_id: required_table(&table, 2, "Scan input stream")?,
                 input_chunk_seq: table.get::<i64>(3).map_err(|error| error.to_string())?,
                 next_row_ordinal: table.get::<i64>(4).map_err(|error| error.to_string())?,
                 next_bootstrap_seq: table.get::<i64>(5).map_err(|error| error.to_string())?,
                 pending_frontier_lsn: frontier,
-            }))
-        }
-        count => Err(format!("Scan continuation relation contains {count} rows")),
-    }
+            })
+        },
+    )
 }
 
 fn load_transform_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
 ) -> Result<Option<TransformContinuation>, String> {
-    let query = format!(
-        r#"
-        SELECT input_stream_id, input_chunk_seq, next_row_ordinal
-        FROM {}
-        WHERE singleton
-        FOR UPDATE
-        "#,
-        relation.sql()
-    );
-    let table = transaction.lock(&query, &[])?;
-    match table.len() {
-        0 => Ok(None),
-        1 => {
+    lock_continuation(
+        transaction,
+        relation,
+        "input_stream_id,input_chunk_seq,next_row_ordinal",
+        "linear",
+        |table| {
             let table = table.first();
-            Ok(Some(TransformContinuation {
+            Ok(TransformContinuation {
                 input_stream_id: required_table(&table, 1, "linear input stream")?,
                 input_chunk_seq: required_table(&table, 2, "linear input chunk")?,
                 next_row_ordinal: required_table(&table, 3, "linear row cursor")?,
-            }))
-        }
-        count => Err(format!(
-            "linear continuation relation contains {count} rows"
-        )),
-    }
+            })
+        },
+    )
 }
 
 fn replace_scan_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     previous: Option<&ScanContinuation>,
     next: &ScanContinuation,
 ) -> Result<(), String> {
     validate_scan_continuation(next)?;
-    if let Some(previous) = previous {
-        delete_scan_continuation(transaction, relation, previous)?;
-    }
-    let frontier = next.pending_frontier_lsn.map(format_lsn);
-    let query = format!(
-        r#"
-        INSERT INTO {}(
-          singleton,
-          phase,
-          input_stream_id,
-          input_chunk_seq,
-          next_row_ordinal,
-          next_bootstrap_seq,
-          pending_frontier_lsn
-        )
-        VALUES(true,$1,$2,$3,$4,$5,$6::pg_lsn)
-        RETURNING 1
-        "#,
-        relation.sql()
-    );
-    let arguments = unsafe {
-        [
-            DatumWithOid::new(next.phase as i16, pg_sys::INT2OID),
-            DatumWithOid::new(next.input_stream_id, pg_sys::INT8OID),
-            DatumWithOid::new(next.input_chunk_seq, pg_sys::INT8OID),
-            DatumWithOid::new(next.next_row_ordinal, pg_sys::INT8OID),
-            DatumWithOid::new(next.next_bootstrap_seq, pg_sys::INT8OID),
-            DatumWithOid::new(frontier.as_deref(), pg_sys::TEXTOID),
-        ]
-    };
-    if transaction.write(&query, &arguments)?.len() != 1 {
-        return Err("Scan continuation insert did not affect one row".into());
-    }
-    Ok(())
+    let previous = previous.map(scan_arguments);
+    let next = scan_arguments(next);
+    replace_continuation_cas(
+        transaction,
+        relation,
+        SCAN_COLUMNS,
+        previous.as_ref().map(|v| &v[..]),
+        Some(&next),
+        "Scan",
+    )
 }
 
-fn delete_scan_continuation(
-    transaction: &mut StepTxn<'_, '_>,
-    relation: &RelationRef,
-    expected: &ScanContinuation,
-) -> Result<(), String> {
-    let frontier = expected.pending_frontier_lsn.map(format_lsn);
-    let query = format!(
-        r#"
-        DELETE FROM {}
-        WHERE singleton
-          AND phase = $1
-          AND input_stream_id = $2
-          AND input_chunk_seq IS NOT DISTINCT FROM $3
-          AND next_row_ordinal IS NOT DISTINCT FROM $4
-          AND next_bootstrap_seq IS NOT DISTINCT FROM $5
-          AND pending_frontier_lsn IS NOT DISTINCT FROM $6::pg_lsn
-        RETURNING 1
-        "#,
-        relation.sql()
-    );
-    let arguments = unsafe {
+fn scan_arguments(value: &ScanContinuation) -> [DatumWithOid<'static>; 6] {
+    let frontier = value.pending_frontier_lsn.map(format_lsn);
+    unsafe {
         [
-            DatumWithOid::new(expected.phase as i16, pg_sys::INT2OID),
-            DatumWithOid::new(expected.input_stream_id, pg_sys::INT8OID),
-            DatumWithOid::new(expected.input_chunk_seq, pg_sys::INT8OID),
-            DatumWithOid::new(expected.next_row_ordinal, pg_sys::INT8OID),
-            DatumWithOid::new(expected.next_bootstrap_seq, pg_sys::INT8OID),
+            DatumWithOid::new(value.phase as i16, pg_sys::INT2OID),
+            DatumWithOid::new(value.input_stream_id, pg_sys::INT8OID),
+            DatumWithOid::new(value.input_chunk_seq, pg_sys::INT8OID),
+            DatumWithOid::new(value.next_row_ordinal, pg_sys::INT8OID),
+            DatumWithOid::new(value.next_bootstrap_seq, pg_sys::INT8OID),
             DatumWithOid::new(frontier.as_deref(), pg_sys::TEXTOID),
         ]
-    };
-    if transaction.write(&query, &arguments)?.len() != 1 {
-        return Err("Scan continuation CAS delete did not affect one row".into());
     }
-    Ok(())
 }
 
 fn replace_transform_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     previous: Option<TransformContinuation>,
     next: TransformContinuation,
@@ -1230,65 +1176,37 @@ fn replace_transform_continuation(
     if next.input_stream_id <= 0 || next.input_chunk_seq <= 0 || next.next_row_ordinal < 0 {
         return Err("linear continuation contains an invalid cursor".into());
     }
-    if let Some(previous) = previous {
-        let query = format!(
-            r#"
-            DELETE FROM {}
-            WHERE singleton
-              AND input_stream_id = $1
-              AND input_chunk_seq = $2
-              AND next_row_ordinal = $3
-            RETURNING 1
-            "#,
-            relation.sql()
-        );
-        let arguments = unsafe {
-            [
-                DatumWithOid::new(previous.input_stream_id, pg_sys::INT8OID),
-                DatumWithOid::new(previous.input_chunk_seq, pg_sys::INT8OID),
-                DatumWithOid::new(previous.next_row_ordinal, pg_sys::INT8OID),
-            ]
-        };
-        if transaction.write(&query, &arguments)?.len() != 1 {
-            return Err("linear continuation CAS delete did not affect one row".into());
-        }
-    }
-    let query = format!(
-        r#"
-        INSERT INTO {}(
-          singleton,input_stream_id,input_chunk_seq,next_row_ordinal
-        )
-        VALUES(true,$1,$2,$3)
-        RETURNING 1
-        "#,
-        relation.sql()
-    );
-    let arguments = unsafe {
+    let previous = previous.map(transform_arguments);
+    let next = transform_arguments(next);
+    replace_continuation_cas(
+        transaction,
+        relation,
+        TRANSFORM_COLUMNS,
+        previous.as_ref().map(|value| &value[..]),
+        Some(&next),
+        "linear",
+    )
+}
+
+fn transform_arguments(value: TransformContinuation) -> [DatumWithOid<'static>; 3] {
+    unsafe {
         [
-            DatumWithOid::new(next.input_stream_id, pg_sys::INT8OID),
-            DatumWithOid::new(next.input_chunk_seq, pg_sys::INT8OID),
-            DatumWithOid::new(next.next_row_ordinal, pg_sys::INT8OID),
+            DatumWithOid::new(value.input_stream_id, pg_sys::INT8OID),
+            DatumWithOid::new(value.input_chunk_seq, pg_sys::INT8OID),
+            DatumWithOid::new(value.next_row_ordinal, pg_sys::INT8OID),
         ]
-    };
-    if transaction.write(&query, &arguments)?.len() != 1 {
-        return Err("linear continuation insert did not affect one row".into());
     }
-    Ok(())
 }
 
 fn delete_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     expected_exists: bool,
 ) -> Result<(), String> {
     if !expected_exists {
         return Ok(());
     }
-    let query = format!("DELETE FROM {} WHERE singleton RETURNING 1", relation.sql());
-    if transaction.write(&query, &[])?.len() != 1 {
-        return Err("operator continuation delete did not affect one row".into());
-    }
-    Ok(())
+    clear_continuation_locked(transaction, relation, "linear")
 }
 
 fn validate_scan_continuation(continuation: &ScanContinuation) -> Result<(), String> {
@@ -1331,35 +1249,8 @@ fn validate_scan_continuation(continuation: &ScanContinuation) -> Result<(), Str
     Ok(())
 }
 
-fn validate_authority(checkpoint: bool, relation: bool) -> Result<(), String> {
-    if checkpoint != relation {
-        return Err("checkpoint and typed continuation authority disagree".into());
-    }
-    Ok(())
-}
-
-fn validate_continuation_abi(
-    transaction: &mut StepTxn<'_, '_>,
-    relation: &RelationRef,
-    expected: &[(&str, pg_sys::Oid, bool)],
-) -> Result<(), String> {
-    let attributes = transaction.relation_attributes(relation.oid())?;
-    if attributes.len() != expected.len() {
-        return Err("operator continuation relation changed its ABI".into());
-    }
-    for (attribute, (name, type_oid, not_null)) in attributes.iter().zip(expected) {
-        if attribute.name != *name
-            || attribute.type_oid != *type_oid
-            || attribute.not_null != *not_null
-        {
-            return Err("operator continuation relation changed its ABI".into());
-        }
-    }
-    Ok(())
-}
-
 fn validate_bootstrap_abi(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
 ) -> Result<(), String> {
     let attributes = transaction.relation_attributes(relation.oid())?;
@@ -1376,7 +1267,7 @@ fn validate_bootstrap_abi(
 }
 
 fn first_bootstrap_sequence(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     bootstrap: &RelationRef,
     at_or_after: i64,
 ) -> Result<Option<i64>, String> {
@@ -1393,7 +1284,7 @@ fn first_bootstrap_sequence(
 }
 
 fn assert_frontier_skips_no_source_chunk(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     frontier: u64,
 ) -> Result<(), String> {
     let input = transaction.input(0)?.clone();
@@ -1429,7 +1320,7 @@ fn assert_frontier_skips_no_source_chunk(
 }
 
 fn source_frontier_after_chunk(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     completed: &ChunkMeta,
 ) -> Result<Option<u64>, String> {
     let input = transaction.input(0)?.clone();
@@ -1445,21 +1336,6 @@ fn source_frontier_after_chunk(
     } else {
         Ok(None)
     }
-}
-
-fn required_table<T: FromDatum + IntoDatum>(
-    table: &pgrx::spi::SpiTupleTable<'_>,
-    ordinal: usize,
-    name: &str,
-) -> Result<T, String> {
-    table
-        .get::<T>(ordinal)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("database returned NULL {name}"))
-}
-
-fn nonnegative(value: i64, name: &str) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| format!("{name} is negative"))
 }
 
 fn i64_from_u64(value: u64) -> Result<i64, String> {
@@ -1534,13 +1410,5 @@ mod tests {
         assert_eq!(ScanPhase::decode(4), Ok(ScanPhase::SourceFrontier));
         assert!(ScanPhase::decode(0).is_err());
         assert!(ScanPhase::decode(5).is_err());
-    }
-
-    #[test]
-    fn checkpoint_flag_is_only_a_checked_index() {
-        assert!(validate_authority(false, false).is_ok());
-        assert!(validate_authority(true, true).is_ok());
-        assert!(validate_authority(true, false).is_err());
-        assert!(validate_authority(false, true).is_err());
     }
 }

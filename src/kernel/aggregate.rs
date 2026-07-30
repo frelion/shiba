@@ -9,11 +9,12 @@ use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiTupleTable};
 
+use crate::kernel::KernelTransition;
 use crate::kernel::{InputPosition, OutputFacts, PageFacts, PrimitiveFacts};
 use crate::logical::model::{
     AggregateExpr, AggregateSpec, DataflowPlan, DataflowStage, OperatorSpec, SortGroupExpr,
 };
-use crate::logical::{StepExecution, WorkBudget};
+use crate::logical::WorkBudget;
 use crate::postgres::{format_lsn, parse_lsn, quote_identifier};
 use crate::scalar_sql::compile_scalar_expression;
 
@@ -26,14 +27,30 @@ use super::register::{
 };
 use super::{
     advance_input, append_frontier, attribute_matches_slot, canonical_row_key_sql, chunk,
-    compile_stage_bindings, next_chunk, payload_facts, AttributeRef, BindingInput, ChunkKind,
-    OutputAppendTarget, ProducerKind, RelationRef, StepTxn, TypeRef, WorkUsage,
+    compile_stage_bindings, next_chunk, payload_facts, replace_continuation_cas,
+    validate_continuation_abi as validate_typed_continuation_abi, AttributeRef, BindingInput,
+    ChunkKind, ContinuationColumn, OutputAppendTarget, ProducerKind, RelationRef, StepContext,
+    TypeRef, WorkUsage,
 };
 
 const APPLY_PHASE: i16 = 1;
 const DRAIN_REBUILD_PHASE: i16 = 2;
 const DRAIN_EMIT_PHASE: i16 = 3;
 const FRONTIER_PHASE: i16 = 4;
+
+const CONTINUATION_COLUMNS: &[ContinuationColumn] = &[
+    ContinuationColumn::required("singleton", pg_sys::BOOLOID),
+    ContinuationColumn::required("phase", pg_sys::INT2OID),
+    ContinuationColumn::required("input_stream_id", pg_sys::INT8OID),
+    ContinuationColumn::nullable("input_chunk_seq", pg_sys::INT8OID),
+    ContinuationColumn::nullable("input_row_ordinal", pg_sys::INT8OID),
+    ContinuationColumn::nullable("group_queue_id", pg_sys::INT8OID),
+    ContinuationColumn::nullable("aggregate_ordinal", pg_sys::INT4OID),
+    ContinuationColumn::nullable("emit_leg", pg_sys::INT2OID),
+    ContinuationColumn::nullable("after_kind", pg_sys::INT2OID),
+    ContinuationColumn::nullable("after_chunk_seq", pg_sys::INT8OID),
+    ContinuationColumn::nullable("after_row_ordinal", pg_sys::INT8OID),
+];
 
 /// What follows one complete drain of the durable dirty-group queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -714,11 +731,19 @@ struct AggregateFields {
     after_row_ordinal: Option<i64>,
 }
 
-pub(crate) fn execute(
-    mut transaction: StepTxn<'_, '_>,
+pub(crate) const KERNEL: super::KernelFn = super::KernelFn::new(
+    super::KernelContract::new(
+        &[super::InputContract::Operator],
+        super::OutputContract::EffectStream,
+    ),
+    step,
+);
+
+pub(crate) fn step(
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "Aggregate stage ID exceeds usize")?)
@@ -735,14 +760,12 @@ pub(crate) fn execute(
     }
     let input = transaction.input(0)?.clone();
     let continuation_relation = transaction.continuation_storage()?;
-    validate_execute_continuation_abi(&mut transaction, &continuation_relation)?;
-    let stored = match load_execute_continuation(&mut transaction, &continuation_relation)? {
+    validate_execute_continuation_abi(transaction, &continuation_relation)?;
+    let stored = match load_execute_continuation(transaction, &continuation_relation)? {
         Some(stored) => stored,
-        None => start_execute_continuation(&mut transaction)?,
+        None => start_execute_continuation(transaction)?,
     };
-    if stored.persisted != transaction.checkpoint_had_continuation() {
-        return Err("Aggregate checkpoint disagrees with its continuation".into());
-    }
+    super::validate_continuation_authority(transaction, stored.persisted)?;
     if stored.value.input_stream_id != input.stream_id {
         return Err("Aggregate continuation changed its input stream".into());
     }
@@ -758,7 +781,7 @@ pub(crate) fn execute(
     } = stored.value.phase
     {
         if let Some(page) = measure_group_page(
-            &mut transaction,
+            transaction,
             plan,
             stage,
             spec,
@@ -808,7 +831,7 @@ pub(crate) fn execute(
 }
 
 fn start_execute_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
 ) -> Result<StoredAggregate, String> {
     let input_chunk = next_chunk(transaction, 0)?
         .ok_or_else(|| "runnable Aggregate has no input chunk".to_string())?;
@@ -852,17 +875,17 @@ fn start_execute_continuation(
 }
 
 fn step_frontier(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let position = stored
         .value
         .input
         .ok_or_else(|| "Aggregate frontier omitted its input cursor".to_string())?;
     let input = transaction.input(0)?.clone();
-    let input_chunk = chunk(&mut transaction, &input, position.chunk_seq)?
+    let input_chunk = chunk(transaction, &input, position.chunk_seq)?
         .ok_or_else(|| "Aggregate frontier references a missing input chunk".to_string())?;
     if input_chunk.kind != ChunkKind::Frontier
         || input_chunk.stream_id != position.stream_id
@@ -925,13 +948,13 @@ fn step_frontier(
                 transaction.budget(),
             )?;
             let has_continuation = next.is_some();
-            replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
-            return transaction.finish(has_continuation, facts.usage);
+            replace_execute_continuation(transaction, continuation_relation, stored, next)?;
+            return transaction.transition(has_continuation, facts.usage);
         }
     }
-    let output = append_frontier(&mut transaction, input_chunk.lsn)?;
+    let output = append_frontier(transaction, input_chunk.lsn)?;
     advance_input(
-        &mut transaction,
+        transaction,
         0,
         input_chunk.sequence + 1,
         input_chunk.lsn,
@@ -952,45 +975,19 @@ fn step_frontier(
         continuation: next, ..
     } = transition;
     let has_continuation = next.is_some();
-    replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
-    transaction.finish(has_continuation, WorkUsage::default())
+    replace_execute_continuation(transaction, continuation_relation, stored, next)?;
+    transaction.transition(has_continuation, WorkUsage::default())
 }
 
 fn validate_execute_continuation_abi(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
 ) -> Result<(), String> {
-    let attributes = transaction.relation_attributes(relation.oid())?;
-    let expected = [
-        ("singleton", pg_sys::BOOLOID, true),
-        ("phase", pg_sys::INT2OID, true),
-        ("input_stream_id", pg_sys::INT8OID, true),
-        ("input_chunk_seq", pg_sys::INT8OID, false),
-        ("input_row_ordinal", pg_sys::INT8OID, false),
-        ("group_queue_id", pg_sys::INT8OID, false),
-        ("aggregate_ordinal", pg_sys::INT4OID, false),
-        ("emit_leg", pg_sys::INT2OID, false),
-        ("after_kind", pg_sys::INT2OID, false),
-        ("after_chunk_seq", pg_sys::INT8OID, false),
-        ("after_row_ordinal", pg_sys::INT8OID, false),
-    ];
-    if attributes.len() != expected.len()
-        || attributes
-            .iter()
-            .zip(expected)
-            .any(|(attribute, (name, type_oid, not_null))| {
-                attribute.name != name
-                    || attribute.type_oid != type_oid
-                    || attribute.not_null != not_null
-            })
-    {
-        return Err("Aggregate continuation relation has an invalid ABI".into());
-    }
-    Ok(())
+    validate_typed_continuation_abi(transaction, relation, CONTINUATION_COLUMNS, "Aggregate")
 }
 
 fn load_execute_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
 ) -> Result<Option<StoredAggregate>, String> {
     let query = format!(
@@ -1107,56 +1104,26 @@ fn decode_after_drain(fields: AggregateFields) -> Result<AfterDrain, String> {
 }
 
 fn replace_execute_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     old: StoredAggregate,
     next: Option<AggregateContinuation>,
 ) -> Result<(), String> {
-    if old.persisted {
-        let old_fields = encode_execute_fields(old.value)?;
-        let query = format!(
-            "DELETE FROM {}
-             WHERE singleton AND phase=$1 AND input_stream_id=$2
-               AND input_chunk_seq IS NOT DISTINCT FROM $3
-               AND input_row_ordinal IS NOT DISTINCT FROM $4
-               AND group_queue_id IS NOT DISTINCT FROM $5
-               AND aggregate_ordinal IS NOT DISTINCT FROM $6
-               AND emit_leg IS NOT DISTINCT FROM $7
-               AND after_kind IS NOT DISTINCT FROM $8
-               AND after_chunk_seq IS NOT DISTINCT FROM $9
-               AND after_row_ordinal IS NOT DISTINCT FROM $10
-             RETURNING singleton",
-            relation.sql()
-        );
-        if transaction
-            .write(&query, &aggregate_field_arguments(&old_fields))?
-            .len()
-            != 1
-        {
-            return Err("Aggregate continuation compare-and-set failed".into());
-        }
-    }
-    if let Some(next) = next {
-        let fields = encode_execute_fields(next)?;
-        let query = format!(
-            "INSERT INTO {}(
-               singleton,phase,input_stream_id,input_chunk_seq,input_row_ordinal,
-               group_queue_id,aggregate_ordinal,emit_leg,
-               after_kind,after_chunk_seq,after_row_ordinal
-             )
-             VALUES(true,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-             RETURNING singleton",
-            relation.sql()
-        );
-        if transaction
-            .write(&query, &aggregate_field_arguments(&fields))?
-            .len()
-            != 1
-        {
-            return Err("Aggregate continuation insert failed".into());
-        }
-    }
-    Ok(())
+    let old_fields = old
+        .persisted
+        .then(|| encode_execute_fields(old.value))
+        .transpose()?;
+    let next_fields = next.map(encode_execute_fields).transpose()?;
+    let old_arguments = old_fields.as_ref().map(aggregate_field_arguments);
+    let next_arguments = next_fields.as_ref().map(aggregate_field_arguments);
+    replace_continuation_cas(
+        transaction,
+        relation,
+        CONTINUATION_COLUMNS,
+        old_arguments.as_ref().map(|arguments| &arguments[..]),
+        next_arguments.as_ref().map(|arguments| &arguments[..]),
+        "Aggregate",
+    )
 }
 
 fn encode_execute_fields(continuation: AggregateContinuation) -> Result<AggregateFields, String> {
@@ -1252,19 +1219,19 @@ fn execute_required<T: FromDatum + IntoDatum>(
 }
 
 fn step_apply(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let position = stored
         .value
         .input
         .ok_or_else(|| "Aggregate Apply omitted its input cursor".to_string())?;
     let input = transaction.input(0)?.clone();
-    let input_chunk = chunk(&mut transaction, &input, position.chunk_seq)?
+    let input_chunk = chunk(transaction, &input, position.chunk_seq)?
         .ok_or_else(|| "Aggregate Apply references a missing input chunk".to_string())?;
     if input_chunk.kind != ChunkKind::Data || input_chunk.stream_id != position.stream_id {
         return Err("Aggregate Apply does not reference data".into());
@@ -1276,13 +1243,13 @@ fn step_apply(
     }
     let input_storage = transaction.payload_storage(input.stream_id)?;
     if row == 0 {
-        payload_facts(&mut transaction, &input_storage.relation, &input_chunk)?;
+        payload_facts(transaction, &input_storage.relation, &input_chunk)?;
     }
     let bag = transaction.state_storage(0)?;
     let groups = transaction.state_storage(1)?;
     let dirty = transaction.state_storage(2000)?;
     let bindings = compile_stage_bindings(
-        &mut transaction,
+        transaction,
         plan,
         stage,
         &[BindingInput {
@@ -1367,8 +1334,7 @@ fn step_apply(
         format!(",{decision_columns}")
     };
     let group_identity = group_columns.join(",");
-    let group_match =
-        aggregate_group_match(&mut transaction, spec, "evaluated_base", "resolved_group")?;
+    let group_match = aggregate_group_match(transaction, spec, "evaluated_base", "resolved_group")?;
     let row_image = canonical_row_key_sql("evaluated_base.row_value", &input_storage.row_type);
     let budget = transaction.budget();
     let max_input_rows =
@@ -1620,7 +1586,7 @@ fn step_apply(
         }
     } else if next_row == chunk_rows {
         advance_input(
-            &mut transaction,
+            transaction,
             0,
             input_chunk.sequence + 1,
             input.consumed_frontier_lsn,
@@ -1630,7 +1596,7 @@ fn step_apply(
                 ..WorkUsage::default()
             },
         )?;
-        match chunk(&mut transaction, &input, input_chunk.sequence + 1)? {
+        match chunk(transaction, &input, input_chunk.sequence + 1)? {
             Some(next) if next.kind == ChunkKind::Frontier => ApplyTarget::Drain {
                 first_group_queue_id,
                 after: AfterDrain::Frontier(InputPosition::new(next.stream_id, next.sequence, 0)?),
@@ -1659,11 +1625,11 @@ fn step_apply(
         continuation: next, ..
     } = transition;
     let has_continuation = next.is_some();
-    replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
+    replace_execute_continuation(transaction, continuation_relation, stored, next)?;
     if facts.continuation_rows != u64::from(has_continuation) {
         return Err("Aggregate continuation mutation disagrees with Apply facts".into());
     }
-    transaction.finish(has_continuation, facts.usage)
+    transaction.transition(has_continuation, facts.usage)
 }
 
 #[derive(Clone, Debug)]
@@ -1680,7 +1646,7 @@ struct GroupPage {
 
 #[allow(clippy::too_many_arguments)]
 fn measure_group_page(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     spec: &AggregateSpec,
@@ -1838,7 +1804,7 @@ fn measure_group_page(
 }
 
 fn build_group_page_sql(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     spec: &AggregateSpec,
@@ -2024,7 +1990,7 @@ fn build_group_page_sql(
 }
 
 fn aggregate_function_sql(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     function_oid: u32,
 ) -> Result<String, String> {
     let rows = transaction.read(
@@ -2050,14 +2016,14 @@ fn aggregate_function_sql(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_group_page(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     _plan: &DataflowPlan,
     _stage: &DataflowStage,
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
     page: GroupPage,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let AggregatePhase::DrainRebuild { after, .. } = stored.value.phase else {
         return Err("Aggregate group page received another phase".into());
     };
@@ -2255,8 +2221,8 @@ fn execute_group_page(
     if let Some(next) = next {
         AggregateMachine::new(spec.aggregates.len() as u32)?.action(next)?;
     }
-    replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
-    transaction.finish(
+    replace_execute_continuation(transaction, continuation_relation, stored, next)?;
+    transaction.transition(
         next.is_some(),
         WorkUsage {
             input_rows: page.input_rows,
@@ -2268,13 +2234,13 @@ fn execute_group_page(
 }
 
 fn step_rebuild(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let AggregatePhase::DrainRebuild {
         group_queue_id,
         aggregate_ordinal,
@@ -2298,7 +2264,7 @@ fn step_rebuild(
         .get(spec.groups.len() + aggregate_index)
         .ok_or_else(|| "Aggregate output attribute is missing".to_string())?;
     let capability = load_aggregate_capability(
-        &mut transaction,
+        transaction,
         aggregate.function_oid,
         output_attribute.type_oid,
         aggregate.args.len(),
@@ -2310,7 +2276,7 @@ fn step_rebuild(
         i32::try_from(2 + aggregate_index).map_err(|_| "Aggregate work slot exceeds integer")?,
     )?;
     let effective_order = aggregate_effective_order(aggregate_index + 1, aggregate)?;
-    let order = aggregate_rebuild_order(&mut transaction, &effective_order)?;
+    let order = aggregate_rebuild_order(transaction, &effective_order)?;
     let work_attributes = transaction.relation_attributes(work.oid())?;
     let transition_state = work_attributes
         .get(1)
@@ -2361,7 +2327,7 @@ fn step_rebuild(
     }
 
     let bindings = compile_stage_bindings(
-        &mut transaction,
+        transaction,
         plan,
         stage,
         &[BindingInput {
@@ -2384,7 +2350,7 @@ fn step_rebuild(
         .transpose()?
         .unwrap_or_else(|| "true".into());
     let rebuilt = aggregate_rebuild_page(
-        &mut transaction,
+        transaction,
         &capability,
         &bag,
         &dirty,
@@ -2420,18 +2386,18 @@ fn step_rebuild(
         continuation: next, ..
     } = transition;
     let has_continuation = next.is_some();
-    replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
-    transaction.finish(has_continuation, facts.usage)
+    replace_execute_continuation(transaction, continuation_relation, stored, next)?;
+    transaction.transition(has_continuation, facts.usage)
 }
 
 fn step_emit(
-    mut transaction: StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let AggregatePhase::DrainEmit {
         group_queue_id,
         leg,
@@ -2453,7 +2419,7 @@ fn step_emit(
     let (has_continuation, usage) = match leg {
         EmitLeg::Decide => {
             let expression = aggregate_output_expression(
-                &mut transaction,
+                transaction,
                 plan,
                 stage,
                 spec,
@@ -2528,7 +2494,7 @@ fn step_emit(
                 }
                 "insert" => {
                     let facts = aggregate_emit_row(
-                        &mut transaction,
+                        transaction,
                         &groups,
                         &dirty,
                         &output_storage.relation,
@@ -2541,7 +2507,7 @@ fn step_emit(
                 }
                 "delete" => {
                     let facts = aggregate_emit_row(
-                        &mut transaction,
+                        transaction,
                         &groups,
                         &dirty,
                         &output_storage.relation,
@@ -2554,7 +2520,7 @@ fn step_emit(
                 }
                 "replace" => {
                     let facts = aggregate_emit_row(
-                        &mut transaction,
+                        transaction,
                         &groups,
                         &dirty,
                         &output_storage.relation,
@@ -2571,10 +2537,10 @@ fn step_emit(
                     ));
                 }
             };
-            let discarded = aggregate_discard_work(&mut transaction, spec, &dirty, group_queue_id)?;
+            let discarded = aggregate_discard_work(transaction, spec, &dirty, group_queue_id)?;
             let (next_group, finished_rows) = if completed {
                 aggregate_finish_dirty_group(
-                    &mut transaction,
+                    transaction,
                     spec,
                     &groups,
                     &bag,
@@ -2617,19 +2583,19 @@ fn step_emit(
                 continuation: next,
                 facts,
             } = transition;
-            replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
+            replace_execute_continuation(transaction, continuation_relation, stored, next)?;
             (next.is_some(), facts.usage)
         }
         EmitLeg::InsertPending => {
             let facts = aggregate_emit_pending_row(
-                &mut transaction,
+                transaction,
                 &groups,
                 &dirty,
                 &output_storage.relation,
                 group_queue_id,
             )?;
             let (next_group, finished_rows) = aggregate_finish_dirty_group(
-                &mut transaction,
+                transaction,
                 spec,
                 &groups,
                 &bag,
@@ -2655,11 +2621,11 @@ fn step_emit(
                 continuation: next,
                 facts,
             } = transition;
-            replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
+            replace_execute_continuation(transaction, continuation_relation, stored, next)?;
             (next.is_some(), facts.usage)
         }
     };
-    transaction.finish(has_continuation, usage)
+    transaction.transition(has_continuation, usage)
 }
 
 #[derive(Clone, Debug)]
@@ -2744,7 +2710,7 @@ enum EmitSource {
 }
 
 fn load_aggregate_capability(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     function_oid: u32,
     output_type_oid: pg_sys::Oid,
     argument_count: usize,
@@ -2769,7 +2735,7 @@ fn load_aggregate_capability(
 }
 
 fn aggregate_group_match(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     spec: &AggregateSpec,
     left: &str,
     right: &str,
@@ -2807,7 +2773,7 @@ fn aggregate_null_safe_equality(left: &str, right: &str, equality: &str) -> Stri
 }
 
 fn aggregate_rebuild_order(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     keys: &[AggregateOrderKey<'_>],
 ) -> Result<AggregateRebuildOrder, String> {
     if keys.is_empty() {
@@ -2881,7 +2847,7 @@ fn aggregate_rebuild_order(
 
 #[allow(clippy::too_many_arguments)]
 fn aggregate_rebuild_page(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     capability: &AggregateCapability,
     bag: &RelationRef,
     dirty: &RelationRef,
@@ -3333,7 +3299,7 @@ fn aggregate_rebuild_page(
 
 #[allow(clippy::too_many_arguments)]
 fn aggregate_output_expression(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage: &DataflowStage,
     spec: &AggregateSpec,
@@ -3422,7 +3388,7 @@ fn aggregate_output_expression(
 
 #[allow(clippy::too_many_arguments)]
 fn aggregate_emit_row(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     groups: &RelationRef,
     dirty: &RelationRef,
     output_payload: &RelationRef,
@@ -3471,7 +3437,7 @@ fn aggregate_emit_row(
 }
 
 fn aggregate_emit_pending_row(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     groups: &RelationRef,
     dirty: &RelationRef,
     output_payload: &RelationRef,
@@ -3495,7 +3461,7 @@ fn aggregate_emit_pending_row(
 
 #[allow(clippy::too_many_arguments)]
 fn aggregate_append_output(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     groups: &RelationRef,
     dirty: &RelationRef,
     output_payload: &RelationRef,
@@ -3617,7 +3583,7 @@ fn aggregate_append_output(
 }
 
 fn aggregate_discard_work(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     spec: &AggregateSpec,
     dirty: &RelationRef,
     group_queue_id: i64,
@@ -3648,7 +3614,7 @@ fn aggregate_discard_work(
 }
 
 fn aggregate_finish_dirty_group(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     spec: &AggregateSpec,
     groups: &RelationRef,
     bag: &RelationRef,

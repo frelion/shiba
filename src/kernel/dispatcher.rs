@@ -3,9 +3,9 @@
 use pgrx::prelude::*;
 
 use crate::logical::model::{DataflowPlan, OperatorSpec};
-use crate::logical::{StepExecution, StepOutcome, WorkBudget};
+use crate::logical::{StepExecution, WorkBudget};
 
-use super::{StepStart, StepTxn};
+use super::KernelRunner;
 
 pub(crate) fn execute_step(
     result_oid: pg_sys::Oid,
@@ -17,38 +17,25 @@ pub(crate) fn execute_step(
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "operator stage ID exceeds usize")?)
         .ok_or_else(|| format!("dataflow has no stage {stage_id}"))?;
-    let expected_inputs = if matches!(stage.spec, OperatorSpec::Scan(_)) {
-        1
-    } else {
-        u16::try_from(stage.inputs.len())
-            .map_err(|_| format!("operator stage {stage_id} has too many input ports"))?
+    let kernel = match &stage.spec {
+        OperatorSpec::Scan(_) => &super::linear::SCAN_KERNEL,
+        OperatorSpec::Filter(_) | OperatorSpec::Project(_) => &super::linear::TRANSFORM_KERNEL,
+        OperatorSpec::Distinct(_) => &super::distinct::KERNEL,
+        OperatorSpec::Sink => &super::sink::KERNEL,
+        OperatorSpec::Join(_) => &super::join::KERNEL,
+        OperatorSpec::Aggregate(_) => &super::aggregate::KERNEL,
+        OperatorSpec::Window(_) => &super::window::KERNEL,
+        OperatorSpec::TopN(_) => &super::topn::KERNEL,
     };
-    let expects_output = !matches!(stage.spec, OperatorSpec::Sink);
-
     Spi::connect_mut(|client| {
-        let transaction = match StepTxn::begin(
+        KernelRunner::run(
             client,
+            kernel,
             result_oid,
             stage_id,
-            expected_inputs,
-            expects_output,
             &plan.execution_settings,
             budget,
-        )? {
-            StepStart::Blocked => return Ok(StepExecution::empty(StepOutcome::Blocked)),
-            StepStart::Idle => return Ok(StepExecution::empty(StepOutcome::Idle)),
-            StepStart::Ready(transaction) => *transaction,
-        };
-        match &stage.spec {
-            OperatorSpec::Scan(_) | OperatorSpec::Filter(_) | OperatorSpec::Project(_) => {
-                super::linear::execute(transaction, plan, stage_id)
-            }
-            OperatorSpec::Distinct(_) => super::distinct::execute(transaction, plan, stage_id),
-            OperatorSpec::Sink => super::sink::execute(transaction, plan, stage_id),
-            OperatorSpec::Join(_) => super::join::execute(transaction, plan, stage_id),
-            OperatorSpec::Aggregate(_) => super::aggregate::execute(transaction, plan, stage_id),
-            OperatorSpec::Window(_) => super::window::execute(transaction, plan, stage_id),
-            OperatorSpec::TopN(_) => super::topn::execute(transaction, plan, stage_id),
-        }
+            plan,
+        )
     })
 }

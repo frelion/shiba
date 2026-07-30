@@ -8,9 +8,10 @@ use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiTupleTable};
 
+use crate::kernel::KernelTransition;
 use crate::kernel::{InputPosition, OutputFacts, PrimitiveFacts};
 use crate::logical::model::{DataflowPlan, DataflowStage, OperatorSpec};
-use crate::logical::{StepExecution, WorkBudget};
+use crate::logical::WorkBudget;
 use crate::postgres::{format_lsn, quote_identifier};
 use crate::scalar_sql::compile_scalar_expression;
 
@@ -22,10 +23,19 @@ use super::register::{
 };
 use super::{
     advance_input, append_frontier, attribute_matches_slot, canonical_row_key_sql,
-    compile_named_outputs, compile_stage_bindings, next_chunk, payload_facts,
-    validate_output_attributes, BindingInput, ChunkKind, ChunkMeta, ProducerKind, RelationRef,
-    StepTxn, TypeRef, WorkUsage,
+    compile_named_outputs, compile_stage_bindings, lock_continuation, next_chunk, payload_facts,
+    replace_continuation_cas, validate_continuation_abi as validate_typed_continuation_abi,
+    validate_output_attributes, BindingInput, ChunkKind, ChunkMeta, ContinuationColumn,
+    ProducerKind, RelationRef, StepContext, TypeRef, WorkUsage,
 };
+
+const CONTINUATION_COLUMNS: &[ContinuationColumn] = &[
+    ContinuationColumn::required("singleton", pg_sys::BOOLOID),
+    ContinuationColumn::required("phase", pg_sys::INT2OID),
+    ContinuationColumn::required("input_stream_id", pg_sys::INT8OID),
+    ContinuationColumn::required("input_chunk_seq", pg_sys::INT8OID),
+    ContinuationColumn::required("next_row_ordinal", pg_sys::INT8OID),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DistinctPhase {
@@ -464,11 +474,19 @@ fn revoke_distinct_relation(
     Ok(())
 }
 
-pub(crate) fn execute(
-    mut transaction: StepTxn<'_, '_>,
+pub(crate) const KERNEL: super::KernelFn = super::KernelFn::new(
+    super::KernelContract::new(
+        &[super::InputContract::Operator],
+        super::OutputContract::EffectStream,
+    ),
+    step,
+);
+
+pub(crate) fn step(
+    transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<StepExecution, String> {
+) -> Result<KernelTransition, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "Distinct stage ID exceeds usize")?)
@@ -484,17 +502,15 @@ pub(crate) fn execute(
     }
     let input = transaction.input(0)?.clone();
     let continuation_relation = transaction.continuation_storage()?;
-    validate_continuation_abi(&mut transaction, &continuation_relation)?;
+    validate_continuation_abi(transaction, &continuation_relation)?;
     let mut stored = load_continuation(
-        &mut transaction,
+        transaction,
         &continuation_relation,
         input.stream_id,
         input.next_chunk_seq,
     )?;
-    if stored.persisted != transaction.checkpoint_had_continuation() {
-        return Err("Distinct checkpoint disagrees with its continuation".into());
-    }
-    let chunk = next_chunk(&mut transaction, 0)?
+    super::validate_continuation_authority(transaction, stored.persisted)?;
+    let chunk = next_chunk(transaction, 0)?
         .ok_or_else(|| "runnable Distinct has no input chunk".to_string())?;
     if stored.persisted {
         if chunk.kind != ChunkKind::Data || stored.value.phase == DistinctPhase::Frontier {
@@ -508,22 +524,22 @@ pub(crate) fn execute(
     }
     let queue = transaction.state_storage(2)?;
     let touched = transaction.state_storage(3)?;
-    require_empty_touched(&mut transaction, &touched)?;
+    require_empty_touched(transaction, &touched)?;
 
     if stored.value.phase == DistinctPhase::Frontier {
         if stored.value.input.row_ordinal != 0 {
             return Err("Distinct frontier has a row continuation".into());
         }
-        require_empty_queue(&mut transaction, &queue)?;
-        let output = append_frontier(&mut transaction, chunk.lsn)?;
+        require_empty_queue(transaction, &queue)?;
+        let output = append_frontier(transaction, chunk.lsn)?;
         advance_input(
-            &mut transaction,
+            transaction,
             0,
             chunk.sequence + 1,
             chunk.lsn,
             WorkUsage::default(),
         )?;
-        replace_continuation(&mut transaction, &continuation_relation, stored, None)?;
+        replace_continuation(transaction, &continuation_relation, stored, None)?;
         DistinctMachine.apply(
             stored.value,
             DistinctActionResult::FrontierForwarded(PrimitiveFacts {
@@ -532,31 +548,31 @@ pub(crate) fn execute(
             }),
             transaction.budget(),
         )?;
-        return transaction.finish(false, WorkUsage::default());
+        return transaction.transition(false, WorkUsage::default());
     }
 
     let input_storage = transaction.payload_storage(input.stream_id)?;
     if stored.value.phase == DistinctPhase::Apply && stored.value.input.row_ordinal == 0 {
-        payload_facts(&mut transaction, &input_storage.relation, &chunk)?;
+        payload_facts(transaction, &input_storage.relation, &chunk)?;
     }
     let output = transaction.output()?.clone();
     let output_storage = transaction.payload_storage(output.stream_id)?;
     let state = transaction.state_storage(0)?;
     let bag = transaction.state_storage(1)?;
     validate_state_abi(
-        &mut transaction,
+        transaction,
         &state,
         spec.keys.len(),
         output_storage.row_type.oid(),
         spec,
     )?;
-    validate_bag_abi(&mut transaction, &bag, output_storage.row_type.oid())?;
-    validate_queue_abi(&mut transaction, &queue, output_storage.row_type.oid())?;
-    validate_touched_abi(&mut transaction, &touched)?;
+    validate_bag_abi(transaction, &bag, output_storage.row_type.oid())?;
+    validate_queue_abi(transaction, &queue, output_storage.row_type.oid())?;
+    validate_touched_abi(transaction, &touched)?;
 
     if stored.value.phase == DistinctPhase::Drain {
         let drained = drain_queue(
-            &mut transaction,
+            transaction,
             &output_storage.relation,
             &output_storage.row_type,
             &queue,
@@ -564,12 +580,7 @@ pub(crate) fn execute(
         let next = if drained.remaining_effects > 0 {
             Some(stored.value)
         } else {
-            finish_input_position(
-                &mut transaction,
-                &input,
-                &chunk,
-                stored.value.input.row_ordinal,
-            )?
+            finish_input_position(transaction, &input, &chunk, stored.value.input.row_ordinal)?
         };
         let facts = PrimitiveFacts {
             continuation_rows: u64::from(next.is_some()),
@@ -588,18 +599,13 @@ pub(crate) fn execute(
             transaction.budget(),
         )?;
         let DistinctTransition::Committed { continuation, .. } = transition;
-        replace_continuation(
-            &mut transaction,
-            &continuation_relation,
-            stored,
-            continuation,
-        )?;
-        return transaction.finish(continuation.is_some(), facts.usage);
+        replace_continuation(transaction, &continuation_relation, stored, continuation)?;
+        return transaction.transition(continuation.is_some(), facts.usage);
     }
 
-    require_empty_queue(&mut transaction, &queue)?;
+    require_empty_queue(transaction, &queue)?;
     let bindings = compile_stage_bindings(
-        &mut transaction,
+        transaction,
         plan,
         stage,
         &[BindingInput {
@@ -615,14 +621,14 @@ pub(crate) fn execute(
     let key_orders = spec
         .keys
         .iter()
-        .map(|key| resolve_btree_step(&mut transaction, key, "Distinct"))
+        .map(|key| resolve_btree_step(transaction, key, "Distinct"))
         .collect::<Result<Vec<_>, _>>()?;
     let output_attributes = transaction.composite_attributes(&output_storage.row_type)?;
     validate_output_attributes(&output_attributes, &stage.schema.outputs)?;
     let expressions =
         compile_named_outputs(&stage.schema.outputs, &spec.outputs, &bindings, "Distinct")?;
     let facts = run_prefix(
-        &mut transaction,
+        transaction,
         &chunk,
         stored.value.input.row_ordinal,
         &PrefixSql {
@@ -643,7 +649,7 @@ pub(crate) fn execute(
             phase: DistinctPhase::Drain,
         })
     } else {
-        finish_input_position(&mut transaction, &input, &chunk, facts.next_row)?
+        finish_input_position(transaction, &input, &chunk, facts.next_row)?
     };
     let primitive = PrimitiveFacts {
         usage: facts.usage,
@@ -661,17 +667,12 @@ pub(crate) fn execute(
     });
     let transition = DistinctMachine.apply(stored.value, result, transaction.budget())?;
     let DistinctTransition::Committed { continuation, .. } = transition;
-    replace_continuation(
-        &mut transaction,
-        &continuation_relation,
-        stored,
-        continuation,
-    )?;
-    transaction.finish(continuation.is_some(), primitive.usage)
+    replace_continuation(transaction, &continuation_relation, stored, continuation)?;
+    transaction.transition(continuation.is_some(), primitive.usage)
 }
 
 fn finish_input_position(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     input: &super::InputState,
     chunk: &ChunkMeta,
     next_row: i64,
@@ -701,7 +702,7 @@ fn finish_input_position(
 }
 
 fn run_prefix(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     chunk: &ChunkMeta,
     first_row: i64,
     sql: &PrefixSql<'_>,
@@ -1021,7 +1022,7 @@ fn run_prefix(
 }
 
 fn reconcile_representatives(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     state: &RelationRef,
     bag: &RelationRef,
     queue: &RelationRef,
@@ -1193,7 +1194,7 @@ fn distinct_null_safe_equality(left: &str, right: &str, equality: &str) -> Strin
 }
 
 fn require_empty_queue(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     queue: &RelationRef,
 ) -> Result<(), String> {
     let rows = transaction.read(
@@ -1210,7 +1211,7 @@ fn require_empty_queue(
 }
 
 fn require_empty_touched(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     touched: &RelationRef,
 ) -> Result<(), String> {
     let rows = transaction.read(
@@ -1227,7 +1228,7 @@ fn require_empty_touched(
 }
 
 fn drain_queue(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     output_payload: &RelationRef,
     output_type: &TypeRef,
     queue: &RelationRef,
@@ -1363,7 +1364,7 @@ fn drain_queue(
 }
 
 fn validate_state_abi(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     state: &RelationRef,
     key_count: usize,
     output_type_oid: pg_sys::Oid,
@@ -1394,7 +1395,7 @@ fn validate_state_abi(
 }
 
 fn validate_bag_abi(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     bag: &RelationRef,
     output_type_oid: pg_sys::Oid,
 ) -> Result<(), String> {
@@ -1420,7 +1421,7 @@ fn validate_bag_abi(
 }
 
 fn validate_queue_abi(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     queue: &RelationRef,
     output_type_oid: pg_sys::Oid,
 ) -> Result<(), String> {
@@ -1447,7 +1448,7 @@ fn validate_queue_abi(
 }
 
 fn validate_touched_abi(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     touched: &RelationRef,
 ) -> Result<(), String> {
     let attributes = transaction.relation_attributes(touched.oid())?;
@@ -1469,51 +1470,24 @@ fn validate_touched_abi(
 }
 
 fn validate_continuation_abi(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
 ) -> Result<(), String> {
-    let attributes = transaction.relation_attributes(relation.oid())?;
-    let expected = [
-        ("singleton", pg_sys::BOOLOID),
-        ("phase", pg_sys::INT2OID),
-        ("input_stream_id", pg_sys::INT8OID),
-        ("input_chunk_seq", pg_sys::INT8OID),
-        ("next_row_ordinal", pg_sys::INT8OID),
-    ];
-    if attributes.len() != expected.len()
-        || attributes
-            .iter()
-            .zip(expected)
-            .any(|(actual, (name, type_oid))| {
-                actual.name != name || actual.type_oid != type_oid || !actual.not_null
-            })
-    {
-        return Err("Distinct continuation relation has an invalid ABI".into());
-    }
-    Ok(())
+    validate_typed_continuation_abi(transaction, relation, CONTINUATION_COLUMNS, "Distinct")
 }
 
 fn load_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     stream_id: i64,
     chunk_seq: i64,
 ) -> Result<StoredContinuation, String> {
-    let query = format!(
-        "SELECT phase,input_stream_id,input_chunk_seq,next_row_ordinal
-         FROM {} WHERE singleton FOR UPDATE",
-        relation.sql()
-    );
-    let rows = transaction.lock(&query, &[])?;
-    match rows.len() {
-        0 => Ok(StoredContinuation {
-            value: DistinctContinuation {
-                input: InputPosition::new(stream_id, chunk_seq, 0)?,
-                phase: DistinctPhase::Apply,
-            },
-            persisted: false,
-        }),
-        1 => {
+    let value = lock_continuation(
+        transaction,
+        relation,
+        "phase,input_stream_id,input_chunk_seq,next_row_ordinal",
+        "Distinct",
+        |rows| {
             let row = rows.first();
             let phase = match required::<i16>(&row, 1, "Distinct continuation phase")? {
                 1 => DistinctPhase::Apply,
@@ -1528,62 +1502,62 @@ fn load_continuation(
             if position.stream_id != stream_id || position.chunk_seq != chunk_seq {
                 return Err("Distinct continuation is not at its input cursor".into());
             }
-            Ok(StoredContinuation {
-                value: DistinctContinuation {
-                    input: position,
-                    phase,
-                },
-                persisted: true,
+            Ok(DistinctContinuation {
+                input: position,
+                phase,
             })
-        }
-        _ => Err("Distinct continuation relation has multiple rows".into()),
-    }
+        },
+    )?;
+    Ok(match value {
+        None => StoredContinuation {
+            value: DistinctContinuation {
+                input: InputPosition::new(stream_id, chunk_seq, 0)?,
+                phase: DistinctPhase::Apply,
+            },
+            persisted: false,
+        },
+        Some(value) => StoredContinuation {
+            value,
+            persisted: true,
+        },
+    })
 }
 
 fn replace_continuation(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     relation: &RelationRef,
     old: StoredContinuation,
     next: Option<DistinctContinuation>,
 ) -> Result<(), String> {
-    let query = match (old.persisted, next) {
-        (false, Some(next)) => format!(
-            "INSERT INTO {} VALUES(true,{},{},{},{}) RETURNING singleton",
-            relation.sql(),
-            phase_code(next.phase)?,
-            next.input.stream_id,
-            next.input.chunk_seq,
-            next.input.row_ordinal
-        ),
-        (true, Some(next)) => format!(
-            "UPDATE {} SET phase={},input_stream_id={},input_chunk_seq={},next_row_ordinal={}
-             WHERE singleton AND phase={} AND input_stream_id={} AND input_chunk_seq={}
-               AND next_row_ordinal={} RETURNING singleton",
-            relation.sql(),
-            phase_code(next.phase)?,
-            next.input.stream_id,
-            next.input.chunk_seq,
-            next.input.row_ordinal,
-            phase_code(old.value.phase)?,
-            old.value.input.stream_id,
-            old.value.input.chunk_seq,
-            old.value.input.row_ordinal
-        ),
-        (true, None) => format!(
-            "DELETE FROM {} WHERE singleton AND phase={} AND input_stream_id={}
-               AND input_chunk_seq={} AND next_row_ordinal={} RETURNING singleton",
-            relation.sql(),
-            phase_code(old.value.phase)?,
-            old.value.input.stream_id,
-            old.value.input.chunk_seq,
-            old.value.input.row_ordinal
-        ),
-        (false, None) => return Ok(()),
-    };
-    if transaction.write(&query, &[])?.len() != 1 {
-        return Err("Distinct continuation compare-and-set failed".into());
-    }
-    Ok(())
+    let old_fields = old
+        .persisted
+        .then(|| continuation_arguments(old.value))
+        .transpose()?;
+    let next_fields = next.map(continuation_arguments).transpose()?;
+    replace_continuation_cas(
+        transaction,
+        relation,
+        CONTINUATION_COLUMNS,
+        old_fields.as_ref().map(|fields| &fields[..]),
+        next_fields.as_ref().map(|fields| &fields[..]),
+        "Distinct",
+    )
+}
+
+fn continuation_arguments(
+    continuation: DistinctContinuation,
+) -> Result<[DatumWithOid<'static>; 4], String> {
+    let phase = phase_code(continuation.phase)?;
+    // Every continuation scalar is copied into PostgreSQL immediately; these
+    // owned values therefore need no borrowed datum lifetime.
+    Ok(unsafe {
+        [
+            DatumWithOid::new(phase, pg_sys::INT2OID),
+            DatumWithOid::new(continuation.input.stream_id, pg_sys::INT8OID),
+            DatumWithOid::new(continuation.input.chunk_seq, pg_sys::INT8OID),
+            DatumWithOid::new(continuation.input.row_ordinal, pg_sys::INT8OID),
+        ]
+    })
 }
 
 fn phase_code(phase: DistinctPhase) -> Result<i16, String> {

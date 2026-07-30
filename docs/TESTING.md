@@ -51,7 +51,7 @@ path just to make an old caller pass.
 - ingress state transitions and row/byte batching;
 - `DataflowPlan` validation and exact JSON contracts;
 - trusted scalar SQL generation from catalog OIDs;
-- deterministic ready-queue rebuild and work-budget behavior;
+- durable readiness selection and work-budget behavior;
 - DDL hook, registration, catalog, and lifecycle integration through pgrx.
 
 `cargo clippy --all-targets -- -D warnings` is required because test-only and

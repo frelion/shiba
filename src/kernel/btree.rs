@@ -11,7 +11,7 @@ use pgrx::spi::{SpiClient, SpiTupleTable};
 use crate::logical::model::SortGroupExpr;
 use crate::postgres::quote_identifier;
 
-use super::StepTxn;
+use super::StepContext;
 
 const BTREE_ORDER_CAPABILITY_SQL: &str = r#"
 WITH matching AS MATERIALIZED (
@@ -132,7 +132,7 @@ pub(crate) fn resolve_client(
 }
 
 pub(crate) fn resolve_step(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     order: &SortGroupExpr,
     operator: &str,
 ) -> Result<BtreeOrder, String> {

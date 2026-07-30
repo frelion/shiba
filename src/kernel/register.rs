@@ -417,8 +417,8 @@ fn provision_sources(
     registration: &mut Registration,
     source_oids: &[u32],
 ) -> Result<(), String> {
-    let target_rows = i64_from_usize(config::ingress_batch_rows(), "ingress row target")?;
-    let target_bytes = i64_from_usize(config::ingress_batch_bytes(), "ingress byte target")?;
+    let target_rows = i64_from_usize(config::batch_rows(), "ingress row target")?;
+    let target_bytes = i64_from_usize(config::batch_bytes(), "ingress byte target")?;
     for &source_oid in source_oids {
         let source = oid(source_oid, "source")?;
         validate_source(client, source)?;
@@ -624,8 +624,8 @@ fn create_payload(
         r#"
         SELECT NOT EXISTS (
           SELECT 1
-          FROM shiba_internal.effect_stream_payloads
-          WHERE stream_id=$1
+          FROM shiba_internal.effect_streams
+          WHERE stream_id=$1 AND relation_oid IS NOT NULL AND row_type_oid IS NOT NULL
         )
         "#,
         &arguments,
@@ -707,10 +707,11 @@ fn create_payload(
         client
             .update(
                 r#"
-                INSERT INTO shiba_internal.effect_stream_payloads(
-                  stream_id,relation_oid,row_type_oid
-                )
-                VALUES($1,$2,$3)
+                UPDATE shiba_internal.effect_streams
+                SET relation_oid=$2,row_type_oid=$3
+                WHERE stream_id=$1
+                  AND relation_oid IS NULL
+                  AND row_type_oid IS NULL
                 RETURNING stream_id
                 "#,
                 Some(1),
@@ -916,8 +917,10 @@ fn ensure_source_payload(
         r#"
         SELECT EXISTS (
           SELECT 1
-          FROM shiba_internal.effect_stream_payloads
+          FROM shiba_internal.effect_streams
           WHERE stream_id = $1
+            AND relation_oid IS NOT NULL
+            AND row_type_oid IS NOT NULL
         )
         "#,
         &arguments,
@@ -935,8 +938,8 @@ fn provision_output_streams(
     registration: &mut Registration,
     plan: &DataflowPlan,
 ) -> Result<(), String> {
-    let target_rows = i64_from_usize(config::stage_chunk_rows(), "operator row target")?;
-    let target_bytes = i64_from_usize(config::stage_chunk_bytes(), "operator byte target")?;
+    let target_rows = i64_from_usize(config::batch_rows(), "operator row target")?;
+    let target_bytes = i64_from_usize(config::batch_bytes(), "operator byte target")?;
     for (stage_index, stage) in plan.stages.iter().enumerate() {
         if matches!(stage.spec, OperatorSpec::Sink) {
             continue;

@@ -1,6 +1,6 @@
 -- Transactional APIs for the durable stream catalog declared in
 -- 00_catalog.sql. Payload rows live in the per-stream LOGGED relation recorded
--- by effect_stream_payloads; chunk metadata and payload rows commit together.
+-- by effect_streams; chunk metadata and payload rows commit together.
 
 -- Logical effect bytes are the complete PostgreSQL binary record plus the
 -- stream's weight field. record_send detoasts every attribute, so an in-memory

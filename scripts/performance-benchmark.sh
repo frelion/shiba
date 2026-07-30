@@ -40,26 +40,22 @@ case "${profile}" in
     fanout_width=64
     complex_fact_rows=200
     complex_keys=16
-    stage_chunk_rows=16384
-    ingress_batch_rows=16384
+    batch_rows=16384
     ;;
   full)
     ingress_rows=1000000
     fanout_width=20000
     complex_fact_rows=500000
     complex_keys=256
-    stage_chunk_rows=16384
-    ingress_batch_rows=16384
+    batch_rows=16384
     ;;
   *) printf 'profile must be smoke or full, got: %s\n' "${profile}" >&2; exit 2 ;;
 esac
 
 # Explicit overrides are for controlled A/B experiments. Matrix profiles keep
 # fixed defaults when these variables are absent.
-stage_chunk_rows="${SHIBA_BENCH_STAGE_CHUNK_ROWS:-${stage_chunk_rows}}"
-stage_chunk_bytes="${SHIBA_BENCH_STAGE_CHUNK_BYTES:-16MB}"
-ingress_batch_rows="${SHIBA_BENCH_INGRESS_BATCH_ROWS:-${ingress_batch_rows}}"
-ingress_batch_bytes="${SHIBA_BENCH_INGRESS_BATCH_BYTES:-16MB}"
+batch_rows="${SHIBA_BENCH_BATCH_ROWS:-${batch_rows}}"
+batch_bytes="${SHIBA_BENCH_BATCH_BYTES:-16MB}"
 ingress_rows="${SHIBA_BENCH_INGRESS_ROWS:-${ingress_rows}}"
 fanout_width="${SHIBA_BENCH_FANOUT_WIDTH:-${fanout_width}}"
 complex_fact_rows="${SHIBA_BENCH_COMPLEX_FACT_ROWS:-${complex_fact_rows}}"
@@ -229,10 +225,8 @@ cargo pgrx install --release --pg-config "${pg_config_path}"
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
-  printf "shiba.ingress_batch_rows = %s\n" "${ingress_batch_rows}"
-  printf "shiba.ingress_batch_bytes = '%s'\n" "${ingress_batch_bytes}"
-  printf "shiba.stage_chunk_rows = %s\n" "${stage_chunk_rows}"
-  printf "shiba.stage_chunk_bytes = '%s'\n" "${stage_chunk_bytes}"
+  printf "shiba.batch_rows = %s\n" "${batch_rows}"
+  printf "shiba.batch_bytes = '%s'\n" "${batch_bytes}"
   printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s connect_timeout=5'\n" \
     "${pg_socket_dir}" "${pg_port}" "${database_name}" "${database_user}"
 } >>"${pg_data_dir}/postgresql.conf"
@@ -333,7 +327,7 @@ cp "${metrics_file}" "${csv_out}"
 postgresql_version_num="$(psql_bench -Atqc 'SHOW server_version_num')"
 extension_version="$(psql_bench -Atqc "SELECT extversion FROM pg_extension WHERE extname='shiba'")"
 {
-  printf '{"run_id":"%s","commit":"%s","profile":"%s","correctness":true,"environment_fingerprint":{"postgresql_version_num":%s,"extension_version":"%s","ingress_batch_rows":%s,"stage_chunk_rows":%s},"scenarios":[' "${run_id}" "${commit}" "${profile}" "${postgresql_version_num}" "${extension_version}" "${ingress_batch_rows}" "${stage_chunk_rows}"
+  printf '{"run_id":"%s","commit":"%s","profile":"%s","correctness":true,"environment_fingerprint":{"postgresql_version_num":%s,"extension_version":"%s","batch_rows":%s,"batch_bytes":"%s"},"scenarios":[' "${run_id}" "${commit}" "${profile}" "${postgresql_version_num}" "${extension_version}" "${batch_rows}" "${batch_bytes}"
   awk -F, 'NR > 1 { if (count++) printf ","; printf "{\"scenario\":\"%s\",\"correctness\":true,\"metrics\":{\"input_rows\":%s,\"result_rows\":%s,\"elapsed_seconds\":%s,\"throughput_rows_per_second\":%s,\"post_commit_convergence_seconds\":%s,\"stream_chunks\":%s,\"buffered_bytes_at_end\":%s,\"state_bytes\":%s,\"database_bytes_at_end\":%s,\"peak_database_bytes\":%s,\"peak_buffered_bytes\":%s,\"peak_buffered_rows\":%s,\"source_stream_chunks\":%s,\"checkpoint_advances\":%s}}", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15 }' "${metrics_file}"
   printf ']}\n'
 } >"${json_out}"

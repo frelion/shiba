@@ -3,7 +3,9 @@ use pgrx::prelude::*;
 
 use crate::postgres::{format_lsn, parse_lsn};
 
-use super::{InputState, OutputFacts, RelationRef, StepTxn, WorkUsage};
+use super::{
+    nonnegative, required_table, InputState, OutputFacts, RelationRef, StepContext, WorkUsage,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChunkKind {
@@ -30,7 +32,7 @@ pub(crate) struct PayloadFacts {
 }
 
 pub(crate) fn next_chunk(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     port: u16,
 ) -> Result<Option<ChunkMeta>, String> {
     let input = transaction.input(port)?.clone();
@@ -38,7 +40,7 @@ pub(crate) fn next_chunk(
 }
 
 pub(crate) fn chunk(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     input: &InputState,
     sequence: i64,
 ) -> Result<Option<ChunkMeta>, String> {
@@ -112,7 +114,7 @@ pub(crate) fn chunk(
 }
 
 pub(crate) fn payload_facts(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     storage: &RelationRef,
     chunk: &ChunkMeta,
 ) -> Result<PayloadFacts, String> {
@@ -166,7 +168,7 @@ pub(crate) fn payload_facts(
 }
 
 pub(crate) fn append_frontier(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     frontier_lsn: u64,
 ) -> Result<OutputFacts, String> {
     let output = transaction.output()?.clone();
@@ -206,7 +208,7 @@ pub(crate) fn append_frontier(
 }
 
 pub(crate) fn advance_input(
-    transaction: &mut StepTxn<'_, '_>,
+    transaction: &mut StepContext<'_, '_>,
     port: u16,
     new_next_chunk_seq: i64,
     new_frontier_lsn: u64,
@@ -267,21 +269,6 @@ pub(crate) fn advance_input(
         return Err("input cursor advance returned unexpected state".into());
     }
     Ok(())
-}
-
-fn required_table<T: FromDatum + IntoDatum>(
-    table: &pgrx::spi::SpiTupleTable<'_>,
-    ordinal: usize,
-    name: &str,
-) -> Result<T, String> {
-    table
-        .get::<T>(ordinal)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("database returned NULL {name}"))
-}
-
-fn nonnegative(value: i64, name: &str) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| format!("{name} is negative"))
 }
 
 fn i64_from_u64(value: u64) -> Result<i64, String> {

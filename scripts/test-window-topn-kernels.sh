@@ -79,19 +79,6 @@ wait_attempts="${SHIBA_WINDOW_TOPN_WAIT_ATTEMPTS:-2400}"
 progress_hard_seconds="${SHIBA_WINDOW_TOPN_PROGRESS_HARD_SECONDS:-600}"
 progress_stall_seconds="${SHIBA_WINDOW_TOPN_PROGRESS_STALL_SECONDS:-120}"
 
-cleanup() {
-  if test "${SHIBA_KEEP_TEST_CLUSTER:-0}" = "1"; then
-    printf 'Retained test cluster: %s\n' "${pg_data_dir}" >&2
-    printf 'Retained test socket: %s\n' "${pg_socket_dir}" >&2
-    printf 'PostgreSQL log: %s\n' "${pg_log_file}" >&2
-    return
-  fi
-  "${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -m immediate stop \
-    >/dev/null 2>&1 || true
-  rm -rf "${pg_data_dir}" "${pg_socket_dir}"
-}
-trap cleanup EXIT
-
 psql_gate() {
   PGOPTIONS="-c statement_timeout=60000 -c lock_timeout=10000" \
     "${pg_bin_dir}/psql" \
@@ -99,37 +86,14 @@ psql_gate() {
       -h "${pg_socket_dir}" -p "${pg_port}" -d "${database_name}" "$@"
 }
 
-fail() {
-  printf 'Window/TopN kernel gate failed: %s\n' "$1" >&2
-  tail -n 240 "${pg_log_file}" >&2 || true
-  exit 1
-}
-
-assert_query() {
-  local expected="$1"
-  local query="$2"
-  local actual
-  actual="$(psql_gate -Atqc "${query}")"
-  if test "${actual}" != "${expected}"; then
-    fail "expected [${expected}], got [${actual}] for: ${query}"
-  fi
-}
-
-wait_for_query() {
-  local expected="$1"
-  local query="$2"
-  local description="$3"
-  local actual=""
-  local attempt
-  for ((attempt = 1; attempt <= wait_attempts; attempt++)); do
-    if actual="$(psql_gate -Atqc "${query}" 2>/dev/null)" &&
-       test "${actual}" = "${expected}"; then
-      return
-    fi
-    sleep 0.05
-  done
-  fail "timed out waiting for ${description}; last value was [${actual}]"
-}
+test_name="Window/TopN kernel gate"
+test_psql_command=psql_gate
+test_log_lines=240
+test_wait_attempts="${wait_attempts}"
+test_wait_sleep=0.05
+test_retain_log=1
+source "${project_root}/scripts/test-lib.sh"
+trap cleanup EXIT
 
 wait_for_target_progress_query() {
   local expected="$1"
@@ -189,34 +153,6 @@ wait_for_target_progress_query() {
   fail "timed out waiting for ${description}; last value was [${actual}]"
 }
 
-wait_for_log() {
-  local pattern="$1"
-  local description="$2"
-  local attempt
-  for ((attempt = 1; attempt <= wait_attempts; attempt++)); do
-    if grep -Fq "${pattern}" "${pg_log_file}"; then
-      return
-    fi
-    sleep 0.05
-  done
-  fail "timed out waiting for ${description}"
-}
-
-assert_bag_equal() {
-  local expected_sql="$1"
-  local actual_sql="$2"
-  local description="$3"
-  wait_for_query "0" "
-    WITH expected AS (${expected_sql}),
-    actual AS (${actual_sql}),
-    difference AS (
-      (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
-      UNION ALL
-      (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
-    )
-    SELECT count(*) FROM difference" "${description}"
-}
-
 assert_bag_equal_with_progress() {
   local expected_sql="$1"
   local actual_sql="$2"
@@ -232,27 +168,6 @@ assert_bag_equal_with_progress() {
     )
     SELECT count(*) AS value FROM difference" \
     "${result_oid}" "${description}"
-}
-
-runtime_pid() {
-  psql_gate -Atqc "
-    SELECT pid
-    FROM pg_stat_activity
-    WHERE backend_type='shiba runtime'"
-}
-
-wait_for_runtime_replacement() {
-  local failed_pid="$1"
-  wait_for_query "1" "
-    SELECT count(*)
-    FROM shiba_internal.runtime_state AS state
-    JOIN pg_stat_activity AS activity
-      ON activity.pid=state.owner_pid
-     AND activity.backend_type='shiba runtime'
-    WHERE state.singleton
-      AND state.active
-      AND state.owner_pid<>${failed_pid}" \
-    "the singleton Runtime replacement"
 }
 
 stage_id() {
@@ -425,14 +340,8 @@ cargo pgrx install \
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
-  printf "shiba.ingress_batch_rows = 8\n"
-  printf "shiba.ingress_batch_bytes = 4096\n"
-  printf "shiba.stage_chunk_rows = 8\n"
-  printf "shiba.stage_chunk_bytes = 4096\n"
-  printf "shiba.stage_admission_rows = %s\n" \
-    "${SHIBA_WINDOW_ADMISSION_ROWS:-64}"
-  printf "shiba.stage_admission_bytes = %s\n" \
-    "${SHIBA_WINDOW_ADMISSION_BYTES:-32768}"
+  printf "shiba.batch_rows = 8\n"
+  printf "shiba.batch_bytes = 4096\n"
   printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s'\n" \
     "${pg_socket_dir}" "${pg_port}" "${database_name}" "$(id -un)"
 } >>"${pg_data_dir}/postgresql.conf"
@@ -889,12 +798,12 @@ assert_all_results "pre-commit ordered fold recovery"
 # Make ntile span hundreds of Evaluate commits. Once its bucket and starting
 # ordinal are durable, kill the following page before commit and prove that
 # both state and cursor remain at the preceding boundary.
-psql_gate -qc "ALTER SYSTEM SET shiba.stage_chunk_rows='1'"
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_rows='1'"
 psql_gate -qc "SELECT pg_reload_conf()"
 wait_for_query "1" "
   SELECT setting::integer
   FROM pg_settings
-  WHERE name='shiba.stage_chunk_rows'" \
+  WHERE name='shiba.batch_rows'" \
   "the single-row ntile evaluation page"
 psql_gate -qc "
   UPDATE public.ntile_recovery_source SET bucket_count=7 WHERE id=257"
@@ -944,7 +853,7 @@ assert_query "6|${ntile_cursor_before}|3|3" "
   CROSS JOIN ${ntile_recovery_state} AS state
   WHERE state.singleton"
 wait_for_runtime_replacement "${runtime_before}"
-psql_gate -qc "ALTER SYSTEM SET shiba.stage_chunk_rows='8'"
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_rows='8'"
 psql_gate -qc "SELECT pg_reload_conf()"
 psql_gate -qc "
   DELETE FROM public.shiba_runtime_failpoints
@@ -1009,6 +918,13 @@ assert_all_results "pre-commit TopN recovery"
 # A fresh TopN sees 8-row upstream chunks but has a 64-row admission quantum.
 # Stop after its first committed Apply: dirty authoritative state is durable,
 # while candidate selection and visible-output reconciliation have not started.
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_rows='64'"
+psql_gate -qc "SELECT pg_reload_conf()"
+wait_for_query "64" "
+  SELECT setting::integer
+  FROM pg_settings
+  WHERE name='shiba.batch_rows'" \
+  "the TopN Apply admission budget"
 psql_gate -qc "
   DELETE FROM public.shiba_runtime_failpoints;
   BEGIN;
@@ -1017,6 +933,13 @@ psql_gate -qc "
   FROM public.kernel_source
   ORDER BY score DESC NULLS LAST
   FETCH FIRST 4 ROWS WITH TIES;
+  UPDATE shiba_internal.effect_streams
+  SET target_chunk_rows=8
+  WHERE stream_id IN (
+    SELECT stream_id
+    FROM shiba_internal.effect_stream_consumers
+    WHERE result_oid='shiba.topn_batch_result'::regclass
+  );
   INSERT INTO public.shiba_runtime_failpoints(
     kind,result_oid,stage_id,pause_ms
   )
@@ -1097,15 +1020,16 @@ wait_for_query "0" "
     AND chunk_seq=1" \
   "GC of a TopN input chunk after Apply"
 
-# Lower the quantum just above the already admitted prefix. The next Apply
-# consumes another full chunk, advances the consumer, and enters pure Drain.
-psql_gate -qc "ALTER SYSTEM SET shiba.stage_admission_rows='9'"
+# Lower the shared batch budget just above the already admitted prefix. The
+# next Apply consumes another full chunk, advances the consumer, and enters
+# pure Drain.
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_rows='9'"
 psql_gate -qc "SELECT pg_reload_conf()"
 wait_for_query "9" "
   SELECT setting::integer
   FROM pg_settings
-  WHERE name='shiba.stage_admission_rows'" \
-  "the temporary TopN admission quantum"
+  WHERE name='shiba.batch_rows'" \
+  "the temporary TopN batch budget"
 drain_runtime_pid="$(runtime_pid)"
 psql_gate -qc "
   UPDATE public.shiba_runtime_failpoints
@@ -1169,7 +1093,7 @@ assert_query "2|0|16" "
     ON checkpoint.result_oid=${batch_result_oid}::oid
    AND checkpoint.stage_id=${batch_topn_stage}"
 
-psql_gate -qc "ALTER SYSTEM SET shiba.stage_admission_rows='64'"
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_rows='8'"
 psql_gate -qc "SELECT pg_reload_conf()"
 psql_gate -qc "
   DELETE FROM public.shiba_runtime_failpoints;
@@ -1213,19 +1137,18 @@ assert_bag_equal "${topn_bag_expected}" "
   FROM shiba.topn_bag_result" \
   "TopN duplicate-bag bootstrap"
 
-# The low admission threshold above isolates Apply-to-Drain cutover behavior.
-# Restore production admission defaults before the independent high-fanout
+# Restore the larger shared batch budget before the independent high-fanout
 # stress case so repeated intermediate rebuilds do not dominate this gate.
-psql_gate -qc "ALTER SYSTEM SET shiba.stage_admission_rows='16384'"
-psql_gate -qc "ALTER SYSTEM SET shiba.stage_admission_bytes='134217728'"
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_rows='16384'"
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_bytes='16777216'"
 psql_gate -qc "SELECT pg_reload_conf()"
-wait_for_query "16384|134217728" "
+wait_for_query "16384|16777216" "
   SELECT (SELECT setting FROM pg_settings
-          WHERE name='shiba.stage_admission_rows')
+          WHERE name='shiba.batch_rows')
          || '|' ||
          (SELECT setting FROM pg_settings
-          WHERE name='shiba.stage_admission_bytes')" \
-  "the production admission thresholds"
+          WHERE name='shiba.batch_bytes')" \
+  "the high-fanout batch budget"
 
 psql_gate -qc "
   INSERT INTO public.kernel_source
@@ -1288,6 +1211,16 @@ wait_for_query "0" "
 # Reconcile a result that is already identical to its rebuilt candidate.
 # Both Diff legs must still advance through durable compared-row cursors in
 # bounded pages; a zero-difference suffix may not collapse into one full scan.
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_rows='8'"
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_bytes='4096'"
+psql_gate -qc "SELECT pg_reload_conf()"
+wait_for_query "8|4096" "
+  SELECT (SELECT setting FROM pg_settings
+          WHERE name='shiba.batch_rows')
+         || '|' ||
+         (SELECT setting FROM pg_settings
+          WHERE name='shiba.batch_bytes')" \
+  "the zero-difference paging budget"
 psql_gate -qc "
   CREATE TABLE public.zero_diff_source(
     id integer PRIMARY KEY,

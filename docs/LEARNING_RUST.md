@@ -192,29 +192,29 @@ arbitrary query text.
 The catalog is exposed through a small trait. Production uses SPI; unit tests
 use a deterministic fake implementation.
 
-## 6. Runnable state and the ready queue
+## 6. Durable runnable state
 
 Read:
 
 1. [`src/logical/dataflow.rs`](../src/logical/dataflow.rs)
 2. [`src/logical/runtime.rs`](../src/logical/runtime.rs)
 
-The main types in `dataflow.rs` are:
+`dataflow.rs` contains the small bounded-work values shared by Runtime and
+kernels:
 
-- `OperatorId`;
-- `InputFrontier`;
-- `DurableOperatorState`;
 - `WorkBudget`;
+- `WorkUsage`;
+- `WorkQuantum`;
 - `StepOutcome`;
-- `ReadyQueue`.
 
-The queue contains only operator IDs. PostgreSQL rows own input positions,
-continuations, and output capacity. `ReadyQueue::rebuild` sorts runnable IDs,
-so restart behavior does not depend on row-return order.
+There is no in-memory ready queue. The one readiness predicate in
+[`src/worker.rs`](../src/worker.rs) reads checkpoints, input cursors and output
+capacity directly from PostgreSQL. It is used both to find a runnable result
+and to choose that result's next stage.
 
-`runtime.rs` loads those durable facts with SPI and dispatches one stage. A
-`LoadedDataflow` is only a validated plan cache plus ready queue; dropping it
-does not lose progress.
+`LoadedDataflow` contains only a validated plan and a stage cursor used for
+fair rotation. Dropping either value does not lose work; the next query finds
+the same durable continuation or unread stream chunk.
 
 Run:
 
@@ -222,25 +222,27 @@ Run:
 cargo test --lib logical::dataflow::tests
 ```
 
-## 7. The common step transaction
+## 7. The common kernel protocol
 
-Read [`src/kernel/step.rs`](../src/kernel/step.rs).
+Read [`src/kernel/runner.rs`](../src/kernel/runner.rs), then
+[`src/kernel/step.rs`](../src/kernel/step.rs).
 
-`StepTxn` does not start a nested transaction. The background worker has
-already opened one PostgreSQL transaction. `StepTxn::begin`:
+Every operator registers one `KernelContract` and one bounded `step` function.
+`KernelRunner` is the only code allowed to open a `StepContext` or commit its
+checkpoint. `StepContext` does not start a nested transaction; the background
+worker has already opened one PostgreSQL transaction. Its setup:
 
 1. applies the plan's execution settings;
 2. locks input and output streams in stream-ID order;
 3. locks the checkpoint and consumer cursors;
 4. loads the checkpoint's shared admission row/byte counters;
 5. checks output backpressure;
-6. returns `Idle`, `Blocked`, or a ready `StepTxn`.
+6. returns `Idle`, `Blocked`, or a ready context.
 
-The kernel then uses `read`, `lock`, and `write` through this value.
-`StepTxn::finish` updates the checkpoint only if its revision still equals the
-value locked at step start. The kernel passes the continuation fact already
-returned and validated by its bounded SQL primitive; the common path does not
-issue a second `count(*)`.
+The kernel uses `read`, `lock`, and `write` through the context, then returns a
+`KernelTransition`. It never returns `StepExecution` and cannot commit the
+checkpoint. The Runner publishes pending output and updates the checkpoint only
+if its revision still equals the value locked at step start.
 
 Important invariant: after a kernel performs durable writes, it may finish
 with `Progress`/`Yield` or return an error. It does not return `Idle`/`Blocked`
@@ -263,7 +265,7 @@ Follow:
 4. one bounded set SQL statement;
 5. output append;
 6. input advance or continuation replacement;
-7. `StepTxn::finish`.
+7. return one `KernelTransition`.
 
 This file shows the intended kernel boundary: Rust has the phase and validates
 database facts; SQL performs typed set work over a bounded prefix.
@@ -373,6 +375,12 @@ The outer loop has a time/step budget, but it cannot interrupt a PostgreSQL
 statement. This is why each kernel's SQL primitive must enforce its own row
 and byte bounds.
 
+The source transaction protocol is [`src/publication.rs`](../src/publication.rs);
+its one dynamic typed CTE delegates only durable stream append to SQL.
+Bounded WAL admission follows the same boundary in
+[`src/admission.rs`](../src/admission.rs): Rust classifies replay and allocates
+counters, then validates the facts returned by one atomic data-modifying CTE.
+
 ## 12. What remains in SQL files
 
 Read the installation order in [`src/lib.rs`](../src/lib.rs):
@@ -380,16 +388,18 @@ Read the installation order in [`src/lib.rs`](../src/lib.rs):
 | File | Responsibility |
 | --- | --- |
 | `sql/00_catalog.sql` | common durable catalog and constraints |
-| `sql/10_runtime.sql` | activation and Runtime identity |
-| `sql/11_ingress.sql` | ingress persistence and source publication |
+| `sql/10_runtime.sql` | Runtime locks, triggers, and source validation primitives |
+| `sql/11_ingress.sql` | ingress header and finalization primitives |
 | `sql/12_effect_stream.sql` | shared stream append/cursor/GC primitives |
 | `sql/25_introspection.sql` | dataflow inspection |
 | `sql/30_registration.sql` | SQL-visible registration boundary and grants |
-| `sql/40_lifecycle.sql` | progress, index, drop, and deactivate APIs |
+| `sql/40_lifecycle.sql` | progress, index, and generated-storage drop primitives |
 
 Operator phase machines do not live in PL/pgSQL. SQL files define catalog and
 shared transactional primitives; Rust kernels generate the small typed set
-operations needed for a particular step.
+operations needed for a particular step. Database activation, Runtime launch
+deduplication, and deactivation are ordered Rust transitions in
+`src/lifecycle.rs`.
 
 ## Running checks
 

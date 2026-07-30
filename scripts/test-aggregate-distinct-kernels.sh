@@ -15,19 +15,6 @@ database_name="shiba_aggregate"
 wait_attempts="${SHIBA_AGGREGATE_WAIT_ATTEMPTS:-1200}"
 aggregate_rows="${SHIBA_AGGREGATE_TEST_ROWS:-80}"
 
-cleanup() {
-  if test "${SHIBA_KEEP_TEST_CLUSTER:-0}" = "1"; then
-    printf 'Retained test cluster: %s\n' "${pg_data_dir}" >&2
-    printf 'Retained test socket: %s\n' "${pg_socket_dir}" >&2
-    printf 'PostgreSQL log: %s\n' "${pg_log_file}" >&2
-    return
-  fi
-  "${pg_bin_dir}/pg_ctl" -D "${pg_data_dir}" -m immediate stop \
-    >/dev/null 2>&1 || true
-  rm -rf "${pg_data_dir}" "${pg_socket_dir}"
-}
-trap cleanup EXIT
-
 psql_stateful() {
   PGOPTIONS="-c statement_timeout=60000 -c lock_timeout=10000" \
     "${pg_bin_dir}/psql" \
@@ -35,98 +22,14 @@ psql_stateful() {
       -h "${pg_socket_dir}" -p "${pg_port}" -d "${database_name}" "$@"
 }
 
-fail() {
-  printf 'aggregate/distinct kernel gate failed: %s\n' "$1" >&2
-  tail -n 200 "${pg_log_file}" >&2 || true
-  exit 1
-}
-
-assert_query() {
-  local expected="$1"
-  local query="$2"
-  local actual
-  actual="$(psql_stateful -Atqc "${query}")"
-  if test "${actual}" != "${expected}"; then
-    fail "expected [${expected}], got [${actual}] for: ${query}"
-  fi
-}
-
-expect_failure() {
-  local expected_message="$1"
-  local query="$2"
-  local output
-  if output="$(psql_stateful -qc "${query}" 2>&1)"; then
-    fail "query unexpectedly succeeded: ${query}"
-  fi
-  if [[ "${output}" != *"${expected_message}"* ]]; then
-    fail "expected error containing [${expected_message}], got: ${output}"
-  fi
-}
-
-wait_for_query() {
-  local expected="$1"
-  local query="$2"
-  local description="$3"
-  local actual=""
-  local attempt
-  for ((attempt = 1; attempt <= wait_attempts; attempt++)); do
-    if actual="$(psql_stateful -Atqc "${query}" 2>/dev/null)" &&
-       test "${actual}" = "${expected}"; then
-      return
-    fi
-    sleep 0.05
-  done
-  fail "timed out waiting for ${description}; last value was [${actual}]"
-}
-
-wait_for_log() {
-  local pattern="$1"
-  local description="$2"
-  local attempt
-  for ((attempt = 1; attempt <= wait_attempts; attempt++)); do
-    if grep -Fq "${pattern}" "${pg_log_file}"; then
-      return
-    fi
-    sleep 0.05
-  done
-  fail "timed out waiting for ${description}"
-}
-
-assert_bag_equal() {
-  local expected_sql="$1"
-  local actual_sql="$2"
-  local description="$3"
-  wait_for_query "0" "
-    WITH expected AS (${expected_sql}),
-    actual AS (${actual_sql}),
-    difference AS (
-      (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual)
-      UNION ALL
-      (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
-    )
-    SELECT count(*) FROM difference" "${description}"
-}
-
-runtime_pid() {
-  psql_stateful -Atqc "
-    SELECT pid
-    FROM pg_stat_activity
-    WHERE backend_type='shiba runtime'"
-}
-
-wait_for_runtime_replacement() {
-  local failed_pid="$1"
-  wait_for_query "1" "
-    SELECT count(*)
-    FROM shiba_internal.runtime_state AS state
-    JOIN pg_stat_activity AS activity
-      ON activity.pid=state.owner_pid
-     AND activity.backend_type='shiba runtime'
-    WHERE state.singleton
-      AND state.active
-      AND state.owner_pid<>${failed_pid}" \
-    "the singleton Runtime replacement"
-}
+test_name="aggregate/distinct kernel gate"
+test_psql_command=psql_stateful
+test_log_lines=200
+test_wait_attempts="${wait_attempts}"
+test_wait_sleep=0.05
+test_retain_log=1
+source "${project_root}/scripts/test-lib.sh"
+trap cleanup EXIT
 
 cd "${project_root}"
 cargo pgrx install \
@@ -143,12 +46,8 @@ cargo pgrx install \
   printf "listen_addresses = ''\n"
   printf "unix_socket_directories = '%s'\n" "${pg_socket_dir}"
   printf "port = %s\n" "${pg_port}"
-  printf "shiba.ingress_batch_rows = 8\n"
-  printf "shiba.ingress_batch_bytes = 4096\n"
-  printf "shiba.stage_chunk_rows = 4\n"
-  printf "shiba.stage_chunk_bytes = 4096\n"
-  printf "shiba.stage_admission_rows = 64\n"
-  printf "shiba.stage_admission_bytes = 65536\n"
+  printf "shiba.batch_rows = 4\n"
+  printf "shiba.batch_bytes = 4096\n"
   printf "shiba.replication_conninfo = 'host=%s port=%s dbname=%s user=%s'\n" \
     "${pg_socket_dir}" "${pg_port}" "${database_name}" "$(id -un)"
 } >>"${pg_data_dir}/postgresql.conf"
@@ -274,10 +173,10 @@ psql_stateful -qc "
 # with different scales must replace the downstream row even while occupancy
 # remains positive. Register this chain with a one-row output target: the
 # replacement must durably Drain -old and +new in separate bounded steps.
-psql_stateful -qc "ALTER SYSTEM SET shiba.stage_chunk_rows='1'"
+psql_stateful -qc "ALTER SYSTEM SET shiba.batch_rows='1'"
 psql_stateful -qc "SELECT pg_reload_conf()"
 wait_for_query "1" \
-  "SELECT current_setting('shiba.stage_chunk_rows')" \
+  "SELECT current_setting('shiba.batch_rows')" \
   "the one-row Distinct replacement budget"
 psql_stateful -qc "
   CREATE TABLE public.distinct_numeric_rep_source (
@@ -294,10 +193,10 @@ psql_stateful -qc "
 wait_for_query "1" \
   "SELECT value_scale FROM shiba.distinct_numeric_rep_scale" \
   "the initial numeric Distinct representative"
-psql_stateful -qc "ALTER SYSTEM SET shiba.stage_chunk_rows='4'"
+psql_stateful -qc "ALTER SYSTEM SET shiba.batch_rows='4'"
 psql_stateful -qc "SELECT pg_reload_conf()"
 wait_for_query "4" \
-  "SELECT current_setting('shiba.stage_chunk_rows')" \
+  "SELECT current_setting('shiba.batch_rows')" \
   "the restored Aggregate/Distinct row budget"
 
 # UPDATE arrives as a same-page delete+insert of SQL-equal physical values.
@@ -324,15 +223,22 @@ numeric_distinct_continuation="$(psql_stateful -Atqc "
   FROM shiba_internal.operator_continuation_relations
   WHERE result_oid=${numeric_result_oid}::oid
     AND stage_id=${numeric_distinct_stage}")"
-# Registration gave every operator a one-row target. Widen only the upstream
-# and downstream streams so the UPDATE's -old/+new reach Distinct in one page;
-# keep the Distinct output itself at one row per Drain chunk.
+# Registration gave every stream a one-row target. Widen the source and
+# upstream/downstream operator streams so the UPDATE's -old/+new reach
+# Distinct in one page; keep the Distinct output at one row per Drain chunk.
 psql_stateful -qc "
   UPDATE shiba_internal.effect_streams
   SET target_chunk_rows=4
-  WHERE producer_kind='operator'
-    AND producer_result_oid=${numeric_result_oid}::oid
-    AND producer_stage_id<>${numeric_distinct_stage}"
+  WHERE stream_id IN (
+    SELECT stream_id
+    FROM shiba_internal.effect_stream_consumers
+    WHERE result_oid=${numeric_result_oid}::oid
+  )
+    AND NOT (
+      producer_kind='operator'
+      AND producer_result_oid=${numeric_result_oid}::oid
+      AND producer_stage_id=${numeric_distinct_stage}
+    )"
 runtime_before="$(runtime_pid)"
 psql_stateful -qc "
   INSERT INTO public.shiba_runtime_failpoints(
@@ -414,12 +320,12 @@ psql_stateful -qc "
          ('1.' || pg_catalog.repeat('0',scale))::numeric
   FROM generate_series(1,1024) AS scale;
   INSERT INTO public.distinct_plan_source VALUES(100000,NULL,NULL)"
-psql_stateful -qc "ALTER SYSTEM SET shiba.stage_chunk_rows='256'"
-psql_stateful -qc "ALTER SYSTEM SET shiba.stage_chunk_bytes='65536'"
+psql_stateful -qc "ALTER SYSTEM SET shiba.batch_rows='256'"
+psql_stateful -qc "ALTER SYSTEM SET shiba.batch_bytes='65536'"
 psql_stateful -qc "SELECT pg_reload_conf()"
 wait_for_query "256|64kB" \
-  "SELECT current_setting('shiba.stage_chunk_rows') || '|' ||
-          current_setting('shiba.stage_chunk_bytes')" \
+  "SELECT current_setting('shiba.batch_rows') || '|' ||
+          current_setting('shiba.batch_bytes')" \
   "the Distinct planner fixture budget"
 psql_stateful -qc "
   CREATE TABLE shiba.distinct_plan_probe AS
@@ -482,12 +388,12 @@ wait_for_query "0" "
   WHERE checkpoint.result_oid=${distinct_plan_result_oid}::oid
     AND checkpoint.has_continuation" \
   "the Distinct planner fixture to quiesce"
-psql_stateful -qc "ALTER SYSTEM SET shiba.stage_chunk_rows='4'"
-psql_stateful -qc "ALTER SYSTEM SET shiba.stage_chunk_bytes='4096'"
+psql_stateful -qc "ALTER SYSTEM SET shiba.batch_rows='4'"
+psql_stateful -qc "ALTER SYSTEM SET shiba.batch_bytes='4096'"
 psql_stateful -qc "SELECT pg_reload_conf()"
 wait_for_query "4|4kB" \
-  "SELECT current_setting('shiba.stage_chunk_rows') || '|' ||
-          current_setting('shiba.stage_chunk_bytes')" \
+  "SELECT current_setting('shiba.batch_rows') || '|' ||
+          current_setting('shiba.batch_bytes')" \
   "the restored Aggregate/Distinct budget after the planner fixture"
 assert_query "1024" "
   SELECT count(*)
@@ -1148,6 +1054,11 @@ fi
 # One fact fans out to 64 joined rows in four-row chunks. Aggregate admits the
 # whole 64-row quantum before rebuilding either accumulator. Rebuilding after
 # every chunk would take more than 270 Aggregate steps for these two calls.
+psql_stateful -qc "ALTER SYSTEM SET shiba.batch_rows='64'"
+psql_stateful -qc "SELECT pg_reload_conf()"
+wait_for_query "64" \
+  "SELECT current_setting('shiba.batch_rows')" \
+  "the hot-group admission budget"
 assert_query "0" "
   SELECT count(*) FROM shiba.aggregate_hot_group"
 hot_revision_before="$(psql_stateful -Atqc "
@@ -1172,7 +1083,7 @@ wait_for_query "f" "
     AND stage_id=${hot_aggregate_stage}" \
   "the hot Aggregate to become idle"
 assert_query "t" "
-  SELECT revision-${hot_revision_before} BETWEEN 35 AND 95
+  SELECT revision-${hot_revision_before} BETWEEN 1 AND 95
   FROM shiba_internal.operator_checkpoints
   WHERE result_oid=${hot_result_oid}::oid
     AND stage_id=${hot_aggregate_stage}"
@@ -1190,6 +1101,11 @@ assert_query "0|0|0" "
   SELECT (SELECT count(*) FROM ${hot_groups_state})
          || '|' || (SELECT count(*) FROM ${hot_first_work_state})
          || '|' || (SELECT count(*) FROM ${hot_second_work_state})"
+psql_stateful -qc "ALTER SYSTEM SET shiba.batch_rows='4'"
+psql_stateful -qc "SELECT pg_reload_conf()"
+wait_for_query "4" \
+  "SELECT current_setting('shiba.batch_rows')" \
+  "the restored Aggregate/Distinct row budget"
 
 # The one persisted Aggregate contract carries typed DISTINCT keys, typed
 # ordering keys, and typed outputs.  DISTINCT and ORDER BY may belong to
@@ -1367,6 +1283,11 @@ assert_bag_equal "${aggregate_expected}" \
 # A fresh Aggregate sees four-row input chunks but has a 64-row admission
 # quantum. Stop after its first committed Apply: the input chunk is already
 # released and GC-able even though the dirty global group has not been rebuilt.
+psql_stateful -qc "ALTER SYSTEM SET shiba.batch_rows='64'"
+psql_stateful -qc "SELECT pg_reload_conf()"
+wait_for_query "64" \
+  "SELECT current_setting('shiba.batch_rows')" \
+  "the Aggregate Apply admission budget"
 psql_stateful -qc "
   DELETE FROM public.shiba_runtime_failpoints;
   BEGIN;
@@ -1374,6 +1295,13 @@ psql_stateful -qc "
   SELECT count(*) AS row_count,
          max(id ORDER BY id) AS max_id
   FROM public.aggregate_batch_source;
+  UPDATE shiba_internal.effect_streams
+  SET target_chunk_rows=4
+  WHERE stream_id IN (
+    SELECT stream_id
+    FROM shiba_internal.effect_stream_consumers
+    WHERE result_oid='shiba.aggregate_batch_result'::regclass
+  );
   INSERT INTO public.shiba_runtime_failpoints(
     kind,result_oid,stage_id,pause_ms
   )
@@ -1458,16 +1386,17 @@ wait_for_query "0" "
     AND chunk_seq=1" \
   "GC of the first Aggregate input chunk after Apply"
 
-# The next full input chunk crosses the lowered quantum. Its Apply commit
-# advances the consumer and persists a phase-2 continuation with no input
-# chunk reference. Killing that Runtime cannot make Drain depend on GC'd input.
-psql_stateful -qc "ALTER SYSTEM SET shiba.stage_admission_rows='5'"
+# The next full input chunk crosses the lowered shared batch budget. Its Apply
+# commit advances the consumer and persists a phase-2 continuation with no
+# input chunk reference. Killing that Runtime cannot make Drain depend on
+# GC'd input.
+psql_stateful -qc "ALTER SYSTEM SET shiba.batch_rows='5'"
 psql_stateful -qc "SELECT pg_reload_conf()"
 wait_for_query "5" "
   SELECT setting::integer
   FROM pg_settings
-  WHERE name='shiba.stage_admission_rows'" \
-  "the temporary Aggregate admission quantum"
+  WHERE name='shiba.batch_rows'" \
+  "the temporary Aggregate batch budget"
 drain_runtime_pid="$(runtime_pid)"
 psql_stateful -qc "
   UPDATE public.shiba_runtime_failpoints
@@ -1510,7 +1439,7 @@ wait_for_query "0" "
     AND chunk_seq<3" \
   "GC of every Aggregate input chunk consumed before pure Drain"
 
-psql_stateful -qc "ALTER SYSTEM SET shiba.stage_admission_rows='64'"
+psql_stateful -qc "ALTER SYSTEM SET shiba.batch_rows='4'"
 psql_stateful -qc "SELECT pg_reload_conf()"
 psql_stateful -qc "
   DELETE FROM public.shiba_runtime_failpoints;

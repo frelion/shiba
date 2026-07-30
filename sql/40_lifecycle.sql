@@ -48,7 +48,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog, shiba_internal
 AS $$
 DECLARE
-    payload shiba_internal.effect_stream_payloads%ROWTYPE;
+    payload shiba_internal.effect_streams%ROWTYPE;
     live_type_schema name;
     live_type_name name;
     live_type_kind "char";
@@ -56,11 +56,17 @@ DECLARE
 BEGIN
     SELECT *
     INTO payload
-    FROM shiba_internal.effect_stream_payloads
+    FROM shiba_internal.effect_streams
     WHERE stream_id = target_stream_id
     FOR UPDATE;
-    IF NOT FOUND THEN
+    IF NOT FOUND
+       OR (payload.relation_oid IS NULL AND payload.row_type_oid IS NULL) THEN
       RETURN;
+    END IF;
+    IF payload.relation_oid IS NULL OR payload.row_type_oid IS NULL THEN
+      RAISE EXCEPTION 'effect stream % has incomplete payload identity',
+        target_stream_id
+        USING ERRCODE = 'data_corrupted';
     END IF;
 
     PERFORM shiba_internal.drop_cataloged_relation(payload.relation_oid);
@@ -92,8 +98,10 @@ BEGIN
       );
     END IF;
 
-    DELETE FROM shiba_internal.effect_stream_payloads
-    WHERE stream_id = target_stream_id;
+    UPDATE shiba_internal.effect_streams
+       SET relation_oid = NULL,
+           row_type_oid = NULL
+     WHERE stream_id = target_stream_id;
 END;
 $$;
 
@@ -458,71 +466,6 @@ BEGIN
       END IF;
       PERFORM pg_sleep(0.01);
     END LOOP;
-END;
-$$;
-
-CREATE FUNCTION shiba.deactivate()
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, shiba, shiba_internal
-AS $$
-DECLARE
-    stream record;
-    active_generation bigint;
-BEGIN
-    PERFORM shiba._lock_database_lifecycle();
-    IF EXISTS (SELECT 1 FROM shiba_internal.dataflows) THEN
-      RAISE EXCEPTION 'drop all Shiba result tables before deactivation'
-        USING ERRCODE = 'object_in_use';
-    END IF;
-    PERFORM shiba_internal.stop_runtime_for_deactivation();
-
-    SELECT slot_generation
-    INTO active_generation
-    FROM shiba_internal.ingress_replay_state
-    WHERE database_oid = (
-      SELECT oid
-      FROM pg_database
-      WHERE datname = current_database()
-    )
-      AND slot_name = shiba_internal.slot_name()
-      AND state = 'active'
-    FOR UPDATE;
-
-    DELETE FROM shiba_internal.ingress_transactions
-    WHERE slot_generation = active_generation;
-    FOR stream IN
-      SELECT stream_id
-      FROM shiba_internal.effect_streams
-      WHERE producer_kind = 'source'
-        AND slot_generation = active_generation
-      ORDER BY stream_id
-    LOOP
-      PERFORM shiba_internal.drop_effect_stream_payload(stream.stream_id);
-      DELETE FROM shiba_internal.effect_streams
-      WHERE stream_id = stream.stream_id;
-    END LOOP;
-
-    UPDATE shiba_internal.runtime_state
-    SET active = false,
-        owner_pid = NULL,
-        started_at = NULL,
-        last_heartbeat = NULL,
-        pending_launch_xid = NULL,
-        pending_since = NULL
-    WHERE singleton;
-
-    PERFORM shiba_internal.retire_ingress_generation(
-      shiba_internal.slot_name()
-    );
-    IF EXISTS (
-      SELECT 1
-      FROM pg_replication_slots
-      WHERE slot_name = shiba_internal.slot_name()::text
-    ) THEN
-      PERFORM pg_drop_replication_slot(shiba_internal.slot_name());
-    END IF;
 END;
 $$;
 

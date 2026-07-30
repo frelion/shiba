@@ -206,32 +206,24 @@ CREATE TABLE shiba_internal.ingress_aborted_subtransactions (
     PRIMARY KEY (ingress_txn_id, source_subxid)
 );
 
--- Each bounded prefix admitted by ingress is independently publishable.
-CREATE TABLE shiba_internal.ingress_apply_batches (
+-- Publication work is per source, not per subscribing dataflow. A published
+-- chunk is shared by every Scan consumer of that source stream. The bounded
+-- ingress range lives here too; a separate one-to-one batch header adds no
+-- recovery authority.
+CREATE TABLE shiba_internal.source_publications (
     ingress_txn_id bigint NOT NULL
       REFERENCES shiba_internal.ingress_transactions(ingress_txn_id)
       ON DELETE CASCADE,
     batch_ordinal bigint NOT NULL CHECK (batch_ordinal > 0),
+    source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
     first_input_seq bigint NOT NULL CHECK (first_input_seq > 0),
     last_input_seq bigint NOT NULL CHECK (last_input_seq >= first_input_seq),
-    persisted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (ingress_txn_id, batch_ordinal),
-    UNIQUE (ingress_txn_id, first_input_seq, last_input_seq)
-);
-
--- Publication work is per source, not per subscribing dataflow. A published
--- chunk is shared by every Scan consumer of that source stream.
-CREATE TABLE shiba_internal.source_publications (
-    ingress_txn_id bigint NOT NULL,
-    batch_ordinal bigint NOT NULL,
-    source_oid oid NOT NULL CHECK (source_oid <> 0::oid),
     next_input_seq bigint CHECK (next_input_seq > 0),
     PRIMARY KEY (ingress_txn_id, batch_ordinal, source_oid),
-    FOREIGN KEY (ingress_txn_id, batch_ordinal)
-      REFERENCES shiba_internal.ingress_apply_batches(
-        ingress_txn_id, batch_ordinal
-      )
-      ON DELETE CASCADE
+    CHECK (
+      next_input_seq IS NULL
+      OR next_input_seq BETWEEN first_input_seq AND last_input_seq
+    )
 );
 
 CREATE INDEX source_publications_ready_idx
@@ -249,6 +241,8 @@ CREATE TABLE shiba_internal.effect_streams (
     source_oid oid,
     producer_result_oid oid,
     producer_stage_id integer,
+    relation_oid oid UNIQUE,
+    row_type_oid oid UNIQUE,
     next_chunk_seq bigint NOT NULL DEFAULT 1 CHECK (next_chunk_seq >= 1),
     first_retained_chunk_seq bigint NOT NULL DEFAULT 1
       CHECK (first_retained_chunk_seq >= 1),
@@ -302,7 +296,8 @@ CREATE TABLE shiba_internal.effect_streams (
     CHECK (target_chunk_bytes <= high_bytes),
     CHECK (low_chunks < high_chunks),
     CHECK (low_rows < high_rows),
-    CHECK (low_bytes < high_bytes)
+    CHECK (low_bytes < high_bytes),
+    CHECK ((relation_oid IS NULL) = (row_type_oid IS NULL))
 );
 
 CREATE UNIQUE INDEX effect_stream_source_producer_idx
@@ -363,16 +358,6 @@ CREATE TABLE shiba_internal.effect_stream_consumers (
       REFERENCES shiba_internal.operator_checkpoints(result_oid, stage_id)
       ON DELETE CASCADE,
     CHECK (consumed_frontier_lsn >= activation_lsn)
-);
-
--- Every stream owns one generated composite and one LOGGED payload relation.
--- relation_oid and row_type_oid are the authority; runtime code must recheck
--- their live namespace/name identity and never guess an object name.
-CREATE TABLE shiba_internal.effect_stream_payloads (
-    stream_id bigint PRIMARY KEY
-      REFERENCES shiba_internal.effect_streams(stream_id) ON DELETE CASCADE,
-    relation_oid oid NOT NULL UNIQUE,
-    row_type_oid oid NOT NULL UNIQUE
 );
 
 -- Each stateful kernel owns typed, LOGGED relations and records them here.

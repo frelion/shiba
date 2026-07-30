@@ -5,11 +5,10 @@
 //! backend. Loaded dataflows are plan metadata, never processes or threads.
 
 use crate::postgres::{format_lsn, parse_lsn};
-use crate::{config, ingress, logical, replication};
+use crate::{admission, config, ingress, logical, publication, replication};
 use pgrx::bgworkers::*;
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
-use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::panic::AssertUnwindSafe;
@@ -171,9 +170,8 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
         }
         reload_config_if_requested();
 
-        let ingress_work = match ingest_and_publish_once(&mut ingress_runtime) {
-            RuntimePhase::Inactive => break 'runtime,
-            RuntimePhase::Worked(count) => count,
+        let Some(ingress_work) = ingest_and_publish_once(&mut ingress_runtime) else {
+            break 'runtime;
         };
 
         let Some(ready_results) = BackgroundWorker::transaction(|| {
@@ -187,12 +185,14 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
         };
         let _ = loaded_dataflows.set_capacity(config::max_cached_dataflows());
 
-        let operator_phase =
-            step_ready_operators_bounded(&mut loaded_dataflows, &mut result_cursor, ready_results);
-        match operator_phase {
-            OperatorPhase::RuntimeInactive | OperatorPhase::SignalReceived => break 'runtime,
-            OperatorPhase::Worked | OperatorPhase::Idle => {}
-        }
+        let operator_work = match step_ready_operators_bounded(
+            &mut loaded_dataflows,
+            &mut result_cursor,
+            ready_results,
+        ) {
+            None => break 'runtime,
+            Some(work) => work,
+        };
 
         let collected = if Instant::now() >= next_gc {
             let count = BackgroundWorker::transaction(AssertUnwindSafe(|| {
@@ -204,7 +204,7 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
         } else {
             0
         };
-        idle = ingress_work == 0 && operator_phase != OperatorPhase::Worked && collected == 0;
+        idle = ingress_work == 0 && operator_work == 0 && collected == 0;
 
         if !idle {
             // Each phase is bounded and each source transaction has already
@@ -215,12 +215,6 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
 
     clear_runtime_owner();
     log!("Shiba Runtime stopped for database {database_name}");
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RuntimePhase {
-    Inactive,
-    Worked(usize),
 }
 
 struct IngressRuntime {
@@ -340,38 +334,9 @@ fn bootstrap_ingress() -> IngressBootstrap {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SourcePublicationOutcome {
-    Idle,
-    Blocked,
-    Appended,
-    Completed,
-    Discarded,
-}
-
-impl SourcePublicationOutcome {
-    fn from_sql(value: &str) -> Self {
-        match value {
-            "idle" => Self::Idle,
-            "blocked" => Self::Blocked,
-            "appended" => Self::Appended,
-            "completed" => Self::Completed,
-            "discarded" => Self::Discarded,
-            unexpected => panic!("Shiba received unknown source publication outcome {unexpected}"),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct SourcePublication {
-    outcome: SourcePublicationOutcome,
-    final_lsn: Option<String>,
-    has_pending: bool,
-}
-
-fn ingest_and_publish_once(runtime: &mut IngressRuntime) -> RuntimePhase {
+fn ingest_and_publish_once(runtime: &mut IngressRuntime) -> Option<usize> {
     if !BackgroundWorker::transaction(runtime_is_active) {
-        return RuntimePhase::Inactive;
+        return None;
     }
 
     maintain_ingress_feedback(runtime, false);
@@ -379,9 +344,9 @@ fn ingest_and_publish_once(runtime: &mut IngressRuntime) -> RuntimePhase {
     advance_ingress_publication_frontier(runtime.generation);
     let publication_work = usize::from(matches!(
         publication.outcome,
-        SourcePublicationOutcome::Appended
-            | SourcePublicationOutcome::Completed
-            | SourcePublicationOutcome::Discarded
+        publication::SourcePublicationOutcome::Appended
+            | publication::SourcePublicationOutcome::Completed
+            | publication::SourcePublicationOutcome::Discarded
     ));
 
     // A durable source task is always drained before more WAL is read. The
@@ -392,12 +357,12 @@ fn ingest_and_publish_once(runtime: &mut IngressRuntime) -> RuntimePhase {
     // This bounds change_log staging to the current ingress batch instead of
     // buffering an unbounded replication stream behind a slow DAG.
     if publication.has_pending {
-        return RuntimePhase::Worked(publication_work);
+        return Some(publication_work);
     }
 
     let budget = ingress::IngressBudget {
-        max_events: config::ingress_batch_rows(),
-        max_wire_bytes: config::ingress_batch_bytes(),
+        max_events: config::batch_rows(),
+        max_wire_bytes: config::batch_bytes(),
         max_poll_time: INGRESS_POLL_TIME_BUDGET,
     };
     let ingested = match runtime
@@ -430,48 +395,32 @@ fn ingest_and_publish_once(runtime: &mut IngressRuntime) -> RuntimePhase {
             }
             1
         }
-        ingress::IngressPoll::Pending { reply_requested } => {
+        ingress::IngressPoll::NoBatch {
+            reply_requested,
+            progressed,
+        } => {
             if reply_requested {
                 maintain_ingress_feedback(runtime, true);
             }
-            0
-        }
-        ingress::IngressPoll::Yield { reply_requested } => {
-            if reply_requested {
-                maintain_ingress_feedback(runtime, true);
-            }
-            1
+            usize::from(progressed)
         }
         ingress::IngressPoll::End => {
             panic!("Shiba replication connection ended unexpectedly")
         }
     };
 
-    RuntimePhase::Worked(ingested + publication_work)
+    Some(ingested + publication_work)
 }
 
-fn publish_source_once(generation: i64) -> SourcePublication {
-    let generation_argument = unsafe { [DatumWithOid::new(generation, pg_sys::INT8OID)] };
+fn publish_source_once(generation: i64) -> publication::SourcePublication {
     let publication = BackgroundWorker::transaction(|| {
-        let (outcome, final_lsn, has_pending) = Spi::get_three_with_args::<String, String, bool>(
-            "SELECT outcome,
-                        final_lsn::text,
-                        has_pending
-                   FROM shiba_internal.publish_source_batch($1)",
-            &generation_argument,
-        )
-        .expect("Shiba could not publish a bounded source batch");
-        let outcome = SourcePublicationOutcome::from_sql(
-            &outcome.expect("source publication returned NULL outcome"),
-        );
-        let publication = SourcePublication {
-            outcome,
-            final_lsn,
-            has_pending: has_pending.expect("source publication returned NULL pending state"),
-        };
+        let publication = publication::publish_source_batch(generation).unwrap_or_else(|error| {
+            panic!("Shiba could not publish a bounded source batch: {error}")
+        });
         if matches!(
             publication.outcome,
-            SourcePublicationOutcome::Appended | SourcePublicationOutcome::Completed
+            publication::SourcePublicationOutcome::Appended
+                | publication::SourcePublicationOutcome::Completed
         ) && publication.final_lsn.is_none()
         {
             panic!("appended source chunk returned NULL causal LSN");
@@ -480,7 +429,8 @@ fn publish_source_once(generation: i64) -> SourcePublication {
         #[cfg(any(test, feature = "pg_test"))]
         if matches!(
             publication.outcome,
-            SourcePublicationOutcome::Appended | SourcePublicationOutcome::Completed
+            publication::SourcePublicationOutcome::Appended
+                | publication::SourcePublicationOutcome::Completed
         ) {
             if let Some(pause) = test_failpoints::claim(
                 "source_publication_before_commit",
@@ -502,7 +452,8 @@ fn publish_source_once(generation: i64) -> SourcePublication {
     #[cfg(any(test, feature = "pg_test"))]
     if matches!(
         publication.outcome,
-        SourcePublicationOutcome::Appended | SourcePublicationOutcome::Completed
+        publication::SourcePublicationOutcome::Appended
+            | publication::SourcePublicationOutcome::Completed
     ) {
         let pause = BackgroundWorker::transaction(|| {
             test_failpoints::claim(
@@ -684,35 +635,8 @@ fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> Opti
     .expect("Shiba could not claim a ingress transaction")
     .expect("ingress transaction claim returned no row");
 
-    let events = Value::Array(
-        batch
-            .events
-            .iter()
-            .map(|event| {
-                serde_json::json!({
-                    "change_lsn": format_lsn(event.change_lsn),
-                    "change_ordinal": event.change_ordinal,
-                    "image_ordinal": event.image_ordinal,
-                    "source_subxid": event.source_subxid,
-                    "source_oid": event.source_oid,
-                    "weight": event.weight,
-                    "payload": event.payload,
-                })
-            })
-            .collect(),
-    )
-    .to_string();
-    let event_arguments = unsafe {
-        [
-            DatumWithOid::new(ingress_txn_id, pg_sys::INT8OID),
-            DatumWithOid::new(events.as_str(), pg_sys::TEXTOID),
-        ]
-    };
-    Spi::run_with_args(
-        "SELECT shiba_internal.insert_ingress_events($1, $2::jsonb)",
-        &event_arguments,
-    )
-    .expect("Shiba could not persist a bounded ingress event batch");
+    admission::insert_ingress_events(ingress_txn_id, &batch.events)
+        .unwrap_or_else(|error| panic!("Shiba could not persist a bounded ingress batch: {error}"));
 
     let feedback_lsn = batch.boundary.as_ref().and_then(|boundary| match boundary {
         ingress::IngressBoundary::Commit { end_lsn, .. } => Some(*end_lsn),
@@ -775,19 +699,11 @@ fn persist_ingress_batch(generation: i64, batch: &ingress::IngressBatch) -> Opti
     feedback_lsn
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OperatorPhase {
-    RuntimeInactive,
-    SignalReceived,
-    Worked,
-    Idle,
-}
-
 fn step_ready_operators_bounded(
     loaded_dataflows: &mut DeterministicLru<pg_sys::Oid, logical::LoadedDataflow>,
     result_cursor: &mut Option<pg_sys::Oid>,
     mut ready_results: Vec<pg_sys::Oid>,
-) -> OperatorPhase {
+) -> Option<usize> {
     rotate_after_cursor(&mut ready_results, *result_cursor);
     let mut ready_results = VecDeque::from(ready_results);
     let started = Instant::now();
@@ -806,15 +722,13 @@ fn step_ready_operators_bounded(
         if !BackgroundWorker::wait_latch(Some(Duration::ZERO))
             || BackgroundWorker::sigint_received()
         {
-            return OperatorPhase::SignalReceived;
+            return None;
         }
         reload_config_if_requested();
 
         *result_cursor = Some(result_oid);
         attempted += 1;
-        let Some((outcome, has_more)) = step_one_operator(loaded_dataflows, result_oid) else {
-            return OperatorPhase::RuntimeInactive;
-        };
+        let (outcome, has_more) = step_one_operator(loaded_dataflows, result_oid)?;
         if matches!(
             outcome,
             logical::StepOutcome::Progress | logical::StepOutcome::Yield
@@ -826,11 +740,7 @@ fn step_ready_operators_bounded(
         }
     }
 
-    if worked == 0 {
-        OperatorPhase::Idle
-    } else {
-        OperatorPhase::Worked
-    }
+    Some(worked)
 }
 
 fn step_one_operator(
@@ -850,25 +760,28 @@ fn step_one_operator(
             loaded_dataflows.remove(&result_oid);
             return Some((None, false, None::<u32>));
         }
-        if !loaded_dataflows.contains_key(&result_oid) {
-            let dataflow = logical::LoadedDataflow::load(result_oid)
-                .expect("Shiba could not load a dataflow from durable operator state");
-            let _ = loaded_dataflows.insert(result_oid, dataflow);
-        }
-        let budget = logical::WorkBudget::new(
-            config::stage_chunk_rows(),
-            config::stage_chunk_bytes(),
-            config::stage_chunk_rows(),
-            config::stage_chunk_bytes(),
-        );
-        let step = {
-            let dataflow = loaded_dataflows
+        let stage_id = loaded_dataflows
+            .get_or_load(result_oid)
+            .expect("Shiba could not load a dataflow from durable operator state")
+            .and_then(|dataflow| next_ready_stage(result_oid, dataflow.stage_cursor()));
+        let step = stage_id.map(|stage_id| {
+            let budget = logical::WorkBudget::new(
+                config::batch_rows(),
+                config::batch_bytes(),
+                config::batch_rows(),
+                config::batch_bytes(),
+            );
+            loaded_dataflows
                 .get_mut(&result_oid)
-                .expect("Shiba loaded-dataflow cache lost an active dataflow");
-            dataflow
-                .step_quantum(budget, OPERATOR_MAX_TRANSITIONS_PER_TRANSACTION)
+                .expect("Shiba loaded-dataflow cache lost an active dataflow")
+                .step_quantum(
+                    result_oid,
+                    stage_id,
+                    budget,
+                    OPERATOR_MAX_TRANSITIONS_PER_TRANSACTION,
+                )
                 .expect("Shiba operator transaction quantum did not complete")
-        };
+        });
         #[cfg(any(test, feature = "pg_test"))]
         if let Some(step) = step.filter(|step| step.transitions > 0) {
             let stage_id = i32::try_from(step.stage_id).expect("operator stage ID exceeds integer");
@@ -892,7 +805,13 @@ fn step_one_operator(
             .map(|step| step.stage_id);
         Some((
             step.map(|step| step.outcome),
-            dag_has_ready_operator(result_oid),
+            next_ready_stage(
+                result_oid,
+                loaded_dataflows
+                    .get_mut(&result_oid)
+                    .and_then(|dataflow| dataflow.stage_cursor()),
+            )
+            .is_some(),
             committed_stage,
         ))
     }))?;
@@ -927,54 +846,6 @@ fn step_one_operator(
     let _ = committed_stage;
 
     Some((outcome, has_more))
-}
-
-fn dag_has_ready_operator(result_oid: pg_sys::Oid) -> bool {
-    let result = unsafe { [DatumWithOid::new(result_oid, pg_sys::OIDOID)] };
-    Spi::get_one_with_args::<bool>(
-        "SELECT EXISTS (
-           SELECT 1
-           FROM shiba_internal.operator_checkpoints AS checkpoint
-           WHERE checkpoint.result_oid = $1::oid
-             AND (
-               checkpoint.has_continuation
-               OR EXISTS (
-                 SELECT 1
-                 FROM shiba_internal.effect_stream_consumers AS consumer
-                 JOIN shiba_internal.effect_streams AS input_stream
-                   ON input_stream.stream_id = consumer.stream_id
-                 WHERE consumer.result_oid = checkpoint.result_oid
-                   AND consumer.consumer_stage_id = checkpoint.stage_id
-                   AND (
-                     consumer.next_chunk_seq < input_stream.next_chunk_seq
-                     OR (
-                       input_stream.producer_kind = 'source'
-                       AND EXISTS (
-                         SELECT 1
-                         FROM shiba_internal.ingress_replay_state publication
-                         WHERE publication.slot_generation
-                                 = input_stream.slot_generation
-                           AND publication.published_lsn IS NOT NULL
-                           AND consumer.consumed_frontier_lsn
-                                 < publication.published_lsn
-                       )
-                     )
-                   )
-               )
-             )
-             AND NOT EXISTS (
-               SELECT 1
-               FROM shiba_internal.effect_streams AS output_stream
-               WHERE output_stream.producer_kind = 'operator'
-                 AND output_stream.producer_result_oid = checkpoint.result_oid
-                 AND output_stream.producer_stage_id = checkpoint.stage_id
-                 AND output_stream.backpressured
-             )
-         )",
-        &result,
-    )
-    .expect("Shiba could not inspect durable operator readiness")
-    .expect("Shiba durable operator readiness returned NULL")
 }
 
 fn gc_change_log(generation: i64) -> i64 {
@@ -1023,10 +894,9 @@ fn gc_change_log(generation: i64) -> i64 {
 }
 
 fn gc_effect_streams(cursor: &mut Option<i64>) -> i64 {
-    let row_limit =
-        i64::try_from(config::stage_chunk_rows()).expect("operator row budget exceeds bigint");
+    let row_limit = i64::try_from(config::batch_rows()).expect("batch row budget exceeds bigint");
     let byte_limit =
-        i64::try_from(config::stage_chunk_bytes()).expect("operator byte budget exceeds bigint");
+        i64::try_from(config::batch_bytes()).expect("batch byte budget exceeds bigint");
     let stream_ids = gc_effect_stream_ids(*cursor);
     let next_cursor = stream_ids.last().copied();
     // The fair rotation may wrap from high IDs back to low IDs. Locking in
@@ -1300,6 +1170,19 @@ where
     }
 }
 
+impl DeterministicLru<pg_sys::Oid, logical::LoadedDataflow> {
+    fn get_or_load(
+        &mut self,
+        result_oid: pg_sys::Oid,
+    ) -> Result<Option<&mut logical::LoadedDataflow>, String> {
+        if !self.contains_key(&result_oid) {
+            let dataflow = logical::LoadedDataflow::load(result_oid)?;
+            let _ = self.insert(result_oid, dataflow);
+        }
+        Ok(self.get_mut(&result_oid))
+    }
+}
+
 fn drain_has_capacity(
     processed: usize,
     elapsed: Duration,
@@ -1498,6 +1381,90 @@ fn try_lock_dataflow_for_step(result_oid: pg_sys::Oid) -> bool {
     .expect("Shiba dataflow step lock returned NULL")
 }
 
+// This is the sole durable readiness predicate. It is deliberately used both
+// to find runnable dataflows and to choose their next stage; Rust remembers
+// only rotation cursors, never a shadow frontier or ready queue.
+const DURABLE_STAGE_READY: &str = "
+    (checkpoint.has_continuation OR EXISTS (
+      SELECT 1
+      FROM shiba_internal.effect_stream_consumers AS consumer
+      JOIN shiba_internal.effect_streams AS input_stream
+        ON input_stream.stream_id=consumer.stream_id
+      WHERE consumer.result_oid=checkpoint.result_oid
+        AND consumer.consumer_stage_id=checkpoint.stage_id
+        AND (
+          consumer.next_chunk_seq < input_stream.next_chunk_seq
+          OR (input_stream.producer_kind='source' AND EXISTS (
+            SELECT 1
+            FROM shiba_internal.ingress_replay_state AS publication
+            WHERE publication.slot_generation=input_stream.slot_generation
+              AND publication.published_lsn IS NOT NULL
+              AND consumer.consumed_frontier_lsn < publication.published_lsn
+          ))
+        )
+    ))
+    AND NOT EXISTS (
+      SELECT 1
+      FROM shiba_internal.effect_streams AS output_stream
+      WHERE output_stream.producer_kind='operator'
+        AND output_stream.producer_result_oid=checkpoint.result_oid
+        AND output_stream.producer_stage_id=checkpoint.stage_id
+        AND output_stream.backpressured
+    )";
+
+fn next_ready_stage(result_oid: pg_sys::Oid, cursor: Option<u32>) -> Option<u32> {
+    let stage = next_ready_stage_in_range(result_oid, cursor, true).or_else(|| {
+        cursor.and_then(|cursor| next_ready_stage_in_range(result_oid, Some(cursor), false))
+    });
+    stage.map(|stage| u32::try_from(stage).expect("ready stage ID is negative"))
+}
+
+fn next_ready_stage_in_range(
+    result_oid: pg_sys::Oid,
+    cursor: Option<u32>,
+    after_cursor: bool,
+) -> Option<i32> {
+    let (cursor_predicate, arguments) = match cursor {
+        Some(cursor) => {
+            let comparison = if after_cursor { ">" } else { "<=" };
+            (
+                format!("AND checkpoint.stage_id {comparison} $2::integer"),
+                unsafe {
+                    vec![
+                        DatumWithOid::new(result_oid, pg_sys::OIDOID),
+                        DatumWithOid::new(
+                            i32::try_from(cursor).expect("stage cursor exceeds integer"),
+                            pg_sys::INT4OID,
+                        ),
+                    ]
+                },
+            )
+        }
+        None => (String::new(), unsafe {
+            vec![DatumWithOid::new(result_oid, pg_sys::OIDOID)]
+        }),
+    };
+    let query = format!(
+        "SELECT checkpoint.stage_id
+         FROM shiba_internal.operator_checkpoints AS checkpoint
+         WHERE checkpoint.result_oid=$1::oid
+           {cursor_predicate}
+           AND {DURABLE_STAGE_READY}
+         ORDER BY checkpoint.stage_id
+         LIMIT 1"
+    );
+    Spi::connect_mut(|client| {
+        let mut rows = client
+            .update(&query, Some(1), &arguments)
+            .expect("Shiba could not select a ready durable stage");
+        rows.next().map(|row| {
+            row.get::<i32>(1)
+                .expect("invalid ready stage ID")
+                .expect("NULL ready stage ID")
+        })
+    })
+}
+
 fn ready_result_oids(cursor: Option<pg_sys::Oid>) -> Vec<pg_sys::Oid> {
     let limit = i32::try_from(OPERATOR_MAX_STEPS_PER_ROUND)
         .expect("operator step round limit exceeds integer");
@@ -1543,40 +1510,7 @@ fn ready_result_oids_in_range(
                  SELECT 1
                  FROM shiba_internal.operator_checkpoints checkpoint
                  WHERE checkpoint.result_oid = dataflow.result_oid
-                   AND (
-                     checkpoint.has_continuation
-                     OR EXISTS (
-                       SELECT 1
-                       FROM shiba_internal.effect_stream_consumers consumer
-                       JOIN shiba_internal.effect_streams input_stream
-                         ON input_stream.stream_id = consumer.stream_id
-                       WHERE consumer.result_oid = checkpoint.result_oid
-                         AND consumer.consumer_stage_id = checkpoint.stage_id
-                         AND (
-                           consumer.next_chunk_seq < input_stream.next_chunk_seq
-                           OR (
-                             input_stream.producer_kind = 'source'
-                             AND EXISTS (
-                               SELECT 1
-                               FROM shiba_internal.ingress_replay_state publication
-                               WHERE publication.slot_generation
-                                       = input_stream.slot_generation
-                                 AND publication.published_lsn IS NOT NULL
-                                 AND consumer.consumed_frontier_lsn
-                                       < publication.published_lsn
-                             )
-                           )
-                         )
-                     )
-                   )
-                   AND NOT EXISTS (
-                     SELECT 1
-                     FROM shiba_internal.effect_streams output_stream
-                     WHERE output_stream.producer_kind = 'operator'
-                       AND output_stream.producer_result_oid = checkpoint.result_oid
-                       AND output_stream.producer_stage_id = checkpoint.stage_id
-                       AND output_stream.backpressured
-                   )
+                   AND {DURABLE_STAGE_READY}
                )
              ORDER BY dataflow.result_oid
              LIMIT {limit_parameter}"

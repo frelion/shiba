@@ -1561,18 +1561,50 @@ mod execution {
     use pgrx::datum::DatumWithOid;
     use pgrx::prelude::*;
 
+    use crate::kernel::KernelTransition;
     use crate::logical::model::{DataflowPlan, DataflowStage, JoinKind, JoinSpec, OperatorSpec};
-    use crate::logical::{StepExecution, WorkBudget};
+    use crate::logical::WorkBudget;
     use crate::postgres::{format_lsn, parse_lsn};
     use crate::scalar_sql::compile_scalar_expression;
 
     use super::*;
     use crate::kernel::{
         advance_input, append_frontier, canonical_row_key_sql, chunk, compile_named_outputs,
-        compile_stage_bindings, next_chunk, payload_facts, validate_output_attributes,
-        BindingInput, ChunkKind, ChunkMeta, OutputAppendTarget, OutputFacts, PayloadStorage,
-        ProducerKind, RelationRef, StepTxn, TypeRef,
+        compile_stage_bindings, lock_continuation, next_chunk, payload_facts,
+        replace_continuation_cas, validate_continuation_abi as validate_typed_continuation_abi,
+        validate_output_attributes, BindingInput, ChunkKind, ChunkMeta, ContinuationColumn,
+        OutputAppendTarget, OutputFacts, PayloadStorage, ProducerKind, RelationRef, StepContext,
+        TypeRef,
     };
+
+    const CONTINUATION_COLUMNS: &[ContinuationColumn] = &[
+        ContinuationColumn::required("singleton", pg_sys::BOOLOID),
+        ContinuationColumn::required("phase", pg_sys::INT2OID),
+        ContinuationColumn::required("input_side", pg_sys::INT2OID),
+        ContinuationColumn::required("left_stream_id", pg_sys::INT8OID),
+        ContinuationColumn::required("left_chunk_seq", pg_sys::INT8OID),
+        ContinuationColumn::required("left_row_ordinal", pg_sys::INT8OID),
+        ContinuationColumn::required("right_stream_id", pg_sys::INT8OID),
+        ContinuationColumn::required("right_chunk_seq", pg_sys::INT8OID),
+        ContinuationColumn::required("right_row_ordinal", pg_sys::INT8OID),
+        ContinuationColumn::nullable("event_weight", pg_sys::INT8OID),
+        ContinuationColumn::nullable("event_bytes", pg_sys::INT8OID),
+        ContinuationColumn::nullable("own_row_id", pg_sys::INT8OID),
+        ContinuationColumn::nullable("own_multiplicity", pg_sys::INT8OID),
+        ContinuationColumn::nullable("own_match_count", pg_sys::INT8OID),
+        ContinuationColumn::nullable("own_unknown_count", pg_sys::INT8OID),
+        ContinuationColumn::nullable("candidate_after", pg_sys::INT8OID),
+        ContinuationColumn::nullable("accumulated_match_count", pg_sys::INT8OID),
+        ContinuationColumn::nullable("accumulated_unknown_count", pg_sys::INT8OID),
+        ContinuationColumn::nullable("pending_row_id", pg_sys::INT8OID),
+        ContinuationColumn::nullable("pending_multiplicity", pg_sys::INT8OID),
+        ContinuationColumn::nullable("pending_truth", pg_sys::INT2OID),
+        ContinuationColumn::nullable("pending_old_match", pg_sys::INT8OID),
+        ContinuationColumn::nullable("pending_old_unknown", pg_sys::INT8OID),
+        ContinuationColumn::nullable("pending_new_match", pg_sys::INT8OID),
+        ContinuationColumn::nullable("pending_new_unknown", pg_sys::INT8OID),
+        ContinuationColumn::nullable_as("frontier_lsn", pg_sys::PG_LSNOID, "pg_lsn"),
+    ];
 
     struct Layout {
         left_payload: PayloadStorage,
@@ -1639,11 +1671,11 @@ mod execution {
         }
     }
 
-    pub(crate) fn execute(
-        mut transaction: StepTxn<'_, '_>,
+    pub(crate) fn step(
+        transaction: &mut StepContext<'_, '_>,
         plan: &DataflowPlan,
         stage_id: u32,
-    ) -> Result<StepExecution, String> {
+    ) -> Result<KernelTransition, String> {
         let stage = plan
             .stages
             .get(usize::try_from(stage_id).map_err(|_| "Join stage ID exceeds usize")?)
@@ -1657,52 +1689,50 @@ mod execution {
         {
             return Err("Join requires exactly two operator-stream inputs".into());
         }
-        let layout = load_layout(&mut transaction, plan, stage, spec)?;
-        let mut continuation = load_continuation(&mut transaction, &layout.continuation)?;
-        if transaction.checkpoint_had_continuation() != continuation.is_some() {
-            return Err("Join checkpoint disagrees with its typed continuation".into());
-        }
+        let layout = load_layout(transaction, plan, stage, spec)?;
+        let mut continuation = load_continuation(transaction, &layout.continuation)?;
+        super::super::validate_continuation_authority(transaction, continuation.is_some())?;
         if continuation.is_none() && spec.kind == JoinKind::Inner {
-            if let Some(page) = measure_inner_page(&mut transaction, &layout)? {
+            if let Some(page) = measure_inner_page(transaction, &layout)? {
                 return execute_inner_page(transaction, &layout, page);
             }
         }
 
         // A quantum publishes at most one immutable output chunk. Clamp the
         // shared budget to that stream's chunk target before any phase runs.
-        let mut quantum = WorkQuantum::new(effective_budget(&transaction)?, 64);
+        let mut quantum = WorkQuantum::new(effective_budget(transaction)?, 64);
         let has_continuation = loop {
             let remaining = quantum
                 .remaining()
                 .ok_or_else(|| "Join quantum exhausted before its first transition".to_string())?;
             transaction.set_transition_budget(remaining);
             let transition = match continuation {
-                None => open_next_input(&mut transaction, &layout)?,
+                None => open_next_input(transaction, &layout)?,
                 Some(JoinContinuation::Preflight { positions, side }) => {
-                    step_preflight(&mut transaction, &layout, positions, side)?
+                    step_preflight(transaction, &layout, positions, side)?
                 }
                 Some(continuation @ JoinContinuation::Probe(_))
                 | Some(continuation @ JoinContinuation::PendingTransition { .. }) => {
-                    step_candidates(&mut transaction, &layout, spec, continuation)?
+                    step_candidates(transaction, &layout, spec, continuation)?
                 }
                 Some(continuation @ JoinContinuation::Finalize(_)) => {
-                    step_finalize(&mut transaction, &layout, spec, continuation)?
+                    step_finalize(transaction, &layout, spec, continuation)?
                 }
                 Some(continuation @ JoinContinuation::Frontier(_)) => {
-                    step_frontier(&mut transaction, &layout, continuation)?
+                    step_frontier(transaction, &layout, continuation)?
                 }
             };
             quantum.record(transition.usage)?;
             if !transition.continue_in_transaction || quantum.remaining().is_none() {
                 break transition.has_continuation;
             }
-            continuation = load_continuation(&mut transaction, &layout.continuation)?;
+            continuation = load_continuation(transaction, &layout.continuation)?;
         };
-        transaction.finish(has_continuation, quantum.usage())
+        transaction.transition(has_continuation, quantum.usage())
     }
 
     fn open_next_input(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
     ) -> Result<JoinTransition, String> {
         let left = next_chunk(transaction, 0)?;
@@ -1736,7 +1766,7 @@ mod execution {
     }
 
     fn step_preflight(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         positions: InputPositions,
         side: InputSide,
@@ -1751,7 +1781,7 @@ mod execution {
     }
 
     fn step_candidates(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         spec: &JoinSpec,
         continuation: JoinContinuation,
@@ -1811,7 +1841,7 @@ mod execution {
     }
 
     fn load_layout(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         plan: &DataflowPlan,
         stage: &DataflowStage,
         spec: &JoinSpec,
@@ -1862,7 +1892,7 @@ mod execution {
     }
 
     fn validate_state_abi(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         relation: &RelationRef,
         row_type: &TypeRef,
     ) -> Result<(), String> {
@@ -1912,54 +1942,13 @@ mod execution {
     }
 
     fn validate_continuation_abi(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         relation: &RelationRef,
     ) -> Result<(), String> {
-        let attributes = transaction.relation_attributes(relation.oid())?;
-        let expected = [
-            ("singleton", pg_sys::BOOLOID, true),
-            ("phase", pg_sys::INT2OID, true),
-            ("input_side", pg_sys::INT2OID, true),
-            ("left_stream_id", pg_sys::INT8OID, true),
-            ("left_chunk_seq", pg_sys::INT8OID, true),
-            ("left_row_ordinal", pg_sys::INT8OID, true),
-            ("right_stream_id", pg_sys::INT8OID, true),
-            ("right_chunk_seq", pg_sys::INT8OID, true),
-            ("right_row_ordinal", pg_sys::INT8OID, true),
-            ("event_weight", pg_sys::INT8OID, false),
-            ("event_bytes", pg_sys::INT8OID, false),
-            ("own_row_id", pg_sys::INT8OID, false),
-            ("own_multiplicity", pg_sys::INT8OID, false),
-            ("own_match_count", pg_sys::INT8OID, false),
-            ("own_unknown_count", pg_sys::INT8OID, false),
-            ("candidate_after", pg_sys::INT8OID, false),
-            ("accumulated_match_count", pg_sys::INT8OID, false),
-            ("accumulated_unknown_count", pg_sys::INT8OID, false),
-            ("pending_row_id", pg_sys::INT8OID, false),
-            ("pending_multiplicity", pg_sys::INT8OID, false),
-            ("pending_truth", pg_sys::INT2OID, false),
-            ("pending_old_match", pg_sys::INT8OID, false),
-            ("pending_old_unknown", pg_sys::INT8OID, false),
-            ("pending_new_match", pg_sys::INT8OID, false),
-            ("pending_new_unknown", pg_sys::INT8OID, false),
-            ("frontier_lsn", pg_sys::PG_LSNOID, false),
-        ];
-        if attributes.len() != expected.len()
-            || attributes
-                .iter()
-                .zip(expected)
-                .any(|(attribute, (name, type_oid, not_null))| {
-                    attribute.name != name
-                        || attribute.type_oid != type_oid
-                        || attribute.not_null != not_null
-                })
-        {
-            return Err("Join continuation relation changed its ABI".into());
-        }
-        Ok(())
+        validate_typed_continuation_abi(transaction, relation, CONTINUATION_COLUMNS, "Join")
     }
 
-    fn effective_budget(transaction: &StepTxn<'_, '_>) -> Result<WorkBudget, String> {
+    fn effective_budget(transaction: &StepContext<'_, '_>) -> Result<WorkBudget, String> {
         let budget = transaction.budget();
         let output = transaction.output()?;
         let output_rows =
@@ -1988,7 +1977,7 @@ mod execution {
     /// Measures one complete inner-join input chunk. The persisted row cursor
     /// remains the continuation for chunks whose fanout exceeds the quantum.
     fn measure_inner_page(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
     ) -> Result<Option<InnerPage>, String> {
         let left = next_chunk(transaction, 0)?;
@@ -2075,23 +2064,23 @@ mod execution {
     }
 
     fn execute_inner_page(
-        mut transaction: StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         page: InnerPage,
-    ) -> Result<StepExecution, String> {
+    ) -> Result<KernelTransition, String> {
         let input = transaction.input(page.side.code() as u16)?.clone();
         let output_facts = append_inner_page(
-            &mut transaction,
+            transaction,
             layout,
             page.side,
             &page.chunk,
             page.output_rows,
             page.output_bytes,
         )?;
-        update_inner_page_candidates(&mut transaction, layout, page.side, &page.chunk)?;
-        apply_inner_page_own_state(&mut transaction, layout, page.side, &page.chunk)?;
+        update_inner_page_candidates(transaction, layout, page.side, &page.chunk)?;
+        apply_inner_page_own_state(transaction, layout, page.side, &page.chunk)?;
         advance_input(
-            &mut transaction,
+            transaction,
             input.port,
             input
                 .next_chunk_seq
@@ -2107,7 +2096,7 @@ mod execution {
         if page.output_rows == 0 && !matches!(output_facts, OutputFacts::None) {
             return Err("empty Join page unexpectedly published output".into());
         }
-        transaction.finish(
+        transaction.transition(
             false,
             WorkUsage {
                 input_rows: page.chunk.rows,
@@ -2119,7 +2108,7 @@ mod execution {
     }
 
     fn append_inner_page(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         side: InputSide,
         chunk: &ChunkMeta,
@@ -2221,7 +2210,7 @@ mod execution {
     }
 
     fn update_inner_page_candidates(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         side: InputSide,
         chunk: &ChunkMeta,
@@ -2289,7 +2278,7 @@ mod execution {
     }
 
     fn apply_inner_page_own_state(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         side: InputSide,
         chunk: &ChunkMeta,
@@ -2410,35 +2399,27 @@ mod execution {
     }
 
     fn load_continuation(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         relation: &RelationRef,
     ) -> Result<Option<JoinContinuation>, String> {
-        let query = format!(
-            r#"
-            SELECT phase,input_side,
-                   left_stream_id,left_chunk_seq,left_row_ordinal,
-                   right_stream_id,right_chunk_seq,right_row_ordinal,
-                   event_weight,event_bytes,
-                   own_row_id,own_multiplicity,
-                   own_match_count,own_unknown_count,
-                   candidate_after,
-                   accumulated_match_count,accumulated_unknown_count,
-                   pending_row_id,pending_multiplicity,pending_truth,
-                   pending_old_match,pending_old_unknown,
-                   pending_new_match,pending_new_unknown,
-                   frontier_lsn::text
-            FROM {}
-            WHERE singleton
-            FOR UPDATE
-            "#,
-            relation.sql()
-        );
-        let table = transaction.lock(&query, &[])?;
-        match table.len() {
-            0 => Ok(None),
-            1 => decode_continuation(&table.first()).map(Some),
-            count => Err(format!("Join continuation relation contains {count} rows")),
-        }
+        lock_continuation(
+            transaction,
+            relation,
+            "phase,input_side,
+             left_stream_id,left_chunk_seq,left_row_ordinal,
+             right_stream_id,right_chunk_seq,right_row_ordinal,
+             event_weight,event_bytes,
+             own_row_id,own_multiplicity,
+             own_match_count,own_unknown_count,
+             candidate_after,
+             accumulated_match_count,accumulated_unknown_count,
+             pending_row_id,pending_multiplicity,pending_truth,
+             pending_old_match,pending_old_unknown,
+             pending_new_match,pending_new_unknown,
+             frontier_lsn::text",
+            "Join",
+            |rows| decode_continuation(&rows.first()),
+        )
     }
 
     fn decode_continuation(row: &pgrx::spi::SpiTupleTable<'_>) -> Result<JoinContinuation, String> {
@@ -2587,9 +2568,35 @@ mod execution {
         }
     }
 
-    fn continuation_values(
-        continuation: &JoinContinuation,
-    ) -> Result<Vec<(&'static str, String)>, String> {
+    struct JoinFields {
+        phase: i16,
+        input_side: i16,
+        left_stream_id: i64,
+        left_chunk_seq: i64,
+        left_row_ordinal: i64,
+        right_stream_id: i64,
+        right_chunk_seq: i64,
+        right_row_ordinal: i64,
+        event_weight: Option<i64>,
+        event_bytes: Option<i64>,
+        own_row_id: Option<i64>,
+        own_multiplicity: Option<i64>,
+        own_match_count: Option<i64>,
+        own_unknown_count: Option<i64>,
+        candidate_after: Option<i64>,
+        accumulated_match_count: Option<i64>,
+        accumulated_unknown_count: Option<i64>,
+        pending_row_id: Option<i64>,
+        pending_multiplicity: Option<i64>,
+        pending_truth: Option<i16>,
+        pending_old_match: Option<i64>,
+        pending_old_unknown: Option<i64>,
+        pending_new_match: Option<i64>,
+        pending_new_unknown: Option<i64>,
+        frontier_lsn: Option<String>,
+    }
+
+    fn continuation_fields(continuation: &JoinContinuation) -> Result<JoinFields, String> {
         let (positions, side) = match continuation {
             JoinContinuation::Preflight { positions, side } => (*positions, *side),
             JoinContinuation::Probe(progress)
@@ -2597,130 +2604,161 @@ mod execution {
             | JoinContinuation::Finalize(progress) => (progress.positions(), progress.side()),
             JoinContinuation::Frontier(frontier) => (frontier.positions(), frontier.side()),
         };
-        let mut values = vec![
-            ("phase", continuation.phase().code().value().to_string()),
-            ("input_side", side.code().to_string()),
-            ("left_stream_id", positions.left.stream_id.to_string()),
-            ("left_chunk_seq", positions.left.chunk_seq.to_string()),
-            ("left_row_ordinal", positions.left.row_ordinal.to_string()),
-            ("right_stream_id", positions.right.stream_id.to_string()),
-            ("right_chunk_seq", positions.right.chunk_seq.to_string()),
-            ("right_row_ordinal", positions.right.row_ordinal.to_string()),
-        ];
-        let mut event = vec![
-            ("event_weight", "NULL".into()),
-            ("event_bytes", "NULL".into()),
-            ("own_row_id", "NULL".into()),
-            ("own_multiplicity", "NULL".into()),
-            ("own_match_count", "NULL".into()),
-            ("own_unknown_count", "NULL".into()),
-            ("candidate_after", "NULL".into()),
-            ("accumulated_match_count", "NULL".into()),
-            ("accumulated_unknown_count", "NULL".into()),
-            ("pending_row_id", "NULL".into()),
-            ("pending_multiplicity", "NULL".into()),
-            ("pending_truth", "NULL".into()),
-            ("pending_old_match", "NULL".into()),
-            ("pending_old_unknown", "NULL".into()),
-            ("pending_new_match", "NULL".into()),
-            ("pending_new_unknown", "NULL".into()),
-            ("frontier_lsn", "NULL".into()),
-        ];
+        let mut fields = JoinFields {
+            phase: continuation.phase().code().value(),
+            input_side: side.code(),
+            left_stream_id: positions.left.stream_id,
+            left_chunk_seq: positions.left.chunk_seq,
+            left_row_ordinal: positions.left.row_ordinal,
+            right_stream_id: positions.right.stream_id,
+            right_chunk_seq: positions.right.chunk_seq,
+            right_row_ordinal: positions.right.row_ordinal,
+            event_weight: None,
+            event_bytes: None,
+            own_row_id: None,
+            own_multiplicity: None,
+            own_match_count: None,
+            own_unknown_count: None,
+            candidate_after: None,
+            accumulated_match_count: None,
+            accumulated_unknown_count: None,
+            pending_row_id: None,
+            pending_multiplicity: None,
+            pending_truth: None,
+            pending_old_match: None,
+            pending_old_unknown: None,
+            pending_new_match: None,
+            pending_new_unknown: None,
+            frontier_lsn: None,
+        };
         match continuation {
             JoinContinuation::Preflight { .. } => {}
             JoinContinuation::Frontier(frontier) => {
-                event[16].1 = format!("'{}'::pg_lsn", format_lsn(frontier.frontier()));
+                fields.frontier_lsn = Some(format_lsn(frontier.frontier()));
             }
             JoinContinuation::Probe(progress) | JoinContinuation::Finalize(progress) => {
-                encode_progress(&mut event, *progress);
+                encode_progress(&mut fields, *progress)?;
             }
             JoinContinuation::PendingTransition {
                 progress,
                 candidate,
             } => {
-                encode_progress(&mut event, *progress);
-                event[9].1 = candidate.row_id.to_string();
-                event[10].1 = candidate.multiplicity.to_string();
-                event[11].1 = candidate.truth.code().to_string();
-                event[12].1 = candidate.old_counts.matched.to_string();
-                event[13].1 = candidate.old_counts.unknown.to_string();
-                event[14].1 = candidate.new_counts.matched.to_string();
-                event[15].1 = candidate.new_counts.unknown.to_string();
+                encode_progress(&mut fields, *progress)?;
+                fields.pending_row_id = Some(candidate.row_id);
+                fields.pending_multiplicity =
+                    Some(join_i64(candidate.multiplicity, "pending multiplicity")?);
+                fields.pending_truth = Some(candidate.truth.code());
+                fields.pending_old_match =
+                    Some(join_i64(candidate.old_counts.matched, "pending old match")?);
+                fields.pending_old_unknown = Some(join_i64(
+                    candidate.old_counts.unknown,
+                    "pending old unknown",
+                )?);
+                fields.pending_new_match =
+                    Some(join_i64(candidate.new_counts.matched, "pending new match")?);
+                fields.pending_new_unknown = Some(join_i64(
+                    candidate.new_counts.unknown,
+                    "pending new unknown",
+                )?);
             }
         }
-        values.extend(event);
-        Ok(values)
+        Ok(fields)
     }
 
-    fn encode_progress(values: &mut [(&'static str, String)], progress: InputProgress) {
-        values[0].1 = progress.event_weight().to_string();
-        values[1].1 = progress.event_bytes().to_string();
+    fn encode_progress(fields: &mut JoinFields, progress: InputProgress) -> Result<(), String> {
+        fields.event_weight = Some(progress.event_weight());
+        fields.event_bytes = Some(join_i64(progress.event_bytes(), "event bytes")?);
         let own = progress.expected_own();
-        values[2].1 = own
-            .row_id
-            .map_or_else(|| "NULL".into(), |value| value.to_string());
-        values[3].1 = own.multiplicity.to_string();
-        values[4].1 = own.counts.matched.to_string();
-        values[5].1 = own.counts.unknown.to_string();
-        values[6].1 = progress
-            .candidate_after()
-            .map_or_else(|| "NULL".into(), |value| value.to_string());
-        values[7].1 = progress.opposite_counts().matched.to_string();
-        values[8].1 = progress.opposite_counts().unknown.to_string();
-    }
-
-    fn insert_continuation(
-        transaction: &mut StepTxn<'_, '_>,
-        relation: &RelationRef,
-        continuation: &JoinContinuation,
-    ) -> Result<(), String> {
-        let values = continuation_values(continuation)?;
-        let columns = values
-            .iter()
-            .map(|(column, _)| *column)
-            .collect::<Vec<_>>()
-            .join(",");
-        let literals = values
-            .iter()
-            .map(|(_, value)| value.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        let query = format!(
-            "INSERT INTO {}(singleton,{columns}) VALUES(true,{literals}) RETURNING 1",
-            relation.sql()
-        );
-        if transaction.write(&query, &[])?.len() != 1 {
-            return Err("Join continuation insert did not affect one row".into());
-        }
+        fields.own_row_id = own.row_id;
+        fields.own_multiplicity = Some(join_i64(own.multiplicity, "own multiplicity")?);
+        fields.own_match_count = Some(join_i64(own.counts.matched, "own match count")?);
+        fields.own_unknown_count = Some(join_i64(own.counts.unknown, "own unknown count")?);
+        fields.candidate_after = progress.candidate_after();
+        fields.accumulated_match_count = Some(join_i64(
+            progress.opposite_counts().matched,
+            "accumulated match count",
+        )?);
+        fields.accumulated_unknown_count = Some(join_i64(
+            progress.opposite_counts().unknown,
+            "accumulated unknown count",
+        )?);
         Ok(())
     }
 
+    fn join_i64(value: u64, field: &str) -> Result<i64, String> {
+        i64::try_from(value).map_err(|_| format!("Join {field} exceeds bigint"))
+    }
+
+    fn continuation_arguments<'a>(fields: &'a JoinFields) -> [DatumWithOid<'a>; 25] {
+        unsafe {
+            [
+                DatumWithOid::new(fields.phase, pg_sys::INT2OID),
+                DatumWithOid::new(fields.input_side, pg_sys::INT2OID),
+                DatumWithOid::new(fields.left_stream_id, pg_sys::INT8OID),
+                DatumWithOid::new(fields.left_chunk_seq, pg_sys::INT8OID),
+                DatumWithOid::new(fields.left_row_ordinal, pg_sys::INT8OID),
+                DatumWithOid::new(fields.right_stream_id, pg_sys::INT8OID),
+                DatumWithOid::new(fields.right_chunk_seq, pg_sys::INT8OID),
+                DatumWithOid::new(fields.right_row_ordinal, pg_sys::INT8OID),
+                DatumWithOid::new(fields.event_weight, pg_sys::INT8OID),
+                DatumWithOid::new(fields.event_bytes, pg_sys::INT8OID),
+                DatumWithOid::new(fields.own_row_id, pg_sys::INT8OID),
+                DatumWithOid::new(fields.own_multiplicity, pg_sys::INT8OID),
+                DatumWithOid::new(fields.own_match_count, pg_sys::INT8OID),
+                DatumWithOid::new(fields.own_unknown_count, pg_sys::INT8OID),
+                DatumWithOid::new(fields.candidate_after, pg_sys::INT8OID),
+                DatumWithOid::new(fields.accumulated_match_count, pg_sys::INT8OID),
+                DatumWithOid::new(fields.accumulated_unknown_count, pg_sys::INT8OID),
+                DatumWithOid::new(fields.pending_row_id, pg_sys::INT8OID),
+                DatumWithOid::new(fields.pending_multiplicity, pg_sys::INT8OID),
+                DatumWithOid::new(fields.pending_truth, pg_sys::INT2OID),
+                DatumWithOid::new(fields.pending_old_match, pg_sys::INT8OID),
+                DatumWithOid::new(fields.pending_old_unknown, pg_sys::INT8OID),
+                DatumWithOid::new(fields.pending_new_match, pg_sys::INT8OID),
+                DatumWithOid::new(fields.pending_new_unknown, pg_sys::INT8OID),
+                DatumWithOid::new(fields.frontier_lsn.as_deref(), pg_sys::TEXTOID),
+            ]
+        }
+    }
+
+    fn insert_continuation(
+        transaction: &mut StepContext<'_, '_>,
+        relation: &RelationRef,
+        continuation: &JoinContinuation,
+    ) -> Result<(), String> {
+        let fields = continuation_fields(continuation)?;
+        let arguments = continuation_arguments(&fields);
+        replace_continuation_cas(
+            transaction,
+            relation,
+            CONTINUATION_COLUMNS,
+            None,
+            Some(&arguments),
+            "Join",
+        )
+    }
+
     fn replace_continuation(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         relation: &RelationRef,
         expected: &JoinContinuation,
         next: Option<&JoinContinuation>,
     ) -> Result<(), String> {
-        let expected = continuation_values(expected)?;
-        let predicate = expected
-            .iter()
-            .map(|(column, value)| format!("{column} IS NOT DISTINCT FROM {value}"))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let query = format!(
-            "DELETE FROM {} WHERE singleton AND {predicate} RETURNING 1",
-            relation.sql()
-        );
-        if transaction.write(&query, &[])?.len() != 1 {
-            return Err("Join continuation CAS delete did not affect one row".into());
-        }
-        if let Some(next) = next {
-            insert_continuation(transaction, relation, next)?;
-        }
-        Ok(())
+        let expected_fields = continuation_fields(expected)?;
+        let expected_arguments = continuation_arguments(&expected_fields);
+        let next_fields = next.map(continuation_fields).transpose()?;
+        let next_arguments = next_fields.as_ref().map(continuation_arguments);
+        replace_continuation_cas(
+            transaction,
+            relation,
+            CONTINUATION_COLUMNS,
+            Some(&expected_arguments),
+            next_arguments.as_ref().map(|arguments| &arguments[..]),
+            "Join",
+        )
     }
 
-    fn consumer_positions(transaction: &StepTxn<'_, '_>) -> Result<InputPositions, String> {
+    fn consumer_positions(transaction: &StepContext<'_, '_>) -> Result<InputPositions, String> {
         InputPositions::new(
             InputPosition::new(
                 transaction.input(0)?.stream_id,
@@ -2736,7 +2774,7 @@ mod execution {
     }
 
     fn validate_positions_for_side(
-        transaction: &StepTxn<'_, '_>,
+        transaction: &StepContext<'_, '_>,
         positions: InputPositions,
         owner: InputSide,
     ) -> Result<(), String> {
@@ -2755,7 +2793,7 @@ mod execution {
     }
 
     fn load_event(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         positions: InputPositions,
         side: InputSide,
@@ -2808,7 +2846,7 @@ mod execution {
     }
 
     fn load_own_expectation(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         event: InputEventFacts,
     ) -> Result<OwnExpectation, String> {
@@ -2872,7 +2910,7 @@ mod execution {
     }
 
     fn probe_candidates(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         mode: JoinMode,
         continuation: &JoinContinuation,
@@ -3089,7 +3127,7 @@ mod execution {
     }
 
     fn append_actions(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         chunk: &ChunkMeta,
         actions: &[OutputAction],
@@ -3290,7 +3328,7 @@ mod execution {
     }
 
     fn apply_candidate_changes(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         state: &RelationRef,
         changes: &[CandidateStateChange],
     ) -> Result<u64, String> {
@@ -3347,7 +3385,7 @@ mod execution {
     }
 
     fn step_finalize(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         spec: &JoinSpec,
         continuation: JoinContinuation,
@@ -3448,7 +3486,7 @@ mod execution {
     }
 
     fn measure_current_output(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         event: InputEventFacts,
     ) -> Result<u64, String> {
@@ -3496,7 +3534,7 @@ mod execution {
     }
 
     fn apply_own_change(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         event: InputEventFacts,
         change: OwnStateChange,
@@ -3571,7 +3609,7 @@ mod execution {
     }
 
     fn step_frontier(
-        transaction: &mut StepTxn<'_, '_>,
+        transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         continuation: JoinContinuation,
     ) -> Result<JoinTransition, String> {
@@ -3695,7 +3733,18 @@ mod execution {
 }
 
 #[cfg(feature = "pg17")]
-pub(crate) use execution::execute;
+pub(crate) use execution::step;
+
+pub(crate) const KERNEL: super::KernelFn = super::KernelFn::new(
+    super::KernelContract::new(
+        &[
+            super::InputContract::Operator,
+            super::InputContract::Operator,
+        ],
+        super::OutputContract::EffectStream,
+    ),
+    step,
+);
 
 #[cfg(feature = "pg17")]
 pub(crate) fn provision(
