@@ -45,7 +45,7 @@ pub(crate) use runner::{
     InputContract, KernelContract, KernelFn, KernelRunner, KernelTransition, OutputContract,
 };
 pub(crate) use step::{
-    InputState, OutputAppendTarget, ProducerKind, StepContext, StepContextStart,
+    InputState, OutputAppendTarget, ProducerKind, StageMetadataCache, StepContext, StepContextStart,
 };
 pub(crate) use storage::payload as resolve_payload_storage;
 pub(crate) use storage::{

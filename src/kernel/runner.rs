@@ -4,7 +4,7 @@ use pgrx::spi::SpiClient;
 use crate::logical::model::{DataflowPlan, ExecutionSettings};
 use crate::logical::{StepExecution, StepOutcome, WorkBudget};
 
-use super::{ProducerKind, StepContext, StepContextStart, WorkUsage};
+use super::{ProducerKind, StageMetadataCache, StepContext, StepContextStart, WorkUsage};
 
 /// Unforgeable outside this module. `StepContext` requires it for both ends of
 /// the lifecycle, so an operator cannot bypass `KernelRunner`.
@@ -141,6 +141,7 @@ impl KernelRunner {
         settings: &ExecutionSettings,
         budget: WorkBudget,
         plan: &DataflowPlan,
+        metadata_cache: StageMetadataCache,
     ) -> Result<StepExecution, String> {
         let contract = kernel.contract();
         let permit = LifecyclePermit::new();
@@ -155,6 +156,7 @@ impl KernelRunner {
             expects_output,
             settings,
             budget,
+            metadata_cache,
             permit,
         )? {
             StepContextStart::Blocked => {

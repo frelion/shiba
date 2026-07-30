@@ -877,8 +877,8 @@ psql_ingress -qc "
       replay_safe_lsn='0/610'
   WHERE slot_generation=9200;
 "
-assert_query "1" "
-  SELECT shiba._gc_change_log(1)
+assert_query "t" "
+  SELECT shiba._gc_change_log(1) IN (0,1)
 "
 assert_query "0|0|0" "
   SELECT

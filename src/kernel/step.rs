@@ -1,3 +1,7 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use pgrx::spi::{Query, SpiClient, SpiTupleTable};
@@ -78,6 +82,92 @@ pub(crate) enum StepContextStart<'client, 'conn> {
     Ready(Box<StepContext<'client, 'conn>>),
 }
 
+/// Backend-local, stage-scoped catalog metadata.
+///
+/// This deliberately contains only immutable physical identities and validated
+/// ABI descriptions.  Input cursors, continuations, checkpoints, output
+/// watermarks, and operator state remain in PostgreSQL and are loaded for
+/// every step.  A `LoadedDataflow` owns one cache per stage, so LRU eviction
+/// drops all of this metadata with its dataflow.
+#[derive(Clone, Default)]
+pub(crate) struct StageMetadataCache {
+    inner: Rc<RefCell<StageMetadata>>,
+}
+
+#[derive(Default)]
+struct StageMetadata {
+    payloads: HashMap<i64, PayloadStorage>,
+    states: HashMap<i32, RelationRef>,
+    continuation: Option<RelationRef>,
+    result: Option<RelationRef>,
+    composite_attributes: HashMap<pg_sys::Oid, Vec<AttributeRef>>,
+    relation_attributes: HashMap<pg_sys::Oid, Vec<AttributeRef>>,
+}
+
+impl StageMetadataCache {
+    fn payload(&self, stream_id: i64) -> Option<PayloadStorage> {
+        self.inner.borrow().payloads.get(&stream_id).cloned()
+    }
+
+    fn insert_payload(&self, stream_id: i64, payload: PayloadStorage) {
+        self.inner.borrow_mut().payloads.insert(stream_id, payload);
+    }
+
+    fn state(&self, slot: i32) -> Option<RelationRef> {
+        self.inner.borrow().states.get(&slot).cloned()
+    }
+
+    fn insert_state(&self, slot: i32, relation: RelationRef) {
+        self.inner.borrow_mut().states.insert(slot, relation);
+    }
+
+    fn continuation(&self) -> Option<RelationRef> {
+        self.inner.borrow().continuation.clone()
+    }
+
+    fn insert_continuation(&self, relation: RelationRef) {
+        self.inner.borrow_mut().continuation = Some(relation);
+    }
+
+    fn result(&self) -> Option<RelationRef> {
+        self.inner.borrow().result.clone()
+    }
+
+    fn insert_result(&self, relation: RelationRef) {
+        self.inner.borrow_mut().result = Some(relation);
+    }
+
+    fn composite_attributes(&self, type_oid: pg_sys::Oid) -> Option<Vec<AttributeRef>> {
+        self.inner
+            .borrow()
+            .composite_attributes
+            .get(&type_oid)
+            .cloned()
+    }
+
+    fn insert_composite_attributes(&self, type_oid: pg_sys::Oid, attributes: Vec<AttributeRef>) {
+        self.inner
+            .borrow_mut()
+            .composite_attributes
+            .insert(type_oid, attributes);
+    }
+
+    fn relation_attributes(&self, relation_oid: pg_sys::Oid) -> Option<Vec<AttributeRef>> {
+        self.inner
+            .borrow()
+            .relation_attributes
+            .get(&relation_oid)
+            .cloned()
+    }
+
+    fn insert_relation_attributes(&self, relation_oid: pg_sys::Oid, attributes: Vec<AttributeRef>) {
+        self.inner
+            .borrow_mut()
+            .relation_attributes
+            .insert(relation_oid, attributes);
+    }
+}
+
 /// The only mutable database context for one operator step.
 ///
 /// The background worker owns the surrounding PostgreSQL transaction.
@@ -95,6 +185,7 @@ pub(crate) struct StepContext<'client, 'conn> {
     admission: AdmissionProgress,
     inputs: Vec<InputState>,
     output: Option<OutputState>,
+    metadata_cache: StageMetadataCache,
 }
 
 impl<'client, 'conn> StepContext<'client, 'conn> {
@@ -107,6 +198,7 @@ impl<'client, 'conn> StepContext<'client, 'conn> {
         expects_output: bool,
         settings: &ExecutionSettings,
         budget: WorkBudget,
+        metadata_cache: StageMetadataCache,
         _permit: LifecyclePermit,
     ) -> Result<StepContextStart<'client, 'conn>, String> {
         if result_oid == pg_sys::InvalidOid {
@@ -350,6 +442,7 @@ impl<'client, 'conn> StepContext<'client, 'conn> {
             admission,
             inputs,
             output,
+            metadata_cache,
         })))
     }
 
@@ -567,33 +660,67 @@ impl<'client, 'conn> StepContext<'client, 'conn> {
     }
 
     pub(crate) fn payload_storage(&mut self, stream_id: i64) -> Result<PayloadStorage, String> {
-        storage::payload(self.client, stream_id)
+        if let Some(payload) = self.metadata_cache.payload(stream_id) {
+            return Ok(payload);
+        }
+        let payload = storage::payload(self.client, stream_id)?;
+        self.metadata_cache
+            .insert_payload(stream_id, payload.clone());
+        Ok(payload)
     }
 
     pub(crate) fn continuation_storage(&mut self) -> Result<RelationRef, String> {
-        storage::continuation(self.client, self.result_oid, self.stage_id)
+        if let Some(continuation) = self.metadata_cache.continuation() {
+            return Ok(continuation);
+        }
+        let continuation = storage::continuation(self.client, self.result_oid, self.stage_id)?;
+        self.metadata_cache
+            .insert_continuation(continuation.clone());
+        Ok(continuation)
     }
 
     pub(crate) fn state_storage(&mut self, slot: i32) -> Result<RelationRef, String> {
-        storage::state(self.client, self.result_oid, self.stage_id, slot)
+        if let Some(state) = self.metadata_cache.state(slot) {
+            return Ok(state);
+        }
+        let state = storage::state(self.client, self.result_oid, self.stage_id, slot)?;
+        self.metadata_cache.insert_state(slot, state.clone());
+        Ok(state)
     }
 
     pub(crate) fn result_storage(&mut self) -> Result<RelationRef, String> {
-        storage::result(self.client, self.result_oid)
+        if let Some(result) = self.metadata_cache.result() {
+            return Ok(result);
+        }
+        let result = storage::result(self.client, self.result_oid)?;
+        self.metadata_cache.insert_result(result.clone());
+        Ok(result)
     }
 
     pub(crate) fn composite_attributes(
         &mut self,
         type_: &TypeRef,
     ) -> Result<Vec<AttributeRef>, String> {
-        storage::composite_attributes(self.client, type_)
+        if let Some(attributes) = self.metadata_cache.composite_attributes(type_.oid()) {
+            return Ok(attributes);
+        }
+        let attributes = storage::composite_attributes(self.client, type_)?;
+        self.metadata_cache
+            .insert_composite_attributes(type_.oid(), attributes.clone());
+        Ok(attributes)
     }
 
     pub(crate) fn relation_attributes(
         &mut self,
         relation_oid: pg_sys::Oid,
     ) -> Result<Vec<AttributeRef>, String> {
-        storage::relation_attributes(self.client, relation_oid)
+        if let Some(attributes) = self.metadata_cache.relation_attributes(relation_oid) {
+            return Ok(attributes);
+        }
+        let attributes = storage::relation_attributes(self.client, relation_oid)?;
+        self.metadata_cache
+            .insert_relation_attributes(relation_oid, attributes.clone());
+        Ok(attributes)
     }
 
     pub(crate) fn lock<Q: Query<'conn>>(
@@ -803,5 +930,25 @@ mod tests {
             available_source_frontier_lsn: None,
         };
         assert!(!input.has_pending());
+    }
+
+    #[test]
+    fn stage_metadata_cache_shares_clones_and_keeps_kinds_separate() {
+        let cache = StageMetadataCache::default();
+        let cache_clone = cache.clone();
+        let relation_oid = pg_sys::Oid::from(10);
+        let attributes = vec![AttributeRef {
+            number: 1,
+            name: "value".into(),
+            type_oid: pg_sys::INT8OID,
+            typmod: -1,
+            collation_oid: pg_sys::InvalidOid,
+            not_null: true,
+        }];
+
+        cache_clone.insert_relation_attributes(relation_oid, attributes.clone());
+
+        assert_eq!(cache.relation_attributes(relation_oid), Some(attributes));
+        assert_eq!(cache.composite_attributes(relation_oid), None);
     }
 }

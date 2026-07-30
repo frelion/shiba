@@ -4,6 +4,9 @@
 //! resolved capability therefore contains both the index opclass/direction
 //! and the qualified operators used by keyset predicates.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiTupleTable};
@@ -98,6 +101,25 @@ FROM chosen
 ORDER BY opfamily_oid
 "#;
 
+// This metadata is immutable for the lifetime of a PostgreSQL backend: the
+// resolver accepts only pg_catalog B-tree families and operators.  Keep the
+// cache bounded nevertheless, because a long-lived Runtime may serve many
+// separately-created dataflows.
+const CAPABILITY_CACHE_CAPACITY: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CapabilityKey {
+    sort_operator_oid: u32,
+    equality_operator_oid: u32,
+    type_oid: u32,
+    nulls_first: bool,
+}
+
+thread_local! {
+    static CAPABILITY_CACHE: RefCell<HashMap<CapabilityKey, BtreeOrder>> =
+        RefCell::new(HashMap::new());
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BtreeOrder {
     pub(crate) opclass: String,
@@ -124,11 +146,16 @@ pub(crate) fn resolve_client(
     order: &SortGroupExpr,
     operator: &str,
 ) -> Result<BtreeOrder, String> {
+    if let Some(resolved) = cached(order) {
+        return Ok(resolved);
+    }
     let arguments = capability_arguments(order);
     let rows = client
         .select(BTREE_ORDER_CAPABILITY_SQL, None, &arguments)
         .map_err(|error| format!("could not resolve {operator} B-tree capability: {error}"))?;
-    decode(rows, order, operator)
+    let resolved = decode(rows, order, operator)?;
+    cache(order, &resolved);
+    Ok(resolved)
 }
 
 pub(crate) fn resolve_step(
@@ -136,8 +163,44 @@ pub(crate) fn resolve_step(
     order: &SortGroupExpr,
     operator: &str,
 ) -> Result<BtreeOrder, String> {
+    if let Some(resolved) = cached(order) {
+        return Ok(resolved);
+    }
     let rows = transaction.read(BTREE_ORDER_CAPABILITY_SQL, &capability_arguments(order))?;
-    decode(rows, order, operator)
+    let resolved = decode(rows, order, operator)?;
+    cache(order, &resolved);
+    Ok(resolved)
+}
+
+fn cached(order: &SortGroupExpr) -> Option<BtreeOrder> {
+    CAPABILITY_CACHE.with(|cache| cache.borrow().get(&capability_key(order)).cloned())
+}
+
+fn cache(order: &SortGroupExpr, resolved: &BtreeOrder) {
+    CAPABILITY_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache_insert(&mut cache, capability_key(order), resolved.clone());
+    });
+}
+
+fn cache_insert(
+    cache: &mut HashMap<CapabilityKey, BtreeOrder>,
+    key: CapabilityKey,
+    resolved: BtreeOrder,
+) {
+    if cache.len() >= CAPABILITY_CACHE_CAPACITY && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, resolved);
+}
+
+fn capability_key(order: &SortGroupExpr) -> CapabilityKey {
+    CapabilityKey {
+        sort_operator_oid: order.sort_operator_oid,
+        equality_operator_oid: order.equality_operator_oid,
+        type_oid: order.type_.type_oid,
+        nulls_first: order.nulls_first,
+    }
 }
 
 fn capability_arguments(order: &SortGroupExpr) -> [DatumWithOid<'static>; 3] {
@@ -240,6 +303,45 @@ mod tests {
         assert_eq!(decode_direction(1, "test").unwrap(), "ASC");
         assert_eq!(decode_direction(5, "test").unwrap(), "DESC");
         assert!(decode_direction(3, "test").is_err());
+    }
+
+    #[test]
+    fn capability_cache_is_bounded_without_evicting_an_existing_key() {
+        let mut cache = HashMap::new();
+        let resolved = BtreeOrder {
+            opclass: "pg_catalog.int4_ops".into(),
+            direction: "ASC",
+            sort_operator: "OPERATOR(pg_catalog.<)".into(),
+            equality_operator: "OPERATOR(pg_catalog.=)".into(),
+            nulls_first: false,
+        };
+        for type_oid in 1..=CAPABILITY_CACHE_CAPACITY as u32 {
+            cache_insert(
+                &mut cache,
+                CapabilityKey {
+                    sort_operator_oid: type_oid,
+                    equality_operator_oid: type_oid,
+                    type_oid,
+                    nulls_first: false,
+                },
+                resolved.clone(),
+            );
+        }
+        let existing = *cache.keys().next().expect("cache has entries");
+        cache_insert(&mut cache, existing, resolved.clone());
+        assert_eq!(cache.len(), CAPABILITY_CACHE_CAPACITY);
+
+        cache_insert(
+            &mut cache,
+            CapabilityKey {
+                sort_operator_oid: u32::MAX,
+                equality_operator_oid: u32::MAX,
+                type_oid: u32::MAX,
+                nulls_first: true,
+            },
+            resolved,
+        );
+        assert_eq!(cache.len(), 1);
     }
 }
 

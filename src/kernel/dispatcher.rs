@@ -5,13 +5,14 @@ use pgrx::prelude::*;
 use crate::logical::model::{DataflowPlan, OperatorSpec};
 use crate::logical::{StepExecution, WorkBudget};
 
-use super::KernelRunner;
+use super::{KernelRunner, StageMetadataCache};
 
 pub(crate) fn execute_step(
     result_oid: pg_sys::Oid,
     stage_id: u32,
     plan: &DataflowPlan,
     budget: WorkBudget,
+    metadata_cache: StageMetadataCache,
 ) -> Result<StepExecution, String> {
     let stage = plan
         .stages
@@ -36,6 +37,7 @@ pub(crate) fn execute_step(
             &plan.execution_settings,
             budget,
             plan,
+            metadata_cache,
         )
     })
 }

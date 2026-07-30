@@ -13,6 +13,7 @@ use super::model::DataflowPlan;
 pub(crate) struct LoadedDataflow {
     plan: DataflowPlan,
     stage_cursor: Option<u32>,
+    stage_metadata: Vec<crate::kernel::StageMetadataCache>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +38,9 @@ impl LoadedDataflow {
             .map_err(|error| format!("invalid dataflow plan: {error}"))?;
         plan.validate()?;
         Ok(Self {
+            stage_metadata: (0..plan.stages.len())
+                .map(|_| crate::kernel::StageMetadataCache::default())
+                .collect(),
             plan,
             stage_cursor: None,
         })
@@ -59,11 +63,21 @@ impl LoadedDataflow {
             return Err("durable readiness selected a stage outside its dataflow plan".into());
         }
         self.stage_cursor = Some(stage_id);
+        let metadata_cache = self
+            .stage_metadata
+            .get(usize::try_from(stage_id).map_err(|_| "operator stage ID exceeds usize")?)
+            .cloned()
+            .ok_or_else(|| "dataflow metadata cache has no selected stage".to_string())?;
         let mut quantum = WorkQuantum::new(budget, max_transitions);
         let mut outcome = StepOutcome::Idle;
         while let Some(remaining) = quantum.remaining() {
-            let execution =
-                crate::kernel::execute_step(result_oid, stage_id, &self.plan, remaining)?;
+            let execution = crate::kernel::execute_step(
+                result_oid,
+                stage_id,
+                &self.plan,
+                remaining,
+                metadata_cache.clone(),
+            )?;
             outcome = execution.outcome;
             if !matches!(outcome, StepOutcome::Progress | StepOutcome::Yield) {
                 break;
