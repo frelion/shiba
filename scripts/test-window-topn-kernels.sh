@@ -284,12 +284,12 @@ ntile_recovery_expected="
 
 assert_all_results() {
   local description="$1"
-  assert_bag_equal "${window_expected}" "
+  assert_bag_equal_with_progress "${window_expected}" "
     SELECT id,grp,score,payload,row_number_value,rank_value,
            dense_rank_value,tile_value,lag_value,lead_value,
            first_value_value,last_value_value,nth_value_value,
            frame_count,frame_max
-    FROM shiba.window_result" \
+    FROM shiba.window_result" "${window_result_oid}" \
     "${description}: Window"
   assert_bag_equal "${topn_expected}" "
     SELECT id,grp,score,payload
