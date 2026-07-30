@@ -3,7 +3,7 @@
 use pgrx::prelude::*;
 
 use crate::logical::model::{DataflowPlan, OperatorSpec};
-use crate::logical::{StepOutcome, WorkBudget};
+use crate::logical::{StepExecution, StepOutcome, WorkBudget};
 
 use super::{StepStart, StepTxn};
 
@@ -12,7 +12,7 @@ pub(crate) fn execute_step(
     stage_id: u32,
     plan: &DataflowPlan,
     budget: WorkBudget,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "operator stage ID exceeds usize")?)
@@ -35,9 +35,9 @@ pub(crate) fn execute_step(
             &plan.execution_settings,
             budget,
         )? {
-            StepStart::Blocked => return Ok(StepOutcome::Blocked),
-            StepStart::Idle => return Ok(StepOutcome::Idle),
-            StepStart::Ready(transaction) => transaction,
+            StepStart::Blocked => return Ok(StepExecution::empty(StepOutcome::Blocked)),
+            StepStart::Idle => return Ok(StepExecution::empty(StepOutcome::Idle)),
+            StepStart::Ready(transaction) => *transaction,
         };
         match &stage.spec {
             OperatorSpec::Scan(_) | OperatorSpec::Filter(_) | OperatorSpec::Project(_) => {

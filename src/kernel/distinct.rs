@@ -10,8 +10,7 @@ use pgrx::spi::{SpiClient, SpiTupleTable};
 
 use crate::kernel::{InputPosition, OutputFacts, PrimitiveFacts};
 use crate::logical::model::{DataflowPlan, DataflowStage, OperatorSpec};
-use crate::logical::StepOutcome;
-use crate::logical::WorkBudget;
+use crate::logical::{StepExecution, WorkBudget};
 use crate::postgres::{format_lsn, quote_identifier};
 use crate::scalar_sql::compile_scalar_expression;
 
@@ -469,7 +468,7 @@ pub(crate) fn execute(
     mut transaction: StepTxn<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "Distinct stage ID exceeds usize")?)
@@ -533,7 +532,7 @@ pub(crate) fn execute(
             }),
             transaction.budget(),
         )?;
-        return transaction.finish(false);
+        return transaction.finish(false, WorkUsage::default());
     }
 
     let input_storage = transaction.payload_storage(input.stream_id)?;
@@ -595,7 +594,7 @@ pub(crate) fn execute(
             stored,
             continuation,
         )?;
-        return transaction.finish(continuation.is_some());
+        return transaction.finish(continuation.is_some(), facts.usage);
     }
 
     require_empty_queue(&mut transaction, &queue)?;
@@ -668,7 +667,7 @@ pub(crate) fn execute(
         stored,
         continuation,
     )?;
-    transaction.finish(continuation.is_some())
+    transaction.finish(continuation.is_some(), primitive.usage)
 }
 
 fn finish_input_position(

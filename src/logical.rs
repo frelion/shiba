@@ -5,5 +5,5 @@ pub(crate) mod model;
 mod runtime;
 mod validate;
 
-pub(crate) use dataflow::{StepOutcome, WorkBudget};
+pub(crate) use dataflow::{StepExecution, StepOutcome, WorkBudget, WorkQuantum, WorkUsage};
 pub(crate) use runtime::LoadedDataflow;

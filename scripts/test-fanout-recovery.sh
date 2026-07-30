@@ -415,35 +415,11 @@ continuation_relation="$(psql_fanout -Atqc "
   JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
   WHERE catalog.result_oid=${chain_result_oid}::oid
     AND catalog.stage_id=${first_join_stage}")"
-assert_query "1" "SELECT phase FROM ${continuation_relation}"
-
-# Preflight resolves the immutable input event and own-side expectation. Stop
-# after that committed step so the following failpoint targets the candidate
-# action batch, not setup control flow.
-preflight_runtime_pid="$(runtime_pid)"
-psql_fanout -qc "
-  UPDATE public.shiba_runtime_failpoints
-  SET kind='operator_step_after_commit',
-      runtime_pid=${preflight_runtime_pid},
-      fired=false,
-      pause_ms=1200
-  WHERE kind='operator_step_after_commit';
-  UPDATE shiba_internal.dataflows
-  SET active=true
-  WHERE result_oid=${chain_result_oid}::oid;
-  SELECT shiba._ensure_runtime()"
-wait_for_query "t" "
-  SELECT fired AND runtime_pid=${preflight_runtime_pid}
-  FROM public.shiba_runtime_failpoints
-  WHERE kind='operator_step_after_commit'" \
-  "the committed Join preflight"
-psql_fanout -qc "
-  UPDATE shiba_internal.dataflows
-  SET active=false
-  WHERE result_oid=${chain_result_oid}::oid"
-wait_for_runtime_replacement "${preflight_runtime_pid}"
-assert_query "2|" "
-  SELECT phase || '|' || coalesce(candidate_after::text,'')
+# One quantum crosses open, preflight, and the first bounded candidate page.
+# The durable phase is therefore the resume point selected by the row/byte
+# budget, not an implementation phase forced into its own transaction.
+assert_query "2|true" "
+  SELECT phase || '|' || (candidate_after>0)
   FROM ${continuation_relation}"
 
 # The next step builds a four-row action chunk and advances four candidates,
@@ -1232,85 +1208,13 @@ psql_fanout -qc "
 wait_for_runtime_replacement "${split_owner_pid}"
 split_phase="$(psql_fanout -Atqc "
   SELECT phase FROM ${left_join_continuation}")"
-for frontier_attempt in {1..8}; do
-  if test "${split_phase}" = "1"; then
-    break
-  fi
-  if test -n "${split_phase}" && test "${split_phase}" != "5"; then
-    fail "expected Preflight/Frontier while locating split input, got ${split_phase}"
-  fi
-  frontier_pid="$(runtime_pid)"
-  psql_fanout -qc "
-    UPDATE public.shiba_runtime_failpoints
-    SET runtime_pid=${frontier_pid},fired=false
-    WHERE kind='operator_step_after_commit';
-    UPDATE shiba_internal.dataflows
-    SET active=true
-    WHERE result_oid=${left_result_oid}::oid;
-    SELECT shiba._ensure_runtime()"
-  wait_for_query "t" "
-    SELECT fired AND runtime_pid=${frontier_pid}
-    FROM public.shiba_runtime_failpoints
-    WHERE kind='operator_step_after_commit'" \
-    "the LEFT Join to advance to its data continuation"
-  psql_fanout -qc "
-    UPDATE shiba_internal.dataflows
-    SET active=false
-    WHERE result_oid=${left_result_oid}::oid"
-  wait_for_runtime_replacement "${frontier_pid}"
-  split_phase="$(psql_fanout -Atqc "
-    SELECT phase FROM ${left_join_continuation}")"
-done
-assert_query "1" "SELECT phase FROM ${left_join_continuation}"
+if test "${split_phase}" != "3"; then
+  fail "expected the bounded quantum to stop at PendingTransition, got ${split_phase}"
+fi
 split_start_chunk="$(psql_fanout -Atqc "
-  SELECT next_chunk_seq
+  SELECT next_chunk_seq-1
   FROM shiba_internal.effect_streams
   WHERE stream_id=${left_join_stream}")"
-
-# Commit Preflight first. The following step is the one that emits the pair
-# and persists its PendingTransition continuation.
-split_preflight_pid="$(runtime_pid)"
-psql_fanout -qc "
-  UPDATE public.shiba_runtime_failpoints
-  SET runtime_pid=${split_preflight_pid},fired=false
-  WHERE kind='operator_step_after_commit';
-  UPDATE shiba_internal.dataflows
-  SET active=true
-  WHERE result_oid=${left_result_oid}::oid;
-  SELECT shiba._ensure_runtime()"
-wait_for_query "t" "
-  SELECT fired AND runtime_pid=${split_preflight_pid}
-  FROM public.shiba_runtime_failpoints
-  WHERE kind='operator_step_after_commit'" \
-  "the committed LEFT Join preflight"
-psql_fanout -qc "
-  UPDATE shiba_internal.dataflows
-  SET active=false
-  WHERE result_oid=${left_result_oid}::oid"
-wait_for_runtime_replacement "${split_preflight_pid}"
-assert_query "2" "SELECT phase FROM ${left_join_continuation}"
-
-split_pair_pid="$(runtime_pid)"
-psql_fanout -qc "
-  UPDATE public.shiba_runtime_failpoints
-  SET runtime_pid=${split_pair_pid},fired=false
-  WHERE kind='operator_step_after_commit';
-  UPDATE shiba_internal.dataflows
-  SET active=true
-  WHERE result_oid=${left_result_oid}::oid;
-  SELECT shiba._ensure_runtime()"
-wait_for_query "t" "
-  SELECT fired AND runtime_pid=${split_pair_pid}
-  FROM public.shiba_runtime_failpoints
-  WHERE kind='operator_step_after_commit'" \
-  "the committed pair and pending transition"
-psql_fanout -qc "
-  UPDATE shiba_internal.dataflows
-  SET active=false
-  WHERE result_oid=${left_result_oid}::oid"
-wait_for_runtime_replacement "${split_pair_pid}"
-assert_query "3" \
-  "SELECT phase FROM ${left_join_continuation}"
 assert_query "1" "
   SELECT row_count
   FROM shiba_internal.effect_stream_chunks

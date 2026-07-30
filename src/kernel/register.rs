@@ -680,6 +680,7 @@ fn create_payload(
                      REFERENCES shiba_internal.effect_stream_chunks(
                        stream_id,chunk_seq
                      ) ON DELETE CASCADE
+                       DEFERRABLE INITIALLY DEFERRED
                  )"
             ),
             None,

@@ -15,7 +15,7 @@ use crate::kernel::{
     PageFacts, PhaseCode, PrimitiveFacts, ProducerKind, RelationRef, StepTxn, TypeRef, WorkUsage,
 };
 use crate::logical::model::{DataflowPlan, DataflowStage, OperatorSpec, TopNSpec};
-use crate::logical::{StepOutcome, WorkBudget};
+use crate::logical::{StepExecution, WorkBudget};
 use crate::postgres::{format_lsn, quote_identifier};
 use crate::scalar_sql::compile_scalar_expression;
 
@@ -1153,7 +1153,7 @@ pub(crate) fn execute(
     mut transaction: StepTxn<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "TopN stage ID exceeds usize")?)
@@ -1270,7 +1270,7 @@ pub(crate) fn execute(
         current.persisted.then_some(current.continuation),
         next,
     )?;
-    transaction.finish(has_continuation)
+    transaction.finish(has_continuation, facts.usage)
 }
 
 fn start_topn_continuation(

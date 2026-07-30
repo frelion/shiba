@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 const RUNTIME_IDLE_WAIT: Duration = Duration::from_millis(25);
 const OPERATOR_MAX_STEPS_PER_ROUND: usize = 64;
 const OPERATOR_TIME_BUDGET: Duration = Duration::from_millis(50);
+const OPERATOR_MAX_TRANSITIONS_PER_TRANSACTION: usize = 64;
 const GC_MAX_TRANSACTIONS_PER_ROUND: i32 = 64;
 const GC_MAX_EFFECT_STREAMS_PER_ROUND: i32 = 64;
 const GC_MAX_EFFECT_CHUNKS_PER_STREAM: i32 = 64;
@@ -808,11 +809,11 @@ fn step_one_operator(
             return None;
         }
         if !try_lock_dataflow_for_step(result_oid) {
-            return Some((None, false));
+            return Some((None, false, None::<u32>));
         }
         if !dataflow_is_active(result_oid) {
             loaded_dataflows.remove(&result_oid);
-            return Some((None, false));
+            return Some((None, false, None::<u32>));
         }
         if !loaded_dataflows.contains_key(&result_oid) {
             let dataflow = logical::LoadedDataflow::load(result_oid)
@@ -830,16 +831,11 @@ fn step_one_operator(
                 .get_mut(&result_oid)
                 .expect("Shiba loaded-dataflow cache lost an active dataflow");
             dataflow
-                .step(budget)
-                .expect("Shiba operator step did not commit")
+                .step_quantum(budget, OPERATOR_MAX_TRANSITIONS_PER_TRANSACTION)
+                .expect("Shiba operator transaction quantum did not complete")
         };
         #[cfg(any(test, feature = "pg_test"))]
-        if let Some(step) = step.filter(|step| {
-            matches!(
-                step.outcome,
-                logical::StepOutcome::Progress | logical::StepOutcome::Yield
-            )
-        }) {
+        if let Some(step) = step.filter(|step| step.transitions > 0) {
             let stage_id = i32::try_from(step.stage_id).expect("operator stage ID exceeds integer");
             if let Some(pause) = test_failpoints::claim(
                 "operator_step_before_commit",
@@ -856,19 +852,24 @@ fn step_one_operator(
                 );
             }
         }
-        Some((step, dag_has_ready_operator(result_oid)))
+        let committed_stage = step
+            .filter(|step| step.transitions > 0)
+            .map(|step| step.stage_id);
+        Some((
+            step.map(|step| step.outcome),
+            dag_has_ready_operator(result_oid),
+            committed_stage,
+        ))
     }))?;
 
-    let (step, has_more) = committed;
-    let Some(step) = step else {
+    let (outcome, has_more, committed_stage) = committed;
+    let Some(outcome) = outcome else {
         return Some((logical::StepOutcome::Idle, has_more));
     };
+
     #[cfg(any(test, feature = "pg_test"))]
-    if matches!(
-        step.outcome,
-        logical::StepOutcome::Progress | logical::StepOutcome::Yield
-    ) {
-        let stage_id = i32::try_from(step.stage_id).expect("operator stage ID exceeds integer");
+    if let Some(stage_id) = committed_stage {
+        let stage_id = i32::try_from(stage_id).expect("operator stage ID exceeds integer");
         let pause = BackgroundWorker::transaction(|| {
             test_failpoints::claim(
                 "operator_step_after_commit",
@@ -887,7 +888,10 @@ fn step_one_operator(
             );
         }
     }
-    Some((step.outcome, has_more))
+    #[cfg(not(any(test, feature = "pg_test")))]
+    let _ = committed_stage;
+
+    Some((outcome, has_more))
 }
 
 fn dag_has_ready_operator(result_oid: pg_sys::Oid) -> bool {

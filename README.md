@@ -55,8 +55,9 @@ Every non-Sink stage writes one durable typed `EffectStream`. Each downstream
 input has its own cursor, so stream fanout shares payload instead of copying it.
 High/low watermarks propagate backpressure upstream.
 
-An operator step uses one PostgreSQL transaction so its internal state, cursor,
-continuation, output, and checkpoint recover together. The user-visible
+An operator transaction quantum may cross several internal phases under one
+shared row/byte budget; its state, cursor, continuation, output, and checkpoint
+recover together. The user-visible
 exactly-once boundary is a Sink step: result-table DML and the corresponding
 input position commit together. A source transaction is deliberately not a
 result-visibility boundary.

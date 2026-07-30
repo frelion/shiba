@@ -12,8 +12,8 @@ use pgrx::prelude::*;
 use pgrx::spi::SpiHeapTupleData;
 
 use super::dataflow::{
-    DurableOperatorState, InputFrontier, OperatorId, ReadyQueue, StepOutcome, StreamSequence,
-    WorkBudget,
+    DurableOperatorState, InputFrontier, OperatorId, ReadyQueue, StepExecution, StepOutcome,
+    StreamSequence, WorkBudget, WorkQuantum, WorkUsage,
 };
 use super::model::DataflowPlan;
 use super::model::OperatorKind;
@@ -28,6 +28,8 @@ pub(crate) struct LoadedDataflow {
 pub(crate) struct OperatorStep {
     pub(crate) stage_id: u32,
     pub(crate) outcome: StepOutcome,
+    pub(crate) usage: WorkUsage,
+    pub(crate) transitions: usize,
 }
 
 impl LoadedDataflow {
@@ -70,12 +72,17 @@ impl LoadedDataflow {
         Ok(runtime)
     }
 
-    /// Runs at most one committed operator step.
+    /// Runs one bounded transaction quantum for a single operator.
     ///
     /// The in-memory queue is supplemented from durable state before choosing
-    /// work. Existing entries retain their order, so a yielding fanout
-    /// operator goes to the tail instead of starving another ready stage.
-    pub(crate) fn step(&mut self, budget: WorkBudget) -> Result<Option<OperatorStep>, String> {
+    /// work. Once selected, an operator may cross several internal phases in
+    /// the same transaction, but all transitions share one row/byte budget.
+    /// The next transaction selects from the fair queue again.
+    pub(crate) fn step_quantum(
+        &mut self,
+        budget: WorkBudget,
+        max_transitions: usize,
+    ) -> Result<Option<OperatorStep>, String> {
         for state in self.durable_states()? {
             if state.is_runnable() {
                 self.ready.activate(state.operator);
@@ -90,12 +97,29 @@ impl LoadedDataflow {
         {
             return Err("ready queue contains an operator outside its dataflow plan".into());
         }
-        let outcome =
-            execute_operator_step(self.result_oid, operator.stage_id, &self.plan, budget)?;
+        let mut quantum = WorkQuantum::new(budget, max_transitions);
+        let mut outcome = StepOutcome::Idle;
+        while quantum.remaining().is_some() {
+            let execution =
+                execute_operator_step(self.result_oid, operator.stage_id, &self.plan, budget)?;
+            outcome = execution.outcome;
+            if !matches!(outcome, StepOutcome::Progress | StepOutcome::Yield) {
+                break;
+            }
+            quantum.record(execution.usage)?;
+            // One set primitive already consumes a complete bounded page.
+            // Coalesce adjacent metadata phases without shrinking the next
+            // primitive and fragmenting its output chunk.
+            if !execution.usage.is_empty() {
+                break;
+            }
+        }
         self.ready.complete(operator, outcome);
         Ok(Some(OperatorStep {
             stage_id: operator.stage_id,
             outcome,
+            usage: quantum.usage(),
+            transitions: quantum.transitions(),
         }))
     }
 
@@ -346,6 +370,6 @@ fn execute_operator_step(
     stage_id: u32,
     plan: &DataflowPlan,
     budget: WorkBudget,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     crate::kernel::execute_step(result_oid, stage_id, plan, budget)
 }

@@ -10,7 +10,8 @@ The matrix measures a streaming system, not only a source-table query. A
 useful workload records the input size and measures at least one of:
 
 - ingress rows or bytes per second, plus time until its first stream chunk;
-- operator actions per second and peak queued chunks/bytes under fanout;
+- operator actions per second, checkpoint advances, and peak queued
+  chunks/bytes under fanout;
 - end-to-end source-commit-to-Sink latency and result rows per second;
 - maximum step work (rows, bytes, or continuation pages) for large groups,
   partitions, and `WITH TIES`.

@@ -1,4 +1,4 @@
-use crate::logical::WorkBudget;
+use crate::logical::{WorkBudget, WorkUsage};
 
 /// Input durably admitted since the last forwarded input frontier.
 ///
@@ -125,15 +125,6 @@ impl InputPosition {
             row_ordinal,
         })
     }
-}
-
-/// Rows and logical bytes consumed and emitted by one database primitive.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct WorkUsage {
-    pub(crate) input_rows: u64,
-    pub(crate) input_bytes: u64,
-    pub(crate) output_rows: u64,
-    pub(crate) output_bytes: u64,
 }
 
 impl WorkUsage {

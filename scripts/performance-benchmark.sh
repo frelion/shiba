@@ -155,18 +155,21 @@ result_stats() {
        WHERE producer_result_oid=${result_oid}::oid),
       (SELECT coalesce(sum(pg_total_relation_size(relation_oid)), 0)
        FROM shiba_internal.operator_state_relations
+       WHERE result_oid=${result_oid}::oid),
+      (SELECT coalesce(sum(revision), 0)
+       FROM shiba_internal.operator_checkpoints
        WHERE result_oid=${result_oid}::oid)"
 }
 
 record_metric() {
   local scenario="$1" input_rows="$2" expected_rows="$3" started="$4" result_name="$5" sample_start="$6" source_name="$7"
-  local ended elapsed actual_rows result_oid stats source_chunks chunks buffered_bytes state_bytes db_bytes peak_bytes peak_buffered peak_rows
+  local ended elapsed actual_rows result_oid stats source_chunks chunks buffered_bytes state_bytes checkpoint_advances db_bytes peak_bytes peak_buffered peak_rows
   ended="$(now_seconds)"
   elapsed="$(number_subtract "${ended}" "${started}")"
   actual_rows="$(psql_bench -Atqc "SELECT count(*) FROM ${result_name}")"
   result_oid="$(psql_bench -Atqc "SELECT '${result_name}'::regclass::oid::integer")"
   stats="$(result_stats "${result_oid}")"
-  IFS='|' read -r chunks buffered_bytes state_bytes <<<"${stats}"
+  IFS='|' read -r chunks buffered_bytes state_bytes checkpoint_advances <<<"${stats}"
   source_chunks="$(psql_bench -Atqc "
     SELECT coalesce(sum(next_chunk_seq - 1), 0)
     FROM shiba_internal.effect_streams
@@ -176,11 +179,11 @@ record_metric() {
   peak_buffered="$(awk -F'|' -v start="${sample_start}" 'NR > start && NF == 3 && $2 > max { max = $2 } END { print max + 0 }' "${monitor_file}")"
   peak_rows="$(awk -F'|' -v start="${sample_start}" 'NR > start && NF == 3 && $3 > max { max = $3 } END { print max + 0 }' "${monitor_file}")"
   test "${actual_rows}" = "${expected_rows}" || fail "${scenario}: expected ${expected_rows} result rows, got ${actual_rows}"
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "${scenario}" "${input_rows}" "${actual_rows}" "${elapsed}" \
     "$(rate "${actual_rows}" "${elapsed}")" "${elapsed}" "${chunks}" "${buffered_bytes}" \
     "${state_bytes}" "${db_bytes}" "${peak_bytes}" "${peak_buffered}" "${peak_rows}" \
-    "${source_chunks}" \
+    "${source_chunks}" "${checkpoint_advances}" \
     >>"${metrics_file}"
 }
 
@@ -214,7 +217,7 @@ psql_bench -qc 'CREATE EXTENSION shiba'
 psql_bench -qc 'SELECT shiba.activate()'
 wait_for_query 1 "SELECT count(*) FROM pg_stat_activity WHERE backend_type='shiba runtime'" 'Runtime'
 
-printf 'scenario,input_rows,result_rows,elapsed_seconds,throughput_rows_per_second,post_commit_convergence_seconds,stream_chunks,buffered_bytes_at_end,state_bytes,database_bytes_at_end,peak_database_bytes,peak_buffered_bytes,peak_buffered_rows,source_stream_chunks\n' >"${metrics_file}"
+printf 'scenario,input_rows,result_rows,elapsed_seconds,throughput_rows_per_second,post_commit_convergence_seconds,stream_chunks,buffered_bytes_at_end,state_bytes,database_bytes_at_end,peak_database_bytes,peak_buffered_bytes,peak_buffered_rows,source_stream_chunks,checkpoint_advances\n' >"${metrics_file}"
 monitor_resources &
 monitor_pid=$!
 
@@ -305,7 +308,7 @@ postgresql_version_num="$(psql_bench -Atqc 'SHOW server_version_num')"
 extension_version="$(psql_bench -Atqc "SELECT extversion FROM pg_extension WHERE extname='shiba'")"
 {
   printf '{"run_id":"%s","commit":"%s","profile":"%s","correctness":true,"environment_fingerprint":{"postgresql_version_num":%s,"extension_version":"%s","ingress_batch_rows":%s,"stage_chunk_rows":%s},"scenarios":[' "${run_id}" "${commit}" "${profile}" "${postgresql_version_num}" "${extension_version}" "${ingress_batch_rows}" "${stage_chunk_rows}"
-  awk -F, 'NR > 1 { if (count++) printf ","; printf "{\"scenario\":\"%s\",\"correctness\":true,\"metrics\":{\"input_rows\":%s,\"result_rows\":%s,\"elapsed_seconds\":%s,\"throughput_rows_per_second\":%s,\"post_commit_convergence_seconds\":%s,\"stream_chunks\":%s,\"buffered_bytes_at_end\":%s,\"state_bytes\":%s,\"database_bytes_at_end\":%s,\"peak_database_bytes\":%s,\"peak_buffered_bytes\":%s,\"peak_buffered_rows\":%s,\"source_stream_chunks\":%s}}", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14 }' "${metrics_file}"
+  awk -F, 'NR > 1 { if (count++) printf ","; printf "{\"scenario\":\"%s\",\"correctness\":true,\"metrics\":{\"input_rows\":%s,\"result_rows\":%s,\"elapsed_seconds\":%s,\"throughput_rows_per_second\":%s,\"post_commit_convergence_seconds\":%s,\"stream_chunks\":%s,\"buffered_bytes_at_end\":%s,\"state_bytes\":%s,\"database_bytes_at_end\":%s,\"peak_database_bytes\":%s,\"peak_buffered_bytes\":%s,\"peak_buffered_rows\":%s,\"source_stream_chunks\":%s,\"checkpoint_advances\":%s}}", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15 }' "${metrics_file}"
   printf ']}\n'
 } >"${json_out}"
 

@@ -289,13 +289,33 @@ LSN；重复 heartbeat 不会重写同一个 replay-state row。
 | --- | --- |
 | ingress 读取 batch | `shiba.ingress_batch_rows`, `shiba.ingress_batch_bytes` |
 | source publication chunk | 复用 ingress row/byte 目标，但按 source stream 独立切分 |
-| operator input/output step | `shiba.stage_chunk_rows`, `shiba.stage_chunk_bytes` |
+| operator transaction quantum | `shiba.stage_chunk_rows`, `shiba.stage_chunk_bytes` |
 | Aggregate/Window/TopN Drain 调度 | `shiba.stage_admission_rows`, `shiba.stage_admission_bytes` |
 
 一个 ingress batch 不对应一个 source chunk，也不对应一个 operator transaction。
 每层按自己的预算提交和恢复。ingress 在完整 pgoutput message 之后检查目标，因此
 一条 message（包括 UPDATE 的 `-old,+new`）可以越过 ingress row/byte target；
-operator step 的 row target 则是硬边界。
+operator quantum 的 row target 则是硬边界。
+
+operator 的 `phase` 不是 transaction 边界。Rust 可以在一个 transaction 中连续
+执行 open、preflight、probe、finalize 等转换；所有转换共享同一份 input/output
+row/byte 预算。任一维度耗尽、输入 chunk 完成、遇到 frontier 或需要让出调度时，
+才提交 state、continuation、input cursor、output 和 checkpoint。
+
+```mermaid
+flowchart LR
+    A["读取持久 continuation"] --> B["集合 SQL primitive"]
+    B --> C["Rust 更新 phase / cursor"]
+    C --> D{"quantum 还有预算？"}
+    D -- "有" --> B
+    D -- "无或边界完成" --> E["一次提交"]
+    E --> F["下次从持久 continuation 恢复"]
+```
+
+Join 在 transaction 内先把输出行写到尚未发布的 typed payload chunk，结束时才
+一次发布对应的不可变 chunk metadata。外部看不到半个 chunk；崩溃会让 payload、
+arrangement、continuation 和 checkpoint 一起回滚。这样 phase 数量不会直接变成
+transaction 数量，也不会为每个小匹配页制造一个 chunk。
 
 普通 Scan、Filter、Project 读取当前 chunk 的有界前缀。Join 记录当前 input row 和
 匹配页 cursor。Aggregate 记录 dirty group 和 rebuild cursor；Window 记录
@@ -303,7 +323,7 @@ partition、frame、function phase 和 cursor；TopN 记录重建和 output diff
 它们都从持久位置继续，不会为一次增量重读完整 source table。
 
 单个不可再拆的 typed work item，例如一条 input row 或一次 Window finalization，
-可以超过 byte target 并单独占一个 step；其余工作必须在达到 row/byte target 时
+可以超过 byte target 并单独占一个 quantum；其余工作必须在达到 row/byte target 时
 保存 continuation。Runtime 还为 PostgreSQL statement 设置 `work_mem` 和
 `temp_file_limit`，但正在执行的 SQL statement 不会被 wall-clock timer 中断，
 所以 kernel 自己的分页条件才是 transaction 边界。

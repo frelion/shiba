@@ -13,7 +13,7 @@
 //! Candidate evaluation still scans stable `row_id` keysets and applies the
 //! arbitrary Join condition.
 
-use crate::logical::WorkBudget;
+use crate::logical::{WorkBudget, WorkQuantum};
 
 use super::{InputPosition, PhaseCode, PrimitiveFacts, WorkUsage};
 
@@ -1562,7 +1562,7 @@ mod execution {
     use pgrx::prelude::*;
 
     use crate::logical::model::{DataflowPlan, DataflowStage, JoinKind, JoinSpec, OperatorSpec};
-    use crate::logical::{StepOutcome, WorkBudget};
+    use crate::logical::{StepExecution, WorkBudget};
     use crate::postgres::{format_lsn, parse_lsn};
     use crate::scalar_sql::compile_scalar_expression;
 
@@ -1570,8 +1570,8 @@ mod execution {
     use crate::kernel::{
         advance_input, append_frontier, canonical_row_key_sql, chunk, compile_named_outputs,
         compile_stage_bindings, next_chunk, payload_facts, validate_output_attributes,
-        BindingInput, ChunkKind, ChunkMeta, OutputFacts, PayloadStorage, ProducerKind, RelationRef,
-        StepTxn, TypeRef,
+        BindingInput, ChunkKind, ChunkMeta, OutputAppendTarget, OutputFacts, PayloadStorage,
+        ProducerKind, RelationRef, StepTxn, TypeRef,
     };
 
     struct Layout {
@@ -1605,11 +1605,45 @@ mod execution {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct JoinTransition {
+        has_continuation: bool,
+        usage: WorkUsage,
+        continue_in_transaction: bool,
+    }
+
+    impl JoinTransition {
+        const fn control(has_continuation: bool) -> Self {
+            Self {
+                has_continuation,
+                usage: WorkUsage {
+                    input_rows: 0,
+                    input_bytes: 0,
+                    output_rows: 0,
+                    output_bytes: 0,
+                },
+                continue_in_transaction: true,
+            }
+        }
+
+        const fn material(
+            has_continuation: bool,
+            usage: WorkUsage,
+            continue_in_transaction: bool,
+        ) -> Self {
+            Self {
+                has_continuation,
+                usage,
+                continue_in_transaction,
+            }
+        }
+    }
+
     pub(crate) fn execute(
         mut transaction: StepTxn<'_, '_>,
         plan: &DataflowPlan,
         stage_id: u32,
-    ) -> Result<StepOutcome, String> {
+    ) -> Result<StepExecution, String> {
         let stage = plan
             .stages
             .get(usize::try_from(stage_id).map_err(|_| "Join stage ID exceeds usize")?)
@@ -1624,35 +1658,50 @@ mod execution {
             return Err("Join requires exactly two operator-stream inputs".into());
         }
         let layout = load_layout(&mut transaction, plan, stage, spec)?;
-        let continuation = load_continuation(&mut transaction, &layout.continuation)?;
+        let mut continuation = load_continuation(&mut transaction, &layout.continuation)?;
         if transaction.checkpoint_had_continuation() != continuation.is_some() {
             return Err("Join checkpoint disagrees with its typed continuation".into());
         }
 
-        match continuation {
-            None => open_next_input(transaction, &layout),
-            Some(JoinContinuation::Preflight { positions, side }) => {
-                step_preflight(transaction, &layout, positions, side)
+        // A quantum publishes at most one immutable output chunk. Clamp the
+        // shared budget to that stream's chunk target before any phase runs.
+        let mut quantum = WorkQuantum::new(effective_budget(&transaction)?, 64);
+        let has_continuation = loop {
+            let remaining = quantum
+                .remaining()
+                .ok_or_else(|| "Join quantum exhausted before its first transition".to_string())?;
+            transaction.set_transition_budget(remaining);
+            let transition = match continuation {
+                None => open_next_input(&mut transaction, &layout)?,
+                Some(JoinContinuation::Preflight { positions, side }) => {
+                    step_preflight(&mut transaction, &layout, positions, side)?
+                }
+                Some(continuation @ JoinContinuation::Probe(_))
+                | Some(continuation @ JoinContinuation::PendingTransition { .. }) => {
+                    step_candidates(&mut transaction, &layout, spec, continuation)?
+                }
+                Some(continuation @ JoinContinuation::Finalize(_)) => {
+                    step_finalize(&mut transaction, &layout, spec, continuation)?
+                }
+                Some(continuation @ JoinContinuation::Frontier(_)) => {
+                    step_frontier(&mut transaction, &layout, continuation)?
+                }
+            };
+            quantum.record(transition.usage)?;
+            if !transition.continue_in_transaction || quantum.remaining().is_none() {
+                break transition.has_continuation;
             }
-            Some(continuation @ JoinContinuation::Probe(_))
-            | Some(continuation @ JoinContinuation::PendingTransition { .. }) => {
-                step_candidates(transaction, &layout, spec, continuation)
-            }
-            Some(continuation @ JoinContinuation::Finalize(_)) => {
-                step_finalize(transaction, &layout, spec, continuation)
-            }
-            Some(continuation @ JoinContinuation::Frontier(_)) => {
-                step_frontier(transaction, &layout, continuation)
-            }
-        }
+            continuation = load_continuation(&mut transaction, &layout.continuation)?;
+        };
+        transaction.finish(has_continuation, quantum.usage())
     }
 
     fn open_next_input(
-        mut transaction: StepTxn<'_, '_>,
+        transaction: &mut StepTxn<'_, '_>,
         layout: &Layout,
-    ) -> Result<StepOutcome, String> {
-        let left = next_chunk(&mut transaction, 0)?;
-        let right = next_chunk(&mut transaction, 1)?;
+    ) -> Result<JoinTransition, String> {
+        let left = next_chunk(transaction, 0)?;
+        let right = next_chunk(transaction, 1)?;
         let (side, head) = match (left, right) {
             (Some(left), Some(right)) => {
                 if (left.lsn, 0_u16) <= (right.lsn, 1_u16) {
@@ -1667,64 +1716,51 @@ mod execution {
                 return Err("runnable Join has neither a continuation nor an input chunk".into());
             }
         };
-        let positions = consumer_positions(&transaction)?;
+        let positions = consumer_positions(transaction)?;
         let continuation = match head.kind {
             ChunkKind::Data => {
-                payload_facts(
-                    &mut transaction,
-                    &layout.input_payload(side).relation,
-                    &head,
-                )?;
+                payload_facts(transaction, &layout.input_payload(side).relation, &head)?;
                 JoinContinuation::start_preflight(positions, side)?
             }
             ChunkKind::Frontier => JoinContinuation::start_frontier(FrontierInputFacts::new(
                 side, positions, head.lsn,
             )?)?,
         };
-        insert_continuation(&mut transaction, &layout.continuation, &continuation)?;
-        transaction.finish(true)
+        insert_continuation(transaction, &layout.continuation, &continuation)?;
+        Ok(JoinTransition::control(true))
     }
 
     fn step_preflight(
-        mut transaction: StepTxn<'_, '_>,
+        transaction: &mut StepTxn<'_, '_>,
         layout: &Layout,
         positions: InputPositions,
         side: InputSide,
-    ) -> Result<StepOutcome, String> {
-        validate_positions_for_side(&transaction, positions, side)?;
+    ) -> Result<JoinTransition, String> {
+        validate_positions_for_side(transaction, positions, side)?;
         let expected = JoinContinuation::start_preflight(positions, side)?;
-        let (event, _) = load_event(&mut transaction, layout, positions, side)?;
-        let own = load_own_expectation(&mut transaction, layout, event)?;
+        let (event, _) = load_event(transaction, layout, positions, side)?;
+        let own = load_own_expectation(transaction, layout, event)?;
         let next = JoinContinuation::start_input(event, own)?;
-        replace_continuation(
-            &mut transaction,
-            &layout.continuation,
-            &expected,
-            Some(&next),
-        )?;
-        transaction.finish(true)
+        replace_continuation(transaction, &layout.continuation, &expected, Some(&next))?;
+        Ok(JoinTransition::control(true))
     }
 
     fn step_candidates(
-        mut transaction: StepTxn<'_, '_>,
+        transaction: &mut StepTxn<'_, '_>,
         layout: &Layout,
         spec: &JoinSpec,
         continuation: JoinContinuation,
-    ) -> Result<StepOutcome, String> {
+    ) -> Result<JoinTransition, String> {
         let progress = continuation
             .input_progress()
             .ok_or_else(|| "Join candidate phase omitted input progress".to_string())?;
-        validate_positions_for_side(&transaction, progress.positions(), progress.side())?;
-        let (event, chunk) = load_event(
-            &mut transaction,
-            layout,
-            progress.positions(),
-            progress.side(),
-        )?;
+        validate_positions_for_side(transaction, progress.positions(), progress.side())?;
+        let (event, chunk) =
+            load_event(transaction, layout, progress.positions(), progress.side())?;
         continuation.validate_input_resume(event)?;
-        let budget = effective_budget(&transaction)?;
+        let budget = effective_budget(transaction)?;
         let page = probe_candidates(
-            &mut transaction,
+            transaction,
             layout,
             mode(spec.kind),
             &continuation,
@@ -1732,14 +1768,14 @@ mod execution {
             budget,
         )?;
         let action = plan_actions(mode(spec.kind), &continuation, event, &page, budget)?;
-        let output = append_actions(&mut transaction, layout, &chunk, action.actions(), event)?;
+        let output = append_actions(transaction, layout, &chunk, action.actions(), event)?;
         let changed = apply_candidate_changes(
-            &mut transaction,
+            transaction,
             layout.state(event.side.opposite()),
             action.candidate_changes(),
         )?;
         replace_continuation(
-            &mut transaction,
+            transaction,
             &layout.continuation,
             &continuation,
             Some(action.next_continuation()),
@@ -1750,7 +1786,11 @@ mod execution {
             continuation_rows: 1,
             output,
         })?;
-        transaction.finish(true)
+        Ok(if action.usage().is_empty() {
+            JoinTransition::control(true)
+        } else {
+            JoinTransition::material(true, action.usage(), true)
+        })
     }
 
     fn mode(kind: JoinKind) -> JoinMode {
@@ -2707,8 +2747,16 @@ mod execution {
             sum.checked_add(action.row_bytes)
                 .ok_or_else(|| "Join output action bytes overflow".to_string())
         })?;
+        let append_target = transaction.output_append_target(expected_rows, expected_bytes)?;
         let output = transaction.output()?.clone();
-        let lsn = format_lsn(chunk.lsn);
+        let (target_sequence, row_offset) = match append_target {
+            OutputAppendTarget::New { sequence } => (sequence, 0),
+            OutputAppendTarget::Extend {
+                sequence,
+                row_offset,
+                ..
+            } => (sequence, row_offset),
+        };
         let query = format!(
             r#"
             WITH action_rows AS MATERIALIZED (
@@ -2729,43 +2777,30 @@ mod execution {
             validated AS MATERIALIZED (
               SELECT *
               FROM stats
-              WHERE row_count = $4
-                AND payload_bytes = $5
+              WHERE row_count = $3
+                AND payload_bytes = $4
                 AND first_ordinal = 0
-                AND last_ordinal = $4 - 1
-            ),
-            appended AS MATERIALIZED (
-              SELECT append.outcome,append.appended_chunk_seq
-              FROM validated
-              CROSS JOIN LATERAL shiba_internal.append_effect_stream_chunk(
-                $1,$2,'data',validated.row_count,
-                validated.payload_bytes,$3::pg_lsn
-              ) AS append
+                AND last_ordinal = $3 - 1
             ),
             inserted AS (
               INSERT INTO {output_relation}(
                 stream_id,chunk_seq,row_ordinal,weight,row_value
               )
-              SELECT $1,appended.appended_chunk_seq,
-                     measured.action_ordinal,
+              SELECT $1,$2,$5 + measured.action_ordinal,
                      measured.weight,measured.row_value
               FROM measured
-              CROSS JOIN appended
-              WHERE appended.outcome = 'appended'
+              CROSS JOIN validated
               ORDER BY measured.action_ordinal
               RETURNING shiba_internal.effect_row_bytes(row_value)
                 AS stored_bytes
             )
             SELECT stats.row_count,stats.payload_bytes,
-                   coalesce(appended.outcome,'invalid'),
-                   appended.appended_chunk_seq,
                    (SELECT count(*)::bigint FROM inserted),
                    (
                      SELECT coalesce(sum(stored_bytes),0)::bigint
                      FROM inserted
-                   )
+            )
             FROM stats
-            LEFT JOIN appended ON true
             "#,
             action_rows = selects.join(" UNION ALL "),
             output_relation = layout.output_payload.relation.sql(),
@@ -2773,10 +2808,10 @@ mod execution {
         let arguments = unsafe {
             [
                 DatumWithOid::new(output.stream_id, pg_sys::INT8OID),
-                DatumWithOid::new(output.next_chunk_seq, pg_sys::INT8OID),
-                DatumWithOid::new(lsn.as_str(), pg_sys::TEXTOID),
+                DatumWithOid::new(target_sequence, pg_sys::INT8OID),
                 DatumWithOid::new(i64_from_u64(expected_rows)?, pg_sys::INT8OID),
                 DatumWithOid::new(i64_from_u64(expected_bytes)?, pg_sys::INT8OID),
+                DatumWithOid::new(i64_from_u64(row_offset)?, pg_sys::INT8OID),
             ]
         };
         let table = transaction.write(&query, &arguments)?;
@@ -2792,34 +2827,29 @@ mod execution {
             required_table(&table, 2, "Join evaluated output bytes")?,
             "Join evaluated output bytes",
         )?;
-        let outcome = required_table::<String>(&table, 3, "Join append outcome")?;
-        let sequence = optional_table::<i64>(&table, 4)?;
         let inserted = nonnegative(
-            required_table(&table, 5, "Join inserted output rows")?,
+            required_table(&table, 3, "Join inserted output rows")?,
             "Join inserted output rows",
         )?;
         let stored_bytes = nonnegative(
-            required_table(&table, 6, "Join stored output bytes")?,
+            required_table(&table, 4, "Join stored output bytes")?,
             "Join stored output bytes",
         )?;
         if rows != expected_rows || bytes != expected_bytes {
             return Err("Join output projection changed after its bounded probe".into());
         }
-        match outcome.as_str() {
-            "appended"
-                if sequence == Some(output.next_chunk_seq)
-                    && inserted == expected_rows
-                    && stored_bytes == expected_bytes =>
-            {
-                Ok(OutputFacts::Data {
-                    chunk_seq: output.next_chunk_seq,
-                })
-            }
-            "blocked" => {
-                Err("locked Join output became backpressured during an append primitive".into())
-            }
-            _ => Err("Join output primitive returned inconsistent append facts".into()),
+        if inserted != expected_rows || stored_bytes != expected_bytes {
+            return Err("Join output staging returned inconsistent payload facts".into());
         }
+        transaction.record_output_append(
+            append_target,
+            expected_rows,
+            expected_bytes,
+            chunk.lsn,
+        )?;
+        Ok(OutputFacts::Data {
+            chunk_seq: target_sequence,
+        })
     }
 
     fn apply_candidate_changes(
@@ -2880,30 +2910,26 @@ mod execution {
     }
 
     fn step_finalize(
-        mut transaction: StepTxn<'_, '_>,
+        transaction: &mut StepTxn<'_, '_>,
         layout: &Layout,
         spec: &JoinSpec,
         continuation: JoinContinuation,
-    ) -> Result<StepOutcome, String> {
+    ) -> Result<JoinTransition, String> {
         let progress = continuation
             .input_progress()
             .ok_or_else(|| "Join Finalize phase omitted input progress".to_string())?;
-        validate_positions_for_side(&transaction, progress.positions(), progress.side())?;
-        let (event, chunk) = load_event(
-            &mut transaction,
-            layout,
-            progress.positions(),
-            progress.side(),
-        )?;
+        validate_positions_for_side(transaction, progress.positions(), progress.side())?;
+        let (event, chunk) =
+            load_event(transaction, layout, progress.positions(), progress.side())?;
         continuation.validate_input_resume(event)?;
-        let actual_own = load_own_expectation(&mut transaction, layout, event)?;
+        let actual_own = load_own_expectation(transaction, layout, event)?;
         if actual_own != progress.expected_own() {
             return Err("Join own arrangement changed during its fanout".into());
         }
         let output_required =
             current_side_is_eligible(mode(spec.kind), event.side, progress.opposite_counts());
         let output_bytes = if output_required {
-            measure_current_output(&mut transaction, layout, event)?
+            measure_current_output(transaction, layout, event)?
         } else {
             1
         };
@@ -2916,11 +2942,11 @@ mod execution {
                 output_bytes,
             )?,
         };
-        let budget = effective_budget(&transaction)?;
+        let budget = effective_budget(transaction)?;
         let plan = plan_finalize(mode(spec.kind), &continuation, event, own_probe, budget)?;
         let actions = plan.output().into_iter().collect::<Vec<_>>();
-        let output = append_actions(&mut transaction, layout, &chunk, &actions, event)?;
-        apply_own_change(&mut transaction, layout, event, plan.own_change())?;
+        let output = append_actions(transaction, layout, &chunk, &actions, event)?;
+        apply_own_change(transaction, layout, event, plan.own_change())?;
 
         let position = progress.positions().get(progress.side());
         let next_ordinal = position
@@ -2943,7 +2969,7 @@ mod execution {
             {
                 let input = transaction.input(progress.side().code() as u16)?.clone();
                 advance_input(
-                    &mut transaction,
+                    transaction,
                     input.port,
                     input
                         .next_chunk_seq
@@ -2961,7 +2987,7 @@ mod execution {
                 return Err("Join Finalize advanced beyond its immutable input chunk".into());
             };
         replace_continuation(
-            &mut transaction,
+            transaction,
             &layout.continuation,
             &continuation,
             next.as_ref(),
@@ -2977,7 +3003,11 @@ mod execution {
             },
             expected_continuation_rows,
         )?;
-        transaction.finish(has_continuation)
+        Ok(JoinTransition::material(
+            has_continuation,
+            plan.usage(),
+            has_continuation,
+        ))
     }
 
     fn measure_current_output(
@@ -3104,23 +3134,23 @@ mod execution {
     }
 
     fn step_frontier(
-        mut transaction: StepTxn<'_, '_>,
+        transaction: &mut StepTxn<'_, '_>,
         layout: &Layout,
         continuation: JoinContinuation,
-    ) -> Result<StepOutcome, String> {
+    ) -> Result<JoinTransition, String> {
         let JoinContinuation::Frontier(frontier) = &continuation else {
             return Err("Join frontier executor received another phase".into());
         };
         let facts =
             FrontierInputFacts::new(frontier.side(), frontier.positions(), frontier.frontier())?;
         continuation.validate_frontier_resume(facts)?;
-        validate_positions_for_side(&transaction, facts.positions, facts.side)?;
+        validate_positions_for_side(transaction, facts.positions, facts.side)?;
         let position = facts.positions.get(facts.side);
         if position.row_ordinal != 0 {
             return Err("Join frontier continuation has a data row ordinal".into());
         }
         let input = transaction.input(facts.side.code() as u16)?.clone();
-        let head = chunk(&mut transaction, &input, position.chunk_seq)?
+        let head = chunk(transaction, &input, position.chunk_seq)?
             .ok_or_else(|| "Join frontier continuation references a missing chunk".to_string())?;
         if head.kind != ChunkKind::Frontier
             || head.rows != 0
@@ -3141,12 +3171,12 @@ mod execution {
         };
         let plan = plan_frontier(&continuation, facts, state, transaction.budget())?;
         let output_facts = if let Some(publish) = plan.publish {
-            append_frontier(&mut transaction, publish)?
+            append_frontier(transaction, publish)?
         } else {
             OutputFacts::None
         };
         advance_input(
-            &mut transaction,
+            transaction,
             input.port,
             input
                 .next_chunk_seq
@@ -3155,14 +3185,14 @@ mod execution {
             facts.frontier,
             WorkUsage::default(),
         )?;
-        replace_continuation(&mut transaction, &layout.continuation, &continuation, None)?;
+        replace_continuation(transaction, &layout.continuation, &continuation, None)?;
         plan.validate_commit(PrimitiveFacts {
             usage: WorkUsage::default(),
             state_rows: 0,
             continuation_rows: 0,
             output: output_facts,
         })?;
-        transaction.finish(false)
+        Ok(JoinTransition::material(false, WorkUsage::default(), false))
     }
 
     fn required_table<T: FromDatum + IntoDatum>(

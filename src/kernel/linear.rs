@@ -4,7 +4,7 @@ use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 
 use crate::logical::model::{DataflowPlan, DataflowStage, OperatorSpec, ScanSpec};
-use crate::logical::StepOutcome;
+use crate::logical::StepExecution;
 use crate::postgres::{format_lsn, parse_lsn, quote_identifier};
 use crate::scalar_sql::compile_scalar_expression;
 
@@ -79,7 +79,7 @@ pub(crate) fn execute(
     mut transaction: StepTxn<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "stage ID exceeds usize")?)
@@ -113,7 +113,7 @@ fn execute_scan(
     plan: &DataflowPlan,
     stage: &DataflowStage,
     continuation_relation: RelationRef,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let OperatorSpec::Scan(spec) = &stage.spec else {
         return Err("Scan kernel received another operator".into());
     };
@@ -203,7 +203,7 @@ fn execute_transform(
     stage: &DataflowStage,
     kind: LinearKind,
     continuation_relation: RelationRef,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     validate_continuation_abi(
         &mut transaction,
         &continuation_relation,
@@ -249,7 +249,7 @@ fn execute_transform(
             &continuation_relation,
             continuation.is_some(),
         )?;
-        return transaction.finish(false);
+        return transaction.finish(false, WorkUsage::default());
     }
     let scan_placeholder = ScanSpec {
         source_oid: 0,
@@ -272,7 +272,7 @@ fn step_bootstrap(
     mut transaction: StepTxn<'_, '_>,
     continuation_relation: &RelationRef,
     continuation: &ScanContinuation,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let next_sequence = continuation
         .next_bootstrap_seq
         .ok_or_else(|| "Scan bootstrap continuation omitted its cursor".to_string())?;
@@ -343,14 +343,14 @@ fn step_bootstrap(
         output: facts.output,
     }
     .validate(transaction.budget())?;
-    transaction.finish(true)
+    transaction.finish(true, facts.usage)
 }
 
 fn step_snapshot_frontier(
     mut transaction: StepTxn<'_, '_>,
     continuation_relation: &RelationRef,
     continuation: &ScanContinuation,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let input = transaction.input(0)?.clone();
     let frontier = continuation
         .pending_frontier_lsn
@@ -360,10 +360,12 @@ fn step_snapshot_frontier(
     }
     append_frontier(&mut transaction, frontier)?;
     delete_scan_continuation(&mut transaction, continuation_relation, continuation)?;
-    transaction.finish(false)
+    transaction.finish(false, WorkUsage::default())
 }
 
-fn step_available_source_frontier(mut transaction: StepTxn<'_, '_>) -> Result<StepOutcome, String> {
+fn step_available_source_frontier(
+    mut transaction: StepTxn<'_, '_>,
+) -> Result<StepExecution, String> {
     let input = transaction.input(0)?.clone();
     let frontier = input
         .available_source_frontier_lsn
@@ -378,14 +380,14 @@ fn step_available_source_frontier(mut transaction: StepTxn<'_, '_>) -> Result<St
         frontier,
         WorkUsage::default(),
     )?;
-    transaction.finish(false)
+    transaction.finish(false, WorkUsage::default())
 }
 
 fn step_scan_frontier(
     mut transaction: StepTxn<'_, '_>,
     continuation_relation: &RelationRef,
     frontier: u64,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let input = transaction.input(0)?.clone();
     if frontier <= input.consumed_frontier_lsn
         || input
@@ -404,7 +406,7 @@ fn step_scan_frontier(
         WorkUsage::default(),
     )?;
     delete_continuation(&mut transaction, continuation_relation, true)?;
-    transaction.finish(false)
+    transaction.finish(false, WorkUsage::default())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -418,7 +420,7 @@ fn step_data_transform(
     had_continuation: bool,
     chunk: ChunkMeta,
     row_ordinal: i64,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     if row_ordinal < 0 || u64::try_from(row_ordinal).map_or(true, |row| row >= chunk.rows) {
         return Err("linear continuation row is outside its input chunk".into());
     }
@@ -543,7 +545,7 @@ fn step_data_transform(
         ..PrimitiveFacts::default()
     }
     .validate(transaction.budget())?;
-    transaction.finish(has_continuation)
+    transaction.finish(has_continuation, facts.usage)
 }
 
 #[allow(clippy::too_many_arguments)]

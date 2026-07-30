@@ -3,7 +3,7 @@ use pgrx::prelude::*;
 use pgrx::spi::{Query, SpiClient, SpiTupleTable};
 
 use crate::logical::model::ExecutionSettings;
-use crate::logical::{StepOutcome, WorkBudget};
+use crate::logical::{StepExecution, StepOutcome, WorkBudget};
 use crate::postgres::parse_lsn;
 
 use super::storage::{self, AttributeRef, PayloadStorage, RelationRef, TypeRef};
@@ -46,12 +46,33 @@ pub(crate) struct OutputState {
     pub(crate) target_bytes: i64,
     pub(crate) latest_data_lsn: Option<u64>,
     pub(crate) published_frontier_lsn: Option<u64>,
+    pending_data_chunk: Option<PendingDataChunk>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingDataChunk {
+    sequence: i64,
+    rows: u64,
+    bytes: u64,
+    lsn: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutputAppendTarget {
+    New {
+        sequence: i64,
+    },
+    Extend {
+        sequence: i64,
+        row_offset: u64,
+        previous_bytes: u64,
+    },
 }
 
 pub(crate) enum StepStart<'client, 'conn> {
     Blocked,
     Idle,
-    Ready(StepTxn<'client, 'conn>),
+    Ready(Box<StepTxn<'client, 'conn>>),
 }
 
 /// The only mutable database context for one operator step.
@@ -63,7 +84,8 @@ pub(crate) struct StepTxn<'client, 'conn> {
     client: &'client mut SpiClient<'conn>,
     result_oid: pg_sys::Oid,
     stage_id: i32,
-    budget: WorkBudget,
+    quantum_budget: WorkBudget,
+    transition_budget: WorkBudget,
     expected_revision: i64,
     checkpoint_had_continuation: bool,
     admission: AdmissionProgress,
@@ -300,6 +322,7 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
                 target_bytes: required_table(&output, 4, "output byte target")?,
                 latest_data_lsn: optional_lsn_table(&output, 5, "output latest data LSN")?,
                 published_frontier_lsn: optional_lsn_table(&output, 6, "output frontier")?,
+                pending_data_chunk: None,
             })
         } else {
             None
@@ -309,17 +332,18 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
             return Ok(StepStart::Idle);
         }
 
-        Ok(StepStart::Ready(Self {
+        Ok(StepStart::Ready(Box::new(Self {
             client,
             result_oid,
             stage_id,
-            budget,
+            quantum_budget: budget,
+            transition_budget: budget,
             expected_revision,
             checkpoint_had_continuation,
             admission,
             inputs,
             output,
-        }))
+        })))
     }
 
     pub(crate) const fn result_oid(&self) -> pg_sys::Oid {
@@ -331,7 +355,11 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
     }
 
     pub(crate) const fn budget(&self) -> WorkBudget {
-        self.budget
+        self.transition_budget
+    }
+
+    pub(crate) fn set_transition_budget(&mut self, budget: WorkBudget) {
+        self.transition_budget = budget;
     }
 
     pub(crate) const fn checkpoint_had_continuation(&self) -> bool {
@@ -373,6 +401,142 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
         self.output
             .as_ref()
             .ok_or_else(|| format!("Sink stage {} has no output stream", self.stage_id))
+    }
+
+    pub(crate) fn output_append_target(
+        &self,
+        rows: u64,
+        bytes: u64,
+    ) -> Result<OutputAppendTarget, String> {
+        if rows == 0 || bytes == 0 {
+            return Err("output append has no rows or bytes".into());
+        }
+        let output = self.output()?;
+        let target_rows = u64::try_from(output.target_rows)
+            .map_err(|_| "output stream has a negative row target".to_string())?;
+        let target_bytes = u64::try_from(output.target_bytes)
+            .map_err(|_| "output stream has a negative byte target".to_string())?;
+        if let Some(open) = output.pending_data_chunk {
+            let combined_rows = open
+                .rows
+                .checked_add(rows)
+                .ok_or_else(|| "open output chunk row count overflow".to_string())?;
+            let combined_bytes = open
+                .bytes
+                .checked_add(bytes)
+                .ok_or_else(|| "open output chunk byte count overflow".to_string())?;
+            if combined_rows <= target_rows && combined_bytes <= target_bytes {
+                return Ok(OutputAppendTarget::Extend {
+                    sequence: open.sequence,
+                    row_offset: open.rows,
+                    previous_bytes: open.bytes,
+                });
+            }
+            return Err("pending output exceeded its immutable chunk target".into());
+        }
+        Ok(OutputAppendTarget::New {
+            sequence: output.next_chunk_seq,
+        })
+    }
+
+    pub(crate) fn record_output_append(
+        &mut self,
+        target: OutputAppendTarget,
+        rows: u64,
+        bytes: u64,
+        lsn: u64,
+    ) -> Result<(), String> {
+        let output = self
+            .output
+            .as_mut()
+            .ok_or_else(|| format!("Sink stage {} has no output stream", self.stage_id))?;
+        match target {
+            OutputAppendTarget::New { sequence } => {
+                if sequence != output.next_chunk_seq {
+                    return Err("new output append changed its expected sequence".into());
+                }
+                output.next_chunk_seq = output
+                    .next_chunk_seq
+                    .checked_add(1)
+                    .ok_or_else(|| "output chunk sequence overflow".to_string())?;
+                output.pending_data_chunk = Some(PendingDataChunk {
+                    sequence,
+                    rows,
+                    bytes,
+                    lsn,
+                });
+            }
+            OutputAppendTarget::Extend {
+                sequence,
+                row_offset,
+                previous_bytes,
+            } => {
+                let open = output
+                    .pending_data_chunk
+                    .as_mut()
+                    .filter(|open| {
+                        open.sequence == sequence
+                            && open.rows == row_offset
+                            && open.bytes == previous_bytes
+                    })
+                    .ok_or_else(|| "extended output append changed its open chunk".to_string())?;
+                open.rows = open
+                    .rows
+                    .checked_add(rows)
+                    .ok_or_else(|| "open output chunk row count overflow".to_string())?;
+                open.bytes = open
+                    .bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| "open output chunk byte count overflow".to_string())?;
+                open.lsn = open.lsn.max(lsn);
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_pending_output(&mut self) -> Result<(), String> {
+        let Some(pending) = self
+            .output
+            .as_ref()
+            .and_then(|output| output.pending_data_chunk)
+        else {
+            return Ok(());
+        };
+        let output = self.output()?;
+        let lsn = crate::postgres::format_lsn(pending.lsn);
+        let arguments = unsafe {
+            [
+                DatumWithOid::new(output.stream_id, pg_sys::INT8OID),
+                DatumWithOid::new(pending.sequence, pg_sys::INT8OID),
+                DatumWithOid::new(
+                    i64::try_from(pending.rows).map_err(|_| "pending output rows exceed bigint")?,
+                    pg_sys::INT8OID,
+                ),
+                DatumWithOid::new(
+                    i64::try_from(pending.bytes)
+                        .map_err(|_| "pending output bytes exceed bigint")?,
+                    pg_sys::INT8OID,
+                ),
+                DatumWithOid::new(lsn.as_str(), pg_sys::TEXTOID),
+            ]
+        };
+        let published = self.write(
+            "SELECT outcome,appended_chunk_seq
+             FROM shiba_internal.append_effect_stream_chunk(
+               $1,$2,'data',$3,$4,$5::pg_lsn
+             )",
+            &arguments,
+        )?;
+        if published.len() != 1 {
+            return Err("pending output publication returned no result".into());
+        }
+        let published = published.first();
+        let outcome = required_table::<String>(&published, 1, "pending output outcome")?;
+        let sequence = required_table::<i64>(&published, 2, "pending output sequence")?;
+        if outcome != "appended" || sequence != pending.sequence {
+            return Err("pending output publication was blocked or inconsistent".into());
+        }
+        Ok(())
     }
 
     pub(crate) fn payload_storage(&mut self, stream_id: i64) -> Result<PayloadStorage, String> {
@@ -439,7 +603,13 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
     ///
     /// The operator derives `has_continuation` from the validated typed
     /// continuation mutation performed in this transaction.
-    pub(crate) fn finish(mut self, has_continuation: bool) -> Result<StepOutcome, String> {
+    pub(crate) fn finish(
+        mut self,
+        has_continuation: bool,
+        usage: WorkUsage,
+    ) -> Result<StepExecution, String> {
+        usage.validate(self.quantum_budget)?;
+        self.publish_pending_output()?;
         let admitted_rows =
             i64::try_from(self.admission.rows()).map_err(|_| "admitted rows exceed bigint")?;
         let admitted_bytes =
@@ -477,11 +647,12 @@ impl<'client, 'conn> StepTxn<'client, 'conn> {
         if revision != self.expected_revision + 1 {
             return Err("operator checkpoint did not advance exactly once".into());
         }
-        Ok(if has_continuation {
+        let outcome = if has_continuation {
             StepOutcome::Yield
         } else {
             StepOutcome::Progress
-        })
+        };
+        Ok(StepExecution::new(outcome, usage))
     }
 }
 

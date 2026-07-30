@@ -14,7 +14,7 @@ use pgrx::spi::SpiTupleTable;
 use crate::logical::model::{
     BindingId, DataflowPlan, DataflowStage, OperatorSpec, SlotId, SlotType,
 };
-use crate::logical::{StepOutcome, WorkBudget};
+use crate::logical::{StepExecution, WorkBudget};
 use crate::postgres::quote_identifier;
 
 use super::{
@@ -64,7 +64,7 @@ pub(crate) fn execute(
     mut transaction: StepTxn<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let stage = sink_stage(plan, stage_id)?;
     if transaction.inputs().len() != 1 {
         return Err("Sink must have exactly one input".into());
@@ -112,7 +112,7 @@ fn consume_frontier(
     continuation_relation: &RelationRef,
     continuation: SinkContinuation,
     chunk: &ChunkMeta,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     if continuation.position.row_ordinal != 0 || continuation.remaining_weight.is_some() {
         return Err("Sink frontier has an invalid continuation".into());
     }
@@ -121,7 +121,7 @@ fn consume_frontier(
     }
     advance_completed_chunk(&mut transaction, chunk, chunk.lsn)?;
     clear_continuation(&mut transaction, continuation_relation, continuation)?;
-    transaction.finish(false)
+    transaction.finish(false, WorkUsage::default())
 }
 
 fn consume_data(
@@ -132,7 +132,7 @@ fn consume_data(
     continuation: SinkContinuation,
     chunk: &ChunkMeta,
     payload: &PayloadLayout,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let ordinal = continuation.position.row_ordinal;
     let ordinal_u64 = u64::try_from(ordinal).map_err(|_| "Sink continuation has a negative row")?;
     if ordinal_u64 >= chunk.rows {
@@ -199,7 +199,7 @@ fn consume_data(
     };
     let has_continuation = next.is_some();
     replace_continuation(&mut transaction, continuation_relation, continuation, next)?;
-    transaction.finish(has_continuation)
+    transaction.finish(has_continuation, page.usage)
 }
 
 fn sink_stage(plan: &DataflowPlan, stage_id: u32) -> Result<&DataflowStage, String> {

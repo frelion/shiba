@@ -13,8 +13,7 @@ use crate::kernel::{InputPosition, OutputFacts, PageFacts, PrimitiveFacts};
 use crate::logical::model::{
     AggregateExpr, AggregateSpec, DataflowPlan, DataflowStage, OperatorSpec, SortGroupExpr,
 };
-use crate::logical::StepOutcome;
-use crate::logical::WorkBudget;
+use crate::logical::{StepExecution, WorkBudget};
 use crate::postgres::{format_lsn, quote_identifier};
 use crate::scalar_sql::compile_scalar_expression;
 
@@ -719,7 +718,7 @@ pub(crate) fn execute(
     mut transaction: StepTxn<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "Aggregate stage ID exceeds usize")?)
@@ -833,7 +832,7 @@ fn step_frontier(
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let position = stored
         .value
         .input
@@ -903,7 +902,7 @@ fn step_frontier(
             )?;
             let has_continuation = next.is_some();
             replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
-            return transaction.finish(has_continuation);
+            return transaction.finish(has_continuation, facts.usage);
         }
     }
     let output = append_frontier(&mut transaction, input_chunk.lsn)?;
@@ -930,7 +929,7 @@ fn step_frontier(
     } = transition;
     let has_continuation = next.is_some();
     replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
-    transaction.finish(has_continuation)
+    transaction.finish(has_continuation, WorkUsage::default())
 }
 
 fn validate_execute_continuation_abi(
@@ -1235,7 +1234,7 @@ fn step_apply(
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let position = stored
         .value
         .input
@@ -1640,7 +1639,7 @@ fn step_apply(
     if facts.continuation_rows != u64::from(has_continuation) {
         return Err("Aggregate continuation mutation disagrees with Apply facts".into());
     }
-    transaction.finish(has_continuation)
+    transaction.finish(has_continuation, facts.usage)
 }
 
 fn step_rebuild(
@@ -1650,7 +1649,7 @@ fn step_rebuild(
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let AggregatePhase::DrainRebuild {
         group_queue_id,
         aggregate_ordinal,
@@ -1797,7 +1796,7 @@ fn step_rebuild(
     } = transition;
     let has_continuation = next.is_some();
     replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
-    transaction.finish(has_continuation)
+    transaction.finish(has_continuation, facts.usage)
 }
 
 fn step_emit(
@@ -1807,7 +1806,7 @@ fn step_emit(
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<StepOutcome, String> {
+) -> Result<StepExecution, String> {
     let AggregatePhase::DrainEmit {
         group_queue_id,
         leg,
@@ -1826,7 +1825,7 @@ fn step_emit(
     let dirty = transaction.state_storage(2000)?;
     let bag = transaction.state_storage(0)?;
     let arguments = unsafe { [DatumWithOid::new(group_queue_id, pg_sys::INT8OID)] };
-    let has_continuation = match leg {
+    let (has_continuation, usage) = match leg {
         EmitLeg::Decide => {
             let expression = aggregate_output_expression(
                 &mut transaction,
@@ -1990,10 +1989,11 @@ fn step_emit(
                 transaction.budget(),
             )?;
             let AggregateTransition::Committed {
-                continuation: next, ..
+                continuation: next,
+                facts,
             } = transition;
             replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
-            next.is_some()
+            (next.is_some(), facts.usage)
         }
         EmitLeg::InsertPending => {
             let facts = aggregate_emit_pending_row(
@@ -2027,13 +2027,14 @@ fn step_emit(
                 transaction.budget(),
             )?;
             let AggregateTransition::Committed {
-                continuation: next, ..
+                continuation: next,
+                facts,
             } = transition;
             replace_execute_continuation(&mut transaction, continuation_relation, stored, next)?;
-            next.is_some()
+            (next.is_some(), facts.usage)
         }
     };
-    transaction.finish(has_continuation)
+    transaction.finish(has_continuation, usage)
 }
 
 #[derive(Clone, Debug)]
