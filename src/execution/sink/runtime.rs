@@ -6,9 +6,13 @@ use super::*;
 /// PostgreSQL ERROR. In particular, an error after result DML must never be
 /// converted into an ordinary `Blocked` or `Idle` outcome.
 pub(crate) const KERNEL: crate::execution::KernelFn = crate::execution::KernelFn::new(
-    crate::execution::KernelContract::new(
+    crate::execution::KernelContract::with_phases(
         &[crate::execution::InputContract::Operator],
         crate::execution::OutputContract::Sink,
+        &[
+            crate::execution::LifecyclePhase::Process,
+            crate::execution::LifecyclePhase::Frontier,
+        ],
     ),
     step,
 );
@@ -17,7 +21,7 @@ pub(crate) fn step(
     transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let stage = sink_stage(plan, stage_id)?;
     if transaction.inputs().len() != 1 {
         return Err("Sink must have exactly one input".into());
@@ -62,7 +66,7 @@ fn consume_frontier(
     continuation_relation: &RelationRef,
     continuation: SinkContinuation,
     chunk: &ChunkMeta,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     if continuation.position.row_ordinal != 0 || continuation.remaining_weight.is_some() {
         return Err("Sink frontier has an invalid continuation".into());
     }
@@ -71,7 +75,7 @@ fn consume_frontier(
     }
     advance_completed_chunk(transaction, chunk, chunk.lsn)?;
     replace_continuation(transaction, continuation_relation, continuation, None)?;
-    transaction.transition(false, WorkUsage::default())
+    transaction.transition(KernelPhase::Frontier, WorkUsage::default())
 }
 
 fn consume_data(
@@ -82,7 +86,7 @@ fn consume_data(
     continuation: SinkContinuation,
     chunk: &ChunkMeta,
     payload: &PayloadLayout,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let first_ordinal = continuation.position.row_ordinal;
     let first_ordinal_u64 =
         u64::try_from(first_ordinal).map_err(|_| "Sink continuation has a negative row")?;
@@ -188,9 +192,10 @@ fn consume_data(
         let frontier = transaction.input(0)?.consumed_frontier_lsn;
         advance_completed_chunk(transaction, chunk, frontier)?;
     }
-    let has_continuation = next.is_some();
     replace_continuation(transaction, continuation_relation, continuation, next)?;
-    transaction.transition(has_continuation, quantum.usage())
+    let usage = quantum.usage();
+    transaction.record_state_rows(usage.output_rows)?;
+    transaction.transition(KernelPhase::Process, usage)
 }
 
 fn sink_stage(plan: &DataflowPlan, stage_id: u32) -> Result<&DataflowStage, String> {
@@ -512,6 +517,8 @@ fn same_type(expected: &SlotType, actual: &AttributeRef) -> bool {
         && actual.collation_oid.to_u32() == expected.collation_oid
 }
 
+// Atomic bounded Sink result primitive: apply one signed result page to the
+// operator-specific result relation. Sink has no effect-stream write here.
 fn mutate_result_page(
     transaction: &mut StepContext<'_, '_>,
     result: &RelationRef,

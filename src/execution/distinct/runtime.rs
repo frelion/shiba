@@ -1,9 +1,14 @@
 use super::*;
 
 pub(crate) const KERNEL: crate::execution::KernelFn = crate::execution::KernelFn::new(
-    crate::execution::KernelContract::new(
+    crate::execution::KernelContract::with_phases(
         &[crate::execution::InputContract::Operator],
         crate::execution::OutputContract::EffectStream,
+        &[
+            crate::execution::LifecyclePhase::Admit,
+            crate::execution::LifecyclePhase::Drain,
+            crate::execution::LifecyclePhase::Frontier,
+        ],
     ),
     step,
 );
@@ -12,7 +17,7 @@ pub(crate) fn step(
     transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "Distinct stage ID exceeds usize")?)
@@ -74,7 +79,13 @@ pub(crate) fn step(
             }),
             transaction.budget(),
         )?;
-        return transaction.transition(false, WorkUsage::default());
+        return transaction.transition_facts(
+            KernelPhase::Frontier,
+            PrimitiveFacts {
+                output,
+                ..PrimitiveFacts::default()
+            },
+        );
     }
 
     let input_storage = transaction.payload_storage(input.stream_id)?;
@@ -108,10 +119,7 @@ pub(crate) fn step(
         } else {
             finish_input_position(transaction, &input, &chunk, stored.value.input.row_ordinal)?
         };
-        let facts = PrimitiveFacts {
-            continuation_rows: u64::from(next.is_some()),
-            ..drained.facts
-        };
+        let facts = PrimitiveFacts { ..drained.facts };
         let transition = DistinctMachine.apply(
             stored.value,
             DistinctActionResult::Drained(AppliedPrefix {
@@ -126,7 +134,7 @@ pub(crate) fn step(
         )?;
         let DistinctTransition::Committed { continuation, .. } = transition;
         replace_continuation(transaction, &continuation_relation, stored, continuation)?;
-        return transaction.transition(continuation.is_some(), facts.usage);
+        return transaction.transition_facts(KernelPhase::Drain, facts);
     }
 
     require_empty_queue(transaction, &queue)?;
@@ -180,7 +188,6 @@ pub(crate) fn step(
     let primitive = PrimitiveFacts {
         usage: facts.usage,
         state_rows: facts.state_rows,
-        continuation_rows: u64::from(next.is_some()),
         output: OutputFacts::None,
     };
     let result = DistinctActionResult::Applied(AppliedPrefix {
@@ -194,7 +201,7 @@ pub(crate) fn step(
     let transition = DistinctMachine.apply(stored.value, result, transaction.budget())?;
     let DistinctTransition::Committed { continuation, .. } = transition;
     replace_continuation(transaction, &continuation_relation, stored, continuation)?;
-    transaction.transition(continuation.is_some(), primitive.usage)
+    transaction.transition_facts(KernelPhase::Admit, primitive)
 }
 
 fn finish_input_position(
@@ -227,6 +234,8 @@ fn finish_input_position(
     Ok(None)
 }
 
+// Atomic bounded Distinct admission primitive: update key/bag/queue state for
+// one input prefix. Effect publication remains a separate shared boundary.
 fn run_prefix(
     transaction: &mut StepContext<'_, '_>,
     chunk: &ChunkMeta,
@@ -547,6 +556,8 @@ fn run_prefix(
     })
 }
 
+// Atomic bounded Distinct reconciliation primitive: resolve touched-key
+// representatives and enqueue only the resulting durable differences.
 fn reconcile_representatives(
     transaction: &mut StepContext<'_, '_>,
     state: &RelationRef,
@@ -753,6 +764,8 @@ fn require_empty_touched(
     Ok(())
 }
 
+// Atomic bounded Distinct drain primitive: consume one queue page and write its
+// payload; StepContext owns effect-stream publication and output sequencing.
 fn drain_queue(
     transaction: &mut StepContext<'_, '_>,
     output_payload: &RelationRef,
@@ -794,37 +807,29 @@ fn drain_queue(
                      bool_and(output_key={canonical_key}) AS canonical_keys
               FROM selected
             ),
-            appended AS MATERIALIZED (
-              SELECT append.outcome,append.appended_chunk_seq
-              FROM summary
-              CROSS JOIN LATERAL shiba_internal.append_effect_stream_chunk(
-                $1,$2,'data',summary.emitted,summary.emitted_bytes,
-                summary.causal_lsn
-              ) AS append
-              WHERE summary.emitted>0 AND summary.one_causal_lsn
-                AND summary.canonical_keys
-            ),
             payload_insert AS (
               INSERT INTO {output_payload}(
                 stream_id,chunk_seq,row_ordinal,weight,row_value
               )
-              SELECT $1,appended.appended_chunk_seq,
+              SELECT $1,$2,
                      row_number() OVER (ORDER BY selected.queue_id)-1,
                      selected.weight,selected.output_row
-              FROM selected,appended
-              WHERE appended.outcome='appended'
+              FROM selected,summary
+              WHERE summary.emitted>0 AND summary.one_causal_lsn
+                AND summary.canonical_keys
               RETURNING 1
             ),
             removed AS (
               DELETE FROM {queue} AS queue
-              USING selected,appended
-              WHERE appended.outcome='appended'
+              USING selected,summary
+              WHERE summary.emitted>0 AND summary.one_causal_lsn
+                AND summary.canonical_keys
                 AND queue.queue_id=selected.queue_id
               RETURNING 1
             )
             SELECT summary.emitted,summary.emitted_bytes,
                    summary.one_causal_lsn,summary.canonical_keys,
-                   appended.outcome,appended.appended_chunk_seq,
+                   summary.causal_lsn::text,
                    (SELECT count(*)::bigint FROM payload_insert),
                    (SELECT count(*)::bigint FROM removed),
                    (SELECT count(*)::bigint
@@ -833,7 +838,7 @@ fn drain_queue(
                       SELECT 1 FROM selected
                       WHERE selected.queue_id=pending.queue_id
                     ))
-            FROM summary LEFT JOIN appended ON true
+            FROM summary
             "#,
             queue = queue.sql(),
             output_payload = output_payload.sql(),
@@ -856,22 +861,27 @@ fn drain_queue(
     let emitted_bytes = nonnegative(required::<i64>(&row, 2, "Distinct emitted bytes")?)?;
     let one_causal_lsn = required::<bool>(&row, 3, "Distinct causal LSN summary")?;
     let canonical_keys = required::<bool>(&row, 4, "Distinct canonical effect keys")?;
-    let outcome = row.get::<String>(5).map_err(|error| error.to_string())?;
-    let sequence = row.get::<i64>(6).map_err(|error| error.to_string())?;
-    let inserted = nonnegative(required::<i64>(&row, 7, "Distinct payload inserts")?)?;
-    let removed = nonnegative(required::<i64>(&row, 8, "Distinct queue deletes")?)?;
-    let remaining = nonnegative(required::<i64>(&row, 9, "Distinct remaining effects")?)?;
+    let causal_lsn = parse_lsn(&required::<String>(&row, 5, "Distinct causal LSN")?)?;
+    let inserted = nonnegative(required::<i64>(&row, 6, "Distinct payload inserts")?)?;
+    let removed = nonnegative(required::<i64>(&row, 7, "Distinct queue deletes")?)?;
+    let remaining = nonnegative(required::<i64>(&row, 8, "Distinct remaining effects")?)?;
     if emitted == 0
         || emitted_bytes == 0
         || !one_causal_lsn
         || !canonical_keys
-        || outcome.as_deref() != Some("appended")
-        || sequence != Some(output.next_chunk_seq)
         || inserted != emitted
         || removed != emitted
     {
         return Err("Distinct bounded effect Drain is inconsistent".into());
     }
+    transaction.record_output_append(
+        OutputAppendTarget::New {
+            sequence: output.next_chunk_seq,
+        },
+        emitted,
+        emitted_bytes,
+        causal_lsn,
+    )?;
     Ok(DrainFacts {
         facts: PrimitiveFacts {
             usage: WorkUsage {
@@ -880,7 +890,6 @@ fn drain_queue(
                 ..WorkUsage::default()
             },
             state_rows: removed,
-            continuation_rows: 0,
             output: OutputFacts::Data {
                 chunk_seq: output.next_chunk_seq,
             },

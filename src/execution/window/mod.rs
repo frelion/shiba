@@ -9,22 +9,22 @@ use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiTupleTable};
 
-use crate::execution::KernelTransition;
+use crate::execution::StepReceipt;
 use crate::execution::{
     advance_input, append_frontier, attribute_matches_slot, canonical_row_key_sql, chunk,
     compile_named_outputs, compile_stage_bindings, database_nonnegative as window_nonnegative,
     next_chunk, payload_facts, replace_continuation_cas, required_table as window_required,
     scalar_work_bytes_sql, validate_continuation_abi as validate_typed_continuation_abi,
     validate_output_attributes, AttributeRef, BindingInput, ChunkKind, ContinuationColumn,
-    InputPosition, KernelCompletion, KernelPhase, OutputFacts, PageFacts, PhaseCode,
-    PrimitiveFacts, ProducerKind, RelationRef, StepContext, TypeRef, WorkUsage,
+    InputPosition, KernelCompletion, KernelPhase, OutputAppendTarget, OutputFacts, PageFacts,
+    PhaseCode, PrimitiveFacts, ProducerKind, RelationRef, StepContext, TypeRef, WorkUsage,
 };
 use crate::planner::model::{
     DataflowPlan, DataflowStage, OperatorSpec, OutputSlot, SlotType, WindowExpr, WindowSpec,
 };
 use crate::planner::scalar_sql::{compile_scalar_expression, SqlBinding};
 use crate::planner::WorkBudget;
-use crate::postgres::{format_lsn, quote_identifier};
+use crate::postgres::{format_lsn, parse_lsn, quote_identifier};
 
 use super::aggregate_capability::{
     decode_aggregate_capability, initial_state_sql, AggregateCapability, AGGREGATE_CAPABILITY_SQL,

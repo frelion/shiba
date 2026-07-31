@@ -198,7 +198,6 @@ impl DistinctMachine {
             || facts.usage.input_rows != 0
             || facts.usage.input_bytes != 0
             || facts.state_rows != 0
-            || facts.continuation_rows != 0
         {
             return Err("Distinct frontier commit is inconsistent".into());
         }

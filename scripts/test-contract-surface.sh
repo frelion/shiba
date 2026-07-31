@@ -75,12 +75,17 @@ require_file src/replication/mod.rs
 require_file src/replication/transport.rs
 require_file src/replication/pgoutput.rs
 require_file docs/OPERATOR_PROTOCOL.md
+require_file docs/OPERATOR_SQL_AUDIT.md
 require_match 'KernelPhase' docs/OPERATOR_PROTOCOL.md \
   "operator lifecycle protocol is not documented"
 require_match 'TransactionResult' docs/OPERATOR_PROTOCOL.md \
   "transaction result protocol is not documented"
 require_match 'OperatorProtocol trait decision' docs/OPERATOR_PROTOCOL.md \
   "operator protocol abstraction decision is not documented"
+require_match 'StepContext::record_output_append' docs/OPERATOR_SQL_AUDIT.md \
+  "operator SQL output boundary is not documented"
+require_match 'Join / `append_inner_page`, `append_actions`' docs/OPERATOR_SQL_AUDIT.md \
+  "Join retention decision is not documented"
 
 for operator_file in \
   src/execution/linear/mod.rs \

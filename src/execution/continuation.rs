@@ -120,7 +120,7 @@ pub(crate) fn clear_locked(
     if transaction.write(&query, &[])?.len() != 1 {
         return Err(format!("{owner} continuation clear failed"));
     }
-    transaction.record_continuation_replace(false);
+    transaction.record_continuation_replace(false, true);
     Ok(())
 }
 
@@ -149,6 +149,7 @@ pub(crate) fn replace_cas(
             ));
         }
     }
+    let mut changed = false;
     if let Some(old) = old {
         let predicate = fields
             .iter()
@@ -169,6 +170,7 @@ pub(crate) fn replace_cas(
         if transaction.write(&query, old)?.len() != 1 {
             return Err(format!("{owner} continuation compare-and-set failed"));
         }
+        changed = true;
     }
     if let Some(next) = next {
         let names = columns
@@ -189,8 +191,9 @@ pub(crate) fn replace_cas(
         if transaction.write(&query, next)?.len() != 1 {
             return Err(format!("{owner} continuation insert failed"));
         }
+        changed = true;
     }
-    transaction.record_continuation_replace(next.is_some());
+    transaction.record_continuation_replace(next.is_some(), changed);
     Ok(())
 }
 

@@ -104,14 +104,61 @@ reject_matches \
   src/execution
 reject_matches \
   'StepTxn|StepExecution|StepOutcome|StepContext::begin|\.commit\(' \
-  "operator algorithms must return KernelTransition through KernelRunner" \
+  "operator algorithms must return StepReceipt through KernelRunner" \
   src/execution/linear src/execution/sink src/execution/distinct \
   src/execution/join src/execution/aggregate src/execution/window src/execution/topn
 reject_matches \
-  'KernelTransition::new|KernelTransition \{|BackgroundWorker::transaction|StartTransaction|CommitTransaction|AbortOutOfAnyTransaction' \
+  'StepReceipt::new|StepReceipt \{|BackgroundWorker::transaction|StartTransaction|CommitTransaction|AbortOutOfAnyTransaction' \
   "operator algorithms must not forge transitions or manage PostgreSQL transactions" \
   src/execution/linear src/execution/sink src/execution/distinct \
   src/execution/join src/execution/aggregate src/execution/window src/execution/topn
+
+operator_roots=(
+  src/execution/linear
+  src/execution/sink
+  src/execution/distinct
+  src/execution/join
+  src/execution/aggregate
+  src/execution/window
+  src/execution/topn
+)
+reject_matches \
+  'append_effect_stream_chunk' \
+  "operator SQL must publish data through StepContext, not append the effect stream directly" \
+  "${operator_roots[@]}"
+reject_matches \
+  'INSERT[[:space:]]+INTO[[:space:]]+shiba_internal\.(effect_stream_chunks|effect_streams)|UPDATE[[:space:]]+shiba_internal\.(effect_stream_chunks|effect_streams)|DELETE[[:space:]]+FROM[[:space:]]+shiba_internal\.(effect_stream_chunks|effect_streams)' \
+  "operators must not mutate effect-stream catalog rows outside the shared publication primitive" \
+  "${operator_roots[@]}"
+reject_matches \
+  'INSERT[[:space:]]+INTO[[:space:]]+shiba_internal\.operator_checkpoints|UPDATE[[:space:]]+shiba_internal\.operator_checkpoints|DELETE[[:space:]]+FROM[[:space:]]+shiba_internal\.operator_checkpoints' \
+  "operators must not mutate the shared checkpoint directly" \
+  "${operator_roots[@]}"
+reject_matches \
+  'next_chunk_seq[[:space:]]*=' \
+  "operators must not maintain the shared output cursor directly" \
+  "${operator_roots[@]}"
+reject_matches \
+  'record_published_output|record_published_frontier' \
+  "operators must use the current StepContext output boundary" \
+  "${operator_roots[@]}"
+for output_operator in linear distinct join aggregate window topn; do
+  if ! rg -q 'record_output_append' "src/execution/${output_operator}" --glob '*.rs'; then
+    printf 'data-producing operator is not wired to the shared output boundary: %s\n' \
+      "${output_operator}" >&2
+    exit 1
+  fi
+done
+
+receipt_definitions=$(rg -l 'pub\(crate\) struct StepReceipt' src/execution --glob '*.rs' | wc -l | tr -d ' ')
+if test "$receipt_definitions" -ne 1; then
+  printf 'StepReceipt must have exactly one definition, found %s\n' "$receipt_definitions" >&2
+  exit 1
+fi
+if rg -n 'StepReceipt::new|StepReceipt \{' src/execution --glob '*.rs' --glob '!step.rs'; then
+  printf 'StepReceipt must only be constructed inside step.rs\n' >&2
+  exit 1
+fi
 reject_matches \
   'StepTxn|linear/join/distinct/aggregate/window/topn/sink::execute|LoadedDataflow::step\b|without waiting for the trailing pgoutput|Only committed source WAL reaches|已发布部分 source chunks.*Commit|peak_queued_bytes|queue high-water' \
   "documentation must describe the current streaming and KernelRunner architecture" \

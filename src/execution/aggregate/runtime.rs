@@ -1,9 +1,14 @@
 use super::*;
 
 pub(crate) const KERNEL: crate::execution::KernelFn = crate::execution::KernelFn::new(
-    crate::execution::KernelContract::new(
+    crate::execution::KernelContract::with_phases(
         &[crate::execution::InputContract::Operator],
         crate::execution::OutputContract::EffectStream,
+        &[
+            crate::execution::LifecyclePhase::Admit,
+            crate::execution::LifecyclePhase::Drain,
+            crate::execution::LifecyclePhase::Frontier,
+        ],
     ),
     step,
 );
@@ -12,7 +17,7 @@ pub(crate) fn step(
     transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "Aggregate stage ID exceeds usize")?)
@@ -148,7 +153,7 @@ fn step_frontier(
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let position = stored
         .value
         .input
@@ -202,7 +207,6 @@ fn step_frontier(
             let queue = execute_required::<i64>(&queued.first(), 1, "global Aggregate queue ID")?;
             let facts = PrimitiveFacts {
                 state_rows: 2,
-                continuation_rows: 1,
                 output: OutputFacts::None,
                 ..PrimitiveFacts::default()
             };
@@ -216,9 +220,8 @@ fn step_frontier(
                 }),
                 transaction.budget(),
             )?;
-            let has_continuation = next.is_some();
             replace_execute_continuation(transaction, continuation_relation, stored, next)?;
-            return transaction.transition(has_continuation, facts.usage);
+            return transaction.transition_facts(KernelPhase::Frontier, facts);
         }
     }
     let output = append_frontier(transaction, input_chunk.lsn)?;
@@ -243,9 +246,14 @@ fn step_frontier(
     let AggregateTransition::Committed {
         continuation: next, ..
     } = transition;
-    let has_continuation = next.is_some();
     replace_execute_continuation(transaction, continuation_relation, stored, next)?;
-    transaction.transition(has_continuation, WorkUsage::default())
+    transaction.transition_facts(
+        KernelPhase::Frontier,
+        PrimitiveFacts {
+            output,
+            ..PrimitiveFacts::default()
+        },
+    )
 }
 
 fn validate_execute_continuation_abi(
@@ -487,6 +495,8 @@ fn execute_required<T: FromDatum + IntoDatum>(
         .ok_or_else(|| format!("database returned NULL {name}"))
 }
 
+// Atomic bounded Aggregate admission primitive: apply one input prefix to the
+// dynamic typed state and queue durable rebuild work.
 fn step_apply(
     transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
@@ -494,7 +504,7 @@ fn step_apply(
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let position = stored
         .value
         .input
@@ -882,7 +892,6 @@ fn step_apply(
     let facts = PrimitiveFacts {
         usage,
         state_rows,
-        continuation_rows: u64::from(!matches!(target, ApplyTarget::Idle)),
         output: OutputFacts::None,
     };
     let transition = AggregateMachine::new(spec.aggregates.len() as u32)?.apply(
@@ -893,12 +902,8 @@ fn step_apply(
     let AggregateTransition::Committed {
         continuation: next, ..
     } = transition;
-    let has_continuation = next.is_some();
     replace_execute_continuation(transaction, continuation_relation, stored, next)?;
-    if facts.continuation_rows != u64::from(has_continuation) {
-        return Err("Aggregate continuation mutation disagrees with Apply facts".into());
-    }
-    transaction.transition(has_continuation, facts.usage)
+    transaction.transition_facts(KernelPhase::Admit, facts)
 }
 
 #[derive(Clone, Debug)]
@@ -1292,7 +1297,7 @@ fn execute_group_page(
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
     page: GroupPage,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let AggregatePhase::DrainRebuild { after, .. } = stored.value.phase else {
         return Err("Aggregate group page received another phase".into());
     };
@@ -1438,10 +1443,11 @@ fn execute_group_page(
     {
         return Err("Aggregate page did not finish every selected group".into());
     }
-    if !spec.groups.is_empty() {
-        transaction.write(
-            &format!(
-                "DELETE FROM {groups} AS groups
+    let deleted_groups = if !spec.groups.is_empty() {
+        transaction
+            .write(
+                &format!(
+                    "DELETE FROM {groups} AS groups
                  WHERE NOT groups.published_present
                    AND NOT groups.pending_present
                    AND NOT EXISTS(
@@ -1449,12 +1455,24 @@ fn execute_group_page(
                      WHERE bag.group_state_id=groups.group_state_id
                    )
                  RETURNING 1",
-                groups = groups.sql(),
-                bag = bag.sql(),
-            ),
-            &[],
-        )?;
-    }
+                    groups = groups.sql(),
+                    bag = bag.sql(),
+                ),
+                &[],
+            )?
+            .len()
+    } else {
+        0
+    };
+    let removed_rows =
+        u64::try_from(removed.len()).map_err(|_| "Aggregate removed state count exceeds bigint")?;
+    let deleted_rows = u64::try_from(deleted_groups)
+        .map_err(|_| "Aggregate deleted state count exceeds bigint")?;
+    let state_rows = updated
+        .checked_add(removed_rows)
+        .and_then(|rows| rows.checked_add(deleted_rows))
+        .ok_or_else(|| "Aggregate page state count overflowed".to_string())?;
+    transaction.record_state_rows(state_rows)?;
     let next_dirty = transaction.read(
         &format!("SELECT min(queue_id)::bigint FROM {}", dirty.sql()),
         &[],
@@ -1492,7 +1510,7 @@ fn execute_group_page(
     }
     replace_execute_continuation(transaction, continuation_relation, stored, next)?;
     transaction.transition(
-        next.is_some(),
+        KernelPhase::Drain,
         WorkUsage {
             input_rows: page.input_rows,
             input_bytes: page.input_bytes,
@@ -1509,7 +1527,7 @@ fn step_rebuild(
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let AggregatePhase::DrainRebuild {
         group_queue_id,
         aggregate_ordinal,
@@ -1640,7 +1658,6 @@ fn step_rebuild(
     let facts = PrimitiveFacts {
         usage: rebuilt.page.usage,
         state_rows,
-        continuation_rows: 1,
         output: OutputFacts::None,
     };
     let transition = AggregateMachine::new(spec.aggregates.len() as u32)?.apply(
@@ -1654,9 +1671,8 @@ fn step_rebuild(
     let AggregateTransition::Committed {
         continuation: next, ..
     } = transition;
-    let has_continuation = next.is_some();
     replace_execute_continuation(transaction, continuation_relation, stored, next)?;
-    transaction.transition(has_continuation, facts.usage)
+    transaction.transition_facts(KernelPhase::Drain, facts)
 }
 
 fn step_emit(
@@ -1666,11 +1682,11 @@ fn step_emit(
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let AggregatePhase::DrainEmit {
         group_queue_id,
         leg,
-        after,
+        after: _,
     } = stored.value.phase
     else {
         return Err("Aggregate emission received another phase".into());
@@ -1685,7 +1701,7 @@ fn step_emit(
     let dirty = transaction.state_storage(2000)?;
     let bag = transaction.state_storage(0)?;
     let arguments = unsafe { [DatumWithOid::new(group_queue_id, pg_sys::INT8OID)] };
-    let (has_continuation, usage) = match leg {
+    let facts = match leg {
         EmitLeg::Decide => {
             let expression = aggregate_output_expression(
                 transaction,
@@ -1825,8 +1841,6 @@ fn step_emit(
                 .checked_add(discarded)
                 .and_then(|rows| rows.checked_add(finished_rows))
                 .ok_or_else(|| "Aggregate emission state count overflowed".to_string())?;
-            facts.continuation_rows =
-                u64::from(!completed || next_group.is_some() || !matches!(after, AfterDrain::Idle));
             let prepared = match prepared {
                 "unchanged" => PreparedOutput::Unchanged {
                     facts,
@@ -1853,7 +1867,7 @@ fn step_emit(
                 facts,
             } = transition;
             replace_execute_continuation(transaction, continuation_relation, stored, next)?;
-            (next.is_some(), facts.usage)
+            facts
         }
         EmitLeg::InsertPending => {
             let facts = aggregate_emit_pending_row(
@@ -1876,8 +1890,6 @@ fn step_emit(
                 .state_rows
                 .checked_add(finished_rows)
                 .ok_or_else(|| "Aggregate emission state count overflowed".to_string())?;
-            facts.continuation_rows =
-                u64::from(next_group.is_some() || !matches!(after, AfterDrain::Idle));
             let transition = AggregateMachine::new(spec.aggregates.len() as u32)?.apply(
                 stored.value,
                 AggregateActionResult::PendingEmitted(PendingOutput {
@@ -1891,10 +1903,10 @@ fn step_emit(
                 facts,
             } = transition;
             replace_execute_continuation(transaction, continuation_relation, stored, next)?;
-            (next.is_some(), facts.usage)
+            facts
         }
     };
-    transaction.transition(has_continuation, usage)
+    transaction.transition_facts(KernelPhase::Drain, facts)
 }
 
 #[derive(Clone, Debug)]
@@ -2115,6 +2127,9 @@ fn aggregate_rebuild_order(
 }
 
 #[allow(clippy::too_many_arguments)]
+// Atomic bounded Aggregate rebuild primitive: advance one ordered group page;
+// dynamic composite SQL stays local because its row type and ordering are
+// operator-specific.
 fn aggregate_rebuild_page(
     transaction: &mut StepContext<'_, '_>,
     capability: &AggregateCapability,
@@ -2729,6 +2744,8 @@ fn aggregate_emit_pending_row(
 }
 
 #[allow(clippy::too_many_arguments)]
+// Atomic bounded Aggregate output primitive: reconcile one pending aggregate
+// row with typed payload/state. Effect publication is deferred to StepContext.
 fn aggregate_append_output(
     transaction: &mut StepContext<'_, '_>,
     groups: &RelationRef,
@@ -2770,20 +2787,12 @@ fn aggregate_append_output(
                       causal_lsn
                FROM emitted
              ),
-             appended AS MATERIALIZED (
-               SELECT append.outcome,append.appended_chunk_seq
-               FROM summary
-               CROSS JOIN LATERAL shiba_internal.append_effect_stream_chunk(
-                 $2,$3,'data',1,summary.bytes,summary.causal_lsn
-               ) AS append
-             ),
              payload_insert AS (
                INSERT INTO {payload}(
                  stream_id,chunk_seq,row_ordinal,weight,row_value
                )
-               SELECT $2,appended.appended_chunk_seq,0,$4,emitted.row_value
-               FROM emitted,appended
-               WHERE appended.outcome='appended'
+               SELECT $2,$3,0,$4,emitted.row_value
+               FROM emitted
                RETURNING 1
              ),
              state_update AS (
@@ -2793,10 +2802,10 @@ fn aggregate_append_output(
                  AND groups.group_state_id=dirty.group_state_id
                RETURNING 1
              )
-             SELECT summary.bytes,appended.outcome,appended.appended_chunk_seq,
+             SELECT summary.bytes,summary.causal_lsn::text,
                     (SELECT count(*)::bigint FROM payload_insert),
                     (SELECT count(*)::bigint FROM state_update)
-             FROM summary,appended",
+             FROM summary",
             groups = groups.sql(),
             dirty = dirty.sql(),
             payload = output_payload.sql(),
@@ -2820,23 +2829,23 @@ fn aggregate_append_output(
     }
     let row = rows.first();
     let bytes = aggregate_nonnegative(execute_required::<i64>(&row, 1, "Aggregate output bytes")?)?;
-    let outcome = execute_required::<String>(&row, 2, "Aggregate append outcome")?;
-    let sequence = execute_required::<i64>(&row, 3, "Aggregate output sequence")?;
+    let causal_lsn = parse_lsn(&execute_required::<String>(
+        &row,
+        2,
+        "Aggregate output LSN",
+    )?)?;
     let inserted = aggregate_nonnegative(execute_required::<i64>(
         &row,
-        4,
+        3,
         "Aggregate payload inserts",
     )?)?;
     let updated =
-        aggregate_nonnegative(execute_required::<i64>(&row, 5, "Aggregate group updates")?)?;
-    if bytes == 0
-        || outcome != "appended"
-        || sequence != output.next_chunk_seq
-        || inserted != 1
-        || updated != 1
-    {
+        aggregate_nonnegative(execute_required::<i64>(&row, 4, "Aggregate group updates")?)?;
+    if bytes == 0 || inserted != 1 || updated != 1 {
         return Err("Aggregate typed output append is inconsistent".into());
     }
+    let sequence = output.next_chunk_seq;
+    transaction.record_output_append(OutputAppendTarget::New { sequence }, 1, bytes, causal_lsn)?;
     Ok(PrimitiveFacts {
         usage: WorkUsage {
             output_rows: 1,
@@ -2844,7 +2853,6 @@ fn aggregate_append_output(
             ..WorkUsage::default()
         },
         state_rows: 1,
-        continuation_rows: 0,
         output: OutputFacts::Data {
             chunk_seq: sequence,
         },

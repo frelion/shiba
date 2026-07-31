@@ -22,7 +22,6 @@ fn internal_page(last_row_id: Option<i64>, complete: bool) -> TopNPage {
                 ..WorkUsage::default()
             },
             state_rows: u64::from(last_row_id.is_some()),
-            continuation_rows: 1,
             output: OutputFacts::None,
         },
         last_row_id,
@@ -41,7 +40,6 @@ fn diff_page(last_row_id: Option<i64>, complete: bool, chunk_seq: Option<i64>) -
                 output_bytes: output_rows * 9,
             },
             state_rows: output_rows,
-            continuation_rows: 1,
             output: chunk_seq.map_or(OutputFacts::None, |chunk_seq| OutputFacts::Data {
                 chunk_seq,
             }),
@@ -79,7 +77,6 @@ fn select_continuation(machine: TopNMachine) -> TopNContinuation {
                         ..WorkUsage::default()
                     },
                     state_rows: 1,
-                    continuation_rows: 1,
                     output: OutputFacts::None,
                 },
                 target: TopNAdmissionTarget::Drain {
@@ -440,7 +437,6 @@ fn one_oversized_effect_row_is_allowed_but_two_are_not() {
                 output_bytes: 13,
             },
             state_rows: 1,
-            continuation_rows: 1,
             output: OutputFacts::Data { chunk_seq: 61 },
         },
         last_row_id: Some(1),
@@ -458,7 +454,6 @@ fn one_oversized_effect_row_is_allowed_but_two_are_not() {
                 input_bytes: 21,
                 ..WorkUsage::default()
             },
-            continuation_rows: 1,
             ..PrimitiveFacts::default()
         },
         last_row_id: Some(2),
@@ -488,7 +483,6 @@ fn admission_can_commit_without_starting_a_drain() {
                         ..WorkUsage::default()
                     },
                     state_rows: 2,
-                    continuation_rows: 0,
                     output: OutputFacts::None,
                 },
                 target: TopNAdmissionTarget::Idle,
@@ -524,7 +518,6 @@ fn drain_continuation_does_not_retain_consumed_chunk() {
                             ..WorkUsage::default()
                         },
                         state_rows: 2,
-                        continuation_rows: 1,
                         output: OutputFacts::None,
                     },
                     target: TopNAdmissionTarget::Drain {
@@ -560,7 +553,6 @@ fn partial_chunk_drain_keeps_only_its_resume_target() {
                             ..WorkUsage::default()
                         },
                         state_rows: 3,
-                        continuation_rows: 1,
                         output: OutputFacts::None,
                     },
                     target: TopNAdmissionTarget::Drain {

@@ -788,9 +788,6 @@ impl ActionPlan {
         if facts.state_rows != expected_state_rows {
             return Err("Join action commit changed an unexpected number of candidate rows".into());
         }
-        if facts.continuation_rows != 1 {
-            return Err("Join action commit did not replace exactly one continuation".into());
-        }
         if self.actions.is_empty() && facts.output != OutputFacts::None {
             return Err("Join action commit created output for an empty action prefix".into());
         }
@@ -1254,15 +1251,12 @@ impl FinalizePlan {
     pub(crate) fn validate_commit(
         &self,
         facts: PrimitiveFacts,
-        expected_continuation_rows: u64,
+        expected_continuation: bool,
     ) -> Result<(), String> {
-        if expected_continuation_rows > 1 {
-            return Err("Join finalize expected more than one continuation".into());
-        }
         facts.validate_protocol(
             self.budget,
             KernelPhase::Process,
-            if expected_continuation_rows == 1 {
+            if expected_continuation {
                 KernelCompletion::Continue
             } else {
                 KernelCompletion::Finished
@@ -1273,9 +1267,6 @@ impl FinalizePlan {
         }
         if facts.state_rows != 1 {
             return Err("Join finalize commit did not change exactly one own row".into());
-        }
-        if facts.continuation_rows != expected_continuation_rows {
-            return Err("Join finalize commit wrote an unexpected continuation count".into());
         }
         if self.output.is_none() && facts.output != OutputFacts::None {
             return Err("Join finalize commit created an unexpected output chunk".into());
@@ -1467,9 +1458,6 @@ impl FrontierPlan {
         }
         if facts.state_rows != 0 {
             return Err("Join frontier commit changed arrangement state".into());
-        }
-        if facts.continuation_rows != 0 {
-            return Err("Join frontier commit left a continuation behind".into());
         }
         match (self.publish, facts.output) {
             (Some(_), OutputFacts::Frontier { .. }) | (None, OutputFacts::None) => Ok(()),

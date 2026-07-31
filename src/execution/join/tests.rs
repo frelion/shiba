@@ -44,7 +44,6 @@ fn data_facts(plan: &ActionPlan, state_rows: u64) -> PrimitiveFacts {
     PrimitiveFacts {
         usage: plan.usage(),
         state_rows,
-        continuation_rows: 1,
         output: if plan.actions().is_empty() {
             super::super::OutputFacts::None
         } else {
@@ -463,10 +462,9 @@ fn right_and_full_outer_finalize_only_the_preserved_current_side() {
             PrimitiveFacts {
                 usage: right_plan.usage(),
                 state_rows: 1,
-                continuation_rows: 0,
                 output: super::super::OutputFacts::Data { chunk_seq: 10 },
             },
-            0,
+            false,
         )
         .unwrap();
 
@@ -684,9 +682,6 @@ fn primitive_facts_must_match_the_exact_planned_prefix() {
     let mut facts = data_facts(&plan, 1);
     plan.validate_commit(facts).unwrap();
     facts.state_rows = 0;
-    assert!(plan.validate_commit(facts).is_err());
-    facts = data_facts(&plan, 1);
-    facts.continuation_rows = 0;
     assert!(plan.validate_commit(facts).is_err());
     facts = data_facts(&plan, 1);
     facts.usage.output_bytes += 1;

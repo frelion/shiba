@@ -15,7 +15,7 @@ Every durable primitive is classified as one of four semantic phases:
 | `Drain` | Durable dirty state, not a new input prefix | Rebuild, compare, clean up, or emit state | `Data` or none | Keep the durable cursor, or finish the drain |
 | `Frontier` | A consumed input frontier and completed drain | Advance frontier state | A `Frontier`, or none while bootstrapping a drain | Normally finished; a bootstrap may continue into `Drain` |
 
-`KernelPhase` is a validation label, not a forced implementation enum. A
+`KernelPhase`/`LifecyclePhase` is a validation label, not a forced implementation enum. A
 concrete operator may have many internal phases inside `Process` or `Drain`.
 The shared rule is that a frontier cannot be emitted from `Admit`, `Process`,
 or `Drain`, and a frontier output cannot leave a continuation behind.
@@ -38,8 +38,8 @@ continuation count, and completion.
 
 ## Transition and transaction results
 
-`KernelTransition` is a pre-commit result. It contains measured `WorkUsage`
-and one completion value:
+`StepReceipt` is the only pre-commit result. It contains the lifecycle phase,
+measured `WorkUsage`, a progress witness, and context-derived effects:
 
 - `Continue`: the typed continuation remains present and the checkpoint will
   be schedulable again.
@@ -57,7 +57,7 @@ commit fact, independent of scheduler policy:
 | `NotCommitted` | `Blocked` | Admission found a durable dependency or backpressure |
 
 The last two outcomes are produced before the operator function is invoked.
-An operator cannot return `Idle` or `Blocked` through `KernelTransition`, and
+An operator cannot return `Idle` or `Blocked` through `StepReceipt`, and
 an error after a write aborts the PostgreSQL transaction instead of producing
 a successful step result. This is the invariant that prevents a persisted
 write from being reported as idle or blocked.
@@ -72,14 +72,28 @@ entry point or scheduler outcome was renamed.
 
 - `usage` reports input and output row/byte consumption;
 - `state_rows` reports typed durable state changes;
-- `output` reports no chunk, a data chunk, or a frontier chunk;
-- `continuation_rows` reports the singleton continuation relation cardinality.
+- `output` reports no chunk, a data chunk, or a frontier chunk.
 
-Callers use `validate_protocol(budget, phase, completion)` after constructing
-the operator-specific next continuation. The common validator checks budget
-dimensions, output metadata, phase/output compatibility, and completion versus
-continuation cardinality. Operator code then retains only SQL-specific checks
-such as join multiplicity, aggregate queue identity, or window cursor rules.
+The step boundary produces the `StepReceipt`. Its progress witness set
+records why a committed step is real progress (`InputAdvanced`, `StateChanged`,
+`OutputAppended`, `FrontierAdvanced`, `ContinuationChanged`, or
+`ActionCompleted`). Multiple durable witnesses may be present in one receipt;
+a continuing step cannot use `ActionCompleted` as its only witness. `StepContext` is the authority for
+continuation and output mutations; kernels do not construct the receipt or
+choose output chunk sequences directly. SQL primitives that publish a data
+chunk must report that publication through
+`StepContext::record_output_append` before returning their facts. This records
+the bounded data append in the step context; the shared commit path performs
+the effect-stream append after the payload has been written and before the
+checkpoint CAS. Frontier publication follows the analogous
+`record_frontier_output` boundary.
+
+Callers use `validate_protocol(budget, phase, completion)` for SQL primitive
+facts. The common validator checks budget dimensions, output metadata, and
+phase/output compatibility. Continuation presence is derived from the
+`StepContext` mutation authority, not reported by primitive SQL facts. Operator
+code retains only SQL-specific checks such as join multiplicity, aggregate
+queue identity, or window cursor rules.
 
 Zero-output progress is valid when durable state or a continuation changes;
 the transition-count budget still bounds repeated metadata-only steps.
@@ -119,7 +133,7 @@ continuation helpers enforce the common boundary.
 
 The contract surface and clean-cut gates verify that operator implementations:
 
-- do not call `StepContext::commit`, create a `KernelTransition` directly, or
+- do not call `StepContext::commit`, create a `StepReceipt` directly, or
   start/commit PostgreSQL transactions;
 - use the shared transition path and expose continuation ABI validation;
 - retain the common `KernelRunner` entry point and persistence schemas.

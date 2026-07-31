@@ -567,6 +567,26 @@ assert_query "0" "
   SELECT count(*) FROM changed
 "
 
+# A later data chunk remains valid after a published frontier when its causal
+# LSN strictly advances that frontier. This is the cross-step rule mirrored by
+# StepContext::record_output_append.
+psql_core -qc "
+  BEGIN;
+  SELECT * FROM shiba_internal.append_effect_stream_chunk(
+    ${operator_stream_id},4,'data',1,50,'0/70'
+  );
+  INSERT INTO shiba_internal.test_effect_payload(
+    stream_id,chunk_seq,row_ordinal,payload
+  )
+  VALUES(${operator_stream_id},4,1,'after frontier');
+  COMMIT;
+"
+assert_query "5|0/70" "
+  SELECT next_chunk_seq || '|' || latest_data_lsn
+  FROM shiba_internal.effect_streams
+  WHERE stream_id=${operator_stream_id}
+"
+
 # A single database-level publication frontier advances both inputs of a
 # multi-source fan-in.  The idle source needs no empty source chunk.
 idle_stream_a="$(psql_core -Atqc "

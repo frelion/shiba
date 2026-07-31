@@ -140,7 +140,7 @@ flowchart TD
 [`KernelRunner`](../src/execution/runner.rs) 是唯一的 step 生命周期入口。每个算子先
 声明物理 input 和 output contract；Runner 创建
 [`StepContext`](../src/execution/step.rs)、执行公共锁与 backpressure 检查，再调用算子
-的一个有界 `step`。算子只能返回 `KernelTransition`，不能自行提交 checkpoint。
+的一个有界 `step`。算子只能返回 `StepReceipt`，不能自行提交 checkpoint。
 Runner 最后发布 pending output 并条件更新 checkpoint revision。
 
 `operator_checkpoints.revision` 是 step commit 的 CAS guard 和递增序列；

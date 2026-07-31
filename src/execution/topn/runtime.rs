@@ -3,9 +3,14 @@ use super::*;
 /// Execute one TopN checkpoint. Every action performs one bounded set
 /// primitive; typed rows and ordering values remain in PostgreSQL.
 pub(crate) const KERNEL: crate::execution::KernelFn = crate::execution::KernelFn::new(
-    crate::execution::KernelContract::new(
+    crate::execution::KernelContract::with_phases(
         &[crate::execution::InputContract::Operator],
         crate::execution::OutputContract::EffectStream,
+        &[
+            crate::execution::LifecyclePhase::Admit,
+            crate::execution::LifecyclePhase::Drain,
+            crate::execution::LifecyclePhase::Frontier,
+        ],
     ),
     step,
 );
@@ -14,7 +19,7 @@ pub(crate) fn step(
     transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "TopN stage ID exceeds usize")?)
@@ -114,17 +119,20 @@ pub(crate) fn step(
         continuation: next,
         facts,
     } = transition;
-    let has_continuation = next.is_some();
-    if facts.continuation_rows != u64::from(has_continuation) {
-        return Err("TopN continuation mutation disagrees with primitive facts".into());
-    }
     replace_topn_continuation(
         transaction,
         &storage.continuation,
         current.persisted.then_some(current.continuation),
         next,
     )?;
-    transaction.transition(has_continuation, facts.usage)
+    let phase = match current.continuation.phase {
+        TopNPhase::Admit => KernelPhase::Admit,
+        TopNPhase::Frontier => KernelPhase::Frontier,
+        TopNPhase::Select { .. } | TopNPhase::Diff { .. } | TopNPhase::Cleanup { .. } => {
+            KernelPhase::Drain
+        }
+    };
+    transaction.transition_facts(phase, facts)
 }
 
 fn start_topn_continuation(
@@ -777,6 +785,8 @@ fn attribute_is(
     attribute.name == name && attribute.type_oid == type_oid && attribute.not_null == not_null
 }
 
+// Atomic bounded TopN admission primitive: apply one input prefix to the
+// dynamic ordered state and return its durable mutation summary.
 fn run_topn_admission(
     transaction: &mut StepContext<'_, '_>,
     storage: &TopNStorage,
@@ -1078,7 +1088,6 @@ fn run_topn_admission(
         facts: PrimitiveFacts {
             usage,
             state_rows: touched,
-            continuation_rows: u64::from(!matches!(target, TopNAdmissionTarget::Idle)),
             output: OutputFacts::None,
         },
         target,
@@ -1108,6 +1117,8 @@ fn next_generation_id(transaction: &mut StepContext<'_, '_>) -> Result<i64, Stri
     Ok(generation)
 }
 
+// Atomic bounded TopN selection primitive: advance one deterministic ranked
+// page, keeping sort/tie semantics local to the operator.
 fn run_topn_selection(
     transaction: &mut StepContext<'_, '_>,
     storage: &TopNStorage,
@@ -1392,7 +1403,6 @@ fn run_topn_selection(
                     ..WorkUsage::default()
                 },
                 state_rows: changed,
-                continuation_rows: 1,
                 output: OutputFacts::None,
             },
             last_row_id,
@@ -1409,6 +1419,8 @@ fn run_topn_selection(
     })
 }
 
+// Atomic bounded TopN diff primitive: reconcile one visible ranked page and
+// write its payload/state delta; shared context publishes the data chunk.
 fn run_topn_diff(
     transaction: &mut StepContext<'_, '_>,
     storage: &TopNStorage,
@@ -1606,24 +1618,14 @@ fn run_topn_diff(
                    AS emitted_bytes
           FROM compared
         ),
-        appended AS MATERIALIZED (
-          SELECT append.outcome,append.appended_chunk_seq
-          FROM stats
-          CROSS JOIN LATERAL shiba_internal.append_effect_stream_chunk(
-            $7,$8,'data',stats.emitted_rows,stats.emitted_bytes,$6::pg_lsn
-          ) AS append
-          WHERE stats.emitted_rows>0
-        ),
         payload_insert AS (
           INSERT INTO {output_payload}(
             stream_id,chunk_seq,row_ordinal,weight,row_value
           )
-          SELECT $7,appended.appended_chunk_seq,
+          SELECT $7,$8,
                  row_number() OVER (ORDER BY differences.page_ordinal)-1,
                  {weight},differences.output_row
           FROM differences
-          CROSS JOIN appended
-          WHERE appended.outcome='appended'
           RETURNING 1
         ),
         {mutation}
@@ -1633,12 +1635,10 @@ fn run_topn_diff(
                  AND (SELECT count(*) FROM bounded_prefix)=stats.compared_rows
                  AND NOT stats.repeat_cursor AS complete,
                stats.repeat_cursor,stats.emitted_rows,stats.emitted_bytes,
-               appended.outcome,appended.appended_chunk_seq,
                (SELECT count(*)::bigint FROM payload_insert),
                (SELECT count(*)::bigint FROM changed)
                  +(SELECT count(*)::bigint FROM deleted)
         FROM stats
-        LEFT JOIN appended ON true
         "#,
         output_payload = storage.output_payload.sql(),
     );
@@ -1672,34 +1672,34 @@ fn run_topn_diff(
     let repeat_cursor = required(&row, 5, "TopN residual cursor")?;
     let emitted = nonnegative(required(&row, 6, "TopN diff rows")?, "TopN diff rows")?;
     let emitted_bytes = nonnegative(required(&row, 7, "TopN diff bytes")?, "TopN diff bytes")?;
-    let append_outcome = row.get::<String>(8).map_err(|error| error.to_string())?;
-    let appended_sequence = row.get::<i64>(9).map_err(|error| error.to_string())?;
-    let inserted = nonnegative(
-        required(&row, 10, "TopN payload rows")?,
-        "TopN payload rows",
-    )?;
+    let inserted = nonnegative(required(&row, 8, "TopN payload rows")?, "TopN payload rows")?;
     let mutated = nonnegative(
-        required(&row, 11, "TopN visible mutations")?,
+        required(&row, 9, "TopN visible mutations")?,
         "TopN visible mutations",
     )?;
     let output_facts = if emitted == 0 {
-        if append_outcome.is_some() || appended_sequence.is_some() || inserted != 0 || mutated != 0
-        {
+        if inserted != 0 || mutated != 0 {
             return Err("TopN appended or mutated an empty diff".into());
         }
         OutputFacts::None
     } else {
-        if append_outcome.as_deref() != Some("appended")
-            || appended_sequence != Some(output.next_chunk_seq)
-            || inserted != emitted
-            || mutated != emitted
-        {
+        if inserted != emitted || mutated != emitted {
             return Err("TopN diff append is inconsistent".into());
         }
         OutputFacts::Data {
             chunk_seq: output.next_chunk_seq,
         }
     };
+    if let OutputFacts::Data { chunk_seq } = output_facts {
+        transaction.record_output_append(
+            OutputAppendTarget::New {
+                sequence: chunk_seq,
+            },
+            emitted,
+            emitted_bytes,
+            parse_lsn(&lsn)?,
+        )?;
+    }
     Ok(TopNDiffPage {
         facts: PrimitiveFacts {
             usage: WorkUsage {
@@ -1709,7 +1709,6 @@ fn run_topn_diff(
                 output_bytes: emitted_bytes,
             },
             state_rows: mutated,
-            continuation_rows: 1,
             output: output_facts,
         },
         last_row_id,
@@ -1723,7 +1722,7 @@ fn run_topn_cleanup(
     storage: &TopNStorage,
     generation_id: i64,
     cursor: TopNCursor,
-    after_drain: AfterDrain,
+    _after_drain: AfterDrain,
 ) -> Result<TopNPage, String> {
     let budget = transaction.budget();
     let max_rows = i64_from_usize(budget.max_input_rows, "TopN cleanup row budget")?;
@@ -1796,7 +1795,6 @@ fn run_topn_cleanup(
     if mutation_count != deleted {
         return Err("TopN cleanup delete count is inconsistent".into());
     }
-    let continuation_rows = u64::from(!complete || !matches!(after_drain, AfterDrain::FinishInput));
     Ok(TopNPage {
         facts: PrimitiveFacts {
             usage: WorkUsage {
@@ -1805,7 +1803,6 @@ fn run_topn_cleanup(
                 ..WorkUsage::default()
             },
             state_rows: mutation_count,
-            continuation_rows,
             output: OutputFacts::None,
         },
         last_row_id,
@@ -1867,7 +1864,6 @@ fn run_topn_frontier(
     )?;
     transaction.reset_admission();
     Ok(PrimitiveFacts {
-        continuation_rows: 0,
         output,
         ..PrimitiveFacts::default()
     })

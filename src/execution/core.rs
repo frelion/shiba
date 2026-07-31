@@ -15,15 +15,17 @@ pub(crate) use super::continuation::{
     validate_authority as validate_continuation_authority, Column as ContinuationColumn,
 };
 pub(crate) use super::contract::{
-    AdmissionProgress, InputPosition, KernelCompletion, KernelPhase, OutputFacts, PageFacts,
-    PhaseCode, PrimitiveFacts,
+    AdmissionProgress, ContinuationDelta, InputPosition, KernelCompletion, KernelPhase,
+    LifecyclePhase, OutputFacts, PageFacts, PhaseCode, PrimitiveFacts, ProgressWitness,
+    StepEffects,
 };
 pub(crate) use super::dispatcher::execute_step;
 pub(crate) use super::runner::{
-    InputContract, KernelContract, KernelFn, KernelRunner, KernelTransition, OutputContract,
+    InputContract, KernelContract, KernelFn, KernelRunner, OutputContract,
 };
 pub(crate) use super::step::{
-    InputState, OutputAppendTarget, ProducerKind, StageMetadataCache, StepContext, StepContextStart,
+    InputState, OutputAppendTarget, ProducerKind, StageMetadataCache, StepContext,
+    StepContextStart, StepReceipt,
 };
 pub(crate) use super::storage::payload as resolve_payload_storage;
 pub(crate) use super::storage::{

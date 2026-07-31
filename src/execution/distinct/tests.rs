@@ -41,7 +41,6 @@ fn crash_before_commit_replays_the_same_prefix() {
                         ..WorkUsage::default()
                     },
                     state_rows: 2,
-                    continuation_rows: 1,
                     output: OutputFacts::None,
                 },
                 occupancy: OccupancyDiff {
@@ -82,7 +81,6 @@ fn occupancy_can_change_without_an_external_diff() {
                         ..WorkUsage::default()
                     },
                     state_rows: 1,
-                    continuation_rows: 0,
                     output: OutputFacts::None,
                 },
                 occupancy: OccupancyDiff {
@@ -116,7 +114,6 @@ fn one_oversized_typed_effect_row_is_valid() {
                         ..WorkUsage::default()
                     },
                     state_rows: 1,
-                    continuation_rows: 0,
                     output: OutputFacts::Data { chunk_seq: 18 },
                 },
                 occupancy: OccupancyDiff {
@@ -167,7 +164,6 @@ fn drain_output_count_must_equal_the_effect_summary() {
                         output_bytes: 4,
                         ..WorkUsage::default()
                     },
-                    continuation_rows: 0,
                     output: OutputFacts::Data { chunk_seq: 20 },
                     ..PrimitiveFacts::default()
                 },
@@ -196,7 +192,6 @@ fn replacement_queues_two_legs_under_a_one_row_output_budget() {
                         ..WorkUsage::default()
                     },
                     state_rows: 3,
-                    continuation_rows: 1,
                     output: OutputFacts::None,
                 },
                 occupancy: OccupancyDiff {
@@ -227,7 +222,6 @@ fn replacement_queues_two_legs_under_a_one_row_output_budget() {
                         ..WorkUsage::default()
                     },
                     state_rows: 1,
-                    continuation_rows: 1,
                     output: OutputFacts::Data { chunk_seq: 21 },
                 },
                 occupancy: OccupancyDiff {

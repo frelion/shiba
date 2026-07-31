@@ -22,7 +22,6 @@ fn internal_page(last_row_id: Option<i64>, complete: bool) -> WindowPage {
                 ..WorkUsage::default()
             },
             state_rows: u64::from(last_row_id.is_some()),
-            continuation_rows: 1,
             output: OutputFacts::None,
         },
         last_row_id,
@@ -43,7 +42,6 @@ fn fold_page(
                 ..WorkUsage::default()
             },
             state_rows: 1,
-            continuation_rows: 1,
             output: OutputFacts::None,
         },
         next_cursor,
@@ -66,7 +64,6 @@ fn diff_page(last_row_id: Option<i64>, complete: bool, chunk_seq: Option<i64>) -
                 output_bytes: output_rows * 9,
             },
             state_rows: output_rows,
-            continuation_rows: 1,
             output: chunk_seq.map_or(OutputFacts::None, |chunk_seq| OutputFacts::Data {
                 chunk_seq,
             }),
@@ -117,7 +114,6 @@ fn admission_can_idle_with_a_durable_dirty_queue() {
                         ..WorkUsage::default()
                     },
                     state_rows: 3,
-                    continuation_rows: 0,
                     output: OutputFacts::None,
                 },
                 target: WindowAdmissionTarget::Idle,
@@ -158,7 +154,6 @@ fn window_resumes_every_bounded_build_phase() {
                             ..WorkUsage::default()
                         },
                         state_rows: 1,
-                        continuation_rows: 1,
                         output: OutputFacts::None,
                     },
                     target: WindowAdmissionTarget::Drain {
@@ -764,7 +759,6 @@ fn one_oversized_row_is_the_only_byte_budget_exception() {
                 output_bytes: 13,
             },
             state_rows: 1,
-            continuation_rows: 1,
             output: OutputFacts::Data { chunk_seq: 50 },
         },
         last_row_id: Some(1),
@@ -782,7 +776,6 @@ fn one_oversized_row_is_the_only_byte_budget_exception() {
                 input_bytes: 21,
                 ..WorkUsage::default()
             },
-            continuation_rows: 1,
             ..PrimitiveFacts::default()
         },
         last_row_id: Some(2),

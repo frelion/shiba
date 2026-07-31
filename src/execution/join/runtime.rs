@@ -3,7 +3,7 @@ pub(super) mod execution {
     use pgrx::datum::DatumWithOid;
     use pgrx::prelude::*;
 
-    use crate::execution::KernelTransition;
+    use crate::execution::StepReceipt;
     use crate::execution::{InputPosition, OutputFacts, PhaseCode, PrimitiveFacts, WorkUsage};
     use crate::planner::model::{DataflowPlan, DataflowStage, JoinKind, JoinSpec, OperatorSpec};
     use crate::planner::scalar_sql::compile_scalar_expression;
@@ -16,7 +16,8 @@ pub(super) mod execution {
         compile_stage_bindings, lock_continuation, next_chunk, payload_facts,
         replace_continuation_cas, validate_continuation_abi as validate_typed_continuation_abi,
         validate_output_attributes, BindingInput, ChunkKind, ChunkMeta, ContinuationColumn,
-        OutputAppendTarget, PayloadStorage, ProducerKind, RelationRef, StepContext, TypeRef,
+        KernelPhase, OutputAppendTarget, PayloadStorage, ProducerKind, RelationRef, StepContext,
+        TypeRef,
     };
 
     const CONTINUATION_COLUMNS: &[ContinuationColumn] = &[
@@ -81,15 +82,15 @@ pub(super) mod execution {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct JoinTransition {
-        has_continuation: bool,
         usage: WorkUsage,
         continue_in_transaction: bool,
+        phase: KernelPhase,
+        state_rows: u64,
     }
 
     impl JoinTransition {
-        const fn control(has_continuation: bool) -> Self {
+        const fn control(phase: KernelPhase) -> Self {
             Self {
-                has_continuation,
                 usage: WorkUsage {
                     input_rows: 0,
                     input_bytes: 0,
@@ -97,18 +98,22 @@ pub(super) mod execution {
                     output_bytes: 0,
                 },
                 continue_in_transaction: true,
+                phase,
+                state_rows: 0,
             }
         }
 
         const fn material(
-            has_continuation: bool,
             usage: WorkUsage,
             continue_in_transaction: bool,
+            phase: KernelPhase,
+            state_rows: u64,
         ) -> Self {
             Self {
-                has_continuation,
                 usage,
                 continue_in_transaction,
+                phase,
+                state_rows,
             }
         }
     }
@@ -117,7 +122,7 @@ pub(super) mod execution {
         transaction: &mut StepContext<'_, '_>,
         plan: &DataflowPlan,
         stage_id: u32,
-    ) -> Result<KernelTransition, String> {
+    ) -> Result<StepReceipt, String> {
         let stage = plan
             .stages
             .get(usize::try_from(stage_id).map_err(|_| "Join stage ID exceeds usize")?)
@@ -143,7 +148,7 @@ pub(super) mod execution {
         // A quantum publishes at most one immutable output chunk. Clamp the
         // shared budget to that stream's chunk target before any phase runs.
         let mut quantum = WorkQuantum::new(effective_budget(transaction)?, 64);
-        let has_continuation = loop {
+        let phase = loop {
             let remaining = quantum
                 .remaining()
                 .ok_or_else(|| "Join quantum exhausted before its first transition".to_string())?;
@@ -164,13 +169,14 @@ pub(super) mod execution {
                     step_frontier(transaction, &layout, continuation)?
                 }
             };
+            transaction.record_state_rows(transition.state_rows)?;
             quantum.record(transition.usage)?;
             if !transition.continue_in_transaction || quantum.remaining().is_none() {
-                break transition.has_continuation;
+                break transition.phase;
             }
             continuation = load_continuation(transaction, &layout.continuation)?;
         };
-        transaction.transition(has_continuation, quantum.usage())
+        transaction.transition(phase, quantum.usage())
     }
 
     fn open_next_input(
@@ -204,7 +210,7 @@ pub(super) mod execution {
             )?)?,
         };
         insert_continuation(transaction, &layout.continuation, &continuation)?;
-        Ok(JoinTransition::control(true))
+        Ok(JoinTransition::control(KernelPhase::Process))
     }
 
     fn step_preflight(
@@ -219,7 +225,7 @@ pub(super) mod execution {
         let own = load_own_expectation(transaction, layout, event)?;
         let next = JoinContinuation::start_input(event, own)?;
         replace_continuation(transaction, &layout.continuation, &expected, Some(&next))?;
-        Ok(JoinTransition::control(true))
+        Ok(JoinTransition::control(KernelPhase::Process))
     }
 
     fn step_candidates(
@@ -260,13 +266,12 @@ pub(super) mod execution {
         action.validate_commit(PrimitiveFacts {
             usage: action.usage(),
             state_rows: changed,
-            continuation_rows: 1,
             output,
         })?;
         Ok(if action.usage().is_empty() {
-            JoinTransition::control(true)
+            JoinTransition::control(KernelPhase::Process)
         } else {
-            JoinTransition::material(true, action.usage(), true)
+            JoinTransition::material(action.usage(), true, KernelPhase::Process, changed)
         })
     }
 
@@ -509,7 +514,7 @@ pub(super) mod execution {
         transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
         page: InnerPage,
-    ) -> Result<KernelTransition, String> {
+    ) -> Result<StepReceipt, String> {
         let input = transaction.input(page.side.code() as u16)?.clone();
         let output_facts = append_inner_page(
             transaction,
@@ -539,7 +544,7 @@ pub(super) mod execution {
             return Err("empty Join page unexpectedly published output".into());
         }
         transaction.transition(
-            false,
+            KernelPhase::Process,
             WorkUsage {
                 input_rows: page.chunk.rows,
                 input_bytes: page.chunk.bytes,
@@ -549,6 +554,8 @@ pub(super) mod execution {
         )
     }
 
+    // Atomic bounded Join page primitive: write typed payload and join-side
+    // state for one input page; StepContext owns output publication.
     fn append_inner_page(
         transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
@@ -1568,6 +1575,8 @@ pub(super) mod execution {
         }
     }
 
+    // Atomic bounded Join action primitive: apply one planned action page and
+    // report its facts through the shared output boundary.
     fn append_actions(
         transaction: &mut StepContext<'_, '_>,
         layout: &Layout,
@@ -1909,21 +1918,20 @@ pub(super) mod execution {
             &continuation,
             next.as_ref(),
         )?;
-        let has_continuation = next.is_some();
-        let expected_continuation_rows = u64::from(has_continuation);
+        let next_present = next.is_some();
         plan.validate_commit(
             PrimitiveFacts {
                 usage: plan.usage(),
                 state_rows: 1,
-                continuation_rows: expected_continuation_rows,
                 output,
             },
-            expected_continuation_rows,
+            next_present,
         )?;
         Ok(JoinTransition::material(
-            has_continuation,
             plan.usage(),
-            has_continuation,
+            next_present,
+            KernelPhase::Process,
+            1,
         ))
     }
 
@@ -2106,10 +2114,14 @@ pub(super) mod execution {
         plan.validate_commit(PrimitiveFacts {
             usage: WorkUsage::default(),
             state_rows: 0,
-            continuation_rows: 0,
             output: output_facts,
         })?;
-        Ok(JoinTransition::material(false, WorkUsage::default(), false))
+        Ok(JoinTransition::material(
+            WorkUsage::default(),
+            false,
+            KernelPhase::Frontier,
+            0,
+        ))
     }
 
     fn required_table<T: FromDatum + IntoDatum>(

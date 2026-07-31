@@ -1,16 +1,26 @@
 use super::*;
 
 pub(crate) const SCAN_KERNEL: crate::execution::KernelFn = crate::execution::KernelFn::new(
-    crate::execution::KernelContract::new(
+    crate::execution::KernelContract::with_phases(
         &[crate::execution::InputContract::Source],
         crate::execution::OutputContract::EffectStream,
+        &[
+            crate::execution::LifecyclePhase::Admit,
+            crate::execution::LifecyclePhase::Process,
+            crate::execution::LifecyclePhase::Frontier,
+        ],
     ),
     step,
 );
 pub(crate) const TRANSFORM_KERNEL: crate::execution::KernelFn = crate::execution::KernelFn::new(
-    crate::execution::KernelContract::new(
+    crate::execution::KernelContract::with_phases(
         &[crate::execution::InputContract::Operator],
         crate::execution::OutputContract::EffectStream,
+        &[
+            crate::execution::LifecyclePhase::Admit,
+            crate::execution::LifecyclePhase::Process,
+            crate::execution::LifecyclePhase::Frontier,
+        ],
     ),
     step,
 );
@@ -19,7 +29,7 @@ pub(crate) fn step(
     transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "stage ID exceeds usize")?)
@@ -53,7 +63,7 @@ fn execute_scan(
     plan: &DataflowPlan,
     stage: &DataflowStage,
     continuation_relation: RelationRef,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let OperatorSpec::Scan(spec) = &stage.spec else {
         return Err("Scan kernel received another operator".into());
     };
@@ -128,7 +138,7 @@ fn execute_transform(
     stage: &DataflowStage,
     kind: LinearKind,
     continuation_relation: RelationRef,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     validate_typed_continuation_abi(
         transaction,
         &continuation_relation,
@@ -163,7 +173,7 @@ fn execute_transform(
             WorkUsage::default(),
         )?;
         delete_continuation(transaction, &continuation_relation, continuation.is_some())?;
-        return transaction.transition(false, WorkUsage::default());
+        return transaction.transition(KernelPhase::Frontier, WorkUsage::default());
     }
     let scan_placeholder = ScanSpec {
         source_oid: 0,
@@ -186,7 +196,7 @@ fn step_bootstrap(
     transaction: &mut StepContext<'_, '_>,
     continuation_relation: &RelationRef,
     continuation: &ScanContinuation,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let next_sequence = continuation
         .next_bootstrap_seq
         .ok_or_else(|| "Scan bootstrap continuation omitted its cursor".to_string())?;
@@ -250,21 +260,21 @@ fn step_bootstrap(
             },
         )?;
     }
-    PrimitiveFacts {
-        usage: facts.usage,
-        state_rows: facts.usage.input_rows,
-        continuation_rows: 1,
-        output: facts.output,
-    }
-    .validate(transaction.budget())?;
-    transaction.transition(true, facts.usage)
+    transaction.transition_facts(
+        KernelPhase::Admit,
+        PrimitiveFacts {
+            usage: facts.usage,
+            state_rows: facts.usage.input_rows,
+            output: facts.output,
+        },
+    )
 }
 
 fn step_snapshot_frontier(
     transaction: &mut StepContext<'_, '_>,
     continuation_relation: &RelationRef,
     continuation: &ScanContinuation,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let input = transaction.input(0)?.clone();
     let frontier = continuation
         .pending_frontier_lsn
@@ -282,12 +292,12 @@ fn step_snapshot_frontier(
         None,
         "Scan",
     )?;
-    transaction.transition(false, WorkUsage::default())
+    transaction.transition(KernelPhase::Frontier, WorkUsage::default())
 }
 
 fn step_available_source_frontier(
     transaction: &mut StepContext<'_, '_>,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let input = transaction.input(0)?.clone();
     let frontier = input
         .available_source_frontier_lsn
@@ -302,14 +312,14 @@ fn step_available_source_frontier(
         frontier,
         WorkUsage::default(),
     )?;
-    transaction.transition(false, WorkUsage::default())
+    transaction.transition(KernelPhase::Frontier, WorkUsage::default())
 }
 
 fn step_scan_frontier(
     transaction: &mut StepContext<'_, '_>,
     continuation_relation: &RelationRef,
     frontier: u64,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let input = transaction.input(0)?.clone();
     if frontier <= input.consumed_frontier_lsn
         || input
@@ -328,7 +338,7 @@ fn step_scan_frontier(
         WorkUsage::default(),
     )?;
     delete_continuation(transaction, continuation_relation, true)?;
-    transaction.transition(false, WorkUsage::default())
+    transaction.transition(KernelPhase::Frontier, WorkUsage::default())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -342,7 +352,7 @@ fn step_data_transform(
     had_continuation: bool,
     chunk: ChunkMeta,
     row_ordinal: i64,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     if row_ordinal < 0 || u64::try_from(row_ordinal).map_or(true, |row| row >= chunk.rows) {
         return Err("linear continuation row is outside its input chunk".into());
     }
@@ -385,7 +395,7 @@ fn step_data_transform(
         .checked_add(1)
         .ok_or_else(|| "linear row ordinal space exhausted".to_string())?;
     let chunk_rows = i64_from_u64(chunk.rows)?;
-    let has_continuation = if next_row < chunk_rows {
+    if next_row < chunk_rows {
         match kind {
             LinearKind::Scan => replace_scan_continuation(
                 transaction,
@@ -422,10 +432,8 @@ fn step_data_transform(
                 },
             )?,
         }
-        true
     } else if next_row == chunk_rows {
         delete_continuation(transaction, continuation_relation, had_continuation)?;
-        let mut has_continuation = false;
         if kind == LinearKind::Scan {
             if let Some(frontier) = source_frontier_after_chunk(transaction, &chunk)? {
                 replace_scan_continuation(
@@ -441,7 +449,6 @@ fn step_data_transform(
                         pending_frontier_lsn: Some(frontier),
                     },
                 )?;
-                has_continuation = true;
             }
         }
         advance_input(
@@ -455,22 +462,22 @@ fn step_data_transform(
                 ..WorkUsage::default()
             },
         )?;
-        has_continuation
     } else {
         return Err("linear primitive advanced beyond its input chunk".into());
-    };
+    }
 
-    PrimitiveFacts {
+    let facts = PrimitiveFacts {
         usage: facts.usage,
-        continuation_rows: u64::from(has_continuation),
         output: facts.output,
         ..PrimitiveFacts::default()
-    }
-    .validate(transaction.budget())?;
-    transaction.transition(has_continuation, facts.usage)
+    };
+    transaction.transition_facts(KernelPhase::Process, facts)
 }
 
 #[allow(clippy::too_many_arguments)]
+// Atomic bounded transform primitive: scan one input prefix, write the typed
+// payload, and return only the SQL mutation summary. Output-stream publication
+// is owned by StepContext's commit boundary.
 fn run_transform_primitive(
     transaction: &mut StepContext<'_, '_>,
     input_relation: &RelationRef,
@@ -492,7 +499,6 @@ fn run_transform_primitive(
         output.target_bytes,
     );
     let chunk_rows = i64_from_u64(chunk.rows)?;
-    let chunk_lsn = format_lsn(chunk.lsn);
     let query = format!(
         r#"
         WITH input_source AS MATERIALIZED (
@@ -527,7 +533,7 @@ fn run_transform_primitive(
         ),
         predicated AS MATERIALIZED (
           SELECT input_row.*,
-                 ($12::boolean AND (({predicate}) IS TRUE)) AS passes
+                 ($11::boolean AND (({predicate}) IS TRUE)) AS passes
           FROM input_bounded AS input_row
         ),
         evaluated AS MATERIALIZED (
@@ -580,28 +586,17 @@ fn run_transform_primitive(
                  )::bigint AS output_bytes
           FROM selected
         ),
-        appended AS MATERIALIZED (
-          SELECT append.outcome, append.appended_chunk_seq
-          FROM stats
-          CROSS JOIN LATERAL shiba_internal.append_effect_stream_chunk(
-            $9, $10, 'data', stats.output_count, stats.output_bytes,
-            $11::pg_lsn
-          ) AS append
-          WHERE stats.output_count > 0
-        ),
         inserted AS (
           INSERT INTO {output_relation}(
             stream_id, chunk_seq, row_ordinal, weight, row_value
           )
           SELECT $9,
-                 appended.appended_chunk_seq,
+                 $10,
                  row_number() OVER (ORDER BY selected.row_ordinal) - 1,
                  selected.weight,
                  selected.output_value
           FROM selected
-          CROSS JOIN appended
           WHERE selected.passes
-            AND appended.outcome = 'appended'
           RETURNING shiba_internal.effect_row_bytes(row_value)
             AS stored_bytes
         )
@@ -611,15 +606,12 @@ fn run_transform_primitive(
                stats.input_bytes,
                stats.output_count,
                stats.output_bytes,
-               coalesce(appended.outcome, 'none'),
-               appended.appended_chunk_seq,
                (SELECT count(*)::bigint FROM inserted),
                (
                  SELECT coalesce(sum(stored_bytes), 0)::bigint
                  FROM inserted
                )
         FROM stats
-        LEFT JOIN appended ON true
         "#,
         input_relation = input_relation.sql(),
         output_relation = output_relation.sql(),
@@ -636,7 +628,6 @@ fn run_transform_primitive(
             DatumWithOid::new(max_output_bytes, pg_sys::INT8OID),
             DatumWithOid::new(output.stream_id, pg_sys::INT8OID),
             DatumWithOid::new(output.next_chunk_seq, pg_sys::INT8OID),
-            DatumWithOid::new(chunk_lsn.as_str(), pg_sys::TEXTOID),
             DatumWithOid::new(emit_rows, pg_sys::BOOLOID),
         ]
     };
@@ -663,14 +654,12 @@ fn run_transform_primitive(
         required_table::<i64>(&table, 6, "emitted bytes")?,
         "emitted bytes",
     )?;
-    let append_outcome = required_table::<String>(&table, 7, "append outcome")?;
-    let appended_sequence = table.get::<i64>(8).map_err(|error| error.to_string())?;
     let inserted = nonnegative(
-        required_table::<i64>(&table, 9, "inserted output rows")?,
+        required_table::<i64>(&table, 7, "inserted output rows")?,
         "inserted output rows",
     )?;
     let stored_bytes = nonnegative(
-        required_table::<i64>(&table, 10, "stored output bytes")?,
+        required_table::<i64>(&table, 8, "stored output bytes")?,
         "stored output bytes",
     )?;
     if processed == 0
@@ -681,14 +670,12 @@ fn run_transform_primitive(
     {
         return Err("linear primitive returned inconsistent row facts".into());
     }
-    let output = match (append_outcome.as_str(), appended_sequence, emitted) {
-        ("none", None, 0) => OutputFacts::None,
-        ("appended", Some(sequence), rows) if rows > 0 && sequence == output.next_chunk_seq => {
-            OutputFacts::Data {
-                chunk_seq: sequence,
-            }
+    let output = if emitted == 0 {
+        OutputFacts::None
+    } else {
+        OutputFacts::Data {
+            chunk_seq: output.next_chunk_seq,
         }
-        _ => return Err("linear primitive returned inconsistent append facts".into()),
     };
     let usage = WorkUsage {
         input_rows: processed,
@@ -704,6 +691,16 @@ fn run_transform_primitive(
     {
         return Err("linear primitive exceeded its stream target".into());
     }
+    if let OutputFacts::Data { chunk_seq } = output {
+        transaction.record_output_append(
+            OutputAppendTarget::New {
+                sequence: chunk_seq,
+            },
+            emitted,
+            output_bytes,
+            chunk.lsn,
+        )?;
+    }
     Ok(TransformFacts {
         usage,
         first_ordinal: first,
@@ -712,6 +709,8 @@ fn run_transform_primitive(
     })
 }
 
+// Atomic bounded bootstrap primitive: materialize the initial typed payload and
+// report its facts; the shared context publishes the resulting data chunk.
 fn run_bootstrap_primitive(
     transaction: &mut StepContext<'_, '_>,
     bootstrap: &RelationRef,
@@ -735,7 +734,6 @@ fn run_bootstrap_primitive(
         ),
         output.target_bytes,
     );
-    let activation_lsn = format_lsn(activation_lsn);
     let query = format!(
         r#"
         WITH candidate AS MATERIALIZED (
@@ -771,43 +769,29 @@ fn run_bootstrap_primitive(
                  coalesce(sum(row_bytes), 0)::bigint AS payload_bytes
           FROM selected
         ),
-        appended AS MATERIALIZED (
-          SELECT append.outcome, append.appended_chunk_seq
-          FROM stats
-          CROSS JOIN LATERAL shiba_internal.append_effect_stream_chunk(
-            $4, $5, 'data', stats.row_count, stats.payload_bytes,
-            $6::pg_lsn
-          ) AS append
-          WHERE stats.row_count > 0
-        ),
         inserted AS (
           INSERT INTO {output_relation}(
             stream_id, chunk_seq, row_ordinal, weight, row_value
           )
           SELECT $4,
-                 appended.appended_chunk_seq,
+                 $5,
                  row_number() OVER (ORDER BY selected.bootstrap_seq) - 1,
                  1,
                  selected.row_value
           FROM selected
-          CROSS JOIN appended
-          WHERE appended.outcome = 'appended'
           RETURNING shiba_internal.effect_row_bytes(row_value)
             AS stored_bytes
         ),
         deleted AS (
           DELETE FROM {bootstrap} AS bootstrap
-          USING selected, appended
-          WHERE appended.outcome = 'appended'
-            AND bootstrap.bootstrap_seq = selected.bootstrap_seq
+          USING selected
+          WHERE bootstrap.bootstrap_seq = selected.bootstrap_seq
           RETURNING bootstrap.bootstrap_seq
         )
         SELECT stats.row_count,
                stats.first_sequence,
                stats.last_sequence,
                stats.payload_bytes,
-               coalesce(appended.outcome, 'none'),
-               appended.appended_chunk_seq,
                (SELECT count(*)::bigint FROM inserted),
                (
                  SELECT coalesce(sum(stored_bytes), 0)::bigint
@@ -815,7 +799,6 @@ fn run_bootstrap_primitive(
                ),
                (SELECT count(*)::bigint FROM deleted)
         FROM stats
-        LEFT JOIN appended ON true
         "#,
         bootstrap = bootstrap.sql(),
         output_relation = output_relation.sql(),
@@ -827,7 +810,6 @@ fn run_bootstrap_primitive(
             DatumWithOid::new(max_bytes, pg_sys::INT8OID),
             DatumWithOid::new(output.stream_id, pg_sys::INT8OID),
             DatumWithOid::new(output.next_chunk_seq, pg_sys::INT8OID),
-            DatumWithOid::new(activation_lsn.as_str(), pg_sys::TEXTOID),
         ]
     };
     let table = transaction.write(&query, &arguments)?;
@@ -845,31 +827,27 @@ fn run_bootstrap_primitive(
         required_table::<i64>(&table, 4, "bootstrap bytes")?,
         "bootstrap bytes",
     )?;
-    let append_outcome = required_table::<String>(&table, 5, "bootstrap append outcome")?;
-    let appended_sequence = table.get::<i64>(6).map_err(|error| error.to_string())?;
     let inserted = nonnegative(
-        required_table::<i64>(&table, 7, "bootstrap inserted rows")?,
+        required_table::<i64>(&table, 5, "bootstrap inserted rows")?,
         "bootstrap inserted rows",
     )?;
     let stored_bytes = nonnegative(
-        required_table::<i64>(&table, 8, "bootstrap stored bytes")?,
+        required_table::<i64>(&table, 6, "bootstrap stored bytes")?,
         "bootstrap stored bytes",
     )?;
     let deleted = nonnegative(
-        required_table::<i64>(&table, 9, "bootstrap deleted rows")?,
+        required_table::<i64>(&table, 7, "bootstrap deleted rows")?,
         "bootstrap deleted rows",
     )?;
     if inserted != rows || deleted != rows || stored_bytes != bytes {
         return Err("Scan bootstrap primitive returned inconsistent row facts".into());
     }
-    let output = match (append_outcome.as_str(), appended_sequence, rows) {
-        ("none", None, 0) => OutputFacts::None,
-        ("appended", Some(sequence), count) if count > 0 && sequence == output.next_chunk_seq => {
-            OutputFacts::Data {
-                chunk_seq: sequence,
-            }
+    let output = if rows == 0 {
+        OutputFacts::None
+    } else {
+        OutputFacts::Data {
+            chunk_seq: output.next_chunk_seq,
         }
-        _ => return Err("Scan bootstrap primitive returned inconsistent append facts".into()),
     };
     let usage = WorkUsage {
         input_rows: rows,
@@ -878,6 +856,16 @@ fn run_bootstrap_primitive(
         output_bytes: bytes,
     };
     usage.validate(budget)?;
+    if let OutputFacts::Data { chunk_seq } = output {
+        transaction.record_output_append(
+            OutputAppendTarget::New {
+                sequence: chunk_seq,
+            },
+            rows,
+            bytes,
+            activation_lsn,
+        )?;
+    }
     Ok(BootstrapFacts {
         usage,
         first_sequence,

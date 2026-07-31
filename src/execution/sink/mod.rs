@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 
-use crate::execution::KernelTransition;
+use crate::execution::StepReceipt;
 use crate::planner::model::{
     BindingId, DataflowPlan, DataflowStage, OperatorSpec, SlotId, SlotType,
 };
@@ -21,7 +21,7 @@ use super::{
     advance_input, lock_continuation, next_chunk, nonnegative, replace_continuation_cas,
     required_row, required_table as required,
     validate_continuation_abi as validate_typed_continuation_abi, AttributeRef, ChunkKind,
-    ChunkMeta, ContinuationColumn, InputPosition, RelationRef, StepContext, WorkUsage,
+    ChunkMeta, ContinuationColumn, InputPosition, KernelPhase, RelationRef, StepContext, WorkUsage,
 };
 
 const CONTINUATION_COLUMNS: &[ContinuationColumn] = &[

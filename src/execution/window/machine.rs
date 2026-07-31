@@ -609,7 +609,6 @@ impl WindowMachine {
             }
             WindowAdmissionTarget::Idle => None,
         };
-        validate_continuation_count(admitted.facts, next.is_some())?;
         if let Some(next) = next {
             self.validate_continuation(next)?;
         }
@@ -661,7 +660,6 @@ impl WindowMachine {
             input: None,
             phase: next_phase,
         };
-        validate_continuation_count(page.facts, true)?;
         Ok(WindowTransition::Committed {
             continuation: Some(next),
             facts: page.facts,
@@ -702,7 +700,6 @@ impl WindowMachine {
             input: None,
             phase: next_phase,
         };
-        validate_continuation_count(page.facts, true)?;
         Ok(WindowTransition::Committed {
             continuation: Some(next),
             facts: page.facts,
@@ -745,7 +742,6 @@ impl WindowMachine {
             input: None,
             phase: next_phase,
         };
-        validate_continuation_count(page.facts, true)?;
         Ok(WindowTransition::Committed {
             continuation: Some(next),
             facts: page.facts,
@@ -794,7 +790,6 @@ impl WindowMachine {
             input: None,
             phase: next_phase,
         };
-        validate_continuation_count(page.facts, true)?;
         Ok(WindowTransition::Committed {
             continuation: Some(next),
             facts: page.facts,
@@ -875,7 +870,6 @@ impl WindowMachine {
                 }),
             }
         };
-        validate_continuation_count(page.page.facts, next.is_some())?;
         Ok(WindowTransition::Committed {
             continuation: next,
             facts: page.page.facts,
@@ -891,7 +885,6 @@ impl WindowMachine {
         if !matches!(facts.output, OutputFacts::Frontier { .. })
             || facts.usage.input_rows != 0
             || facts.usage.input_bytes != 0
-            || facts.continuation_rows != 0
         {
             return Err("Window frontier commit is inconsistent".into());
         }
@@ -1254,13 +1247,6 @@ pub(super) fn validate_no_external_output(facts: PrimitiveFacts) -> Result<(), S
         return Err("Window internal phase reported external output".into());
     }
     Ok(())
-}
-
-pub(super) fn validate_continuation_count(
-    facts: PrimitiveFacts,
-    has_continuation: bool,
-) -> Result<(), String> {
-    facts.validate_continuation(has_continuation)
 }
 
 #[derive(Clone, Debug)]

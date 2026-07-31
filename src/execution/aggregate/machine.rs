@@ -236,7 +236,6 @@ impl AggregateMachine {
             }
             ApplyTarget::Idle => None,
         };
-        validate_continuation_count(applied.facts, next.is_some())?;
         if let Some(next) = next {
             self.validate_continuation(next)?;
         }
@@ -260,7 +259,6 @@ impl AggregateMachine {
         rebuilt.facts.validate(budget)?;
         if rebuilt.facts.usage != page.usage
             || rebuilt.facts.output != OutputFacts::None
-            || rebuilt.facts.continuation_rows != 1
             || rebuilt.facts.state_rows == 0
         {
             return Err("Aggregate rebuild primitive facts are inconsistent".into());
@@ -361,7 +359,6 @@ impl AggregateMachine {
                 after,
             )?
         };
-        validate_continuation_count(facts, next.is_some())?;
         Ok(AggregateTransition::Committed {
             continuation: next,
             facts,
@@ -386,7 +383,6 @@ impl AggregateMachine {
             emitted.next_group_queue_id,
             after,
         )?;
-        validate_continuation_count(emitted.facts, next.is_some())?;
         Ok(AggregateTransition::Committed {
             continuation: next,
             facts: emitted.facts,
@@ -407,7 +403,6 @@ impl AggregateMachine {
                     KernelCompletion::Finished,
                 )?;
                 if !matches!(facts.output, OutputFacts::Frontier { .. })
-                    || facts.continuation_rows != 0
                     || facts.state_rows != 0
                     || facts.usage.input_rows != 0
                     || facts.usage.input_bytes != 0
@@ -430,7 +425,7 @@ impl AggregateMachine {
                 )?;
                 validate_internal_page(facts, false)?;
                 validate_queue_id(group_queue_id)?;
-                if facts.continuation_rows != 1 || facts.state_rows == 0 {
+                if facts.state_rows == 0 {
                     return Err("global Aggregate bootstrap omitted its continuation".into());
                 }
                 let frontier = continuation
@@ -658,13 +653,6 @@ pub(super) fn validate_one_effect(facts: PrimitiveFacts) -> Result<(), String> {
         return Err("Aggregate emission must contain exactly one typed effect row".into());
     }
     Ok(())
-}
-
-pub(super) fn validate_continuation_count(
-    facts: PrimitiveFacts,
-    has_continuation: bool,
-) -> Result<(), String> {
-    facts.validate_continuation(has_continuation)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

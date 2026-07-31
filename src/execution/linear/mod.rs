@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 
-use crate::execution::KernelTransition;
+use crate::execution::StepReceipt;
 use crate::planner::model::{DataflowPlan, DataflowStage, OperatorSpec, ScanSpec};
 use crate::planner::scalar_sql::compile_scalar_expression;
 use crate::postgres::{format_lsn, parse_lsn, quote_identifier};
@@ -13,8 +13,9 @@ use super::{
     compile_named_outputs, compile_stage_bindings, lock_continuation, next_chunk, nonnegative,
     payload_facts, replace_continuation_cas, required_table,
     validate_continuation_abi as validate_typed_continuation_abi, validate_output_attributes,
-    BindingInput, ChunkKind, ChunkMeta, ContinuationColumn, OutputFacts, PhaseCode, PrimitiveFacts,
-    ProducerKind, RelationRef, StepContext, TypeRef, WorkUsage,
+    BindingInput, ChunkKind, ChunkMeta, ContinuationColumn, KernelPhase, OutputAppendTarget,
+    OutputFacts, PhaseCode, PrimitiveFacts, ProducerKind, RelationRef, StepContext, TypeRef,
+    WorkUsage,
 };
 
 const SCAN_COLUMNS: &[ContinuationColumn] = &[

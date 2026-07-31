@@ -10,21 +10,17 @@ fn position(row: i64) -> InputPosition {
     InputPosition::new(7, 11, row).unwrap()
 }
 
-fn no_output(continuation_rows: u64) -> PrimitiveFacts {
-    PrimitiveFacts {
-        continuation_rows,
-        ..PrimitiveFacts::default()
-    }
+fn no_output(_continuation: u64) -> PrimitiveFacts {
+    PrimitiveFacts::default()
 }
 
-fn one_effect(continuation_rows: u64, chunk_seq: i64) -> PrimitiveFacts {
+fn one_effect(_continuation: u64, chunk_seq: i64) -> PrimitiveFacts {
     PrimitiveFacts {
         usage: WorkUsage {
             output_rows: 1,
             output_bytes: 9,
             ..WorkUsage::default()
         },
-        continuation_rows,
         output: OutputFacts::Data { chunk_seq },
         ..PrimitiveFacts::default()
     }
@@ -141,7 +137,6 @@ fn an_uncommitted_action_replays_from_the_same_durable_state() {
                         ..WorkUsage::default()
                     },
                     state_rows: 2,
-                    continuation_rows: 1,
                     output: OutputFacts::None,
                 },
                 target: ApplyTarget::Drain {
@@ -201,7 +196,6 @@ fn rebuild_ordinal_and_cursor_are_bounded() {
                         ..WorkUsage::default()
                     },
                     state_rows: 1,
-                    continuation_rows: 1,
                     output: OutputFacts::None,
                 },
             }),
@@ -234,7 +228,6 @@ fn rebuild_ordinal_and_cursor_are_bounded() {
                 },
                 facts: PrimitiveFacts {
                     state_rows: 1,
-                    continuation_rows: 1,
                     ..PrimitiveFacts::default()
                 },
             }),
@@ -418,7 +411,6 @@ fn global_empty_input_rebuilds_before_forwarding_frontier() {
             AggregateActionResult::Frontier(FrontierResult::GlobalGroupQueued {
                 facts: PrimitiveFacts {
                     state_rows: 1,
-                    continuation_rows: 1,
                     ..PrimitiveFacts::default()
                 },
                 group_queue_id: 61,

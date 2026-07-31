@@ -330,12 +330,10 @@ pub(super) fn run_window_admission(
     } else {
         return Err("Window admission advanced beyond its input chunk".into());
     };
-    let continuation_rows = u64::from(!matches!(target, WindowAdmissionTarget::Idle));
     Ok(WindowAdmission {
         facts: PrimitiveFacts {
             usage,
             state_rows,
-            continuation_rows,
             output: OutputFacts::None,
         },
         target,
@@ -397,6 +395,8 @@ pub(super) fn window_admission_evaluated_sql(
     )
 }
 
+// Atomic bounded Window enumeration primitive: materialize one ordered page
+// for a partition; dynamic ordering and row types remain operator-specific.
 pub(super) fn run_window_enumeration(
     transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
@@ -592,7 +592,6 @@ pub(super) fn window_internal_page(
                 ..WorkUsage::default()
             },
             state_rows,
-            continuation_rows: 1,
             output: OutputFacts::None,
         },
         last_row_id,
@@ -600,6 +599,8 @@ pub(super) fn window_internal_page(
     }
 }
 
+// Atomic bounded Window peer primitive: resolve one peer boundary page while
+// advancing only the typed window cursor.
 pub(super) fn run_window_peers(
     transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
@@ -754,6 +755,8 @@ pub(super) fn run_window_peers(
     ))
 }
 
+// Atomic bounded Window frame primitive: resolve one frame page against the
+// dynamic ordered state and return its complete mutation summary.
 pub(super) fn run_window_frames(
     transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
@@ -1096,6 +1099,8 @@ pub(super) fn validate_window_finalize_decision(
     Ok(())
 }
 
+// Atomic bounded Window fold primitive: apply one aggregate function page to
+// durable fold state; output publication is handled by the shared context.
 pub(super) fn run_window_aggregate_fold(
     transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
@@ -1150,7 +1155,6 @@ pub(super) fn run_window_aggregate_fold(
         }
         return Ok(WindowFoldPage {
             facts: PrimitiveFacts {
-                continuation_rows: 1,
                 ..PrimitiveFacts::default()
             },
             next_cursor: None,
@@ -1364,7 +1368,6 @@ pub(super) fn run_window_aggregate_fold(
                 ..WorkUsage::default()
             },
             state_rows,
-            continuation_rows: 1,
             output: OutputFacts::None,
         },
         next_cursor,

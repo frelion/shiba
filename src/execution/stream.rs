@@ -202,6 +202,7 @@ pub(crate) fn append_frontier(
     if sequence != output.next_chunk_seq {
         return Err("frontier append returned an unexpected chunk sequence".into());
     }
+    transaction.record_frontier_output(sequence, frontier_lsn)?;
     Ok(OutputFacts::Frontier {
         chunk_seq: sequence,
     })
@@ -268,6 +269,7 @@ pub(crate) fn advance_input(
     if actual_chunk != new_next_chunk_seq || actual_frontier_lsn != new_frontier_lsn {
         return Err("input cursor advance returned unexpected state".into());
     }
+    transaction.record_input_advance();
     Ok(())
 }
 

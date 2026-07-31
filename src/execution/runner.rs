@@ -4,8 +4,9 @@ use pgrx::spi::SpiClient;
 use crate::planner::model::{DataflowPlan, ExecutionSettings};
 use crate::planner::{StepExecution, StepOutcome, WorkBudget};
 
-use super::contract::KernelCompletion;
-use super::{ProducerKind, StageMetadataCache, StepContext, StepContextStart, WorkUsage};
+use super::contract::LifecyclePhase;
+use super::step::StepReceipt;
+use super::{ProducerKind, StageMetadataCache, StepContext, StepContextStart};
 
 /// Unforgeable outside this module. `StepContext` requires it for both ends of
 /// the lifecycle, so an operator cannot bypass `KernelRunner`.
@@ -31,21 +32,48 @@ pub(crate) enum OutputContract {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OperatorDescriptor {
+    pub(crate) phases: &'static [LifecyclePhase],
+    pub(crate) inputs: &'static [InputContract],
+    pub(crate) output: OutputContract,
+}
+
+impl OperatorDescriptor {
+    #[allow(dead_code)]
+    pub(crate) fn supports_phase(self, phase: LifecyclePhase) -> bool {
+        self.phases.contains(&phase)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KernelContract {
-    inputs: &'static [InputContract],
-    output: OutputContract,
+    descriptor: OperatorDescriptor,
 }
 
 impl KernelContract {
-    pub(crate) const fn new(inputs: &'static [InputContract], output: OutputContract) -> Self {
-        Self { inputs, output }
+    pub(crate) const fn with_phases(
+        inputs: &'static [InputContract],
+        output: OutputContract,
+        phases: &'static [LifecyclePhase],
+    ) -> Self {
+        Self {
+            descriptor: OperatorDescriptor {
+                phases,
+                inputs,
+                output,
+            },
+        }
+    }
+
+    pub(crate) const fn descriptor(self) -> OperatorDescriptor {
+        self.descriptor
     }
 
     fn validate(self, context: &StepContext<'_, '_>) -> Result<(), String> {
-        if context.inputs().len() != self.inputs.len() {
+        if context.inputs().len() != self.descriptor.inputs.len() {
             return Err("kernel context does not match its input contract".into());
         }
-        for (port, expected) in self.inputs.iter().enumerate() {
+        for (port, expected) in self.descriptor.inputs.iter().enumerate() {
             let port = u16::try_from(port).map_err(|_| "kernel input port exceeds smallint")?;
             let input = context.input(port)?;
             let producer_matches = matches!(
@@ -61,36 +89,16 @@ impl KernelContract {
         }
         Ok(())
     }
-}
 
-/// The complete result of one bounded operator invocation.
-///
-/// Kernels may mutate typed state and continuation through `StepContext`, but
-/// only `KernelRunner` can turn this transition into a durable checkpoint.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct KernelTransition {
-    pub(super) completion: KernelCompletion,
-    pub(super) usage: WorkUsage,
-}
-
-impl KernelTransition {
-    pub(crate) const fn new(has_continuation: bool, usage: WorkUsage) -> Self {
-        Self::from_completion(
-            if has_continuation {
-                KernelCompletion::Continue
-            } else {
-                KernelCompletion::Finished
-            },
-            usage,
-        )
-    }
-
-    pub(crate) const fn from_completion(completion: KernelCompletion, usage: WorkUsage) -> Self {
-        Self { completion, usage }
-    }
-
-    pub(crate) const fn completion(self) -> KernelCompletion {
-        self.completion
+    fn validate_phase(self, phase: LifecyclePhase) -> Result<(), String> {
+        if self.descriptor.supports_phase(phase) {
+            Ok(())
+        } else {
+            Err(format!(
+                "kernel does not support the {:?} lifecycle phase",
+                phase
+            ))
+        }
     }
 }
 
@@ -104,14 +112,14 @@ pub(crate) trait Kernel {
         context: &mut StepContext<'_, '_>,
         plan: &DataflowPlan,
         stage_id: u32,
-    ) -> Result<KernelTransition, String>;
+    ) -> Result<StepReceipt, String>;
 }
 
 pub(crate) type KernelStep = for<'client, 'conn> fn(
     &mut StepContext<'client, 'conn>,
     &DataflowPlan,
     u32,
-) -> Result<KernelTransition, String>;
+) -> Result<StepReceipt, String>;
 
 /// Adapts an operator module's single step function to the shared contract.
 pub(crate) struct KernelFn {
@@ -135,7 +143,7 @@ impl Kernel for KernelFn {
         context: &mut StepContext<'_, '_>,
         plan: &DataflowPlan,
         stage_id: u32,
-    ) -> Result<KernelTransition, String> {
+    ) -> Result<StepReceipt, String> {
         (self.step)(context, plan, stage_id)
     }
 }
@@ -158,9 +166,10 @@ impl KernelRunner {
     ) -> Result<StepExecution, String> {
         let contract = kernel.contract();
         let permit = LifecyclePermit::new();
-        let expected_inputs = u16::try_from(contract.inputs.len())
+        let descriptor = contract.descriptor();
+        let expected_inputs = u16::try_from(descriptor.inputs.len())
             .map_err(|_| "kernel input contract exceeds smallint")?;
-        let expects_output = contract.output == OutputContract::EffectStream;
+        let expects_output = descriptor.output == OutputContract::EffectStream;
         let mut context = match StepContext::begin(
             client,
             result_oid,
@@ -180,6 +189,7 @@ impl KernelRunner {
         };
         contract.validate(&context)?;
         let transition = kernel.step(&mut context, plan, stage_id)?;
+        contract.validate_phase(transition.phase())?;
         context.commit(transition, permit)
     }
 }
@@ -189,19 +199,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kernel_transition_exposes_completion_without_changing_legacy_constructor() {
-        assert_eq!(
-            KernelTransition::new(true, WorkUsage::default()).completion(),
-            KernelCompletion::Continue
+    fn kernel_contract_exposes_operator_phase_capabilities() {
+        let contract = KernelContract::with_phases(
+            &[],
+            OutputContract::EffectStream,
+            &[LifecyclePhase::Process, LifecyclePhase::Frontier],
         );
-        assert_eq!(
-            KernelTransition::new(false, WorkUsage::default()).completion(),
-            KernelCompletion::Finished
-        );
-        assert_eq!(
-            KernelTransition::from_completion(KernelCompletion::Continue, WorkUsage::default())
-                .completion(),
-            KernelCompletion::Continue
-        );
+        assert!(contract
+            .descriptor()
+            .supports_phase(LifecyclePhase::Process));
+        assert!(!contract.descriptor().supports_phase(LifecyclePhase::Admit));
+    }
+
+    #[test]
+    fn kernel_contract_rejects_an_undeclared_receipt_phase() {
+        let contract =
+            KernelContract::with_phases(&[], OutputContract::Sink, &[LifecyclePhase::Process]);
+        assert!(contract.validate_phase(LifecyclePhase::Frontier).is_err());
+        assert!(contract.validate_phase(LifecyclePhase::Process).is_ok());
     }
 }

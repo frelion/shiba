@@ -8,12 +8,14 @@ use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiTupleTable};
 
-use crate::execution::KernelTransition;
-use crate::execution::{InputPosition, KernelCompletion, KernelPhase, OutputFacts, PrimitiveFacts};
+use crate::execution::StepReceipt;
+use crate::execution::{
+    InputPosition, KernelCompletion, KernelPhase, OutputAppendTarget, OutputFacts, PrimitiveFacts,
+};
 use crate::planner::model::{DataflowPlan, DataflowStage, OperatorSpec};
 use crate::planner::scalar_sql::compile_scalar_expression;
 use crate::planner::WorkBudget;
-use crate::postgres::{format_lsn, quote_identifier};
+use crate::postgres::{format_lsn, parse_lsn, quote_identifier};
 
 use super::btree::{
     resolve_client as resolve_btree_client, resolve_step as resolve_btree_step, BtreeOrder,

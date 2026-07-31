@@ -1,19 +1,57 @@
 use crate::planner::{WorkBudget, WorkUsage};
 
-/// The semantic phase of a durable operator primitive.
-///
-/// Concrete operators may have more detailed internal phases, but every
-/// bounded database action belongs to one of these four protocol phases. The
-/// phase is intentionally metadata supplied to validation rather than a field
-/// on `PrimitiveFacts`: existing SQL result shapes and Rust struct literals
-/// remain compatible while callers still have to validate the phase boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum KernelPhase {
+pub(crate) enum LifecyclePhase {
     Admit,
     Process,
     Drain,
     Frontier,
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProgressWitness {
+    pub(crate) input_advanced: bool,
+    pub(crate) state_changed: bool,
+    pub(crate) output_appended: bool,
+    pub(crate) frontier_advanced: bool,
+    pub(crate) continuation_changed: bool,
+    pub(crate) action_completed: bool,
+}
+
+impl ProgressWitness {
+    pub(crate) const fn has_durable_progress(self) -> bool {
+        self.input_advanced
+            || self.state_changed
+            || self.output_appended
+            || self.frontier_advanced
+            || self.continuation_changed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContinuationDelta {
+    Keep,
+    Replace,
+    Remove,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StepEffects {
+    pub(crate) state_rows: u64,
+    pub(crate) output: OutputFacts,
+}
+
+impl Default for StepEffects {
+    fn default() -> Self {
+        Self {
+            state_rows: 0,
+            output: OutputFacts::None,
+        }
+    }
+}
+
+/// Compatibility name for the shared lifecycle phase vocabulary.
+pub(crate) type KernelPhase = LifecyclePhase;
 
 /// Whether a committed kernel transition leaves durable work to resume.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,7 +238,6 @@ impl PageFacts {
 pub(crate) struct PrimitiveFacts {
     pub(crate) usage: WorkUsage,
     pub(crate) state_rows: u64,
-    pub(crate) continuation_rows: u64,
     pub(crate) output: OutputFacts,
 }
 
@@ -222,9 +259,6 @@ pub(crate) enum OutputFacts {
 impl PrimitiveFacts {
     pub(crate) fn validate(self, budget: WorkBudget) -> Result<(), String> {
         self.usage.validate(budget)?;
-        if self.continuation_rows > 1 {
-            return Err("operator continuation relation contains more than one row".into());
-        }
         match self.output {
             OutputFacts::None if self.usage.output_rows > 0 => {
                 return Err("primitive emitted rows without an output chunk".into());
@@ -264,8 +298,6 @@ impl PrimitiveFacts {
         completion: KernelCompletion,
     ) -> Result<(), String> {
         self.validate(budget)?;
-        self.validate_continuation(completion.has_continuation())?;
-
         if !matches!(phase, KernelPhase::Frontier)
             && matches!(self.output, OutputFacts::Frontier { .. })
         {
@@ -279,13 +311,6 @@ impl PrimitiveFacts {
             && !matches!(completion, KernelCompletion::Finished)
         {
             return Err("frontier output left a continuation behind".into());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn validate_continuation(self, has_continuation: bool) -> Result<(), String> {
-        if self.continuation_rows != u64::from(has_continuation) {
-            return Err("primitive facts disagree with their continuation row".into());
         }
         Ok(())
     }
@@ -523,26 +548,6 @@ mod tests {
     }
 
     #[test]
-    fn primitive_protocol_requires_completion_to_match_continuation() {
-        PrimitiveFacts {
-            continuation_rows: 1,
-            ..PrimitiveFacts::default()
-        }
-        .validate_protocol(budget(), KernelPhase::Admit, KernelCompletion::Continue)
-        .unwrap();
-
-        assert!(PrimitiveFacts::default()
-            .validate_protocol(budget(), KernelPhase::Process, KernelCompletion::Continue)
-            .is_err());
-        assert!(PrimitiveFacts {
-            continuation_rows: 1,
-            ..PrimitiveFacts::default()
-        }
-        .validate_protocol(budget(), KernelPhase::Drain, KernelCompletion::Finished)
-        .is_err());
-    }
-
-    #[test]
     fn primitive_protocol_reserves_frontier_output_for_the_frontier_phase() {
         let facts = PrimitiveFacts {
             output: OutputFacts::Frontier { chunk_seq: 5 },
@@ -562,7 +567,6 @@ mod tests {
     #[test]
     fn zero_output_continue_is_valid_metadata_progress() {
         PrimitiveFacts {
-            continuation_rows: 1,
             state_rows: 1,
             ..PrimitiveFacts::default()
         }

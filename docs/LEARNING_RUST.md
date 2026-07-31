@@ -44,7 +44,7 @@ shiba_runtime_main
                 └── KernelRunner::run
                     ├── StepContext::begin
                     ├── linear/join/distinct/aggregate/window/topn/sink::step
-                    │   └── KernelTransition
+                    │   └── StepReceipt
                     └── StepContext::commit
 ```
 
@@ -243,7 +243,7 @@ worker has already opened one PostgreSQL transaction. Its setup:
 6. returns `Idle`, `Blocked`, or a ready context.
 
 The kernel uses `read`, `lock`, and `write` through the context, then returns a
-`KernelTransition`. It never returns `StepExecution` and cannot commit the
+`StepReceipt`. It never returns `StepExecution` and cannot commit the
 checkpoint. The Runner publishes pending output and updates the checkpoint only
 if its revision still equals the value locked at step start.
 
@@ -276,7 +276,7 @@ Follow:
 4. one bounded set SQL statement;
 5. output append;
 6. input advance or continuation replacement;
-7. return one `KernelTransition`.
+7. return one `StepReceipt`.
 
 This file shows the intended kernel boundary: Rust has the phase and validates
 database facts; SQL performs typed set work over a bounded prefix.

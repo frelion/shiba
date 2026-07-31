@@ -18,12 +18,16 @@ pub(crate) use provision::provision;
 pub(crate) use runtime::execution::step;
 
 pub(crate) const KERNEL: crate::execution::KernelFn = crate::execution::KernelFn::new(
-    crate::execution::KernelContract::new(
+    crate::execution::KernelContract::with_phases(
         &[
             crate::execution::InputContract::Operator,
             crate::execution::InputContract::Operator,
         ],
         crate::execution::OutputContract::EffectStream,
+        &[
+            crate::execution::LifecyclePhase::Process,
+            crate::execution::LifecyclePhase::Frontier,
+        ],
     ),
     step,
 );

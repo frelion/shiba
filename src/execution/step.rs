@@ -13,8 +13,137 @@ use crate::postgres::parse_lsn;
 use super::runner::LifecyclePermit;
 use super::storage::{self, AttributeRef, PayloadStorage, RelationRef, TypeRef};
 use super::{
-    nonnegative, required_row, required_table, AdmissionProgress, KernelTransition, WorkUsage,
+    nonnegative, required_row, required_table, AdmissionProgress, ContinuationDelta,
+    KernelCompletion, KernelPhase, OutputFacts, PrimitiveFacts, ProgressWitness, StepEffects,
+    WorkUsage,
 };
+
+/// The only pre-commit result an operator may return. Its constructor is
+/// private to this module; kernels can only obtain one through StepContext.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StepReceipt {
+    phase: KernelPhase,
+    output_stream: bool,
+    completion: KernelCompletion,
+    usage: WorkUsage,
+    progress: ProgressWitness,
+    effects: StepEffects,
+    continuation: ContinuationDelta,
+}
+
+impl StepReceipt {
+    fn new(
+        phase: KernelPhase,
+        output_stream: bool,
+        completion: KernelCompletion,
+        usage: WorkUsage,
+        progress: ProgressWitness,
+        effects: StepEffects,
+        continuation: ContinuationDelta,
+    ) -> Self {
+        Self {
+            phase,
+            output_stream,
+            completion,
+            usage,
+            progress,
+            effects,
+            continuation,
+        }
+    }
+
+    fn validate(self) -> Result<(), String> {
+        match self.effects.output {
+            OutputFacts::None if self.output_stream && self.usage.output_rows > 0 => {
+                return Err("step receipt emitted rows without an output effect".into());
+            }
+            OutputFacts::Data { .. } if !self.output_stream => {
+                return Err("sink step reported an effect-stream output".into());
+            }
+            OutputFacts::Data { .. } if self.usage.output_rows == 0 => {
+                return Err("step receipt reported a data output without rows".into());
+            }
+            OutputFacts::Frontier { .. } if !self.output_stream => {
+                return Err("sink step reported a frontier output".into());
+            }
+            OutputFacts::Frontier { .. }
+                if self.usage.output_rows != 0 || self.usage.output_bytes != 0 =>
+            {
+                return Err("step receipt frontier contains output rows".into());
+            }
+            _ => {}
+        }
+        if matches!(self.completion, KernelCompletion::Continue)
+            && (!self.progress.has_durable_progress() || self.progress.action_completed)
+        {
+            return Err("continuing operator step did not make durable progress".into());
+        }
+        if matches!(self.continuation, ContinuationDelta::Remove)
+            && !matches!(self.completion, KernelCompletion::Finished)
+        {
+            return Err("continuing operator step removed its continuation".into());
+        }
+        if matches!(self.completion, KernelCompletion::Finished)
+            && !matches!(self.continuation, ContinuationDelta::Remove)
+        {
+            return Err("finished operator step did not remove its continuation".into());
+        }
+        if self.progress.output_appended && matches!(self.effects.output, OutputFacts::None) {
+            return Err("output progress witness omitted its output effect".into());
+        }
+        if self.progress.frontier_advanced
+            && !matches!(self.effects.output, OutputFacts::Frontier { .. })
+        {
+            return Err("frontier progress witness omitted its frontier effect".into());
+        }
+        if self.effects.state_rows > 0 && !self.progress.state_changed {
+            return Err("state effects were omitted from the progress witness".into());
+        }
+        if self.progress.state_changed && self.effects.state_rows == 0 {
+            return Err("state progress witness omitted its state effect".into());
+        }
+        if self.progress.continuation_changed
+            && matches!(self.continuation, ContinuationDelta::Keep)
+        {
+            return Err("continuation progress omitted its replacement effect".into());
+        }
+        if matches!(self.continuation, ContinuationDelta::Replace)
+            && !self.progress.continuation_changed
+        {
+            return Err("continuation replacement omitted its progress witness".into());
+        }
+        if matches!(self.phase, KernelPhase::Frontier)
+            && matches!(self.effects.output, OutputFacts::Data { .. })
+        {
+            return Err("frontier phase emitted a data output".into());
+        }
+        if !matches!(self.phase, KernelPhase::Frontier)
+            && matches!(self.effects.output, OutputFacts::Frontier { .. })
+        {
+            return Err("non-frontier phase emitted a frontier output".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn phase(self) -> KernelPhase {
+        self.phase
+    }
+
+    fn completion(self) -> KernelCompletion {
+        self.completion
+    }
+
+    fn usage(self) -> WorkUsage {
+        self.usage
+    }
+
+    fn effects_output(self) -> Option<OutputFacts> {
+        match self.effects.output {
+            OutputFacts::None => None,
+            output => Some(output),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProducerKind {
@@ -54,6 +183,27 @@ pub(crate) struct OutputState {
     pub(crate) latest_data_lsn: Option<u64>,
     pub(crate) published_frontier_lsn: Option<u64>,
     pending_data_chunk: Option<PendingDataChunk>,
+}
+
+impl OutputState {
+    fn record_published_frontier(&mut self, sequence: i64, lsn: u64) -> Result<(), String> {
+        if self.pending_data_chunk.is_some() || sequence != self.next_chunk_seq {
+            return Err("published frontier changed the shared output cursor".into());
+        }
+        if self
+            .published_frontier_lsn
+            .is_some_and(|frontier| lsn <= frontier)
+            || self.latest_data_lsn.is_some_and(|data| lsn < data)
+        {
+            return Err("published frontier is not causally advancing".into());
+        }
+        self.next_chunk_seq = self
+            .next_chunk_seq
+            .checked_add(1)
+            .ok_or_else(|| "output chunk sequence overflow".to_string())?;
+        self.published_frontier_lsn = Some(lsn);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +333,10 @@ pub(crate) struct StepContext<'client, 'conn> {
     checkpoint_had_continuation: bool,
     continuation_presence: Option<bool>,
     admission: AdmissionProgress,
+    continuation_changed: bool,
+    input_advanced: bool,
+    frontier_output: Option<i64>,
+    state_rows: u64,
     inputs: Vec<InputState>,
     output: Option<OutputState>,
     metadata_cache: StageMetadataCache,
@@ -278,7 +432,7 @@ impl<'client, 'conn> StepContext<'client, 'conn> {
                   AND checkpoint.stage_id = $2
                 FOR UPDATE
                 "#,
-                Some(2),
+                Some(4),
                 &identity,
             )
             .map_err(|error| format!("could not lock operator checkpoint: {error}"))?;
@@ -440,6 +594,10 @@ impl<'client, 'conn> StepContext<'client, 'conn> {
             checkpoint_had_continuation,
             continuation_presence: None,
             admission,
+            continuation_changed: false,
+            input_advanced: false,
+            frontier_output: None,
+            state_rows: 0,
             inputs,
             output,
             metadata_cache,
@@ -482,8 +640,38 @@ impl<'client, 'conn> StepContext<'client, 'conn> {
         }
     }
 
-    pub(crate) fn record_continuation_replace(&mut self, present: bool) {
+    pub(crate) fn record_continuation_replace(&mut self, present: bool, changed: bool) {
         self.continuation_presence = Some(present);
+        self.continuation_changed |= changed;
+    }
+
+    pub(crate) fn record_input_advance(&mut self) {
+        self.input_advanced = true;
+    }
+
+    pub(crate) fn record_frontier_output(
+        &mut self,
+        chunk_seq: i64,
+        lsn: u64,
+    ) -> Result<(), String> {
+        if self.frontier_output.is_some() {
+            return Err("step cannot publish more than one frontier output".into());
+        }
+        let output = self
+            .output
+            .as_mut()
+            .ok_or_else(|| format!("Sink stage {} has no output stream", self.stage_id))?;
+        output.record_published_frontier(chunk_seq, lsn)?;
+        self.frontier_output = Some(chunk_seq);
+        Ok(())
+    }
+
+    pub(crate) fn record_state_rows(&mut self, rows: u64) -> Result<(), String> {
+        self.state_rows = self
+            .state_rows
+            .checked_add(rows)
+            .ok_or_else(|| "step state row count overflowed".to_string())?;
+        Ok(())
     }
 
     pub(crate) const fn admission_progress(&self) -> AdmissionProgress {
@@ -532,6 +720,9 @@ impl<'client, 'conn> StepContext<'client, 'conn> {
             return Err("output append has no rows or bytes".into());
         }
         let output = self.output()?;
+        if self.frontier_output.is_some() {
+            return Err("step cannot append data after a frontier output".into());
+        }
         let target_rows = u64::try_from(output.target_rows)
             .map_err(|_| "output stream has a negative row target".to_string())?;
         let target_bytes = u64::try_from(output.target_bytes)
@@ -566,10 +757,25 @@ impl<'client, 'conn> StepContext<'client, 'conn> {
         bytes: u64,
         lsn: u64,
     ) -> Result<(), String> {
+        if rows == 0 || bytes == 0 {
+            return Err("data output append must contain rows and bytes".into());
+        }
+        if self.frontier_output.is_some() {
+            return Err("step cannot append data after a frontier output".into());
+        }
         let output = self
             .output
             .as_mut()
             .ok_or_else(|| format!("Sink stage {} has no output stream", self.stage_id))?;
+        if output
+            .published_frontier_lsn
+            .is_some_and(|frontier| lsn <= frontier)
+        {
+            return Err("data output causal LSN did not advance its frontier".into());
+        }
+        if output.latest_data_lsn.is_some_and(|latest| lsn < latest) {
+            return Err("data output causal LSN moved backwards".into());
+        }
         match target {
             OutputAppendTarget::New { sequence } => {
                 if sequence != output.next_chunk_seq {
@@ -755,14 +961,95 @@ impl<'client, 'conn> StepContext<'client, 'conn> {
 
     pub(crate) fn transition(
         &self,
-        has_continuation: bool,
+        phase: KernelPhase,
         usage: WorkUsage,
-    ) -> Result<KernelTransition, String> {
+    ) -> Result<StepReceipt, String> {
         usage.validate(self.quantum_budget)?;
-        if self.continuation_presence != Some(has_continuation) {
-            return Err("kernel transition disagrees with typed continuation authority".into());
+        let has_continuation = self.continuation_presence.ok_or_else(|| {
+            "kernel transition was created before continuation authority was bound".to_string()
+        })?;
+        let completion = if has_continuation {
+            KernelCompletion::Continue
+        } else {
+            KernelCompletion::Finished
+        };
+        let continuation = if has_continuation {
+            if self.continuation_changed {
+                ContinuationDelta::Replace
+            } else {
+                ContinuationDelta::Keep
+            }
+        } else {
+            ContinuationDelta::Remove
+        };
+        let output = self.frontier_output.map_or_else(
+            || {
+                self.pending_output_chunk()
+                    .map_or(OutputFacts::None, |sequence| OutputFacts::Data {
+                        chunk_seq: sequence,
+                    })
+            },
+            |sequence| OutputFacts::Frontier {
+                chunk_seq: sequence,
+            },
+        );
+        let progress = ProgressWitness {
+            input_advanced: self.input_advanced,
+            state_changed: self.state_rows > 0,
+            output_appended: matches!(output, OutputFacts::Data { .. }),
+            frontier_advanced: matches!(output, OutputFacts::Frontier { .. }),
+            continuation_changed: self.continuation_changed,
+            action_completed: !self.input_advanced
+                && self.state_rows == 0
+                && matches!(output, OutputFacts::None)
+                && !self.continuation_changed,
+        };
+        let receipt = StepReceipt::new(
+            phase,
+            self.output.is_some(),
+            completion,
+            usage,
+            progress,
+            StepEffects {
+                state_rows: self.state_rows,
+                output,
+            },
+            continuation,
+        );
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn transition_facts(
+        &mut self,
+        phase: KernelPhase,
+        facts: PrimitiveFacts,
+    ) -> Result<StepReceipt, String> {
+        facts.validate_protocol(
+            self.quantum_budget,
+            phase,
+            if self.continuation_presence.is_some_and(|present| present) {
+                KernelCompletion::Continue
+            } else {
+                KernelCompletion::Finished
+            },
+        )?;
+        self.record_state_rows(facts.state_rows)?;
+        let transition = self.transition(phase, facts.usage)?;
+        let actual_output = match transition.effects_output() {
+            Some(output) => output,
+            None => OutputFacts::None,
+        };
+        if actual_output != facts.output {
+            return Err("primitive output facts disagree with the step context".into());
         }
-        Ok(KernelTransition::new(has_continuation, usage))
+        Ok(transition)
+    }
+
+    fn pending_output_chunk(&self) -> Option<i64> {
+        self.output
+            .as_ref()
+            .and_then(|output| output.pending_data_chunk.map(|chunk| chunk.sequence))
     }
 
     /// Commits the logical step by advancing its single CAS authority.
@@ -771,11 +1058,12 @@ impl<'client, 'conn> StepContext<'client, 'conn> {
     /// continuation mutation performed in this transaction.
     pub(super) fn commit(
         mut self,
-        transition: KernelTransition,
+        transition: StepReceipt,
         _permit: LifecyclePermit,
     ) -> Result<StepExecution, String> {
+        transition.validate()?;
         let completion = transition.completion();
-        let usage = transition.usage;
+        let usage = transition.usage();
         let has_continuation = completion.has_continuation();
         usage.validate(self.quantum_budget)?;
         if self.continuation_presence != Some(has_continuation) {
@@ -949,5 +1237,163 @@ mod tests {
 
         assert_eq!(cache.relation_attributes(relation_oid), Some(attributes));
         assert_eq!(cache.composite_attributes(relation_oid), None);
+    }
+
+    #[test]
+    fn published_frontier_advances_the_context_output_mirror() {
+        let mut output = OutputState {
+            stream_id: 1,
+            next_chunk_seq: 4,
+            target_rows: 10,
+            target_bytes: 100,
+            latest_data_lsn: Some(10),
+            published_frontier_lsn: None,
+            pending_data_chunk: None,
+        };
+
+        output.record_published_frontier(4, 10).unwrap();
+        assert_eq!(output.next_chunk_seq, 5);
+        assert_eq!(output.published_frontier_lsn, Some(10));
+        assert!(output.record_published_frontier(5, 10).is_err());
+        assert!(output.record_published_frontier(5, 9).is_err());
+    }
+
+    #[test]
+    fn published_frontier_rejects_an_open_data_chunk() {
+        let mut output = OutputState {
+            stream_id: 1,
+            next_chunk_seq: 5,
+            target_rows: 10,
+            target_bytes: 100,
+            latest_data_lsn: Some(10),
+            published_frontier_lsn: None,
+            pending_data_chunk: Some(PendingDataChunk {
+                sequence: 4,
+                rows: 1,
+                bytes: 8,
+                lsn: 10,
+            }),
+        };
+
+        assert!(output.record_published_frontier(5, 10).is_err());
+        assert_eq!(output.next_chunk_seq, 5);
+    }
+
+    fn receipt(
+        phase: KernelPhase,
+        output_stream: bool,
+        completion: KernelCompletion,
+        progress: ProgressWitness,
+        effects: StepEffects,
+        continuation: ContinuationDelta,
+    ) -> StepReceipt {
+        StepReceipt::new(
+            phase,
+            output_stream,
+            completion,
+            WorkUsage {
+                output_rows: match effects.output {
+                    OutputFacts::Data { .. } => 1,
+                    _ => 0,
+                },
+                output_bytes: match effects.output {
+                    OutputFacts::Data { .. } => 8,
+                    _ => 0,
+                },
+                ..WorkUsage::default()
+            },
+            progress,
+            effects,
+            continuation,
+        )
+    }
+
+    #[test]
+    fn step_receipt_rejects_a_continuation_without_progress() {
+        let receipt = receipt(
+            KernelPhase::Drain,
+            false,
+            KernelCompletion::Continue,
+            ProgressWitness {
+                action_completed: true,
+                ..ProgressWitness::default()
+            },
+            StepEffects::default(),
+            ContinuationDelta::Keep,
+        );
+        assert!(receipt.validate().is_err());
+    }
+
+    #[test]
+    fn step_receipt_requires_finished_steps_to_remove_continuation() {
+        let receipt = receipt(
+            KernelPhase::Process,
+            false,
+            KernelCompletion::Finished,
+            ProgressWitness {
+                state_changed: true,
+                ..ProgressWitness::default()
+            },
+            StepEffects {
+                state_rows: 1,
+                ..StepEffects::default()
+            },
+            ContinuationDelta::Replace,
+        );
+        assert!(receipt.validate().is_err());
+    }
+
+    #[test]
+    fn step_receipt_accepts_zero_output_continuation_replacement() {
+        let receipt = receipt(
+            KernelPhase::Drain,
+            true,
+            KernelCompletion::Continue,
+            ProgressWitness {
+                continuation_changed: true,
+                ..ProgressWitness::default()
+            },
+            StepEffects::default(),
+            ContinuationDelta::Replace,
+        );
+        receipt.validate().unwrap();
+    }
+
+    #[test]
+    fn step_receipt_treats_sink_rows_as_state_effects() {
+        let receipt = receipt(
+            KernelPhase::Process,
+            false,
+            KernelCompletion::Finished,
+            ProgressWitness {
+                state_changed: true,
+                ..ProgressWitness::default()
+            },
+            StepEffects {
+                state_rows: 1,
+                ..StepEffects::default()
+            },
+            ContinuationDelta::Remove,
+        );
+        receipt.validate().unwrap();
+    }
+
+    #[test]
+    fn step_receipt_rejects_a_frontier_data_output() {
+        let receipt = receipt(
+            KernelPhase::Frontier,
+            true,
+            KernelCompletion::Finished,
+            ProgressWitness {
+                output_appended: true,
+                ..ProgressWitness::default()
+            },
+            StepEffects {
+                output: OutputFacts::Data { chunk_seq: 2 },
+                ..StepEffects::default()
+            },
+            ContinuationDelta::Remove,
+        );
+        assert!(receipt.validate().is_err());
     }
 }

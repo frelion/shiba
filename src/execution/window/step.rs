@@ -4,7 +4,7 @@ pub(crate) fn step(
     transaction: &mut StepContext<'_, '_>,
     plan: &DataflowPlan,
     stage_id: u32,
-) -> Result<KernelTransition, String> {
+) -> Result<StepReceipt, String> {
     let stage = plan
         .stages
         .get(usize::try_from(stage_id).map_err(|_| "Window stage ID exceeds usize")?)
@@ -158,17 +158,24 @@ pub(crate) fn step(
         continuation: next,
         facts,
     } = transition;
-    let has_continuation = next.is_some();
-    if facts.continuation_rows != u64::from(has_continuation) {
-        return Err("Window continuation mutation disagrees with primitive facts".into());
-    }
     replace_window_continuation(
         transaction,
         &storage.continuation,
         current.persisted.then_some(current.continuation),
         next,
     )?;
-    transaction.transition(has_continuation, facts.usage)
+    let phase = match current.continuation.phase {
+        WindowPhase::Admit => KernelPhase::Admit,
+        WindowPhase::Frontier => KernelPhase::Frontier,
+        WindowPhase::Enumerate { .. }
+        | WindowPhase::Peers { .. }
+        | WindowPhase::Frames { .. }
+        | WindowPhase::FoldAggregate { .. }
+        | WindowPhase::Evaluate { .. }
+        | WindowPhase::Diff { .. }
+        | WindowPhase::Cleanup { .. } => KernelPhase::Drain,
+    };
+    transaction.transition_facts(phase, facts)
 }
 
 pub(super) fn start_window_continuation(

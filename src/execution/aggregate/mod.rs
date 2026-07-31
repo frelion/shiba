@@ -9,7 +9,7 @@ use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiTupleTable};
 
-use crate::execution::KernelTransition;
+use crate::execution::StepReceipt;
 use crate::execution::{
     InputPosition, KernelCompletion, KernelPhase, OutputFacts, PageFacts, PrimitiveFacts,
 };

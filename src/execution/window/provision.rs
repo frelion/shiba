@@ -546,9 +546,14 @@ pub(super) fn decode_native_window(
 
 /// Execute exactly one durable Window action.
 pub(crate) const KERNEL: crate::execution::KernelFn = crate::execution::KernelFn::new(
-    crate::execution::KernelContract::new(
+    crate::execution::KernelContract::with_phases(
         &[crate::execution::InputContract::Operator],
         crate::execution::OutputContract::EffectStream,
+        &[
+            crate::execution::LifecyclePhase::Admit,
+            crate::execution::LifecyclePhase::Drain,
+            crate::execution::LifecyclePhase::Frontier,
+        ],
     ),
     step,
 );

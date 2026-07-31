@@ -462,6 +462,9 @@ pub(super) fn window_target_value(
     })
 }
 
+// Atomic bounded Window diff primitive: compare one visible-output page and
+// write its typed payload/state delta. Effect-stream publication is deferred
+// to StepContext's shared commit boundary.
 pub(super) fn run_window_diff(
     transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
@@ -648,23 +651,14 @@ pub(super) fn run_window_diff(
                    AS emitted_bytes
           FROM compared
         ),
-        appended AS MATERIALIZED (
-          SELECT append.outcome,append.appended_chunk_seq
-          FROM stats
-          CROSS JOIN LATERAL shiba_internal.append_effect_stream_chunk(
-            $7,$8,'data',stats.emitted_rows,stats.emitted_bytes,$6::pg_lsn
-          ) AS append
-          WHERE stats.emitted_rows>0
-        ),
         payload_insert AS (
           INSERT INTO {output_payload}(
             stream_id,chunk_seq,row_ordinal,weight,row_value
           )
-          SELECT $7,appended.appended_chunk_seq,
+          SELECT $7,$8,
                  row_number() OVER (ORDER BY differences.page_ordinal)-1,
                  {weight},differences.output_row
-          FROM differences CROSS JOIN appended
-          WHERE appended.outcome='appended'
+          FROM differences
           RETURNING 1
         ),
         {mutation}
@@ -674,11 +668,10 @@ pub(super) fn run_window_diff(
                  AND (SELECT count(*) FROM bounded_prefix)=stats.compared_rows
                  AND NOT stats.repeat_cursor,
                stats.repeat_cursor,stats.emitted_rows,stats.emitted_bytes,
-               appended.outcome,appended.appended_chunk_seq,
                (SELECT count(*)::bigint FROM payload_insert),
                (SELECT count(*)::bigint FROM changed)
                  +(SELECT count(*)::bigint FROM deleted)
-        FROM stats LEFT JOIN appended ON true
+        FROM stats
         "#,
         output_payload = storage.output_payload.sql(),
     );
@@ -718,34 +711,37 @@ pub(super) fn run_window_diff(
         window_required(&row, 7, "Window diff bytes")?,
         "Window diff bytes",
     )?;
-    let append_outcome = row.get::<String>(8).map_err(|error| error.to_string())?;
-    let appended_sequence = row.get::<i64>(9).map_err(|error| error.to_string())?;
     let inserted = window_nonnegative(
-        window_required(&row, 10, "Window payload inserts")?,
+        window_required(&row, 8, "Window payload inserts")?,
         "Window payload inserts",
     )?;
     let mutated = window_nonnegative(
-        window_required(&row, 11, "Window visible mutations")?,
+        window_required(&row, 9, "Window visible mutations")?,
         "Window visible mutations",
     )?;
     let output_facts = if emitted == 0 {
-        if append_outcome.is_some() || appended_sequence.is_some() || inserted != 0 || mutated != 0
-        {
+        if inserted != 0 || mutated != 0 {
             return Err("Window appended or mutated an empty diff".into());
         }
         OutputFacts::None
     } else {
-        if append_outcome.as_deref() != Some("appended")
-            || appended_sequence != Some(output.next_chunk_seq)
-            || inserted != emitted
-            || mutated != emitted
-        {
+        if inserted != emitted || mutated != emitted {
             return Err("Window diff append is inconsistent".into());
         }
         OutputFacts::Data {
             chunk_seq: output.next_chunk_seq,
         }
     };
+    if let OutputFacts::Data { chunk_seq } = output_facts {
+        transaction.record_output_append(
+            OutputAppendTarget::New {
+                sequence: chunk_seq,
+            },
+            emitted,
+            emitted_bytes,
+            parse_lsn(&lsn)?,
+        )?;
+    }
     Ok(WindowDiffPage {
         facts: PrimitiveFacts {
             usage: WorkUsage {
@@ -755,7 +751,6 @@ pub(super) fn run_window_diff(
                 output_bytes: emitted_bytes,
             },
             state_rows: mutated,
-            continuation_rows: 1,
             output: output_facts,
         },
         last_row_id,
@@ -764,13 +759,15 @@ pub(super) fn run_window_diff(
     })
 }
 
+// Atomic bounded Window cleanup primitive: remove one completed partition page
+// after its output diff has committed in the same PostgreSQL transaction.
 pub(super) fn run_window_cleanup(
     transaction: &mut StepContext<'_, '_>,
     storage: &WindowStorage,
     expressions: &WindowExpressions,
     partition_queue_id: i64,
     cursor: WindowCleanupCursor,
-    after_partitions: AfterPartitions,
+    _after_partitions: AfterPartitions,
 ) -> Result<WindowCleanup, String> {
     let final_ordinal = 3;
     let relation = match cursor.relation_ordinal {
@@ -875,12 +872,6 @@ pub(super) fn run_window_cleanup(
             .checked_add(finalized)
             .ok_or_else(|| "Window cleanup state count overflow".to_string())?;
     }
-    page.facts.continuation_rows = u64::from(
-        !page.complete
-            || cursor.relation_ordinal != final_ordinal
-            || next_partition_queue_id.is_some()
-            || !matches!(after_partitions, AfterPartitions::FinishInput),
-    );
     Ok(WindowCleanup {
         page,
         next_partition_queue_id,
@@ -995,7 +986,6 @@ pub(super) fn run_window_frontier(
     )?;
     transaction.reset_admission();
     Ok(PrimitiveFacts {
-        continuation_rows: 0,
         output,
         ..PrimitiveFacts::default()
     })
