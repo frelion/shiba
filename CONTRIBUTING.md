@@ -23,6 +23,9 @@ cargo pgrx init --pg17 /path/to/pg_config
 - Contract changes are clean cuts. Delete removed types, JSON fields,
   functions, tables, tests, and documentation; do not add aliases, dual writes,
   decoder branches, or adapters for the old contract.
+- Every operator has an implementation page under `docs/operators/`. New
+  operators must copy `docs/operators/_TEMPLATE.md` and keep the page in the
+  same change as code and tests.
 
 ## Before a pull request
 
@@ -43,6 +46,9 @@ New operator behavior needs:
 - crash tests on both sides of commit;
 - backpressure and recovery coverage;
 - a chained DAG case when the operator can fan out or fan in.
+- an implementation page describing state relations, indexes, continuation
+  phases, primitive complexity, access paths, performance evidence, and known
+  limits; use `docs/OPERATOR_IMPLEMENTATION_STANDARD.md` as the checklist.
 
 Do not run concurrent `cargo pgrx install` jobs against the same PostgreSQL
 installation.

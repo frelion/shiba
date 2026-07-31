@@ -40,6 +40,7 @@ case "${profile}" in
     fanout_width=64
     complex_fact_rows=200
     complex_keys=16
+    selective_right_rows=100000
     batch_rows=16384
     ;;
   full)
@@ -47,6 +48,7 @@ case "${profile}" in
     fanout_width=20000
     complex_fact_rows=500000
     complex_keys=256
+    selective_right_rows=1000000
     batch_rows=16384
     ;;
   *) printf 'profile must be smoke or full, got: %s\n' "${profile}" >&2; exit 2 ;;
@@ -60,6 +62,7 @@ ingress_rows="${SHIBA_BENCH_INGRESS_ROWS:-${ingress_rows}}"
 fanout_width="${SHIBA_BENCH_FANOUT_WIDTH:-${fanout_width}}"
 complex_fact_rows="${SHIBA_BENCH_COMPLEX_FACT_ROWS:-${complex_fact_rows}}"
 complex_keys="${SHIBA_BENCH_COMPLEX_KEYS:-${complex_keys}}"
+selective_right_rows="${SHIBA_BENCH_SELECTIVE_RIGHT_ROWS:-${selective_right_rows}}"
 
 pg_bin_dir="$("${pg_config_path}" --bindir)"
 pg_data_dir="$(mktemp -d /tmp/shiba-benchmark-data.XXXXXX)"
@@ -275,7 +278,117 @@ wait_for_query "${fanout_width}" 'SELECT count(*) FROM shiba.bench_fanout_result
 assert_query 0 "WITH d AS ((SELECT left_side.id,right_side.id FROM public.bench_fanout_left AS left_side JOIN public.bench_fanout_right AS right_side ON right_side.key=left_side.key EXCEPT ALL SELECT left_id,right_id FROM shiba.bench_fanout_result) UNION ALL (SELECT left_id,right_id FROM shiba.bench_fanout_result EXCEPT ALL SELECT left_side.id,right_side.id FROM public.bench_fanout_left AS left_side JOIN public.bench_fanout_right AS right_side ON right_side.key=left_side.key)) SELECT count(*) FROM d"
 record_metric join_high_fanout 1 "${fanout_width}" "${fanout_started}" shiba.bench_fanout_result "${fanout_sample_start}" public.bench_fanout_left
 
-# 3. Generic composition, not a fixed query family: two Joins -> Aggregate
+# 3. Selective Join A/B: the keyed plan and a semantically equivalent generic
+# predicate both probe one missing key against the same large right state.
+# The generic predicate deliberately contains an OR so the planner must keep
+# the full row-id candidate scan. This is a diagnostic comparison, not a
+# correctness shortcut: both results are checked against PostgreSQL.
+psql_bench -qc "
+  CREATE TABLE public.bench_selective_right (id bigint PRIMARY KEY, key bigint NOT NULL);
+  CREATE TABLE public.bench_selective_left_keyed (id bigint PRIMARY KEY, key bigint NOT NULL);
+  CREATE TABLE public.bench_selective_left_generic (id bigint PRIMARY KEY, key bigint NOT NULL);
+  CREATE TABLE shiba.bench_selective_keyed_result AS
+  SELECT left_side.id AS left_id, right_side.id AS right_id
+  FROM public.bench_selective_left_keyed AS left_side
+  JOIN public.bench_selective_right AS right_side
+    ON right_side.key=left_side.key;
+  CREATE TABLE shiba.bench_selective_generic_result AS
+  SELECT left_side.id AS left_id, right_side.id AS right_id
+  FROM public.bench_selective_left_generic AS left_side
+  JOIN public.bench_selective_right AS right_side
+    ON right_side.key=left_side.key OR right_side.key IS NULL;
+  INSERT INTO public.bench_selective_right
+  SELECT id,id FROM generate_series(1,${selective_right_rows}) AS id;"
+selective_keyed_oid="$(psql_bench -Atqc "SELECT 'shiba.bench_selective_keyed_result'::regclass::oid::integer")"
+selective_generic_oid="$(psql_bench -Atqc "SELECT 'shiba.bench_selective_generic_result'::regclass::oid::integer")"
+selective_keyed_stage="$(psql_bench -Atqc "
+  SELECT stage.ordinality-1
+  FROM shiba_internal.dataflows AS dataflow
+  CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+    WITH ORDINALITY AS stage(value,ordinality)
+  WHERE dataflow.result_oid=${selective_keyed_oid}::oid
+    AND stage.value->'spec'->>'operator'='join'")"
+selective_generic_stage="$(psql_bench -Atqc "
+  SELECT stage.ordinality-1
+  FROM shiba_internal.dataflows AS dataflow
+  CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+    WITH ORDINALITY AS stage(value,ordinality)
+  WHERE dataflow.result_oid=${selective_generic_oid}::oid
+    AND stage.value->'spec'->>'operator'='join'")"
+selective_keyed_right_state="$(psql_bench -Atqc "
+  SELECT format('%I.%I',namespace.nspname,relation.relname)
+  FROM shiba_internal.operator_state_relations AS catalog
+  JOIN pg_catalog.pg_class AS relation ON relation.oid=catalog.relation_oid
+  JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+  WHERE catalog.result_oid=${selective_keyed_oid}::oid
+    AND catalog.stage_id=${selective_keyed_stage}
+    AND catalog.state_slot=1")"
+selective_generic_right_state="$(psql_bench -Atqc "
+  SELECT format('%I.%I',namespace.nspname,relation.relname)
+  FROM shiba_internal.operator_state_relations AS catalog
+  JOIN pg_catalog.pg_class AS relation ON relation.oid=catalog.relation_oid
+  JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+  WHERE catalog.result_oid=${selective_generic_oid}::oid
+    AND catalog.stage_id=${selective_generic_stage}
+    AND catalog.state_slot=1")"
+wait_for_query "${selective_right_rows}" \
+  "SELECT count(*) FROM ${selective_keyed_right_state}" \
+  "the keyed selective Join right state"
+wait_for_query "${selective_right_rows}" \
+  "SELECT count(*) FROM ${selective_generic_right_state}" \
+  "the generic selective Join right state"
+# The optimized arrangement must expose the typed equality lookup to the
+# PostgreSQL planner.  Keep this as a hard gate: a benchmark that silently
+# falls back to a sequential scan is not evidence for the keyed algorithm.
+assert_query 1 "
+  SELECT count(*)
+  FROM pg_catalog.pg_index AS lookup_index
+  WHERE lookup_index.indrelid='${selective_keyed_right_state}'::regclass
+    AND lookup_index.indnkeyatts=2
+    AND lookup_index.indnatts=2
+    AND lookup_index.indkey[0]=4
+    AND lookup_index.indkey[1]=1
+    AND lookup_index.indisvalid
+    AND lookup_index.indisready
+    AND lookup_index.indislive"
+assert_query 0 "
+  SELECT count(*)
+  FROM pg_catalog.pg_index AS lookup_index
+  WHERE lookup_index.indrelid='${selective_generic_right_state}'::regclass
+    AND lookup_index.indnkeyatts=2
+    AND lookup_index.indnatts=2
+    AND lookup_index.indkey[0]=4
+    AND lookup_index.indkey[1]=1
+    AND lookup_index.indisvalid
+    AND lookup_index.indisready
+    AND lookup_index.indislive"
+if ! psql_bench -Atqc "
+  EXPLAIN (COSTS OFF)
+  SELECT row_id
+  FROM ${selective_keyed_right_state}
+  WHERE key_0=${selective_right_rows}+1
+  ORDER BY row_id
+  LIMIT ${batch_rows}" | grep -Eq 'Index (Only )?Scan'; then
+  fail 'keyed selective Join lookup did not produce an index scan plan'
+fi
+keyed_selective_sample_start="$(wc -l <"${monitor_file}")"
+keyed_selective_revision="$(psql_bench -Atqc "SELECT revision FROM shiba_internal.operator_checkpoints WHERE result_oid=${selective_keyed_oid}::oid AND stage_id=${selective_keyed_stage}")"
+psql_bench -qc "INSERT INTO public.bench_selective_left_keyed VALUES (1,${selective_right_rows}+1)"
+keyed_selective_started="$(now_seconds)"
+wait_for_query 1 "SELECT count(*) FROM shiba_internal.operator_checkpoints WHERE result_oid=${selective_keyed_oid}::oid AND stage_id=${selective_keyed_stage} AND revision>${keyed_selective_revision}" 'keyed selective Join miss processing'
+wait_for_query 0 'SELECT count(*) FROM shiba.bench_selective_keyed_result' 'keyed selective Join miss'
+assert_query 0 "WITH expected AS (SELECT left_side.id AS left_id,right_side.id AS right_id FROM public.bench_selective_left_keyed AS left_side JOIN public.bench_selective_right AS right_side ON right_side.key=left_side.key), d AS ((SELECT * FROM expected EXCEPT ALL SELECT * FROM shiba.bench_selective_keyed_result) UNION ALL (SELECT * FROM shiba.bench_selective_keyed_result EXCEPT ALL SELECT * FROM expected)) SELECT count(*) FROM d"
+record_metric join_selective_miss_keyed 1 0 "${keyed_selective_started}" shiba.bench_selective_keyed_result "${keyed_selective_sample_start}" public.bench_selective_left_keyed
+generic_selective_sample_start="$(wc -l <"${monitor_file}")"
+generic_selective_revision="$(psql_bench -Atqc "SELECT revision FROM shiba_internal.operator_checkpoints WHERE result_oid=${selective_generic_oid}::oid AND stage_id=${selective_generic_stage}")"
+psql_bench -qc "INSERT INTO public.bench_selective_left_generic VALUES (1,${selective_right_rows}+1)"
+generic_selective_started="$(now_seconds)"
+wait_for_query 1 "SELECT count(*) FROM shiba_internal.operator_checkpoints WHERE result_oid=${selective_generic_oid}::oid AND stage_id=${selective_generic_stage} AND revision>${generic_selective_revision}" 'generic selective Join miss processing'
+wait_for_query 0 'SELECT count(*) FROM shiba.bench_selective_generic_result' 'generic selective Join miss'
+assert_query 0 "WITH expected AS (SELECT left_side.id AS left_id,right_side.id AS right_id FROM public.bench_selective_left_generic AS left_side JOIN public.bench_selective_right AS right_side ON right_side.key=left_side.key OR right_side.key IS NULL), d AS ((SELECT * FROM expected EXCEPT ALL SELECT * FROM shiba.bench_selective_generic_result) UNION ALL (SELECT * FROM shiba.bench_selective_generic_result EXCEPT ALL SELECT * FROM expected)) SELECT count(*) FROM d"
+record_metric join_selective_miss_generic 1 0 "${generic_selective_started}" shiba.bench_selective_generic_result "${generic_selective_sample_start}" public.bench_selective_left_generic
+
+# 4. Generic composition, not a fixed query family: two Joins -> Aggregate
 # -> Window -> TopN -> Sink. Every source is empty at registration, then one
 # committed transaction supplies all live effects.
 psql_bench -qc "

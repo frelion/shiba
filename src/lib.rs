@@ -299,6 +299,227 @@ mod tests {
     }
 
     #[pg_test]
+    fn join_planner_extracts_only_direct_anded_equality_keys() {
+        Spi::run(
+            r#"
+            CREATE TABLE tests.join_key_left (
+                id integer NOT NULL,
+                region integer NOT NULL,
+                payload integer NOT NULL
+            );
+            CREATE TABLE tests.join_key_right (
+                id integer NOT NULL,
+                region integer NOT NULL,
+                payload integer NOT NULL
+            )
+            "#,
+        )
+        .unwrap();
+
+        let keyed_plan = unsafe {
+            crate::planner::lowering::lower_select_for_test(
+                r#"
+                SELECT left_side.id, right_side.payload
+                FROM tests.join_key_left AS left_side
+                JOIN tests.join_key_right AS right_side
+                  ON left_side.id=right_side.id
+                 AND left_side.region=right_side.region
+                "#,
+            )
+        }
+        .unwrap();
+        let keyed_join = keyed_plan
+            .stages
+            .iter()
+            .find_map(|stage| match &stage.spec {
+                crate::planner::model::OperatorSpec::Join(spec) => Some(spec),
+                _ => None,
+            })
+            .expect("query should contain a Join stage");
+        assert_eq!(keyed_join.equi_keys.len(), 2);
+        assert!(keyed_join.equi_keys.iter().all(|key| {
+            keyed_plan
+                .stages
+                .iter()
+                .find(|stage| stage.spec.kind() == crate::planner::model::OperatorKind::Join)
+                .expect("Join stage should still exist")
+                .schema
+                .inputs
+                .iter()
+                .any(|slot| slot.binding == key.left_binding && slot.input == 0)
+                && keyed_plan
+                    .stages
+                    .iter()
+                    .find(|stage| stage.spec.kind() == crate::planner::model::OperatorKind::Join)
+                    .expect("Join stage should still exist")
+                    .schema
+                    .inputs
+                    .iter()
+                    .any(|slot| slot.binding == key.right_binding && slot.input == 1)
+        }));
+
+        let generic_plan = unsafe {
+            crate::planner::lowering::lower_select_for_test(
+                r#"
+                SELECT left_side.id, right_side.payload
+                FROM tests.join_key_left AS left_side
+                JOIN tests.join_key_right AS right_side
+                  ON left_side.id=right_side.id
+                  OR left_side.region=right_side.region
+                "#,
+            )
+        }
+        .unwrap();
+        let generic_join = generic_plan
+            .stages
+            .iter()
+            .find_map(|stage| match &stage.spec {
+                crate::planner::model::OperatorSpec::Join(spec) => Some(spec),
+                _ => None,
+            })
+            .expect("query should contain a Join stage");
+        assert!(generic_join.equi_keys.is_empty());
+    }
+
+    #[pg_test]
+    fn join_planner_key_classification_matrix_is_conservative() {
+        Spi::run(
+            r#"
+            CREATE TABLE tests.join_key_matrix_left (
+                id integer NOT NULL,
+                payload integer NOT NULL,
+                label text NOT NULL
+            );
+            CREATE TABLE tests.join_key_matrix_right (
+                id integer NOT NULL,
+                payload integer NOT NULL,
+                label text NOT NULL
+            )
+            "#,
+        )
+        .unwrap();
+
+        let classify = |query: &str| {
+            let plan = unsafe { crate::planner::lowering::lower_select_for_test(query) }
+                .expect("query should lower");
+            plan.stages
+                .iter()
+                .find_map(|stage| match &stage.spec {
+                    crate::planner::model::OperatorSpec::Join(spec) => {
+                        Some((spec.kind, spec.equi_keys.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("query should contain a Join stage")
+        };
+
+        let (kind, keys) = classify(
+            r#"
+            SELECT left_side.id, right_side.payload
+            FROM tests.join_key_matrix_left AS left_side
+            JOIN tests.join_key_matrix_right AS right_side
+              ON right_side.id=left_side.id
+             AND left_side.payload>right_side.payload
+            "#,
+        );
+        assert_eq!(kind, crate::planner::model::JoinKind::Inner);
+        assert_eq!(keys.len(), 1, "residual predicates must not hide the key");
+
+        let (kind, keys) = classify(
+            r#"
+            SELECT left_side.id, right_side.payload
+            FROM tests.join_key_matrix_left AS left_side
+            JOIN tests.join_key_matrix_right AS right_side
+              ON left_side.id=right_side.id
+             AND right_side.id=left_side.id
+            "#,
+        );
+        assert_eq!(kind, crate::planner::model::JoinKind::Inner);
+        assert_eq!(
+            keys.len(),
+            1,
+            "duplicate equality atoms must be deduplicated"
+        );
+
+        let (_, keys) = classify(
+            r#"
+            SELECT left_side.id, right_side.payload
+            FROM tests.join_key_matrix_left AS left_side
+            JOIN tests.join_key_matrix_right AS right_side
+              ON left_side.id::bigint=right_side.id::bigint
+            "#,
+        );
+        assert!(keys.is_empty(), "casts must remain on the generic path");
+
+        let (_, keys) = classify(
+            r#"
+            SELECT left_side.id, right_side.payload
+            FROM tests.join_key_matrix_left AS left_side
+            JOIN tests.join_key_matrix_right AS right_side
+              ON lower(left_side.label)=lower(right_side.label)
+            "#,
+        );
+        assert!(keys.is_empty(), "function expressions must remain residual");
+
+        let (_, keys) = classify(
+            r#"
+            SELECT left_side.id, right_side.payload
+            FROM tests.join_key_matrix_left AS left_side
+            JOIN tests.join_key_matrix_right AS right_side
+              ON left_side.id>right_side.id
+            "#,
+        );
+        assert!(
+            keys.is_empty(),
+            "non-equality predicates have no lookup key"
+        );
+
+        let (kind, keys) = classify(
+            r#"
+            SELECT left_side.id
+            FROM tests.join_key_matrix_left AS left_side
+            WHERE EXISTS (
+                SELECT 1
+                FROM tests.join_key_matrix_right AS right_side
+                WHERE right_side.id=left_side.id
+            )
+            "#,
+        );
+        assert_eq!(kind, crate::planner::model::JoinKind::Semi);
+        assert_eq!(keys.len(), 1);
+
+        let (kind, keys) = classify(
+            r#"
+            SELECT left_side.id
+            FROM tests.join_key_matrix_left AS left_side
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM tests.join_key_matrix_right AS right_side
+                WHERE right_side.id=left_side.id
+            )
+            "#,
+        );
+        assert_eq!(kind, crate::planner::model::JoinKind::Anti);
+        assert_eq!(keys.len(), 1);
+
+        let (kind, keys) = classify(
+            r#"
+            SELECT left_side.id
+            FROM tests.join_key_matrix_left AS left_side
+            WHERE left_side.id NOT IN (
+                SELECT right_side.id
+                FROM tests.join_key_matrix_right AS right_side
+            )
+            "#,
+        );
+        assert_eq!(kind, crate::planner::model::JoinKind::NullAwareAnti);
+        assert!(
+            keys.is_empty(),
+            "NULL-aware anti must not use equality pruning"
+        );
+    }
+
+    #[pg_test]
     fn lowers_nested_from_subquery_through_its_output_binding() {
         Spi::run(
             r#"

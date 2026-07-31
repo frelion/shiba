@@ -1,4 +1,11 @@
 #[cfg(feature = "pg17")]
+use crate::execution::register::column_sql;
+#[cfg(feature = "pg17")]
+use crate::planner::model::{JoinSpec, SlotType};
+#[cfg(feature = "pg17")]
+use crate::postgres::quote_identifier;
+
+#[cfg(feature = "pg17")]
 pub(crate) fn provision(
     client: &mut pgrx::spi::SpiClient<'_>,
     result_oid: pgrx::pg_sys::Oid,
@@ -64,12 +71,15 @@ pub(crate) fn provision(
     let result_id = result_oid.to_u32();
     let left_state = qualified_internal(&format!("join_left_state_r{result_id}_s{stage_id}"));
     let right_state = qualified_internal(&format!("join_right_state_r{result_id}_s{stage_id}"));
+    let left_key_types = join_key_types(stage, spec, 0)?;
+    let right_key_types = join_key_types(stage, spec, 1)?;
     create_join_state(
         client,
         stage_id,
         "left",
         &left_state,
         left_payload.row_type.sql(),
+        &left_key_types,
     )?;
     create_join_state(
         client,
@@ -77,6 +87,7 @@ pub(crate) fn provision(
         "right",
         &right_state,
         right_payload.row_type.sql(),
+        &right_key_types,
     )?;
 
     let continuation = qualified_internal(&format!("join_continuation_r{result_id}_s{stage_id}"));
@@ -239,33 +250,97 @@ pub(crate) fn provision(
 }
 
 #[cfg(feature = "pg17")]
+fn join_key_types(
+    stage: &crate::planner::model::DataflowStage,
+    spec: &JoinSpec,
+    input: u16,
+) -> Result<Vec<SlotType>, String> {
+    let by_binding = stage
+        .schema
+        .inputs
+        .iter()
+        .map(|slot| (slot.binding, slot))
+        .collect::<std::collections::HashMap<_, _>>();
+    spec.equi_keys
+        .iter()
+        .map(|key| {
+            let binding = if input == 0 {
+                key.left_binding
+            } else {
+                key.right_binding
+            };
+            let slot = by_binding.get(&binding).ok_or_else(|| {
+                format!(
+                    "Join equality key references missing BindingId {}",
+                    binding.0
+                )
+            })?;
+            if slot.input != input {
+                return Err(format!(
+                    "Join equality key BindingId {} belongs to input {}, expected {}",
+                    binding.0, slot.input, input
+                ));
+            }
+            Ok(slot.type_.clone())
+        })
+        .collect()
+}
+
+#[cfg(feature = "pg17")]
 fn create_join_state(
     client: &mut pgrx::spi::SpiClient<'_>,
     stage_id: i32,
     side: &str,
     relation: &str,
     row_type: &str,
+    key_types: &[SlotType],
 ) -> Result<(), String> {
+    let mut columns = vec![
+        "row_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY".to_string(),
+        "row_key bytea NOT NULL UNIQUE".to_string(),
+        format!("row_value {row_type} NOT NULL"),
+    ];
+    for (ordinal, type_) in key_types.iter().enumerate() {
+        columns.push(format!("key_{ordinal} {}", column_sql(client, type_)?));
+    }
+    columns.extend([
+        "multiplicity bigint NOT NULL CHECK(multiplicity > 0)".to_string(),
+        "match_count bigint NOT NULL CHECK(match_count >= 0)".to_string(),
+        "unknown_count bigint NOT NULL CHECK(unknown_count >= 0)".to_string(),
+    ]);
     client
         .update(
-            &format!(
-                r#"
-                CREATE TABLE {relation}(
-                  row_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                  row_key bytea NOT NULL UNIQUE,
-                  row_value {row_type} NOT NULL,
-                  multiplicity bigint NOT NULL CHECK(multiplicity > 0),
-                  match_count bigint NOT NULL CHECK(match_count >= 0),
-                  unknown_count bigint NOT NULL CHECK(unknown_count >= 0)
-                )
-                "#
-            ),
+            &format!("CREATE TABLE {relation}({})", columns.join(",")),
             None,
             &[],
         )
         .map_err(|error| {
             format!("could not create Join stage {stage_id} {side} arrangement: {error}")
         })?;
+    if !key_types.is_empty() {
+        let relation_name = relation
+            .rsplit('.')
+            .next()
+            .unwrap_or("state")
+            .trim_matches('"');
+        let index_name = quote_identifier(&format!("{relation_name}_key_idx"));
+        let index_columns = (0..key_types.len())
+            .map(|ordinal| format!("key_{ordinal}"))
+            .chain(std::iter::once("row_id".to_string()))
+            .collect::<Vec<_>>();
+        client
+            .update(
+                &format!(
+                    "CREATE INDEX {index_name} ON {relation} ({})",
+                    index_columns.join(",")
+                ),
+                None,
+                &[],
+            )
+            .map_err(|error| {
+                format!("could not index Join stage {stage_id} {side} arrangement: {error}")
+            })?;
+    }
     protect_join_relation(client, stage_id, side, relation)
 }
 

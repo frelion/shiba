@@ -1,11 +1,13 @@
 # Shiba performance benchmarks
 
 `../scripts/performance-benchmark.sh` starts a fresh PostgreSQL 17 cluster,
-installs the current extension once, and measures three live-WAL workloads:
+installs the current extension once, and measures four live-WAL workloads:
 
 1. a large committed source transaction flowing through `Scan -> Sink`;
-2. a single-row Join input with a large opposite-side fanout; and
-3. `Join -> Join -> Aggregate -> Window -> TopN -> Sink`.
+2. a single-row Join input with a large opposite-side fanout;
+3. a keyed/generic selective Join A/B against the same large opposite-side
+   state; and
+4. `Join -> Join -> Aggregate -> Window -> TopN -> Sink`.
 
 Every scenario waits for Sink visibility and compares the result relation with
 the equivalent PostgreSQL query before recording a result. It does not reuse a
@@ -36,3 +38,13 @@ storage and stream-pressure regressions comparable without platform-specific
 `time` or container accounting. Compare results only on the same PostgreSQL,
 hardware, filesystem and profile; a noisy shared machine is not a performance
 baseline.
+
+The selective A/B uses a direct equality predicate for the keyed plan and a
+semantically equivalent `OR ... IS NULL` predicate for the generic fallback.
+The smoke profile uses 100,000 right rows; the full profile uses 1,000,000.
+For a diagnostic 1,000,000-row run, both paths must pass correctness, the
+keyed arrangement must expose an index-scan `EXPLAIN` plan, and the JSON
+records convergence time, state bytes, and checkpoint advances so the index
+maintenance trade-off is visible. One current same-host observation is 0.571 s
+keyed versus 0.754 s generic; treat it as diagnostic until repeated by the
+performance matrix on the target baseline host.

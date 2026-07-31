@@ -216,7 +216,8 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 See [testing](docs/TESTING.md), the [Rust code tour](docs/LEARNING_RUST.md),
-and [release instructions](docs/RELEASING.md).
+the [operator implementation docs](docs/operators/README.md), and [release
+instructions](docs/RELEASING.md).
 
 ## License
 

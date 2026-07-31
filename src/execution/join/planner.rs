@@ -399,7 +399,7 @@ impl InputProgress {
 
     pub(super) fn complete_candidate(
         &mut self,
-        mode: JoinMode,
+        _mode: JoinMode,
         candidate: CandidateExpectation,
     ) -> Result<(), String> {
         self.candidate_after = Some(candidate.row_id);
@@ -411,14 +411,14 @@ impl InputProgress {
                     "Join event matched count",
                 )?;
             }
-            MatchTruth::Unknown if mode == JoinMode::NullAwareAnti => {
+            MatchTruth::Unknown => {
                 self.opposite_counts.unknown = checked_count_sum(
                     self.opposite_counts.unknown,
                     candidate.multiplicity,
                     "Join event unknown count",
                 )?;
             }
-            MatchTruth::False | MatchTruth::Unknown => {}
+            MatchTruth::False => {}
         }
         Ok(())
     }
@@ -997,7 +997,7 @@ struct Classified {
 }
 
 pub(super) fn apply_match_delta(
-    mode: JoinMode,
+    _mode: JoinMode,
     old: MatchCounts,
     truth: MatchTruth,
     event_weight: i64,
@@ -1009,11 +1009,15 @@ pub(super) fn apply_match_delta(
             new.matched =
                 checked_signed_count(old.matched, event_weight, "Join candidate matched count")?;
         }
-        MatchTruth::Unknown if mode == JoinMode::NullAwareAnti => {
+        // Keep the three-valued comparison count exact for every Join mode.
+        // Null-aware anti uses it for eligibility today; the other modes
+        // still persist it so keyed NULL candidates can be audited and
+        // future mode policies cannot silently lose UNKNOWN state.
+        MatchTruth::Unknown => {
             new.unknown =
                 checked_signed_count(old.unknown, event_weight, "Join candidate unknown count")?;
         }
-        MatchTruth::False | MatchTruth::Unknown => {}
+        MatchTruth::False => {}
     }
     Ok(new)
 }

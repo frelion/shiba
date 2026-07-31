@@ -229,7 +229,18 @@ pub(crate) struct JoinSpec {
     pub(crate) kind: JoinKind,
     /// Cross join is represented as an inner join with a constant true condition.
     pub(crate) condition: ScalarExpr,
+    /// Direct, strict equality keys extracted from the condition.  The full
+    /// condition remains authoritative and is still evaluated as a residual
+    /// predicate at runtime.
+    pub(crate) equi_keys: Vec<JoinEquiKey>,
     pub(crate) outputs: Vec<NamedExpr>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JoinEquiKey {
+    pub(crate) left_binding: BindingId,
+    pub(crate) right_binding: BindingId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::model::{
-    BindingId, BoolExprKind, DataflowPlan, DataflowStage, OperatorKind, OperatorSpec, ScalarExpr,
-    SlotId, SlotType,
+    BindingId, BoolExprKind, DataflowPlan, DataflowStage, JoinKind, OperatorKind, OperatorSpec,
+    ScalarExpr, SlotId, SlotType,
 };
 
 impl DataflowPlan {
@@ -141,6 +141,32 @@ fn validate_operator_spec(
         OperatorSpec::Distinct(spec) => {
             for key in &spec.keys {
                 validate_sort_group_expression(key, bindings, label, "DISTINCT key")?;
+            }
+        }
+        OperatorSpec::Join(spec) => {
+            if spec.equi_keys.iter().any(|key| {
+                bindings.get(&key.left_binding).is_none()
+                    || bindings.get(&key.right_binding).is_none()
+                    || bindings[&key.left_binding] != bindings[&key.right_binding]
+                    || stage
+                        .schema
+                        .inputs
+                        .iter()
+                        .find(|input| input.binding == key.left_binding)
+                        .is_none_or(|input| input.input != 0)
+                    || stage
+                        .schema
+                        .inputs
+                        .iter()
+                        .find(|input| input.binding == key.right_binding)
+                        .is_none_or(|input| input.input != 1)
+            }) {
+                return Err(format!("{label} has invalid Join equality keys"));
+            }
+            if spec.kind == JoinKind::NullAwareAnti && !spec.equi_keys.is_empty() {
+                return Err(format!(
+                    "{label} NullAwareAnti Join cannot use equality key arrangements"
+                ));
             }
         }
         OperatorSpec::Aggregate(spec) => {
@@ -604,6 +630,7 @@ mod tests {
                     spec: OperatorSpec::Join(JoinSpec {
                         kind: JoinKind::Inner,
                         condition: bool_constant(),
+                        equi_keys: Vec::new(),
                         outputs: vec![NamedExpr {
                             output: SlotId(4),
                             name: None,

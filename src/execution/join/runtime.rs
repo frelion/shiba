@@ -5,8 +5,11 @@ pub(super) mod execution {
 
     use crate::execution::StepReceipt;
     use crate::execution::{InputPosition, OutputFacts, PhaseCode, PrimitiveFacts, WorkUsage};
-    use crate::planner::model::{DataflowPlan, DataflowStage, JoinKind, JoinSpec, OperatorSpec};
-    use crate::planner::scalar_sql::compile_scalar_expression;
+    use crate::planner::model::{
+        DataflowPlan, DataflowStage, InputSlot, JoinEquiKey, JoinKind, JoinSpec, OperatorSpec,
+        ScalarExpr,
+    };
+    use crate::planner::scalar_sql::{compile_scalar_expression, SqlBinding};
     use crate::planner::{WorkBudget, WorkQuantum};
     use crate::postgres::{format_lsn, parse_lsn};
 
@@ -55,6 +58,8 @@ pub(super) mod execution {
         output_payload: PayloadStorage,
         left_state: RelationRef,
         right_state: RelationRef,
+        left_key_exprs: Vec<String>,
+        right_key_exprs: Vec<String>,
         continuation: RelationRef,
         condition: String,
         outputs: String,
@@ -77,6 +82,17 @@ pub(super) mod execution {
                 InputSide::Left => &self.left_state,
                 InputSide::Right => &self.right_state,
             }
+        }
+
+        fn key_exprs(&self, side: InputSide) -> &[String] {
+            match side {
+                InputSide::Left => &self.left_key_exprs,
+                InputSide::Right => &self.right_key_exprs,
+            }
+        }
+
+        fn keyed(&self) -> bool {
+            !self.left_key_exprs.is_empty() && !self.right_key_exprs.is_empty()
         }
     }
 
@@ -303,8 +319,20 @@ pub(super) mod execution {
         let right_state = transaction.state_storage(1)?;
         let continuation = transaction.continuation_storage()?;
 
-        validate_state_abi(transaction, &left_state, &left_payload.row_type)?;
-        validate_state_abi(transaction, &right_state, &right_payload.row_type)?;
+        let left_slots = join_key_slots(stage, spec, 0)?;
+        let right_slots = join_key_slots(stage, spec, 1)?;
+        validate_state_abi(
+            transaction,
+            &left_state,
+            &left_payload.row_type,
+            &left_slots,
+        )?;
+        validate_state_abi(
+            transaction,
+            &right_state,
+            &right_payload.row_type,
+            &right_slots,
+        )?;
         validate_continuation_abi(transaction, &continuation)?;
         let bindings = compile_stage_bindings(
             transaction,
@@ -321,6 +349,8 @@ pub(super) mod execution {
                 },
             ],
         )?;
+        let left_key_exprs = key_expressions(&bindings, &spec.equi_keys, true)?;
+        let right_key_exprs = key_expressions(&bindings, &spec.equi_keys, false)?;
         let output_attributes = transaction.composite_attributes(&output_payload.row_type)?;
         validate_output_attributes(&output_attributes, &stage.schema.outputs)?;
         let outputs =
@@ -332,6 +362,8 @@ pub(super) mod execution {
             output_payload,
             left_state,
             right_state,
+            left_key_exprs,
+            right_key_exprs,
             continuation,
             condition: compile_scalar_expression(&spec.condition, &bindings)?,
             outputs,
@@ -342,25 +374,40 @@ pub(super) mod execution {
         transaction: &mut StepContext<'_, '_>,
         relation: &RelationRef,
         row_type: &TypeRef,
+        key_slots: &[&InputSlot],
     ) -> Result<(), String> {
         let attributes = transaction.relation_attributes(relation.oid())?;
-        let expected = [
-            ("row_id", pg_sys::INT8OID),
-            ("row_key", pg_sys::BYTEAOID),
-            ("row_value", row_type.oid()),
-            ("multiplicity", pg_sys::INT8OID),
-            ("match_count", pg_sys::INT8OID),
-            ("unknown_count", pg_sys::INT8OID),
-        ];
-        if attributes.len() != expected.len()
-            || attributes
-                .iter()
-                .zip(expected)
-                .any(|(attribute, (name, type_oid))| {
-                    attribute.name != name || attribute.type_oid != type_oid || !attribute.not_null
-                })
-        {
+        let expected_len = 6 + key_slots.len();
+        if attributes.len() != expected_len {
             return Err("Join arrangement relation changed its ABI".into());
+        }
+        let fixed = [
+            (0, "row_id", pg_sys::INT8OID),
+            (1, "row_key", pg_sys::BYTEAOID),
+            (2, "row_value", row_type.oid()),
+            (3 + key_slots.len(), "multiplicity", pg_sys::INT8OID),
+            (4 + key_slots.len(), "match_count", pg_sys::INT8OID),
+            (5 + key_slots.len(), "unknown_count", pg_sys::INT8OID),
+        ];
+        if fixed.iter().any(|(ordinal, name, type_oid)| {
+            let attribute = &attributes[*ordinal];
+            attribute.name != *name || attribute.type_oid != *type_oid || !attribute.not_null
+        }) {
+            return Err("Join arrangement relation changed its ABI".into());
+        }
+        for (ordinal, (attribute, slot)) in attributes[3..3 + key_slots.len()]
+            .iter()
+            .zip(key_slots)
+            .enumerate()
+        {
+            if attribute.name != format!("key_{ordinal}")
+                || attribute.type_oid.to_u32() != slot.type_.type_oid
+                || attribute.typmod != slot.type_.typmod
+                || attribute.collation_oid.to_u32() != slot.type_.collation_oid
+                || attribute.not_null
+            {
+                return Err("Join equality key columns changed the Join ABI".into());
+            }
         }
         let arguments = unsafe { [DatumWithOid::new(relation.oid(), pg_sys::OIDOID)] };
         let indexes = transaction.read(
@@ -385,7 +432,95 @@ pub(super) mod execution {
         if !required_table::<bool>(&indexes.first(), 1, "Join arrangement row-key unique index")? {
             return Err("Join arrangement relation lacks its row-key unique index".into());
         }
+        if key_slots.is_empty() {
+            return Ok(());
+        }
+        let index_keys = (0..key_slots.len())
+            .map(|ordinal| format!("identity_index.indkey[{}] = {}", ordinal, ordinal + 4))
+            .chain(std::iter::once(format!(
+                "identity_index.indkey[{}] = 1",
+                key_slots.len()
+            )))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let arity = key_slots.len() + 1;
+        let arguments = unsafe { [DatumWithOid::new(relation.oid(), pg_sys::OIDOID)] };
+        let indexes = transaction.read(
+            &format!(
+                r#"
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM pg_catalog.pg_index AS identity_index
+                  WHERE identity_index.indrelid = $1
+                    AND identity_index.indnkeyatts = {arity}
+                    AND identity_index.indnatts = {arity}
+                    AND identity_index.indisvalid
+                    AND identity_index.indisready
+                    AND identity_index.indislive
+                    AND identity_index.indexprs IS NULL
+                    AND identity_index.indpred IS NULL
+                    AND {index_keys}
+                )
+                "#
+            ),
+            &arguments,
+        )?;
+        if !required_table::<bool>(&indexes.first(), 1, "Join equality key index")? {
+            return Err("Join arrangement lacks its equality lookup index".into());
+        }
         Ok(())
+    }
+
+    fn join_key_slots<'a>(
+        stage: &'a DataflowStage,
+        spec: &JoinSpec,
+        input: u16,
+    ) -> Result<Vec<&'a InputSlot>, String> {
+        spec.equi_keys
+            .iter()
+            .map(|key| {
+                let binding = if input == 0 {
+                    key.left_binding
+                } else {
+                    key.right_binding
+                };
+                let slot = stage
+                    .schema
+                    .inputs
+                    .iter()
+                    .find(|slot| slot.binding == binding)
+                    .ok_or_else(|| {
+                        format!(
+                            "Join equality key references missing BindingId {}",
+                            binding.0
+                        )
+                    })?;
+                if slot.input != input {
+                    return Err(format!(
+                        "Join equality key BindingId {} belongs to input {}, expected {}",
+                        binding.0, slot.input, input
+                    ));
+                }
+                Ok(slot)
+            })
+            .collect()
+    }
+
+    fn key_expressions(
+        bindings: &[SqlBinding],
+        keys: &[JoinEquiKey],
+        left: bool,
+    ) -> Result<Vec<String>, String> {
+        keys.iter()
+            .map(|key| {
+                let binding = if left {
+                    key.left_binding
+                } else {
+                    key.right_binding
+                };
+                compile_scalar_expression(&ScalarExpr::Input { binding }, bindings)
+            })
+            .collect()
     }
 
     fn validate_continuation_abi(
@@ -410,6 +545,84 @@ pub(super) mod execution {
             budget.max_input_bytes,
             budget.max_output_rows.min(output_rows),
             budget.max_output_bytes.min(output_bytes),
+        ))
+    }
+
+    fn key_predicate_sql(
+        layout: &Layout,
+        current_side: InputSide,
+        candidate_alias: &str,
+        include_unknown: bool,
+    ) -> String {
+        if !layout.keyed() {
+            return "TRUE".into();
+        }
+        let exact = key_exact_predicate_sql(layout, current_side, candidate_alias);
+        if !include_unknown {
+            return format!("({exact})");
+        }
+        format!(
+            "({exact}) OR ({})",
+            key_unknown_predicate_sql(layout, current_side, candidate_alias)
+        )
+    }
+
+    fn key_exact_predicate_sql(
+        layout: &Layout,
+        current_side: InputSide,
+        candidate_alias: &str,
+    ) -> String {
+        layout
+            .key_exprs(current_side)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, expression)| {
+                format!("{candidate_alias}.key_{ordinal} = ({expression})")
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
+
+    fn key_unknown_predicate_sql(
+        layout: &Layout,
+        current_side: InputSide,
+        candidate_alias: &str,
+    ) -> String {
+        let compatible = layout
+            .key_exprs(current_side)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, expression)| {
+                format!(
+                    "({candidate_alias}.key_{ordinal} = ({expression}) OR {candidate_alias}.key_{ordinal} IS NULL OR ({expression}) IS NULL)"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let any_unknown = layout
+            .key_exprs(current_side)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, expression)| {
+                format!("{candidate_alias}.key_{ordinal} IS NULL OR ({expression}) IS NULL")
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!("(({compatible}) AND ({any_unknown}))")
+    }
+
+    fn key_join_sql(
+        layout: &Layout,
+        current_side: InputSide,
+        candidate_alias: &str,
+        include_unknown: bool,
+    ) -> Result<String, String> {
+        if !layout.keyed() {
+            return Ok(String::new());
+        }
+        Ok(format!(
+            "AND {}",
+            key_predicate_sql(layout, current_side, candidate_alias, include_unknown)
         ))
     }
 
@@ -455,6 +668,7 @@ pub(super) mod execution {
 
         let current_alias = side_alias(side);
         let opposite_alias = side_alias(side.opposite());
+        let key_join = key_join_sql(layout, side, opposite_alias, false)?;
         let output_row = format!(
             "ROW({})::{}",
             layout.outputs,
@@ -472,11 +686,13 @@ pub(super) mod execution {
                 FROM {current_payload} AS {current_alias}
                 JOIN {opposite_state} AS {opposite_alias}
                   ON ({condition}) IS TRUE
+                {key_join}
                 WHERE {page_predicate}
                 "#,
                 current_payload = current_payload.relation.sql(),
                 opposite_state = layout.state(side.opposite()).sql(),
                 condition = layout.condition,
+                key_join = key_join,
             ),
             &unsafe {
                 [
@@ -582,6 +798,7 @@ pub(super) mod execution {
         };
         let current_alias = side_alias(side);
         let opposite_alias = side_alias(side.opposite());
+        let key_join = key_join_sql(layout, side, opposite_alias, false)?;
         let output_row = format!(
             "ROW({})::{}",
             layout.outputs,
@@ -601,6 +818,7 @@ pub(super) mod execution {
                   FROM {current_payload} AS {current_alias}
                   JOIN {opposite_state} AS {opposite_alias}
                     ON ({condition}) IS TRUE
+                  {key_join}
                   WHERE {current_alias}.stream_id=$1
                     AND {current_alias}.chunk_seq=$2
                 ),
@@ -620,6 +838,7 @@ pub(super) mod execution {
                 current_payload = layout.input_payload(side).relation.sql(),
                 opposite_state = layout.state(side.opposite()).sql(),
                 condition = layout.condition,
+                key_join = key_join,
                 output_payload = layout.output_payload.relation.sql(),
             ),
             &unsafe {
@@ -666,6 +885,7 @@ pub(super) mod execution {
     ) -> Result<(), String> {
         let current_alias = side_alias(side);
         let opposite_alias = side_alias(side.opposite());
+        let key_join = key_join_sql(layout, side, opposite_alias, true)?;
         let updated = transaction.write(
             &format!(
                 r#"
@@ -677,8 +897,10 @@ pub(super) mod execution {
                          coalesce(sum({current_alias}.weight)
                            FILTER (WHERE ({condition}) IS NULL),0)::bigint
                            AS unknown_delta
-                  FROM {opposite_state} AS {opposite_alias}
-                  CROSS JOIN {current_payload} AS {current_alias}
+                  FROM {current_payload} AS {current_alias}
+                  JOIN {opposite_state} AS {opposite_alias}
+                    ON TRUE
+                  {key_join}
                   WHERE {current_alias}.stream_id=$1
                     AND {current_alias}.chunk_seq=$2
                   GROUP BY {opposite_alias}.row_id
@@ -706,6 +928,7 @@ pub(super) mod execution {
                 current_payload = layout.input_payload(side).relation.sql(),
                 opposite_state = layout.state(side.opposite()).sql(),
                 condition = layout.condition,
+                key_join = key_join,
             ),
             &unsafe {
                 [
@@ -735,6 +958,41 @@ pub(super) mod execution {
         let current_alias = side_alias(side);
         let opposite_alias = side_alias(side.opposite());
         let state = layout.state(side);
+        let match_key_join = key_join_sql(layout, side, opposite_alias, false)?;
+        let unknown_key_join = key_join_sql(layout, side, opposite_alias, true)?;
+        let key_columns = layout
+            .key_exprs(side)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, _)| format!("key_{ordinal}"))
+            .collect::<Vec<_>>();
+        let key_projection = layout
+            .key_exprs(side)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, expression)| format!("{expression} AS key_{ordinal}"))
+            .collect::<Vec<_>>();
+        let key_projection = if key_projection.is_empty() {
+            String::new()
+        } else {
+            format!(",{}", key_projection.join(","))
+        };
+        let insert_columns = if key_columns.is_empty() {
+            "row_key,row_value,multiplicity,match_count,unknown_count".to_string()
+        } else {
+            format!(
+                "row_key,row_value,{},multiplicity,match_count,unknown_count",
+                key_columns.join(",")
+            )
+        };
+        let insert_values = if key_columns.is_empty() {
+            "row_key,row_value,new_multiplicity,match_count,unknown_count".to_string()
+        } else {
+            format!(
+                "row_key,row_value,{},new_multiplicity,match_count,unknown_count",
+                key_columns.join(",")
+            )
+        };
         let row_key = canonical_row_key_sql("effect.row_value", layout.input_type(side));
         let changed = transaction.write(
             &format!(
@@ -760,26 +1018,31 @@ pub(super) mod execution {
                   GROUP BY row_key
                 ),
                 desired AS MATERIALIZED (
-                  SELECT collapsed.*,
+                  SELECT collapsed.*{key_projection},
                          own.row_id,
                          coalesce(own.multiplicity,0)::bigint AS old_multiplicity,
                          coalesce((
                            SELECT sum({opposite_alias}.multiplicity)::bigint
-                           FROM {opposite_state} AS {opposite_alias}
-                           CROSS JOIN LATERAL (
+                           FROM LATERAL (
                              SELECT collapsed.row_value
                            ) AS {current_alias}
-                           WHERE ({condition}) IS TRUE
+                           JOIN {opposite_state} AS {opposite_alias}
+                             ON ({condition}) IS TRUE
+                           {match_key_join}
                          ),0)::bigint AS match_count,
                          coalesce((
                            SELECT sum({opposite_alias}.multiplicity)::bigint
-                           FROM {opposite_state} AS {opposite_alias}
-                           CROSS JOIN LATERAL (
+                           FROM LATERAL (
                              SELECT collapsed.row_value
                            ) AS {current_alias}
-                           WHERE ({condition}) IS NULL
+                           JOIN {opposite_state} AS {opposite_alias}
+                             ON ({condition}) IS NULL
+                           {unknown_key_join}
                          ),0)::bigint AS unknown_count
                   FROM collapsed
+                  CROSS JOIN LATERAL (
+                    SELECT collapsed.row_value
+                  ) AS {current_alias}
                   LEFT JOIN {state} AS own USING(row_key)
                 ),
                 valid AS MATERIALIZED (
@@ -806,11 +1069,8 @@ pub(super) mod execution {
                   RETURNING own.row_id
                 ),
                 inserted AS (
-                  INSERT INTO {state}(
-                    row_key,row_value,multiplicity,match_count,unknown_count
-                  )
-                  SELECT row_key,row_value,new_multiplicity,
-                         match_count,unknown_count
+                  INSERT INTO {state}({insert_columns})
+                  SELECT {insert_values}
                   FROM valid
                   WHERE row_id IS NULL AND new_multiplicity>0
                   ON CONFLICT (row_key) DO NOTHING
@@ -825,6 +1085,11 @@ pub(super) mod execution {
                 current_payload = layout.input_payload(side).relation.sql(),
                 opposite_state = layout.state(side.opposite()).sql(),
                 condition = layout.condition,
+                match_key_join = match_key_join,
+                unknown_key_join = unknown_key_join,
+                key_projection = key_projection,
+                insert_columns = insert_columns,
+                insert_values = insert_values,
                 state = state.sql(),
             ),
             &unsafe {
@@ -1421,23 +1686,70 @@ pub(super) mod execution {
         } else {
             "NULL::bigint".into()
         };
-        let unknown_delta = if mode == JoinMode::NullAwareAnti {
-            "CASE WHEN truth_rows.truth = -1 THEN $7::numeric ELSE 0::numeric END"
+        // Keep UNKNOWN counts exact for every Join mode.  Null-aware anti
+        // consumes this count for eligibility, while outer/semi/anti modes
+        // still need the durable state to describe the full three-valued
+        // logic and to remain correct if their mode-specific policy changes.
+        let unknown_delta = "CASE WHEN truth_rows.truth = -1 THEN $7::numeric ELSE 0::numeric END";
+        let candidate_source = if layout.keyed() {
+            let exact_key_predicate = key_exact_predicate_sql(layout, event.side, "candidate");
+            let unknown_key_predicate = key_unknown_predicate_sql(layout, event.side, "candidate");
+            format!(
+                r#"
+                SELECT candidate.row_id,candidate.row_value,
+                       candidate.multiplicity,candidate.match_count,
+                       candidate.unknown_count,
+                       shiba_internal.effect_row_bytes(candidate.row_value)
+                         AS row_bytes
+                FROM {candidate_state} AS candidate
+                CROSS JOIN current_input AS {current_alias}
+                WHERE candidate.row_id > $4
+                  AND ({exact_key_predicate})
+                UNION ALL
+                SELECT candidate.row_id,candidate.row_value,
+                       candidate.multiplicity,candidate.match_count,
+                       candidate.unknown_count,
+                       shiba_internal.effect_row_bytes(candidate.row_value)
+                         AS row_bytes
+                FROM {candidate_state} AS candidate
+                CROSS JOIN current_input AS {current_alias}
+                WHERE candidate.row_id > $4
+                  AND ({unknown_key_predicate})
+                ORDER BY row_id
+                LIMIT $5
+                "#,
+                candidate_state = layout.state(opposite).sql(),
+                current_alias = current_alias,
+                exact_key_predicate = exact_key_predicate,
+                unknown_key_predicate = unknown_key_predicate,
+            )
         } else {
-            "0::numeric"
+            format!(
+                r#"
+                SELECT candidate.row_id,candidate.row_value,
+                       candidate.multiplicity,candidate.match_count,
+                       candidate.unknown_count,
+                       shiba_internal.effect_row_bytes(candidate.row_value)
+                         AS row_bytes
+                FROM {candidate_state} AS candidate
+                WHERE candidate.row_id > $4
+                ORDER BY candidate.row_id
+                LIMIT $5
+                "#,
+                candidate_state = layout.state(opposite).sql(),
+            )
         };
         let query = format!(
             r#"
-            WITH candidate_source AS MATERIALIZED (
-              SELECT candidate.row_id,candidate.row_value,
-                     candidate.multiplicity,candidate.match_count,
-                     candidate.unknown_count,
-                     shiba_internal.effect_row_bytes(candidate.row_value)
-                       AS row_bytes
-              FROM {candidate_state} AS candidate
-              WHERE candidate.row_id > $4
-              ORDER BY candidate.row_id
-              LIMIT $5
+            WITH current_input AS MATERIALIZED (
+              SELECT input_row.row_value
+              FROM {current_payload} AS input_row
+              WHERE input_row.stream_id = $1
+                AND input_row.chunk_seq = $2
+                AND input_row.row_ordinal = $3
+            ),
+            candidate_source AS MATERIALIZED (
+              {candidate_source}
             ),
             measured AS MATERIALIZED (
               SELECT candidate_source.*,
@@ -1451,13 +1763,6 @@ pub(super) mod execution {
               SELECT *
               FROM measured
               WHERE running_rows = 1 OR running_bytes <= $6
-            ),
-            current_input AS MATERIALIZED (
-              SELECT input_row.row_value
-              FROM {current_payload} AS input_row
-              WHERE input_row.stream_id = $1
-                AND input_row.chunk_seq = $2
-                AND input_row.row_ordinal = $3
             ),
             truth_rows AS MATERIALIZED (
               SELECT {candidate_alias}.*,
@@ -1493,9 +1798,9 @@ pub(super) mod execution {
             CROSS JOIN current_input AS {current_alias}
             ORDER BY {candidate_alias}.row_id
             "#,
-            candidate_state = layout.state(opposite).sql(),
             current_payload = layout.input_payload(event.side).relation.sql(),
             condition = layout.condition,
+            candidate_source = candidate_source,
         );
         let arguments = unsafe {
             [
@@ -1543,17 +1848,68 @@ pub(super) mod execution {
             .map_or(progress.candidate_after().unwrap_or(0), |candidate| {
                 candidate.row_id
             });
-        let complete_query = format!(
-            "SELECT NOT EXISTS (SELECT 1 FROM {} WHERE row_id > $1)",
-            layout.state(opposite).sql()
-        );
-        let complete_arguments = unsafe { [DatumWithOid::new(after, pg_sys::INT8OID)] };
-        let complete = transaction
-            .read(&complete_query, &complete_arguments)?
-            .first()
-            .get_one::<bool>()
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "Join candidate completion probe returned NULL".to_string())?;
+        let complete_query = if layout.keyed() {
+            let exact_key_predicate = key_exact_predicate_sql(layout, event.side, "candidate");
+            let unknown_key_predicate = key_unknown_predicate_sql(layout, event.side, "candidate");
+            format!(
+                r#"
+                WITH current_input AS MATERIALIZED (
+                  SELECT input_row.row_value
+                  FROM {current_payload} AS input_row
+                  WHERE input_row.stream_id = $2
+                    AND input_row.chunk_seq = $3
+                    AND input_row.row_ordinal = $4
+                ), remaining AS (
+                  SELECT candidate.row_id
+                  FROM {candidate_state} AS candidate
+                  CROSS JOIN current_input AS {current_alias}
+                  WHERE candidate.row_id > $1
+                    AND ({exact_key_predicate})
+                  UNION ALL
+                  SELECT candidate.row_id
+                  FROM {candidate_state} AS candidate
+                  CROSS JOIN current_input AS {current_alias}
+                  WHERE candidate.row_id > $1
+                    AND ({unknown_key_predicate})
+                )
+                SELECT NOT EXISTS (SELECT 1 FROM remaining)
+                "#,
+                candidate_state = layout.state(opposite).sql(),
+                current_payload = layout.input_payload(event.side).relation.sql(),
+                current_alias = current_alias,
+                exact_key_predicate = exact_key_predicate,
+                unknown_key_predicate = unknown_key_predicate,
+            )
+        } else {
+            format!(
+                "SELECT NOT EXISTS (SELECT 1 FROM {} WHERE row_id > $1)",
+                layout.state(opposite).sql()
+            )
+        };
+        let complete = if layout.keyed() {
+            let arguments = unsafe {
+                [
+                    DatumWithOid::new(after, pg_sys::INT8OID),
+                    DatumWithOid::new(current.stream_id, pg_sys::INT8OID),
+                    DatumWithOid::new(current.chunk_seq, pg_sys::INT8OID),
+                    DatumWithOid::new(current.row_ordinal, pg_sys::INT8OID),
+                ]
+            };
+            transaction
+                .read(&complete_query, &arguments)?
+                .first()
+                .get_one::<bool>()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Join candidate completion probe returned NULL".to_string())?
+        } else {
+            let arguments = unsafe { [DatumWithOid::new(after, pg_sys::INT8OID)] };
+            transaction
+                .read(&complete_query, &arguments)?
+                .first()
+                .get_one::<bool>()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Join candidate completion probe returned NULL".to_string())?
+        };
         ProbePage::new(candidates, complete)
     }
 
@@ -1992,29 +2348,55 @@ pub(super) mod execution {
         let current = event.positions.get(event.side);
         let state = layout.state(event.side);
         let payload = layout.input_payload(event.side);
-        let row_key = canonical_row_key_sql("input_row.row_value", layout.input_type(event.side));
+        let current_alias = side_alias(event.side);
+        let row_key = canonical_row_key_sql(
+            &format!("{current_alias}.row_value"),
+            layout.input_type(event.side),
+        );
+        let key_columns = layout
+            .key_exprs(event.side)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, _)| format!("key_{ordinal}"))
+            .collect::<Vec<_>>();
+        let insert_columns = if key_columns.is_empty() {
+            "row_key,row_value,multiplicity,match_count,unknown_count".to_string()
+        } else {
+            format!(
+                "row_key,row_value,{},multiplicity,match_count,unknown_count",
+                key_columns.join(",")
+            )
+        };
+        let insert_values = if key_columns.is_empty() {
+            format!("{row_key},{current_alias}.row_value")
+        } else {
+            format!(
+                "{row_key},{current_alias}.row_value,{}",
+                layout.key_exprs(event.side).join(",")
+            )
+        };
         let query = match change.kind {
             OwnStateChangeKind::Insert => format!(
                 r#"
-                INSERT INTO {}(
-                  row_key,row_value,multiplicity,match_count,unknown_count
-                )
-                SELECT {row_key},input_row.row_value,{},{},{}
-                FROM {} AS input_row
-                WHERE input_row.stream_id = {}
-                  AND input_row.chunk_seq = {}
-                  AND input_row.row_ordinal = {}
+                INSERT INTO {state}({insert_columns})
+                SELECT {insert_values},{new_multiplicity},{match_count},{unknown_count}
+                FROM {payload} AS {current_alias}
+                WHERE {current_alias}.stream_id = {stream_id}
+                  AND {current_alias}.chunk_seq = {chunk_seq}
+                  AND {current_alias}.row_ordinal = {row_ordinal}
                 ON CONFLICT (row_key) DO NOTHING
                 RETURNING row_id
                 "#,
-                state.sql(),
-                change.new_multiplicity,
-                change.counts.matched,
-                change.counts.unknown,
-                payload.relation.sql(),
-                current.stream_id,
-                current.chunk_seq,
-                current.row_ordinal,
+                state = state.sql(),
+                insert_columns = insert_columns,
+                insert_values = insert_values,
+                new_multiplicity = change.new_multiplicity,
+                match_count = change.counts.matched,
+                unknown_count = change.counts.unknown,
+                payload = payload.relation.sql(),
+                stream_id = current.stream_id,
+                chunk_seq = current.chunk_seq,
+                row_ordinal = current.row_ordinal,
             ),
             OwnStateChangeKind::Update => format!(
                 r#"
@@ -2052,7 +2434,8 @@ pub(super) mod execution {
                 change.counts.unknown,
             ),
         };
-        if transaction.write(&query, &[])?.len() != 1 {
+        let changed = transaction.write(&query, &[])?;
+        if changed.len() != 1 {
             return Err("Join own arrangement compare-and-set did not affect one row".into());
         }
         Ok(())

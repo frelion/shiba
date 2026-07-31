@@ -185,6 +185,38 @@ assert_query "2" "
   WHERE result_oid=${chain_result_oid}::oid
     AND stage_id=${second_join_stage}"
 assert_query "0" "
+  WITH keyed_join AS (
+    SELECT dataflow.result_oid,stage.ordinality-1 AS stage_id
+    FROM shiba_internal.dataflows AS dataflow
+    CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+      WITH ORDINALITY AS stage(value,ordinality)
+    WHERE stage.value->'spec'->>'operator'='join'
+      AND jsonb_array_length(stage.value->'spec'->'config'->'equi_keys') > 0
+  ), keyed_state AS (
+    SELECT catalog.relation_oid
+    FROM keyed_join
+    JOIN shiba_internal.operator_state_relations AS catalog
+      ON catalog.result_oid=keyed_join.result_oid
+     AND catalog.stage_id=keyed_join.stage_id
+     AND catalog.state_slot IN (0,1)
+  )
+  SELECT count(*)
+  FROM keyed_state
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_index AS lookup_index
+    WHERE lookup_index.indrelid=keyed_state.relation_oid
+      AND lookup_index.indnkeyatts=2
+      AND lookup_index.indnatts=2
+      AND lookup_index.indkey[0]=4
+      AND lookup_index.indkey[1]=1
+      AND lookup_index.indisvalid
+      AND lookup_index.indisready
+      AND lookup_index.indislive
+      AND lookup_index.indexprs IS NULL
+      AND lookup_index.indpred IS NULL
+  )"
+assert_query "0" "
   WITH join_state AS (
     SELECT catalog.relation_oid
     FROM shiba_internal.operator_state_relations AS catalog
@@ -194,6 +226,7 @@ assert_query "0" "
       WITH ORDINALITY AS stage(value,ordinality)
     WHERE catalog.result_oid=${chain_result_oid}::oid
       AND stage.ordinality-1=catalog.stage_id
+      AND catalog.state_slot IN (0,1)
       AND stage.value->'spec'->>'operator'='join'
   ),
   identity_column AS (
@@ -1031,6 +1064,262 @@ assert_join_semantics() {
 
 assert_join_semantics
 
+# Every ordinary equality Join above should use the keyed arrangement. Check
+# the physical invariant, not only the final bag: key_0 must equal the
+# source row's key (including NULL), the composite lookup index must exist,
+# and UNKNOWN counts must include NULL comparisons that the equality index
+# intentionally cannot match.
+check_keyed_join_state() {
+  local result_name="$1"
+  local expected_null_unknown="$2"
+  local result_oid join_stage left_state right_state
+  local left_binding right_binding left_source_slot right_source_slot
+  local left_field right_field
+  result_oid="$(psql_fanout -Atqc "SELECT '${result_name}'::regclass::oid::integer")"
+  join_stage="$(psql_fanout -Atqc "
+    SELECT stage.ordinality-1
+    FROM shiba_internal.dataflows AS dataflow
+    CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+      WITH ORDINALITY AS stage(value,ordinality)
+    WHERE dataflow.result_oid=${result_oid}::oid
+      AND stage.value->'spec'->>'operator'='join'")"
+  left_binding="$(psql_fanout -Atqc "
+    SELECT stage.value->'spec'->'config'->'equi_keys'->0->>'left_binding'
+    FROM shiba_internal.dataflows AS dataflow
+    CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+      WITH ORDINALITY AS stage(value,ordinality)
+    WHERE dataflow.result_oid=${result_oid}::oid
+      AND stage.ordinality-1=${join_stage}")"
+  right_binding="$(psql_fanout -Atqc "
+    SELECT stage.value->'spec'->'config'->'equi_keys'->0->>'right_binding'
+    FROM shiba_internal.dataflows AS dataflow
+    CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+      WITH ORDINALITY AS stage(value,ordinality)
+    WHERE dataflow.result_oid=${result_oid}::oid
+      AND stage.ordinality-1=${join_stage}")"
+  left_source_slot="$(psql_fanout -Atqc "
+    SELECT mapping.value->>'source_slot'
+    FROM shiba_internal.dataflows AS dataflow
+    CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+      WITH ORDINALITY AS stage(value,ordinality)
+    CROSS JOIN LATERAL jsonb_array_elements(stage.value->'inputs'->0->'bindings')
+      AS mapping(value)
+    WHERE dataflow.result_oid=${result_oid}::oid
+      AND stage.ordinality-1=${join_stage}
+      AND mapping.value->>'target_binding'='${left_binding}'")"
+  right_source_slot="$(psql_fanout -Atqc "
+    SELECT mapping.value->>'source_slot'
+    FROM shiba_internal.dataflows AS dataflow
+    CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+      WITH ORDINALITY AS stage(value,ordinality)
+    CROSS JOIN LATERAL jsonb_array_elements(stage.value->'inputs'->1->'bindings')
+      AS mapping(value)
+    WHERE dataflow.result_oid=${result_oid}::oid
+      AND stage.ordinality-1=${join_stage}
+      AND mapping.value->>'target_binding'='${right_binding}'")"
+  left_field="slot_${left_source_slot}"
+  right_field="slot_${right_source_slot}"
+  left_state="$(psql_fanout -Atqc "
+    SELECT format('%I.%I',namespace.nspname,relation.relname)
+    FROM shiba_internal.operator_state_relations AS catalog
+    JOIN pg_catalog.pg_class AS relation ON relation.oid=catalog.relation_oid
+    JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+    WHERE catalog.result_oid=${result_oid}::oid
+      AND catalog.stage_id=${join_stage}
+      AND catalog.state_slot=0")"
+  right_state="$(psql_fanout -Atqc "
+    SELECT format('%I.%I',namespace.nspname,relation.relname)
+    FROM shiba_internal.operator_state_relations AS catalog
+    JOIN pg_catalog.pg_class AS relation ON relation.oid=catalog.relation_oid
+    JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+    WHERE catalog.result_oid=${result_oid}::oid
+      AND catalog.stage_id=${join_stage}
+      AND catalog.state_slot=1")"
+  assert_query "1" "
+    SELECT jsonb_array_length(plan_stage.value->'spec'->'config'->'equi_keys')
+    FROM shiba_internal.dataflows AS dataflow
+    CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+      WITH ORDINALITY AS plan_stage(value,ordinality)
+    WHERE dataflow.result_oid=${result_oid}::oid
+      AND plan_stage.ordinality-1=${join_stage}"
+  assert_query "0" "
+    SELECT count(*)
+    FROM ${left_state}
+    WHERE key_0 IS DISTINCT FROM ((row_value).${left_field})"
+  assert_query "0" "
+    SELECT count(*)
+    FROM ${right_state}
+    WHERE key_0 IS DISTINCT FROM ((row_value).${right_field})"
+  assert_query "2" "
+    SELECT count(*)
+    FROM pg_catalog.pg_index AS lookup_index
+    WHERE lookup_index.indrelid IN ('${left_state}'::regclass,'${right_state}'::regclass)
+      AND lookup_index.indnkeyatts=2
+      AND lookup_index.indnatts=2
+      AND lookup_index.indkey[0]=4
+      AND lookup_index.indkey[1]=1
+      AND lookup_index.indisvalid
+      AND lookup_index.indisready
+      AND lookup_index.indislive
+      AND lookup_index.indexprs IS NULL
+      AND lookup_index.indpred IS NULL"
+  assert_query "${expected_null_unknown}" "
+    SELECT count(*) || '|' || coalesce(sum(unknown_count),0)
+    FROM ${left_state}
+    WHERE ((row_value).${left_field}) IS NULL"
+}
+
+check_keyed_join_state shiba.left_join_result "1|3"
+check_keyed_join_state shiba.right_join_result "1|3"
+check_keyed_join_state shiba.full_join_result "1|3"
+check_keyed_join_state shiba.semi_join_result "1|3"
+check_keyed_join_state shiba.anti_join_result "1|3"
+check_keyed_join_state shiba.in_join_result "1|3"
+
+# Equality extraction must coexist with a residual predicate.  The keyed
+# lookup may narrow candidates, but the residual remains the final authority
+# for TRUE/FALSE/UNKNOWN output semantics.
+psql_fanout -qc "
+  CREATE TABLE public.residual_key_left (
+    id integer PRIMARY KEY,
+    key integer,
+    value integer
+  );
+  CREATE TABLE public.residual_key_right (
+    id integer PRIMARY KEY,
+    key integer,
+    value integer
+  );
+  CREATE TABLE shiba.residual_key_result AS
+  SELECT left_side.id AS left_id,right_side.id AS right_id
+  FROM public.residual_key_left AS left_side
+  LEFT JOIN public.residual_key_right AS right_side
+    ON left_side.key=right_side.key
+   AND left_side.value>right_side.value;
+  INSERT INTO public.residual_key_left VALUES
+    (1,1,20),(2,1,5),(3,NULL,20);
+  INSERT INTO public.residual_key_right VALUES
+    (10,1,10),(11,1,30),(12,NULL,10)"
+assert_bag_equal \
+  "SELECT left_side.id AS left_id,right_side.id AS right_id
+   FROM public.residual_key_left AS left_side
+   LEFT JOIN public.residual_key_right AS right_side
+     ON left_side.key=right_side.key
+    AND left_side.value>right_side.value" \
+  "SELECT left_id,right_id FROM shiba.residual_key_result" \
+  "the keyed Join with a residual predicate"
+check_keyed_join_state shiba.residual_key_result "1|2"
+
+# A two-column equality key must be materialized and used as a conjunction;
+# sharing the first key component must not produce a false match.
+psql_fanout -qc "
+  CREATE TABLE public.composite_key_left (
+    id integer PRIMARY KEY,
+    tenant integer NOT NULL,
+    item integer NOT NULL,
+    value integer NOT NULL
+  );
+  CREATE TABLE public.composite_key_right (
+    id integer PRIMARY KEY,
+    tenant integer NOT NULL,
+    item integer NOT NULL,
+    value integer NOT NULL
+  );
+  INSERT INTO public.composite_key_left VALUES
+    (1,10,1,100),(2,10,2,200),(3,20,1,300);
+  INSERT INTO public.composite_key_right VALUES
+    (11,10,1,1000),(12,10,1,1001),(13,10,2,2000),(14,20,2,3000);
+  CREATE TABLE shiba.composite_key_result AS
+  SELECT left_side.id AS left_id,right_side.id AS right_id
+  FROM public.composite_key_left AS left_side
+  JOIN public.composite_key_right AS right_side
+    ON left_side.tenant=right_side.tenant
+   AND left_side.item=right_side.item"
+assert_bag_equal \
+  "SELECT left_side.id AS left_id,right_side.id AS right_id
+   FROM public.composite_key_left AS left_side
+   JOIN public.composite_key_right AS right_side
+     ON left_side.tenant=right_side.tenant
+    AND left_side.item=right_side.item" \
+  "SELECT left_id,right_id FROM shiba.composite_key_result" \
+  "the multi-column keyed Join"
+composite_result_oid="$(psql_fanout -Atqc "SELECT 'shiba.composite_key_result'::regclass::oid::integer")"
+assert_query "2" "
+  SELECT jsonb_array_length(stage.value->'spec'->'config'->'equi_keys')
+  FROM shiba_internal.dataflows AS dataflow
+  CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+    WITH ORDINALITY AS stage(value,ordinality)
+  WHERE dataflow.result_oid=${composite_result_oid}::oid
+    AND stage.value->'spec'->>'operator'='join'"
+composite_join_stage="$(psql_fanout -Atqc "
+  SELECT stage.ordinality-1
+  FROM shiba_internal.dataflows AS dataflow
+  CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+    WITH ORDINALITY AS stage(value,ordinality)
+  WHERE dataflow.result_oid=${composite_result_oid}::oid
+    AND stage.value->'spec'->>'operator'='join'")"
+composite_left_key0_binding="$(psql_fanout -Atqc "
+  SELECT stage.value->'spec'->'config'->'equi_keys'->0->>'left_binding'
+  FROM shiba_internal.dataflows AS dataflow
+  CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+    WITH ORDINALITY AS stage(value,ordinality)
+  WHERE dataflow.result_oid=${composite_result_oid}::oid
+    AND stage.ordinality-1=${composite_join_stage}")"
+composite_left_key1_binding="$(psql_fanout -Atqc "
+  SELECT stage.value->'spec'->'config'->'equi_keys'->1->>'left_binding'
+  FROM shiba_internal.dataflows AS dataflow
+  CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+    WITH ORDINALITY AS stage(value,ordinality)
+  WHERE dataflow.result_oid=${composite_result_oid}::oid
+    AND stage.ordinality-1=${composite_join_stage}")"
+composite_left_key0_slot="$(psql_fanout -Atqc "
+  SELECT mapping.value->>'source_slot'
+  FROM shiba_internal.dataflows AS dataflow
+  CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+    WITH ORDINALITY AS stage(value,ordinality)
+  CROSS JOIN LATERAL jsonb_array_elements(stage.value->'inputs'->0->'bindings')
+    AS mapping(value)
+  WHERE dataflow.result_oid=${composite_result_oid}::oid
+    AND stage.ordinality-1=${composite_join_stage}
+    AND mapping.value->>'target_binding'='${composite_left_key0_binding}'")"
+composite_left_key1_slot="$(psql_fanout -Atqc "
+  SELECT mapping.value->>'source_slot'
+  FROM shiba_internal.dataflows AS dataflow
+  CROSS JOIN LATERAL jsonb_array_elements(dataflow.plan->'stages')
+    WITH ORDINALITY AS stage(value,ordinality)
+  CROSS JOIN LATERAL jsonb_array_elements(stage.value->'inputs'->0->'bindings')
+    AS mapping(value)
+  WHERE dataflow.result_oid=${composite_result_oid}::oid
+    AND stage.ordinality-1=${composite_join_stage}
+    AND mapping.value->>'target_binding'='${composite_left_key1_binding}'")"
+composite_left_key0_field="slot_${composite_left_key0_slot}"
+composite_left_key1_field="slot_${composite_left_key1_slot}"
+composite_left_state="$(psql_fanout -Atqc "
+  SELECT format('%I.%I',namespace.nspname,relation.relname)
+  FROM shiba_internal.operator_state_relations AS catalog
+  JOIN pg_catalog.pg_class AS relation ON relation.oid=catalog.relation_oid
+  JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+  WHERE catalog.result_oid=${composite_result_oid}::oid
+    AND catalog.stage_id=${composite_join_stage}
+    AND catalog.state_slot=0")"
+assert_query "0" "
+  SELECT count(*)
+  FROM ${composite_left_state}
+  WHERE key_0 IS DISTINCT FROM ((row_value).${composite_left_key0_field})
+     OR key_1 IS DISTINCT FROM ((row_value).${composite_left_key1_field})"
+assert_query "1" "
+  SELECT count(*)
+  FROM pg_catalog.pg_index AS lookup_index
+  WHERE lookup_index.indrelid='${composite_left_state}'::regclass
+    AND lookup_index.indnkeyatts=3
+    AND lookup_index.indnatts=3
+    AND lookup_index.indkey[0]=4
+    AND lookup_index.indkey[1]=5
+    AND lookup_index.indkey[2]=1
+    AND lookup_index.indisvalid
+    AND lookup_index.indisready
+    AND lookup_index.indislive"
+
 # Force one LEFT Join candidate's ordered pair/zero-cross actions across two
 # one-row chunks. The pair commits first; the typed continuation then owns the
 # pending transition and may resume after a crash without replaying the pair.
@@ -1219,23 +1508,28 @@ psql_fanout -qc "
   SET active=true
   WHERE result_oid=${left_result_oid}::oid"
 assert_join_semantics
+check_keyed_join_state shiba.left_join_result "1|4"
 psql_fanout -qc "DELETE FROM public.join_right WHERE id=13"
 assert_join_semantics
+check_keyed_join_state shiba.left_join_result "1|3"
 
 psql_fanout -qc "
   DELETE FROM public.join_right WHERE id=10;
   DELETE FROM public.join_right WHERE id=11;
   DELETE FROM public.join_right WHERE id=12"
 assert_join_semantics
+check_keyed_join_state shiba.left_join_result "1|0"
 psql_fanout -qc "
   INSERT INTO public.join_right VALUES (20,2),(21,NULL);
   DELETE FROM public.join_left WHERE id=2;
   INSERT INTO public.join_left VALUES (2,2)"
 assert_join_semantics
+check_keyed_join_state shiba.left_join_result "1|2"
 psql_fanout -qc "
   UPDATE public.join_right SET key=3 WHERE id=21;
   INSERT INTO public.join_left VALUES (4,3)"
 assert_join_semantics
+check_keyed_join_state shiba.left_join_result "1|2"
 
 # Sink pages a single large signed weight in the same transaction as its
 # continuation, input cursor, checkpoint, and result DML. Duplicate rows on

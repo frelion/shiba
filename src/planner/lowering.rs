@@ -13,9 +13,9 @@ use pgrx::pg_sys;
 use crate::planner::model::{
     AggregateExpr, AggregateSpec, BindingId, BoolExprKind, BooleanTestKind, CaseWhen,
     DataflowInput, DataflowPlan, DataflowStage, DatumRepr, DistinctSpec, ExecutionSettings,
-    FilterSpec, GroupExpr, InputSlot, JoinKind, JoinSpec, NamedExpr, OperatorSpec, OutputSlot,
-    ProjectSpec, ScalarExpr, ScanColumn, ScanSpec, SlotBinding, SlotId, SlotType, SortGroupExpr,
-    StageSchema, TopNSpec, WindowExpr, WindowFrame, WindowSpec,
+    FilterSpec, GroupExpr, InputSlot, JoinEquiKey, JoinKind, JoinSpec, NamedExpr, OperatorSpec,
+    OutputSlot, ProjectSpec, ScalarExpr, ScanColumn, ScanSpec, SlotBinding, SlotId, SlotType,
+    SortGroupExpr, StageSchema, TopNSpec, WindowExpr, WindowFrame, WindowSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -999,6 +999,91 @@ fn join_kind(kind: pg_sys::JoinType::Type) -> Result<JoinKind, LoweringError> {
     }
 }
 
+/// Extract only the equality predicates for which a key lookup is a proven
+/// superset of the original Join predicate.  The original condition remains
+/// the residual predicate, so this optimization is allowed to be conservative.
+///
+/// The first implementation intentionally accepts direct Input = Input atoms
+/// under AND.  Expressions, casts, OR trees, and NULL-aware anti joins remain
+/// on the generic candidate scan until their semantics have a dedicated key
+/// representation.
+unsafe fn extract_join_equi_keys(
+    kind: JoinKind,
+    condition: &ScalarExpr,
+    left_inputs: &[InputSlot],
+    right_inputs: &[InputSlot],
+) -> Vec<JoinEquiKey> {
+    if kind == JoinKind::NullAwareAnti {
+        return Vec::new();
+    }
+
+    let mut by_binding = HashMap::with_capacity(left_inputs.len() + right_inputs.len());
+    for input in left_inputs.iter().chain(right_inputs) {
+        by_binding.insert(input.binding, input);
+    }
+
+    fn conjuncts<'a>(expression: &'a ScalarExpr, output: &mut Vec<&'a ScalarExpr>) {
+        match expression {
+            ScalarExpr::Bool {
+                op: BoolExprKind::And,
+                args,
+            } => {
+                for arg in args {
+                    conjuncts(arg, output);
+                }
+            }
+            _ => output.push(expression),
+        }
+    }
+
+    let mut atoms = Vec::new();
+    conjuncts(condition, &mut atoms);
+    let mut keys = Vec::new();
+    for atom in atoms {
+        let ScalarExpr::Operator {
+            operator_oid, args, ..
+        } = atom
+        else {
+            continue;
+        };
+        if c_string(pg_sys::get_opname(pg_sys::Oid::from_u32(*operator_oid))).as_deref()
+            != Some("=")
+        {
+            continue;
+        }
+        let [ScalarExpr::Input { binding: first }, ScalarExpr::Input { binding: second }] =
+            args.as_slice()
+        else {
+            continue;
+        };
+        let Some(first_input) = by_binding.get(first) else {
+            continue;
+        };
+        let Some(second_input) = by_binding.get(second) else {
+            continue;
+        };
+        let same_type = first_input.type_.type_oid == second_input.type_.type_oid
+            && first_input.type_.typmod == second_input.type_.typmod
+            && first_input.type_.collation_oid == second_input.type_.collation_oid;
+        if !same_type {
+            continue;
+        }
+        let (left_binding, right_binding) = match (first_input.input, second_input.input) {
+            (0, 1) => (*first, *second),
+            (1, 0) => (*second, *first),
+            _ => continue,
+        };
+        let key = JoinEquiKey {
+            left_binding,
+            right_binding,
+        };
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
 unsafe fn build_join(
     builder: &mut Builder,
     query: *mut pg_sys::Query,
@@ -1029,6 +1114,12 @@ unsafe fn build_join(
     } else {
         scalar(qualification, &context, "join.condition")?
     };
+    let equi_keys = extract_join_equi_keys(
+        kind,
+        &condition,
+        &left_bound.schema_inputs,
+        &right_bound.schema_inputs,
+    );
     let output_count = if matches!(
         kind,
         JoinKind::Semi | JoinKind::Anti | JoinKind::NullAwareAnti
@@ -1086,6 +1177,7 @@ unsafe fn build_join(
         spec: OperatorSpec::Join(JoinSpec {
             kind,
             condition,
+            equi_keys,
             outputs: expressions,
         }),
         schema: typed_schema(schema_inputs, &relation.columns),
@@ -1498,6 +1590,12 @@ unsafe fn build_semi_join(
             }
         }
     };
+    let equi_keys = extract_join_equi_keys(
+        kind,
+        &condition,
+        &outer_bound.schema_inputs,
+        &inner_bound.schema_inputs,
+    );
     let (columns, expressions) = builder.passthrough_outputs(&outer, &outer_bound.columns, 0);
     let mut schema_inputs = outer_bound.schema_inputs;
     schema_inputs.extend(inner_bound.schema_inputs);
@@ -1505,6 +1603,7 @@ unsafe fn build_semi_join(
         spec: OperatorSpec::Join(JoinSpec {
             kind,
             condition,
+            equi_keys,
             outputs: expressions,
         }),
         schema: typed_schema(schema_inputs, &columns),
