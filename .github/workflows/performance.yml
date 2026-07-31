@@ -44,10 +44,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-directories: ~/.pgrx
+          shared-key: shiba-pg${{ matrix.pg_major }}
 
       - name: Install and initialize cargo-pgrx
         run: |
           cargo install cargo-pgrx --version 0.19.1 --locked
+          rm -f "$HOME/.pgrx/config.toml"
           cargo pgrx init --pg${{ matrix.pg_major }} "$PG_CONFIG"
 
       - name: Allow extension installation

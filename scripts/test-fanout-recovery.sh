@@ -1171,10 +1171,15 @@ check_keyed_join_state() {
       AND lookup_index.indislive
       AND lookup_index.indexprs IS NULL
       AND lookup_index.indpred IS NULL"
-  assert_query "${expected_null_unknown}" "
+  # The output bag can become correct in the same runtime quantum before the
+  # keyed arrangement's NULL/UNKNOWN counters finish their following commit.
+  # Poll the durable state instead of making this eventual-consistency check
+  # sensitive to runner scheduling.
+  wait_for_query "${expected_null_unknown}" "
     SELECT count(*) || '|' || coalesce(sum(unknown_count),0)
     FROM ${left_state}
-    WHERE ((row_value).${left_field}) IS NULL"
+    WHERE ((row_value).${left_field}) IS NULL" \
+    "the NULL UNKNOWN count for ${result_name}"
 }
 
 check_keyed_join_state shiba.left_join_result "1|3"
