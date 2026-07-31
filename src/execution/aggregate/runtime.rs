@@ -1099,8 +1099,8 @@ fn build_group_page_sql(
             alias: "bag",
         }],
     )?;
-    let (mut values, representative_join) = if spec.groups.is_empty() {
-        (Vec::new(), String::new())
+    let (mut values, representative_cte, representative_join) = if spec.groups.is_empty() {
+        (Vec::new(), String::new(), String::new())
     } else {
         let representative_bindings = compile_stage_bindings(
             transaction,
@@ -1117,15 +1117,16 @@ fn build_group_page_sql(
                 .map(|group| compile_scalar_expression(&group.key.expr, &representative_bindings))
                 .collect::<Result<Vec<_>, _>>()?,
             format!(
-                " LEFT JOIN LATERAL (
-                    SELECT bag.row_value
-                    FROM {bag} AS bag
-                    WHERE bag.group_state_id=groups.group_state_id
-                    ORDER BY bag.row_id
-                    LIMIT 1
-                  ) AS representative ON true",
+                r#"representatives AS MATERIALIZED (
+                  SELECT DISTINCT ON (bag.group_state_id)
+                         bag.group_state_id,bag.row_value
+                  FROM selected_dirty
+                  JOIN {bag} AS bag USING(group_state_id)
+                  ORDER BY bag.group_state_id,bag.row_id
+                ),"#,
                 bag = bag.sql(),
             ),
+            " LEFT JOIN representatives AS representative USING(group_state_id)".into(),
         )
     };
     for (aggregate_index, aggregate) in spec.aggregates.iter().enumerate() {
@@ -1217,6 +1218,7 @@ fn build_group_page_sql(
           SELECT * FROM {dirty}
           WHERE queue_id BETWEEN $1 AND $2
         ),
+        {representative_cte}
         desired_base AS MATERIALIZED (
           SELECT selected_dirty.queue_id,selected_dirty.group_state_id,
                  groups.published_present,groups.published_key,
@@ -1247,6 +1249,7 @@ fn build_group_page_sql(
         "#,
         dirty = dirty.sql(),
         groups = groups.sql(),
+        representative_cte = representative_cte,
         representative_join = representative_join,
     );
     let action_rows = "

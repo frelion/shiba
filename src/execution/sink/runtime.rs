@@ -467,8 +467,10 @@ fn sink_mapping(
 
     let mut insert_columns = Vec::with_capacity(target.len());
     let mut select_columns = Vec::with_capacity(target.len());
-    let mut delete_predicate = Vec::with_capacity(target.len());
-    let mut effect_equality = Vec::with_capacity(payload.len());
+    let mut ranked_delete_predicate = Vec::with_capacity(target.len());
+    let mut target_partition = Vec::with_capacity(target.len());
+    let mut ranked_columns = Vec::with_capacity(target.len());
+    let mut effect_partition = Vec::with_capacity(target.len());
     for (ordinal, (input_slot, target_attribute)) in
         sink.schema.inputs.iter().zip(target).enumerate()
     {
@@ -495,19 +497,20 @@ fn sink_mapping(
         let payload_name = quote_identifier(&payload_attribute.name);
         insert_columns.push(target_name.clone());
         select_columns.push(format!("(effect.row_value).{payload_name}"));
-        delete_predicate.push(format!(
-            "target.{target_name} IS NOT DISTINCT FROM (effect.row_value).{payload_name}"
+        ranked_delete_predicate.push(format!(
+            "ranked.{target_name} IS NOT DISTINCT FROM (effect.row_value).{payload_name}"
         ));
-        effect_equality.push(format!(
-            "(previous_effect.row_value).{payload_name} \
-             IS NOT DISTINCT FROM (effect.row_value).{payload_name}"
-        ));
+        target_partition.push(format!("target.{target_name}"));
+        ranked_columns.push(format!("target.{target_name}"));
+        effect_partition.push(format!("(effect.row_value).{payload_name}"));
     }
     Ok(SinkMapping {
         insert_columns: insert_columns.join(","),
         select_columns: select_columns.join(","),
-        delete_predicate: delete_predicate.join(" AND "),
-        effect_equality: effect_equality.join(" AND "),
+        ranked_delete_predicate: ranked_delete_predicate.join(" AND "),
+        target_partition: target_partition.join(","),
+        ranked_columns: ranked_columns.join(","),
+        effect_partition: effect_partition.join(","),
     })
 }
 
@@ -566,30 +569,35 @@ fn mutate_result_page(
         ),
         negative_actions AS MATERIALIZED (
           SELECT effect.*,
-                 (
-                   SELECT coalesce(
-                     sum(-previous_effect.applied_weight),0
-                   )::bigint
-                   FROM effects AS previous_effect
-                   WHERE previous_effect.applied_weight < 0
-                     AND previous_effect.row_ordinal < effect.row_ordinal
-                     AND {effect_equality}
-                 ) AS copies_before
+                 coalesce(
+                   sum(-effect.applied_weight) FILTER (
+                     WHERE effect.applied_weight < 0
+                   ) OVER (
+                     PARTITION BY {effect_partition}
+                     ORDER BY effect.row_ordinal
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                   ),0
+                 )::bigint AS copies_before
           FROM effects AS effect
           WHERE effect.applied_weight < 0
         ),
+        ranked_targets AS MATERIALIZED (
+          SELECT target.ctid,{ranked_columns},
+                 row_number() OVER (
+                   PARTITION BY {target_partition}
+                   ORDER BY target.ctid
+                 )-1 AS copy_ordinal
+          FROM {result} AS target
+        ),
         victims AS MATERIALIZED (
-          SELECT victim.ctid
+          SELECT target.ctid
           FROM negative_actions AS effect
-          CROSS JOIN LATERAL (
-            SELECT target.ctid
-            FROM {result} AS target
-            WHERE {predicate}
-            ORDER BY target.ctid
-            OFFSET effect.copies_before
-            LIMIT -effect.applied_weight
-            FOR UPDATE OF target
-          ) AS victim
+          JOIN ranked_targets AS ranked
+            ON ranked.copy_ordinal >= effect.copies_before
+           AND ranked.copy_ordinal < effect.copies_before-effect.applied_weight
+           AND {ranked_predicate}
+          JOIN {result} AS target ON target.ctid=ranked.ctid
+          FOR UPDATE OF target
         ),
         deleted AS (
           DELETE FROM {result} AS target
@@ -605,8 +613,10 @@ fn mutate_result_page(
         result = result.sql(),
         columns = mapping.insert_columns,
         values = mapping.select_columns,
-        effect_equality = mapping.effect_equality,
-        predicate = mapping.delete_predicate,
+        effect_partition = mapping.effect_partition,
+        ranked_columns = mapping.ranked_columns,
+        target_partition = mapping.target_partition,
+        ranked_predicate = mapping.ranked_delete_predicate,
     );
     let rows = transaction.write(&query, &arguments)?;
     if rows.len() != 1 {

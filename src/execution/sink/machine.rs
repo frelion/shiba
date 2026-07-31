@@ -31,8 +31,10 @@ pub(super) struct WeightPage {
 pub(super) struct SinkMapping {
     pub(super) insert_columns: String,
     pub(super) select_columns: String,
-    pub(super) delete_predicate: String,
-    pub(super) effect_equality: String,
+    pub(super) ranked_delete_predicate: String,
+    pub(super) target_partition: String,
+    pub(super) ranked_columns: String,
+    pub(super) effect_partition: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

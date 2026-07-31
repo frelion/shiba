@@ -7,7 +7,7 @@
 - Linear（Scan/Filter/Project）是目前最接近高效热路径的实现，主要成本是每个 step 的 PostgreSQL/SPI/锁/checkpoint 固定开销和 typed row bytes 计算。
 - Distinct、Aggregate、Window、TopN 都通过 continuation 把单步工作限制住，但大 key、hot group、large partition 或频繁 dirty update 的总复杂度仍会随状态规模增长。
 - Join 的 generic/theta fallback 仍按 row_id 分页扫描，但直接 AND equi-join 已增加 typed key 列和复合 B-tree access path；大选择性 miss 已有同机 A/B 证据。
-- Sink 的负向动作按完整结果行找 ctid；结果表没有可保证存在的内部 identity index 时，delete-heavy workload 可能重复扫描结果表。
+- Sink 的负向动作按完整结果行找 ctid；结果表没有可保证存在的内部 identity index 时，delete-heavy workload 仍需扫描结果表，但同一页的多个负 action 已批量复用一次 ctid ranking。
 
 所以现在适合继续做正确性和协议演进，但在声明“生产级高效”前，应先解决 Join 访问路径、Sink 删除路径，并补齐 hot-key/partition/large-offset baseline。
 
@@ -35,17 +35,17 @@
 
 当前证据：PostgreSQL 17.10、release、对侧 1,000,000 行、miss key 的同机 A/B 中，keyed 0.571 s，generic 0.754 s，正确性和 keyed `EXPLAIN` index-scan 门槛均通过；约 24.2% 收敛时间收益。仍需持续关注低选择性 fanout 的 index maintenance 成本，以及 OR/cast/function/NullAwareAnti fallback。
 
-### P0：Sink delete 可能重复扫描结果表
+### P0：Sink delete 仍依赖结果表扫描
 
-[sink/runtime.rs](../src/execution/sink/runtime.rs) 的负向路径用完整 row 的 NULL-safe predicate、ORDER BY ctid、OFFSET 和 LIMIT 选择 victims。结果表没有 Shiba 统一创建的可覆盖索引时，P 个 delete action 对 R 行结果表可能接近 O(P*R)。
+[sink/runtime.rs](../src/execution/sink/runtime.rs) 的负向路径用完整 row 的 NULL-safe predicate、一次 `ctid` ranking 和 copy ordinal range join 选择 victims。结果表没有 Shiba 统一创建的可覆盖索引时，一页 P 个 delete action 对 R 行结果表约为 O(R+C)，不再是 P 次 O(R)；但每个 page 仍可能扫描结果表。
 
-建议评估 side identity table 或注册时可证明的匹配索引。不能只依赖用户恰好创建的主键；需要覆盖 NULL、duplicate 和 update old/new row 的恢复测试。
+本机 PostgreSQL 17.10 duplicate-heavy A/B（100,000 行结果、256 个负 action）从 2,130.296 ms/246,408 blocks 降到 1,515.810 ms/1,929 blocks。后续仍应评估 side identity table 或注册时可证明的匹配索引；不能只依赖用户恰好创建的主键，需要覆盖 NULL、duplicate 和 update old/new row 的恢复测试。
 
 ### P1：状态型算子的总工作不是增量常数
 
 Aggregate 以 dirty group 为单位重建 aggregate transition，约为 O(A*G)；Window 对 dirty partition 经过 enumeration/peers/frames/fold/diff 多阶段，约为 O(P*W+K)；TopN 每次 generation selection 仍需遍历 active input，约为 O(N+K)。continuation 只把这些工作切成小事务，并没有消除总工作。
 
-建议把这些工作负载加入独立 benchmark：hot group、large partition、large OFFSET/WITH TIES、频繁更新排序边界，并记录 pages、最大 step 时间、state bytes、output rows/s 和 post-commit convergence。
+Aggregate representative lookup 已从逐 group 的 LATERAL point lookup 改为 dirty page 的 bag-index batch join；TopN 的 `has_more` 已复用 bounded terminal row；Window Fold 已复用 interval 阶段的 typed row，避免再次按 entry_id 回查 input。建议把这些工作负载加入独立 benchmark：hot group、large partition、large OFFSET/WITH TIES、频繁更新排序边界，并记录 pages、最大 step 时间、state bytes、output rows/s 和 post-commit convergence。
 
 ### P1：固定 step/transaction 成本
 

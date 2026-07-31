@@ -1288,9 +1288,8 @@ fn run_topn_selection(
           RETURNING 1
         ),
         last_processed AS MATERIALIZED (
-          SELECT input_row.*
+          SELECT page.*
           FROM bounded AS page
-          JOIN {state} AS input_row USING(entry_id)
           ORDER BY page.page_ordinal DESC
           LIMIT 1
         ),

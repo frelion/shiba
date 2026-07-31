@@ -62,6 +62,15 @@ for interval in 1 2 3; do
     "interval_${interval} AS MATERIALIZED" \
     "Window aggregate frame interval ${interval} is not independently bounded"
 done
+static_require src/execution/window/primitives.rs \
+  'SELECT \(selected\.row_value\)\.\*' \
+  'Window aggregate Fold does not reuse the interval row payload'
+if grep -Fq 'ON current_input.entry_id=selected.entry_id' \
+  "${project_root}/src/execution/window/primitives.rs"; then
+  printf '%s\n' \
+    'Window/TopN static gate failed: aggregate Fold re-queries input for selected rows' >&2
+  exit 1
+fi
 if grep -Eq 'pg_catalog\.record_send' \
   "${project_root}/src/execution/window/output.rs" \
   "${project_root}/src/execution/window/primitives.rs" \

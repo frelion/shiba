@@ -116,6 +116,23 @@ fn aggregate_key_equality_uses_the_resolved_operator_and_explicit_nulls() {
 }
 
 #[test]
+fn group_page_batches_representative_lookup_through_the_bag_index() {
+    let production = include_str!("runtime.rs");
+    let page = production
+        .split_once("fn build_group_page_sql(")
+        .expect("Aggregate must build a group page")
+        .1
+        .split_once("fn aggregate_function_sql(")
+        .expect("Aggregate group-page SQL must end before catalog lookup")
+        .0;
+    assert!(page.contains("representatives AS MATERIALIZED"));
+    assert!(page.contains("SELECT DISTINCT ON (bag.group_state_id)"));
+    assert!(page.contains("ORDER BY bag.group_state_id,bag.row_id"));
+    assert!(page.contains("LEFT JOIN representatives AS representative USING(group_state_id)"));
+    assert!(!page.contains("JOIN LATERAL (\n                    SELECT bag.row_value"));
+}
+
+#[test]
 fn an_uncommitted_action_replays_from_the_same_durable_state() {
     let machine = AggregateMachine::new(2).unwrap();
     let durable = AggregateContinuation {

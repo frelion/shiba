@@ -533,7 +533,8 @@ fn run_prefix(
         return Err("Distinct Apply exceeded its per-input state bound".into());
     }
 
-    // A new SPI statement observes the bag mutations. It performs one
+    // A new SPI statement observes the bag mutations. State rows are locked by
+    // one ordered join; the representative lookup still performs one
     // `(group_state_id,output_key) LIMIT 1` probe per touched SQL group, so a
     // group with many SQL-equal physical representations remains bounded.
     let reconciled =
@@ -577,15 +578,11 @@ fn reconcile_representatives(
               RETURNING group_state_id,net_weight
             ),
             locked AS MATERIALIZED (
-              SELECT locked_group.*
+              SELECT groups.*
               FROM touched_page
-              JOIN LATERAL (
-                SELECT groups.*
-                FROM {state} AS groups
-                WHERE groups.group_state_id=touched_page.group_state_id
-                LIMIT 1
-                FOR UPDATE
-              ) AS locked_group ON true
+              JOIN {state} AS groups USING(group_state_id)
+              ORDER BY groups.group_state_id
+              FOR UPDATE OF groups
             ),
             desired AS MATERIALIZED (
               SELECT locked.group_state_id,locked.output_key AS old_output_key,

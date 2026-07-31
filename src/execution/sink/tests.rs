@@ -47,3 +47,21 @@ fn remaining_weight_must_be_a_signed_suffix() {
     assert!(plan_weight_page(-5, Some(-6), 1, budget(1, 1)).is_err());
     assert!(plan_weight_page(5, Some(0), 1, budget(1, 1)).is_err());
 }
+
+#[test]
+fn negative_mutation_batches_ctid_ranking_before_locking_victims() {
+    let production = include_str!("runtime.rs");
+    let mutation = production
+        .split_once("fn mutate_result_page(")
+        .expect("Sink must have a result mutation primitive")
+        .1
+        .split_once("pub(super) fn plan_weight_page(")
+        .expect("Sink result mutation must end before weight planning")
+        .0;
+    assert!(mutation.contains("ranked_targets AS MATERIALIZED"));
+    assert!(mutation
+        .contains("row_number() OVER (\n                   PARTITION BY {target_partition}"));
+    assert!(mutation.contains("JOIN {result} AS target ON target.ctid=ranked.ctid"));
+    assert!(mutation.contains("FOR UPDATE OF target"));
+    assert!(!mutation.contains("OFFSET effect.copies_before"));
+}

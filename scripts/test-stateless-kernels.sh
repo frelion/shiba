@@ -440,6 +440,37 @@ wait_for_query "0" "
   SELECT count(*) FROM difference" \
   "the second Sink after switching generated composite types"
 
+# Sink negative mutation must delete duplicate result rows by multiplicity, not
+# by a source primary key. This also exercises NULL-safe matching: half of the
+# result rows share a NULL label and the other half share the same non-NULL
+# label. Raise the page budget so the delete reaches the batched ctid ranking
+# path with many negative actions in one mutation page.
+psql_gate -qc "
+  CREATE TABLE public.duplicate_source (
+    id bigint PRIMARY KEY,
+    amount integer NOT NULL,
+    label text
+  );
+  INSERT INTO public.duplicate_source
+  SELECT id, 42, CASE WHEN id <= 64 THEN 'duplicate' END
+  FROM generate_series(1, 128) AS id;
+  CREATE TABLE shiba.duplicate_result AS
+  SELECT amount, label
+  FROM public.duplicate_source"
+wait_for_query "128" "
+  SELECT count(*) FROM shiba.duplicate_result" \
+  "a duplicate-heavy Sink result to bootstrap"
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_rows = '256'"
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_bytes = '1048576'"
+psql_gate -qc "SELECT pg_reload_conf()"
+psql_gate -qc "DELETE FROM public.duplicate_source"
+wait_for_query "0" "
+  SELECT count(*) FROM shiba.duplicate_result" \
+  "duplicate-heavy and NULL-safe negative Sink mutation"
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_rows = '2'"
+psql_gate -qc "ALTER SYSTEM SET shiba.batch_bytes = '512'"
+psql_gate -qc "SELECT pg_reload_conf()"
+
 # An empty source still owns one bootstrap continuation at registration. One
 # scheduled Scan step consumes that authority without fabricating a data
 # chunk, then later live effects use the same source-stream path.

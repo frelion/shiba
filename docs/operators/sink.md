@@ -18,9 +18,9 @@ Sink 有一个 Operator input、没有 output stream。continuation 保存 input
 
 ## 4. Primitive 与复杂度
 
-effect_heads 按 stream_id、chunk_seq、row_ordinal keyset 读取 bounded rows。plan_weight_page 同时受 input/output row/byte budget 限制。mutate_result_page 把 page 转为 VALUES，正 weight 使用 generate_series 插入副本；负 weight 通过完整结果 row 的 IS NOT DISTINCT FROM 条件选择 ctid，再按 ctid 删除。
+effect_heads 按 stream_id、chunk_seq、row_ordinal keyset 读取 bounded rows。plan_weight_page 同时受 input/output row/byte budget 限制。mutate_result_page 把 page 转为 VALUES，正 weight 使用 generate_series 插入副本；负 weight 先按 NULL-safe row value 对结果表做一次 deterministic `ctid` 分组排序，再把每个负 action 映射到自己的 copy ordinal range，最后锁定并按 ctid 删除 victims。页内多条相同负 effect 因而共享一次结果扫描。
 
-设 effect page 行数为 P、实际变更副本数为 C、结果表行数为 R：正向成本约为 O(P + C)；负向删除在没有可用结果索引时最坏为 O(P*R)，并且每个负 action 有 OFFSET/ctid victim selection。结果表是否有用户索引不能作为 Shiba 的通用性能保证，因此删除路径是 Sink 的主要风险。
+设 effect page 行数为 P、实际变更副本数为 C、结果表行数为 R：正向成本约为 O(P + C)；负向删除在没有可用结果索引时为一次 O(R) 排名扫描加 O(C) victim range join，避免原先每个负 action 重复 O(R) 扫描和 OFFSET。结果表是否有用户索引不能作为 Shiba 的通用性能保证，因此结果表扫描仍是 Sink 的主要成本。
 
 后续可考虑维护 Shiba-owned 的结果 identity/multiset side table，或在注册时建立可证明覆盖 delete predicate 的索引；设计必须保留 NULL-safe equality 和 duplicate deletion 顺序。
 
@@ -32,8 +32,10 @@ effect_heads 按 stream_id、chunk_seq、row_ordinal keyset 读取 bounded rows�
 
 scripts/test-stateless-kernels.sh 和 src/execution/sink/tests.rs 覆盖正/负 weight、最小 bigint、宽 row、crash-before/after-commit、backpressure 和 schema binding。性能必须分别测全是 insert、全是 delete、duplicate-heavy delete 以及结果表有/无匹配索引的场景。
 
+在 PostgreSQL 17.10 的本机 100,000 条相同 key 结果行、256 条负 effect 的 duplicate-heavy fixture 中，旧的每 action `ORDER BY ctid OFFSET ... LIMIT` 路径为 2,130.296 ms、246,408 个 shared blocks；批量 ctid ranking/range join 为 1,515.810 ms、1,929 个 blocks，约 29% wall-time、99.2% block 降幅。`scripts/test-stateless-kernels.sh` 另有 128 条重复结果、NULL label、批量删除和最终归零的真实 PostgreSQL 门禁。
+
 ## 7. 已知限制
 
-- 负向 DML 依赖结果表按值寻找 victim，不能假设存在主键或唯一索引。
+- 负向 DML 依赖结果表按值寻找 victim，不能假设存在主键或唯一索引；批量排名只优化同一页内的重复扫描。
 - generate_series 的副本数受 budget 限制，但大量 multiplicity 仍需要多次提交。
 - 结果表上的用户索引会影响 DML 成本；benchmark 必须记录其 schema/index。

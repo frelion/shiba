@@ -23,7 +23,7 @@ TopN 根据 planner 解析的排序 key、OFFSET、LIMIT 和 WITH TIES 生成有
 
 ## 4. Primitive 与复杂度
 
-run_topn_admission 更新 input/order state 并记录 dirty causal LSN。run_topn_selection 按 order index 取 bounded page，计算 OFFSET/LIMIT/TIES 的可用 multiplicity，将结果聚合到 candidate。run_topn_diff 按 visible/candidate identity cursor 生成 payload 和 visible mutation；run_topn_cleanup 删除已消费 work。
+run_topn_admission 更新 input/order state 并记录 dirty causal LSN。run_topn_selection 按 order index 取 bounded page，计算 OFFSET/LIMIT/TIES 的可用 multiplicity，将结果聚合到 candidate；`has_more` 直接复用该页的最后一行，不再按 `entry_id` 对同一行做第二次状态点查。run_topn_diff 按 visible/candidate identity cursor 生成 payload 和 visible mutation；run_topn_cleanup 删除已消费 work。
 
 设 active input rows 为 N、候选/可见输出为 K、selection page 为 P：一次 dirty update 的 selection 最坏仍需扫描/排序遍历 N，总体约为 O(N + K)（排序表达式和 ties 会改变常数）；diff/cleanup 约为 O(K)。order index 和 keyset 避免了 selection/diff continuation 使用 OFFSET，但 generation 重建意味着每个 dirty update 不能只维护受影响的前 K 行。
 
@@ -34,6 +34,8 @@ input/candidate/visible/control state、payload、output append、diff cursor、
 ## 6. 测试与性能证据
 
 scripts/test-window-topn-kernels.sh 和 src/execution/topn/tests.rs 覆盖 NULL 排序、方向、large OFFSET/LIMIT、WITH TIES、零 LIMIT、多页 diff、cleanup、crash、backpressure 和链式 DAG。性能至少要测 N 很大但 K 很小、频繁更新同一排序边界、以及 ties 很宽的情况。
+
+在 PostgreSQL 17.10 的本机 1,000,000-row fixture、256-row bounded page 中，selection 的旧实现为终端行再次按 `entry_id` 回查 state，耗时 0.271 ms、读取 1,033 个 shared blocks；复用 bounded page 的终端行后为 0.120 ms、9 个 blocks，约 56% wall-time、99% block 降幅。该数字是 kernel SQL A/B，不替代端到端 DAG benchmark。
 
 ## 7. 已知限制
 

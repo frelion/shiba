@@ -282,7 +282,15 @@ fn sql_contract_checks_both_negative_prefixes_and_bounds_representative_lookup()
               RETURNING group_state_id,net_weight"
     ));
     assert!(reconcile.contains(
-        "WHERE groups.group_state_id=touched_page.group_state_id
+        "JOIN {state} AS groups USING(group_state_id)
+              ORDER BY groups.group_state_id
+              FOR UPDATE OF groups"
+    ));
+    assert!(!reconcile.contains(
+        "JOIN LATERAL (
+                SELECT groups.*
+                FROM {state} AS groups
+                WHERE groups.group_state_id=touched_page.group_state_id
                 LIMIT 1
                 FOR UPDATE"
     ));

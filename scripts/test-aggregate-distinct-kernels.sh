@@ -364,13 +364,6 @@ distinct_plan_state_index="$(psql_stateful -Atqc "
   WHERE index_catalog.indrelid='${distinct_plan_state}'::regclass
     AND index_catalog.indisunique
     AND index_catalog.indnullsnotdistinct")"
-distinct_plan_state_pk="$(psql_stateful -Atqc "
-  SELECT index_relation.relname
-  FROM pg_catalog.pg_constraint AS constraint_catalog
-  JOIN pg_catalog.pg_class AS index_relation
-    ON index_relation.oid=constraint_catalog.conindid
-  WHERE constraint_catalog.conrelid='${distinct_plan_state}'::regclass
-    AND constraint_catalog.contype='p'")"
 distinct_plan_bag_index="$(psql_stateful -Atqc "
   SELECT index_relation.relname
   FROM pg_catalog.pg_constraint AS constraint_catalog
@@ -559,17 +552,13 @@ distinct_bag_probe_values="$(psql_stateful -Atqc "
   ) AS selected")"
 distinct_state_probe_plan="$(psql_stateful -Atqc "
   EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON)
-  SELECT locked_group.group_state_id
+  SELECT groups.group_state_id
   FROM (
     VALUES ${distinct_state_probe_values}
   ) AS touched_page(group_state_id)
-  JOIN LATERAL (
-    SELECT groups.*
-    FROM ${distinct_plan_state} AS groups
-    WHERE groups.group_state_id=touched_page.group_state_id
-    LIMIT 1
-    FOR UPDATE
-  ) AS locked_group ON true")"
+  JOIN ${distinct_plan_state} AS groups USING(group_state_id)
+  ORDER BY groups.group_state_id
+  FOR UPDATE OF groups")"
 distinct_bag_probe_plan="$(psql_stateful -Atqc "
   EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON)
   SELECT locked_bag.bag_id
@@ -584,9 +573,8 @@ distinct_bag_probe_plan="$(psql_stateful -Atqc "
     LIMIT 1
     FOR UPDATE
   ) AS locked_bag ON true")"
-distinct_point_probe_gate="$(STATE_PLAN="${distinct_state_probe_plan}" \
+distinct_probe_gate="$(STATE_PLAN="${distinct_state_probe_plan}" \
   BAG_PLAN="${distinct_bag_probe_plan}" \
-  STATE_INDEX="${distinct_plan_state_pk}" \
   BAG_INDEX="${distinct_plan_bag_index}" \
   PROBE_ROWS="${distinct_probe_rows}" \
   python3 -c '
@@ -595,7 +583,30 @@ import os
 
 expected = int(os.environ["PROBE_ROWS"])
 
-def bounded_probe(raw, index_name, relation_prefix, condition_columns):
+def batched_probe(raw, relation_prefix):
+    root = json.loads(raw)[0]["Plan"]
+    nodes = []
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        stack.extend(node.get("Plans", []))
+    scans = [
+        node for node in nodes
+        if node.get("Relation Name", "").startswith(relation_prefix)
+        and node.get("Node Type") in (
+            "Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Heap Scan"
+        )
+    ]
+    blocks = root.get("Shared Hit Blocks", 0) + root.get("Shared Read Blocks", 0)
+    bounded = (
+        root.get("Actual Rows") == expected
+        and len(scans) == 1
+        and scans[0].get("Actual Loops") == 1
+    )
+    return bounded, blocks
+
+def point_probe(raw, index_name, relation_prefix, condition_columns):
     root = json.loads(raw)[0]["Plan"]
     nodes = []
     stack = [root]
@@ -626,13 +637,11 @@ def bounded_probe(raw, index_name, relation_prefix, condition_columns):
     )
     return bounded, blocks
 
-state_ok, state_blocks = bounded_probe(
+state_ok, state_blocks = batched_probe(
     os.environ["STATE_PLAN"],
-    os.environ["STATE_INDEX"],
     "distinct_groups_",
-    ("group_state_id",),
 )
-bag_ok, bag_blocks = bounded_probe(
+bag_ok, bag_blocks = point_probe(
     os.environ["BAG_PLAN"],
     os.environ["BAG_INDEX"],
     "distinct_bag_",
@@ -645,12 +654,12 @@ print(
 ')"
 IFS='|' read -r distinct_state_probe_ok distinct_state_probe_blocks \
   distinct_bag_probe_ok distinct_bag_probe_blocks \
-  <<<"${distinct_point_probe_gate}"
+  <<<"${distinct_probe_gate}"
 if test "${distinct_state_probe_ok}|${distinct_bag_probe_ok}" != "true|true"; then
-  fail "Distinct point probes were not physically bounded: ${distinct_point_probe_gate}; state=${distinct_state_probe_plan}; bag=${distinct_bag_probe_plan}"
+  fail "Distinct state lock was not batched or bag point probe was not bounded: ${distinct_probe_gate}; state=${distinct_state_probe_plan}; bag=${distinct_bag_probe_plan}"
 fi
-printf 'Distinct point probes: rows=%s state_index=%s state_blocks=%s bag_index=%s bag_blocks=%s\n' \
-  "${distinct_probe_rows}" "${distinct_plan_state_pk}" \
+printf 'Distinct probes: rows=%s batched_state_blocks=%s bag_index=%s bag_blocks=%s\n' \
+  "${distinct_probe_rows}" \
   "${distinct_state_probe_blocks}" "${distinct_plan_bag_index}" \
   "${distinct_bag_probe_blocks}"
 if test "${SHIBA_DISTINCT_PLAN_GATE_ONLY:-0}" = "1"; then

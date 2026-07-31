@@ -398,6 +398,22 @@ fn zero_limit_skips_candidate_selection() {
 }
 
 #[test]
+fn selection_reuses_the_bounded_terminal_row_for_has_more() {
+    let production = include_str!("runtime.rs");
+    let selection = production
+        .split_once("fn run_topn_selection(")
+        .expect("TopN must have a selection primitive")
+        .1
+        .split_once("fn run_topn_diff(")
+        .expect("TopN selection must end before diff")
+        .0;
+    assert!(selection.contains(
+        "SELECT page.*\n          FROM bounded AS page\n          ORDER BY page.page_ordinal DESC\n          LIMIT 1"
+    ));
+    assert!(!selection.contains("JOIN {state} AS input_row USING(entry_id)"));
+}
+
+#[test]
 fn selection_rejects_counter_and_tie_boundary_regressions() {
     let machine = TopNMachine::new(2, 3, true);
     let continuation = select_continuation(machine);

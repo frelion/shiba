@@ -8,11 +8,11 @@
 | --- | --- | --- | --- |
 | Scan / Filter / Project（Linear） | [linear.md](linear.md) | execution/linear | 线性热路径；固定 step/SQL 开销仍明显 |
 | Join | [join.md](join.md) | execution/join | 有界 fanout；当前候选探测最坏为全 arrangement 扫描 |
-| Distinct | [distinct.md](distinct.md) | execution/distinct | key index 正确；Apply/Drain 有额外重排和队列成本 |
-| Aggregate | [aggregate.md](aggregate.md) | execution/aggregate | 增量 admission；dirty group 按 aggregate 重建 |
-| Window | [window.md](window.md) | execution/window | 状态和 keyset 完整；大 partition 多阶段重建成本高 |
-| TopN | [topn.md](topn.md) | execution/topn | 排序索引可分页；每次 dirty update 仍重做排名选择 |
-| Sink | [sink.md](sink.md) | execution/sink | 正向插入简单；负向删除可能按结果表扫描 |
+| Distinct | [distinct.md](distinct.md) | execution/distinct | key/state 已批量锁定；代表行仍按 bag index 选择 |
+| Aggregate | [aggregate.md](aggregate.md) | execution/aggregate | representative 已按 dirty page 批量读取；dirty group 仍按 aggregate 重建 |
+| Window | [window.md](window.md) | execution/window | Fold 复用 interval payload；大 partition 仍多阶段重建 |
+| TopN | [topn.md](topn.md) | execution/topn | selection 已复用 bounded terminal row；每次 dirty update 仍重做排名选择 |
+| Sink | [sink.md](sink.md) | execution/sink | 负向 page 已批量 ctid ranking；无 identity index 时仍需扫描结果表 |
 
 ## 统一运行模型
 
@@ -26,4 +26,8 @@ shiba.batch_rows 和 shiba.batch_bytes 同时约束输入/输出 step；单个�
 
 ## 性能阅读顺序
 
-先看每页的“复杂度与访问路径”，再看 [OPERATOR_PERFORMANCE_AUDIT.md](../OPERATOR_PERFORMANCE_AUDIT.md)。当前 release smoke 的真实性能数据只用于建立测量路径，尚未形成同机 baseline。
+先看每页的“复杂度与访问路径”，再看 [OPERATOR_PERFORMANCE_AUDIT.md](../OPERATOR_PERFORMANCE_AUDIT.md)。各算子页中的 A/B 数字用于说明局部 SQL 访问路径变化；端到端 release smoke 仍需与同机 workload baseline 分开解读。
+
+## 新算子文档规范
+
+新增或改变算子算法时，代码与实现文档必须在同一个变更中落地。文档至少包含：语义与 NULL/重复/排序范围、plan contract、持久 relation 与索引、生命周期和 typed continuation、单步事务边界、每个 primitive 的复杂度与访问路径、crash/frontier/backpressure 恢复语义、Rust 与 PostgreSQL 测试、同机 baseline/A-B 性能证据，以及已知限制和后续计划。没有性能基线时只能写诊断观察，不能宣称收益。

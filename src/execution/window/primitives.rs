@@ -1464,7 +1464,7 @@ pub(super) fn window_fold_page(
           WHERE ordinal=$2
         ),
         interval_1 AS MATERIALIZED (
-          SELECT interval_row.ordinal,interval_row.entry_id,
+          SELECT interval_row.ordinal,interval_row.entry_id,current_input.row_value,
                  shiba_internal.effect_row_bytes(current_input.row_value)
                    AS row_bytes
           FROM frame
@@ -1481,7 +1481,7 @@ pub(super) fn window_fold_page(
             ON current_input.entry_id=interval_row.entry_id
         ),
         interval_2 AS MATERIALIZED (
-          SELECT interval_row.ordinal,interval_row.entry_id,
+          SELECT interval_row.ordinal,interval_row.entry_id,current_input.row_value,
                  shiba_internal.effect_row_bytes(current_input.row_value)
                    AS row_bytes
           FROM frame
@@ -1498,7 +1498,7 @@ pub(super) fn window_fold_page(
             ON current_input.entry_id=interval_row.entry_id
         ),
         interval_3 AS MATERIALIZED (
-          SELECT interval_row.ordinal,interval_row.entry_id,
+          SELECT interval_row.ordinal,interval_row.entry_id,current_input.row_value,
                  shiba_internal.effect_row_bytes(current_input.row_value)
                    AS row_bytes
           FROM frame
@@ -1549,8 +1549,9 @@ pub(super) fn window_fold_page(
                  selected.ordinal
           FROM fold
           JOIN selected ON selected.page_ordinal=fold.step+1
-          JOIN {input} AS current_input
-            ON current_input.entry_id=selected.entry_id
+          CROSS JOIN LATERAL (
+            SELECT (selected.row_value).*
+          ) AS current_input
         ),
         final_fold AS MATERIALIZED (
           SELECT * FROM fold ORDER BY step DESC LIMIT 1
