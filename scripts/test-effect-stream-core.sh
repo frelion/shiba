@@ -25,9 +25,7 @@ source "${project_root}/scripts/test-lib.sh"
 trap cleanup EXIT
 
 cd "${project_root}"
-cargo pgrx install \
-  --pg-config "${pg_config_path}" \
-  --features pg_test
+install_test_extension "${pg_config_path}"
 
 "${pg_bin_dir}/initdb" -D "${pg_data_dir}" \
   --no-locale --encoding=UTF8 >/dev/null

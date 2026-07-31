@@ -290,6 +290,104 @@ CREATE EVENT TRIGGER shiba_cleanup_dropped_dataflow
   ON sql_drop
   EXECUTE FUNCTION shiba_internal.cleanup_dropped_dataflow();
 
+CREATE FUNCTION shiba_internal.guard_source_trigger_drop()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, shiba_internal
+AS $$
+DECLARE
+    dropped record;
+    relation_oid oid;
+BEGIN
+    FOR dropped IN
+        SELECT *
+      FROM pg_event_trigger_dropped_objects()
+      WHERE object_type = 'trigger'
+        AND split_part(object_identity, ' on ', 1) IN (
+          'shiba_wakeup', 'shiba_no_truncate', 'shiba_result_guard'
+        )
+    LOOP
+      SELECT pg_catalog.to_regclass(
+        split_part(dropped.object_identity, ' on ', 2)
+      )::oid
+      INTO relation_oid;
+      IF EXISTS (
+        SELECT 1
+        FROM shiba_internal.dataflow_sources
+        WHERE source_oid = relation_oid
+      ) THEN
+        RAISE EXCEPTION
+          'cannot drop Shiba source protection trigger %; drop dependent Shiba tables first',
+          dropped.object_identity
+          USING ERRCODE = 'object_not_in_prerequisite_state';
+      END IF;
+      IF split_part(dropped.object_identity, ' on ', 1) =
+           'shiba_result_guard'
+         AND EXISTS (
+           SELECT 1
+           FROM shiba_internal.dataflows
+           WHERE result_oid = relation_oid
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM pg_event_trigger_dropped_objects() AS table_drop
+           WHERE table_drop.object_type = 'table'
+             AND table_drop.objid = relation_oid
+         ) THEN
+        RAISE EXCEPTION
+          'cannot drop Shiba result protection trigger %; drop the result table through Shiba lifecycle',
+          dropped.object_identity
+          USING ERRCODE = 'object_not_in_prerequisite_state';
+      END IF;
+    END LOOP;
+END;
+$$;
+
+CREATE EVENT TRIGGER shiba_guard_source_trigger_drop
+  ON sql_drop
+  EXECUTE FUNCTION shiba_internal.guard_source_trigger_drop();
+
+CREATE FUNCTION shiba_internal.guard_dataflow_trigger_alter()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, shiba_internal
+AS $$
+DECLARE
+    command record;
+    relation_oid oid;
+BEGIN
+    FOR command IN SELECT * FROM pg_event_trigger_ddl_commands()
+    LOOP
+      IF command.object_type <> 'trigger' THEN
+        CONTINUE;
+      END IF;
+      SELECT pg_catalog.to_regclass(
+        split_part(command.object_identity, ' on ', 2)
+      )::oid
+      INTO relation_oid;
+      IF EXISTS (
+        SELECT 1
+        FROM shiba_internal.dataflow_sources
+        WHERE source_oid = relation_oid
+      ) OR EXISTS (
+        SELECT 1
+        FROM shiba_internal.dataflows
+        WHERE result_oid = relation_oid
+      ) THEN
+        RAISE EXCEPTION
+          'cannot ALTER Shiba protection trigger on %; drop dependent Shiba tables first',
+          command.object_identity
+          USING ERRCODE = 'object_not_in_prerequisite_state';
+      END IF;
+    END LOOP;
+END;
+$$;
+
+CREATE EVENT TRIGGER shiba_guard_dataflow_trigger_alter
+  ON ddl_command_end
+  WHEN TAG IN ('ALTER TRIGGER')
+  EXECUTE FUNCTION shiba_internal.guard_dataflow_trigger_alter();
+
 CREATE FUNCTION shiba_internal.cleanup_dropped_managed_index()
 RETURNS event_trigger
 LANGUAGE plpgsql
@@ -331,6 +429,17 @@ BEGIN
          ) THEN
         RAISE EXCEPTION
           'cannot ALTER TABLE % while it is a Shiba source; drop dependent Shiba tables first',
+          command.object_identity
+          USING ERRCODE = 'object_not_in_prerequisite_state';
+      END IF;
+      IF command.object_type = 'table'
+         AND EXISTS (
+           SELECT 1
+           FROM shiba_internal.dataflows
+           WHERE result_oid = command.objid
+         ) THEN
+        RAISE EXCEPTION
+          'cannot ALTER Shiba result table %; drop the result table through Shiba lifecycle',
           command.object_identity
           USING ERRCODE = 'object_not_in_prerequisite_state';
       END IF;

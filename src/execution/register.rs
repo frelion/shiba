@@ -171,6 +171,11 @@ fn register(
         "registration LSN",
     )?;
 
+    // Transfer ownership before cataloging the result. The lifecycle event
+    // trigger intentionally rejects ALTER TABLE on a live Shiba result, so
+    // this one-time provisioning step must happen before the dataflow row is
+    // visible to that guard.
+    transfer_result_ownership(client, &result)?;
     insert_dataflow(client, result_oid, serialized_plan, &activation_lsn)?;
     insert_checkpoints(client, result_oid, plan.stages.len())?;
 
@@ -1531,6 +1536,13 @@ fn protect_result(
             &[],
         )
         .map_err(|error| format!("could not grant result SELECT: {error}"))?;
+    Ok(())
+}
+
+fn transfer_result_ownership(
+    client: &mut SpiClient<'_>,
+    result: &ResultIdentity,
+) -> Result<(), String> {
     let owner = required_scalar::<String>(
         client,
         "SELECT shiba_internal.extension_owner()::text",

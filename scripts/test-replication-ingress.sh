@@ -38,8 +38,7 @@ wait_for_runtime_and_walsender() {
 }
 
 cd "${project_root}"
-PG_CONFIG="${pg_config_path}" \
-  cargo pgrx install --pg-config "${pg_config_path}" --features pg_test
+install_test_extension "${pg_config_path}"
 
 "${pg_bin_dir}/initdb" -D "${pg_data_dir}" \
   --no-locale --encoding=UTF8 >/dev/null

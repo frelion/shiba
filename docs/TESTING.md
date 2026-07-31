@@ -15,16 +15,42 @@ replace an existing layer.
 
 The current order is:
 
-1. `scripts/test-clean-cut.sh`
-2. `cargo fmt --all -- --check`
-3. `cargo clippy --all-targets -- -D warnings`
-4. `cargo test --lib`
-5. `scripts/test-effect-stream-core.sh`
-6. `scripts/test-replication-ingress.sh`
-7. `scripts/test-stateless-kernels.sh`
-8. `scripts/test-fanout-recovery.sh`
-9. `scripts/test-aggregate-distinct-kernels.sh`
-10. `scripts/test-window-topn-kernels.sh`
+1. `scripts/test-gate-contract.sh`
+2. `scripts/test-clean-cut.sh`
+3. `scripts/test-contract-surface.sh`
+4. `cargo fmt --all -- --check`
+5. `cargo clippy --all-targets -- -D warnings`
+6. `cargo test --lib`
+7. one `cargo pgrx install --features pg_test` for all server-level gates
+8. `scripts/test-differential-oracle.sh`
+9. `scripts/test-effect-stream-core.sh`
+10. `scripts/test-replication-ingress.sh`
+11. `scripts/test-stateless-kernels.sh`
+12. `scripts/test-fanout-recovery.sh`
+13. `scripts/test-aggregate-distinct-kernels.sh`
+14. `scripts/test-window-topn-kernels.sh`
+
+The gate self-check is intentional: every `scripts/test-*.sh` scenario must be
+invoked exactly once by `test-all.sh`, and every PostgreSQL scenario must use
+strict failure propagation, bounded SQL/lock waits, and temporary-cluster
+cleanup. The six server scenarios reuse the one extension artifact prepared
+by `test-all.sh`; invoking a scenario directly still installs the artifact so
+focused development runs remain self-contained.
+
+### Independent differential oracle
+
+`test-differential-oracle.sh` is the most important user-visible correctness
+layer. Shiba maintains seven result tables, while PostgreSQL's ordinary
+executor re-evaluates the corresponding SQL against the live source tables. A
+deterministic pseudo-random sequence of INSERT/UPDATE/DELETE transactions
+compares all seven results after every commit with `EXCEPT ALL`, including
+duplicates, NULLs, nullable grouping/join keys, and projection-collision bag
+multiplicity. It also commits multi-statement transactions with SAVEPOINT
+rollback and exercises MERGE against a result table. The same scenario attacks
+active-source ALTER/TRUNCATE/DROP, source-trigger disable/drop/rename,
+result-guard disable/drop/rename, direct result writes, and managed-index
+create/drop. This catches a wrong incremental implementation even when a
+hand-written expected fixture would accidentally share the same assumption.
 
 Each server-level script creates its own temporary data directory and Unix
 socket. It never connects to the developer's normal database cluster. The

@@ -2,10 +2,15 @@
 CREATE FUNCTION shiba_internal.reject_result_write()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = pg_catalog, shiba_internal
 AS $$
 BEGIN
-    IF current_user <> shiba_internal.extension_owner() THEN
+    IF shiba.invoker_oid() <> (
+        SELECT extension.extowner
+        FROM pg_catalog.pg_extension AS extension
+        WHERE extension.extname = 'shiba'
+    ) THEN
         RAISE EXCEPTION 'cannot modify Shiba result table %.% directly',
           TG_TABLE_SCHEMA, TG_TABLE_NAME
           USING ERRCODE = 'read_only_sql_transaction';

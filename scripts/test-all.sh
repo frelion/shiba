@@ -13,6 +13,10 @@ run_gate() {
   "$@"
 }
 
+pg_config_path="${PG_CONFIG:-/opt/homebrew/opt/postgresql@17/bin/pg_config}"
+
+run_gate "Gate self-check" \
+  "${project_root}/scripts/test-gate-contract.sh"
 run_gate "Clean-cut architecture guard" \
   "${project_root}/scripts/test-clean-cut.sh"
 run_gate "Public and persistence contract guard" \
@@ -20,6 +24,13 @@ run_gate "Public and persistence contract guard" \
 run_gate "Rust formatting" cargo fmt --all -- --check
 run_gate "Rust lints" cargo clippy --all-targets -- -D warnings
 run_gate "Rust unit and pgrx integration tests" cargo test --lib
+run_gate "Prepare PostgreSQL extension once" \
+  cargo pgrx install \
+    --pg-config "${pg_config_path}" \
+    --features pg_test
+export SHIBA_SKIP_EXTENSION_INSTALL=1
+run_gate "Independent differential SQL oracle test" \
+  "${project_root}/scripts/test-differential-oracle.sh"
 run_gate "Continuous effect-stream core test" \
   "${project_root}/scripts/test-effect-stream-core.sh"
 run_gate "Durable logical-replication ingress test" \

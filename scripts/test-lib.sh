@@ -3,6 +3,20 @@
 # gate supplies its connection wrapper and timing knobs; its SQL scenario stays
 # in the gate itself.
 
+install_test_extension() {
+  local pg_config_path="$1"
+
+  # test-all.sh performs this once before the isolated server scenarios. A
+  # direct invocation still installs its own artifact, so focused development
+  # runs remain self-contained.
+  if test "${SHIBA_SKIP_EXTENSION_INSTALL:-0}" = "1"; then
+    return
+  fi
+  cargo pgrx install \
+    --pg-config "${pg_config_path}" \
+    --features pg_test
+}
+
 cleanup() {
   if test "${SHIBA_KEEP_TEST_CLUSTER:-0}" = "1"; then
     printf 'Retained test cluster: %s\n' "${pg_data_dir}" >&2
