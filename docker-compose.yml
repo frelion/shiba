@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      args:
+        PG_MAJOR: ${PG_MAJOR:-17}
     environment:
       POSTGRES_DB: shiba
       POSTGRES_PASSWORD: shiba

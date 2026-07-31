@@ -5,6 +5,17 @@
 
 install_test_extension() {
   local pg_config_path="$1"
+  local pg_major
+  local pg_feature
+
+  pg_major="$("${pg_config_path}" --version | sed -E 's/^PostgreSQL ([0-9]+).*/\1/')"
+  case "${pg_major}" in
+    17|18) pg_feature="pg${pg_major}" ;;
+    *)
+      printf 'unsupported PostgreSQL major version: %s\n' "${pg_major}" >&2
+      return 1
+      ;;
+  esac
 
   # test-all.sh performs this once before the isolated server scenarios. A
   # direct invocation still installs its own artifact, so focused development
@@ -14,7 +25,8 @@ install_test_extension() {
   fi
   cargo pgrx install \
     --pg-config "${pg_config_path}" \
-    --features pg_test
+    --no-default-features \
+    --features "${pg_feature} pg_test"
 }
 
 cleanup() {

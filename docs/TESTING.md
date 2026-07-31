@@ -1,7 +1,9 @@
 # Testing
 
-Shiba's execution tests use PostgreSQL 17. State layout, locking, WAL decoding,
-crash behavior, and generated SQL are not tested against an in-memory database.
+Shiba's execution tests use PostgreSQL 17 and 18. State layout, locking, WAL
+decoding, crash behavior, and generated SQL are not tested against an in-memory
+database. Set `PG_CONFIG` to select the server under test; the harness selects
+the matching `pg17` or `pg18` Cargo feature.
 
 ## Complete gate
 
@@ -21,7 +23,8 @@ The current order is:
 4. `cargo fmt --all -- --check`
 5. `cargo clippy --all-targets -- -D warnings`
 6. `cargo test --lib`
-7. one `cargo pgrx install --features pg_test` for all server-level gates
+7. one `cargo pgrx install` with the matching PostgreSQL feature for all
+   server-level gates
 8. `scripts/test-differential-oracle.sh`
 9. `scripts/test-effect-stream-core.sh`
 10. `scripts/test-replication-ingress.sh`
@@ -33,7 +36,7 @@ The current order is:
 The gate self-check is intentional: every `scripts/test-*.sh` scenario must be
 invoked exactly once by `test-all.sh`, and every PostgreSQL scenario must use
 strict failure propagation, bounded SQL/lock waits, and temporary-cluster
-cleanup. The six server scenarios reuse the one extension artifact prepared
+cleanup. The server scenarios reuse the one extension artifact prepared
 by `test-all.sh`; invoking a scenario directly still installs the artifact so
 focused development runs remain self-contained.
 
@@ -54,9 +57,9 @@ hand-written expected fixture would accidentally share the same assumption.
 
 Each server-level script creates its own temporary data directory and Unix
 socket. It never connects to the developer's normal database cluster. The
-extension artifacts are installed into the selected PostgreSQL 17
-installation, so do not run two `cargo pgrx install` jobs against the same
-installation concurrently.
+extension artifacts are installed into the selected PostgreSQL installation,
+so do not run two `cargo pgrx install` jobs against the same installation
+concurrently.
 
 ## What each layer proves
 

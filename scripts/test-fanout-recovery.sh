@@ -14,7 +14,7 @@ if ! grep -Fq 'FILTER (WHERE ({condition}) IS TRUE)' \
   exit 1
 fi
 
-pg_config_path="${PG_CONFIG:-/opt/homebrew/opt/postgresql@17/bin/pg_config}"
+pg_config_path="${PG_CONFIG:-$("${project_root}/scripts/resolve-pg-config.sh")}"
 pg_bin_dir="$("${pg_config_path}" --bindir)"
 pg_data_dir="$(mktemp -d /tmp/shiba-fanout-data.XXXXXX)"
 pg_socket_dir="$(mktemp -d /tmp/shiba-fanout-socket.XXXXXX)"

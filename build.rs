@@ -28,9 +28,25 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PG_CONFIG");
 
     let version = pg_config("--version");
+    let major = version
+        .strip_prefix("PostgreSQL ")
+        .and_then(|version| version.split('.').next())
+        .unwrap_or_default();
     assert!(
-        version.starts_with("PostgreSQL 17."),
-        "Shiba replication transport requires PostgreSQL 17, found {version}"
+        matches!(major, "17" | "18"),
+        "Shiba replication transport requires PostgreSQL 17 or 18, found {version}"
+    );
+
+    let configured_major = if env::var_os("CARGO_FEATURE_PG18").is_some() {
+        "18"
+    } else if env::var_os("CARGO_FEATURE_PG17").is_some() {
+        "17"
+    } else {
+        ""
+    };
+    assert_eq!(
+        major, configured_major,
+        "the selected pgrx feature ({configured_major:?}) does not match pg_config ({version})"
     );
 
     println!("cargo:rustc-link-search=native={}", pg_config("--libdir"));

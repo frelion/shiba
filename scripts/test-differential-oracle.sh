@@ -7,7 +7,7 @@ set -euo pipefail
 # random DML sequence makes this a compact differential test instead of one
 # more hand-picked fixture.
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-pg_config_path="${PG_CONFIG:-/opt/homebrew/opt/postgresql@17/bin/pg_config}"
+pg_config_path="${PG_CONFIG:-$("${project_root}/scripts/resolve-pg-config.sh")}"
 pg_bin_dir="$("${pg_config_path}" --bindir)"
 pg_data_dir="$(mktemp -d /tmp/shiba-differential-data.XXXXXX)"
 pg_socket_dir="$(mktemp -d /tmp/shiba-differential-socket.XXXXXX)"

@@ -8,19 +8,22 @@ on:
 permissions:
   contents: read
 
-env:
-  PG_CONFIG: /usr/lib/postgresql/17/bin/pg_config
-
 jobs:
   correctness:
-    name: PostgreSQL 17 correctness
+    name: PostgreSQL ${{ matrix.pg_major }} correctness
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_major: [17, 18]
+    env:
+      PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg_major }}/bin/pg_config
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      - name: Install PostgreSQL 17
+      - name: Install PostgreSQL ${{ matrix.pg_major }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -31,7 +34,10 @@ jobs:
           echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo \"$VERSION_CODENAME\")-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
-          sudo apt-get install -y postgresql-17 postgresql-client-17 postgresql-server-dev-17
+          sudo apt-get install -y \
+            postgresql-${{ matrix.pg_major }} \
+            postgresql-client-${{ matrix.pg_major }} \
+            postgresql-server-dev-${{ matrix.pg_major }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -46,8 +52,8 @@ jobs:
       - name: Install cargo-pgrx
         run: cargo install cargo-pgrx --version 0.19.1 --locked
 
-      - name: Initialize pgrx for PostgreSQL 17
-        run: cargo pgrx init --pg17 "$PG_CONFIG"
+      - name: Initialize pgrx for PostgreSQL ${{ matrix.pg_major }}
+        run: cargo pgrx init --pg${{ matrix.pg_major }} "$PG_CONFIG"
 
       - name: Allow pgrx test extension installation
         run: |

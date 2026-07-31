@@ -1,4 +1,4 @@
-#[cfg(feature = "pg17")]
+#[cfg(any(feature = "pg17", feature = "pg18"))]
 pub(super) mod execution {
     use pgrx::datum::DatumWithOid;
     use pgrx::prelude::*;

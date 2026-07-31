@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Repeatable, isolated PostgreSQL 17 performance benchmark for Shiba's one
+# Repeatable, isolated PostgreSQL 17/18 performance benchmark for Shiba's one
 # execution architecture.  This is deliberately not a correctness gate: its
 # results are machine-readable measurements which a caller can compare to a
 # checked-in or CI baseline.
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-pg_config_path="${PG_CONFIG:-/opt/homebrew/opt/postgresql@17/bin/pg_config}"
+pg_config_path="${PG_CONFIG:-$("${project_root}/scripts/resolve-pg-config.sh")}"
+pg_major="$("${pg_config_path}" --version | sed -E 's/^PostgreSQL ([0-9]+).*/\1/')"
+case "${pg_major}" in
+  17|18) pg_feature="pg${pg_major}" ;;
+  *)
+    printf 'unsupported PostgreSQL major version: %s\n' "${pg_major}" >&2
+    exit 1
+    ;;
+esac
 profile="smoke"
 json_out=""
 csv_out=""
@@ -216,7 +224,11 @@ cd "${project_root}"
 # A benchmark must load the optimized extension.  `pg_test` selects the
 # development/test build used by correctness scripts and would make every
 # result a measurement of debug assertions instead of Runtime throughput.
-cargo pgrx install --release --pg-config "${pg_config_path}"
+cargo pgrx install \
+  --release \
+  --pg-config "${pg_config_path}" \
+  --no-default-features \
+  --features "${pg_feature}"
 
 "${pg_bin_dir}/initdb" -D "${pg_data_dir}" --no-locale --encoding=UTF8 >/dev/null
 {

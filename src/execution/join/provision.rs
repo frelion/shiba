@@ -1,11 +1,11 @@
-#[cfg(feature = "pg17")]
+#[cfg(any(feature = "pg17", feature = "pg18"))]
 use crate::execution::register::column_sql;
-#[cfg(feature = "pg17")]
+#[cfg(any(feature = "pg17", feature = "pg18"))]
 use crate::planner::model::{JoinSpec, SlotType};
-#[cfg(feature = "pg17")]
+#[cfg(any(feature = "pg17", feature = "pg18"))]
 use crate::postgres::quote_identifier;
 
-#[cfg(feature = "pg17")]
+#[cfg(any(feature = "pg17", feature = "pg18"))]
 pub(crate) fn provision(
     client: &mut pgrx::spi::SpiClient<'_>,
     result_oid: pgrx::pg_sys::Oid,
@@ -249,7 +249,7 @@ pub(crate) fn provision(
     catalog_continuation(client, result_oid, stage_id, continuation_oid)
 }
 
-#[cfg(feature = "pg17")]
+#[cfg(any(feature = "pg17", feature = "pg18"))]
 fn join_key_types(
     stage: &crate::planner::model::DataflowStage,
     spec: &JoinSpec,
@@ -286,7 +286,7 @@ fn join_key_types(
         .collect()
 }
 
-#[cfg(feature = "pg17")]
+#[cfg(any(feature = "pg17", feature = "pg18"))]
 fn create_join_state(
     client: &mut pgrx::spi::SpiClient<'_>,
     stage_id: i32,
@@ -344,7 +344,7 @@ fn create_join_state(
     protect_join_relation(client, stage_id, side, relation)
 }
 
-#[cfg(feature = "pg17")]
+#[cfg(any(feature = "pg17", feature = "pg18"))]
 fn protect_join_relation(
     client: &mut pgrx::spi::SpiClient<'_>,
     stage_id: i32,

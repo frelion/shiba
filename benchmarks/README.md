@@ -1,6 +1,6 @@
 # Shiba performance benchmarks
 
-`../scripts/performance-benchmark.sh` starts a fresh PostgreSQL 17 cluster,
+`../scripts/performance-benchmark.sh` starts a fresh PostgreSQL 17 or 18 cluster,
 installs the current extension once, and measures four live-WAL workloads:
 
 1. a large committed source transaction flowing through `Scan -> Sink`;

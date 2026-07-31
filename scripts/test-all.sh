@@ -13,7 +13,15 @@ run_gate() {
   "$@"
 }
 
-pg_config_path="${PG_CONFIG:-/opt/homebrew/opt/postgresql@17/bin/pg_config}"
+pg_config_path="${PG_CONFIG:-$("${project_root}/scripts/resolve-pg-config.sh")}"
+pg_major="$("${pg_config_path}" --version | sed -E 's/^PostgreSQL ([0-9]+).*/\1/')"
+case "${pg_major}" in
+  17|18) pg_feature="pg${pg_major}" ;;
+  *)
+    printf 'unsupported PostgreSQL major version: %s\n' "${pg_major}" >&2
+    exit 1
+    ;;
+esac
 
 run_gate "Gate self-check" \
   "${project_root}/scripts/test-gate-contract.sh"
@@ -22,12 +30,13 @@ run_gate "Clean-cut architecture guard" \
 run_gate "Public and persistence contract guard" \
   "${project_root}/scripts/test-contract-surface.sh"
 run_gate "Rust formatting" cargo fmt --all -- --check
-run_gate "Rust lints" cargo clippy --all-targets -- -D warnings
-run_gate "Rust unit and pgrx integration tests" cargo test --lib
+run_gate "Rust lints" cargo clippy --all-targets --no-default-features --features "${pg_feature}" -- -D warnings
+run_gate "Rust unit and pgrx integration tests" cargo test --lib --no-default-features --features "${pg_feature}"
 run_gate "Prepare PostgreSQL extension once" \
   cargo pgrx install \
     --pg-config "${pg_config_path}" \
-    --features pg_test
+    --no-default-features \
+    --features "${pg_feature} pg_test"
 export SHIBA_SKIP_EXTENSION_INSTALL=1
 run_gate "Independent differential SQL oracle test" \
   "${project_root}/scripts/test-differential-oracle.sh"

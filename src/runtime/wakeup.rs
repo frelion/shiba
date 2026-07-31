@@ -37,9 +37,12 @@ pub(crate) unsafe extern "C-unwind" fn runtime_wakeup_xact_callback(
 
 #[cfg(not(test))]
 unsafe fn wake_backend_latch(owner_pid: i32) {
-    const PROC_ARRAY_LWLOCK_INDEX_PG17: usize = 4;
+    // ProcArrayLock has remained at index 4 in PostgreSQL 17 and 18's
+    // generated lwlocknames.h. Keep the version-specific dependency explicit
+    // because MainLWLockArray is an internal PostgreSQL ABI.
+    const PROC_ARRAY_LWLOCK_INDEX: usize = 4;
     let proc_array_lock =
-        std::ptr::addr_of_mut!((*pg_sys::MainLWLockArray.add(PROC_ARRAY_LWLOCK_INDEX_PG17)).lock);
+        std::ptr::addr_of_mut!((*pg_sys::MainLWLockArray.add(PROC_ARRAY_LWLOCK_INDEX)).lock);
     pg_sys::LWLockAcquire(proc_array_lock, pg_sys::LWLockMode::LW_SHARED);
     let process = pg_sys::BackendPidGetProcWithLock(owner_pid);
     if !process.is_null() {

@@ -1,4 +1,4 @@
-//! Synchronous libpq transport for PostgreSQL 17 logical replication.
+//! Synchronous libpq transport for PostgreSQL 17/18 logical replication.
 //!
 //! Connection setup and `START_REPLICATION` are synchronous. Once streaming
 //! starts, CopyData reads and standby-status writes are non-blocking. This

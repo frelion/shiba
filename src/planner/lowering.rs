@@ -295,10 +295,15 @@ struct ScalarScope<'a> {
 
 struct ScalarContext<'a> {
     scopes: Vec<ScalarScope<'a>>,
+    grouping: Option<(i32, &'a [*mut pg_sys::Node])>,
 }
 
 impl ScalarContext<'_> {
-    unsafe fn input(&self, variable: *mut pg_sys::Var) -> Result<ScalarExpr, LoweringError> {
+    unsafe fn input(
+        &self,
+        variable: *mut pg_sys::Var,
+        capability: &'static str,
+    ) -> Result<ScalarExpr, LoweringError> {
         let level = (*variable).varlevelsup as usize;
         let Some(scope) = self.scopes.get(level) else {
             return Err(LoweringError::unsupported(
@@ -307,6 +312,30 @@ impl ScalarContext<'_> {
                 format!("varlevelsup {level} has no lowering scope"),
             ));
         };
+        if level == 0 {
+            if let Some((group_rte, group_expressions)) = self.grouping {
+                if (*variable).varno == group_rte {
+                    if (*variable).varattno <= 0 {
+                        return Err(LoweringError::invalid(
+                            capability,
+                            "PostgreSQL supplied an invalid RTE_GROUP attribute number",
+                        ));
+                    }
+                    let index = (*variable).varattno as usize - 1;
+                    let Some(expression) = group_expressions.get(index).copied() else {
+                        return Err(LoweringError::unsupported(
+                            capability,
+                            variable.cast(),
+                            format!(
+                                "RTE_GROUP attribute {} has no grouping expression",
+                                (*variable).varattno
+                            ),
+                        ));
+                    };
+                    return scalar(expression, self, capability);
+                }
+            }
+        }
         let key = VarKey {
             rte: (*variable).varno,
             attnum: (*variable).varattno,
@@ -414,7 +443,7 @@ unsafe fn scalar(
         }
     }
     match (*node).type_ {
-        pg_sys::NodeTag::T_Var => context.input(node.cast()),
+        pg_sys::NodeTag::T_Var => context.input(node.cast(), capability),
         pg_sys::NodeTag::T_Const => {
             let constant = node.cast::<pg_sys::Const>();
             let type_ = slot_type(node);
@@ -770,6 +799,24 @@ unsafe fn range_table_entry(
     Ok(entry)
 }
 
+#[cfg(feature = "pg18")]
+unsafe fn aggregate_grouping_expressions(
+    query: *mut pg_sys::Query,
+) -> Option<(i32, Vec<*mut pg_sys::Node>)> {
+    for (index, item) in list_items((*query).rtable).enumerate() {
+        let entry = item.cast::<pg_sys::RangeTblEntry>();
+        if (*entry).rtekind != pg_sys::RTEKind::RTE_GROUP {
+            continue;
+        }
+        let rtindex = i32::try_from(index + 1).ok()?;
+        let expressions = list_items((*entry).groupexprs)
+            .map(|item| item.cast::<pg_sys::Node>())
+            .collect();
+        return Some((rtindex, expressions));
+    }
+    None
+}
+
 unsafe fn alias_column_names(entry: *mut pg_sys::RangeTblEntry) -> Vec<Option<String>> {
     if (*entry).eref.is_null() {
         return Vec::new();
@@ -1108,6 +1155,7 @@ unsafe fn build_join(
             relation: &combined,
             bindings: &bindings,
         }],
+        grouping: None,
     };
     let condition = if qualification.is_null() {
         true_constant()
@@ -1278,6 +1326,7 @@ unsafe fn lower_join_aliases(
             relation: &joined,
             bindings: &bound.columns,
         }],
+        grouping: None,
     };
     let computed_count = aliases
         .iter()
@@ -1406,6 +1455,7 @@ unsafe fn lower_filter(
             relation: &source,
             bindings: &bound.columns,
         }],
+        grouping: None,
     };
     let predicate = scalar(predicate, &context, capability)?;
     let (outputs, expressions) = builder.passthrough_outputs(&source, &bound.columns, 0);
@@ -1537,6 +1587,7 @@ unsafe fn build_semi_join(
                         bindings: &outer_bound.columns,
                     },
                 ],
+                grouping: None,
             };
             let mut lowered = expressions
                 .into_iter()
@@ -1563,6 +1614,7 @@ unsafe fn build_semi_join(
                     relation: &outer,
                     bindings: &outer_bound.columns,
                 }],
+                grouping: None,
             };
             let left = scalar(expression, &outer_context, "subquery.in")?;
             let Some(right_binding) = inner_bound.columns.first().copied() else {
@@ -2061,11 +2113,18 @@ unsafe fn lower_aggregate(
     }
     let stage_id = builder.next_stage_id();
     let bound = builder.bind_input(&source, 0);
+    #[cfg(feature = "pg18")]
+    let aggregate_grouping = aggregate_grouping_expressions(query);
+    #[cfg(not(feature = "pg18"))]
+    let aggregate_grouping: Option<(i32, Vec<*mut pg_sys::Node>)> = None;
     let context = ScalarContext {
         scopes: vec![ScalarScope {
             relation: &source,
             bindings: &bound.columns,
         }],
+        grouping: aggregate_grouping
+            .as_ref()
+            .map(|(group_rte, expressions)| (*group_rte, expressions.as_slice())),
     };
     let mut groups = Vec::new();
     let mut group_outputs = Vec::new();
@@ -2219,6 +2278,7 @@ unsafe fn lower_windows(
                 relation: &source,
                 bindings: &bound.columns,
             }],
+            grouping: None,
         };
         let partition_by = sort_group_expressions(
             (*clause).partitionClause,
@@ -2353,6 +2413,7 @@ unsafe fn lower_project(
             relation: &source,
             bindings: &bound.columns,
         }],
+        grouping: None,
     };
     let mut columns = Vec::with_capacity(targets.len());
     let mut expressions = Vec::with_capacity(targets.len());

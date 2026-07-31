@@ -41,6 +41,16 @@ pub unsafe fn install_runtime_wakeup_callback() {
     wakeup::install_runtime_wakeup_callback();
 }
 
+#[cfg(feature = "pg17")]
+unsafe fn install_runtime_term_handler() {
+    pg_sys::pqsignal(pg_sys::SIGTERM as i32, Some(wakeup::runtime_sigterm));
+}
+
+#[cfg(feature = "pg18")]
+unsafe fn install_runtime_term_handler() {
+    pg_sys::pqsignal_be(pg_sys::SIGTERM as i32, Some(wakeup::runtime_sigterm));
+}
+
 #[cfg_attr(not(test), unsafe(no_mangle))]
 #[cfg_attr(not(test), pg_guard)]
 #[cfg_attr(test, allow(dead_code))]
@@ -52,7 +62,7 @@ pub extern "C-unwind" fn shiba_runtime_main(_arg: pg_sys::Datum) {
     // ProcDiePending. `die` marks the current transaction for safe abort at
     // PostgreSQL's next interrupt check.
     unsafe {
-        pg_sys::pqsignal(pg_sys::SIGTERM as i32, Some(wakeup::runtime_sigterm));
+        install_runtime_term_handler();
     }
     let extra = BackgroundWorker::get_extra().to_owned();
     let (database_and_xid, launch_generation) = extra

@@ -4,7 +4,7 @@
 [![Latest release](https://img.shields.io/github/v/release/frelion/shiba)](https://github.com/frelion/shiba/releases)
 [![License: PostgreSQL](https://img.shields.io/badge/license-PostgreSQL-blue.svg)](LICENSE)
 
-Shiba is a PostgreSQL 17 extension for continuously maintained SQL result
+Shiba is a PostgreSQL 17/18 extension for continuously maintained SQL result
 tables. It stages streamed WAL in bounded batches, publishes only committed
 source transactions into a stateful dataflow, and applies the final effects to
 an ordinary PostgreSQL table.
@@ -76,7 +76,7 @@ TopN DAG with its streams, state, recovery, and backpressure.
 
 ### Fast install on Linux x86_64
 
-For a Debian/Ubuntu PostgreSQL 17 installation, download the installer from
+For a Debian/Ubuntu PostgreSQL 17 or 18 installation, download the installer from
 the repository and pin the release you want to install:
 
 ```bash
@@ -99,6 +99,12 @@ To try Shiba in an isolated PostgreSQL 17 container:
 docker compose up --build
 ```
 
+Set `PG_MAJOR=18` to build the same setup for PostgreSQL 18:
+
+```bash
+PG_MAJOR=18 docker compose up --build
+```
+
 The Compose setup configures logical replication and activates Shiba in the
 `shiba` database. It is intended for local development and evaluation, not as
 a production deployment.
@@ -107,7 +113,7 @@ a production deployment.
 
 Requirements:
 
-- PostgreSQL 17 and its development headers;
+- PostgreSQL 17 or 18 and its development headers;
 - a Rust toolchain;
 - `cargo-pgrx 0.19.1`.
 
@@ -116,7 +122,14 @@ Install from a checkout:
 ```bash
 cargo install cargo-pgrx --version 0.19.1
 cargo pgrx init --pg17 /path/to/pg_config
-cargo pgrx install --pg-config /path/to/pg_config
+cargo pgrx install --pg-config /path/to/pg_config --no-default-features --features pg17
+```
+
+For PostgreSQL 18, use `--pg18` and `--features pg18` instead:
+
+```bash
+cargo pgrx init --pg18 /path/to/pg_config
+cargo pgrx install --pg-config /path/to/pg_config --no-default-features --features pg18
 ```
 
 Configure PostgreSQL and restart it:

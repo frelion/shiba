@@ -10,7 +10,7 @@ pg_config=""
 
 usage() {
   cat <<'EOF'
-Install the pre-built Shiba PostgreSQL 17 extension from GitHub Releases.
+Install the pre-built Shiba PostgreSQL 17 or 18 extension from GitHub Releases.
 
 Usage:
   ./install.sh [--version VERSION] [--pg-config PATH]
@@ -18,12 +18,12 @@ Usage:
 Options:
   --version VERSION    Release tag to install, for example v0.1.0.
                        Defaults to the latest GitHub Release.
-  --pg-config PATH     PostgreSQL 17 pg_config to install against.
+  --pg-config PATH     PostgreSQL 17 or 18 pg_config to install against.
   --help               Show this help.
 
 This installer currently supports Linux x86_64 with the Debian/Ubuntu
-PostgreSQL 17 directory layout. It installs the extension files only; it does
-not change postgresql.conf or restart PostgreSQL.
+PostgreSQL 17/18 Debian/Ubuntu directory layout. It installs the extension
+files only; it does not change postgresql.conf or restart PostgreSQL.
 EOF
 }
 
@@ -78,16 +78,26 @@ done
 if [[ -z "$pg_config" ]]; then
   if command_exists pg_config; then
     pg_config="$(command -v pg_config)"
+  elif [[ -x /usr/lib/postgresql/18/bin/pg_config ]]; then
+    pg_config=/usr/lib/postgresql/18/bin/pg_config
   elif [[ -x /usr/lib/postgresql/17/bin/pg_config ]]; then
     pg_config=/usr/lib/postgresql/17/bin/pg_config
   else
-    die 'PostgreSQL 17 pg_config was not found; pass --pg-config /path/to/pg_config'
+    die 'PostgreSQL 17 or 18 pg_config was not found; pass --pg-config /path/to/pg_config'
   fi
 fi
 
 [[ -x "$pg_config" ]] || die "pg_config is not executable: $pg_config"
-pg_version="$($pg_config --version)"
-[[ "$pg_version" == PostgreSQL\ 17.* ]] || die "Shiba requires PostgreSQL 17, found: $pg_version"
+pg_version="$("$pg_config" --version)"
+pg_major="${pg_version#PostgreSQL }"
+pg_major="${pg_major%%.*}"
+case "$pg_major" in
+  17|18)
+    ;;
+  *)
+    die "Shiba requires PostgreSQL 17 or 18, found: $pg_version"
+    ;;
+esac
 
 case "$version" in
   latest)
@@ -107,7 +117,7 @@ case "$version" in
     ;;
 esac
 
-asset="shiba-${version}-postgresql17.tar.gz"
+asset="shiba-${version}-postgresql${pg_major}.tar.gz"
 checksum="${asset}.sha256"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/shiba-install.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -126,13 +136,13 @@ download "https://github.com/${REPOSITORY}/releases/download/${version}/${checks
   fi
 )
 
-pkglibdir="$($pg_config --pkglibdir)"
-sharedir="$($pg_config --sharedir)"
+pkglibdir="$("$pg_config" --pkglibdir)"
+sharedir="$("$pg_config" --sharedir)"
 case "$pkglibdir:$sharedir" in
-  /usr/lib/postgresql/17/lib:/usr/share/postgresql/17)
+  "/usr/lib/postgresql/${pg_major}/lib:/usr/share/postgresql/${pg_major}")
     ;;
   *)
-    die "the pre-built package uses Debian/Ubuntu PostgreSQL 17 paths, but pg_config reports pkglibdir=$pkglibdir sharedir=$sharedir"
+    die "the pre-built package uses Debian/Ubuntu PostgreSQL ${pg_major} paths, but pg_config reports pkglibdir=$pkglibdir sharedir=$sharedir"
     ;;
 esac
 

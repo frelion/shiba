@@ -8,19 +8,22 @@ on:
 permissions:
   contents: write
 
-env:
-  PG_CONFIG: /usr/lib/postgresql/17/bin/pg_config
-
 jobs:
   package:
-    name: Package PostgreSQL 17 extension
+    name: Package PostgreSQL ${{ matrix.pg_major }} extension
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_major: [17, 18]
+    env:
+      PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg_major }}/bin/pg_config
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      - name: Install PostgreSQL 17 development files
+      - name: Install PostgreSQL ${{ matrix.pg_major }} development files
         shell: bash
         run: |
           set -euxo pipefail
@@ -31,7 +34,9 @@ jobs:
           echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo \"$VERSION_CODENAME\")-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
-          sudo apt-get install -y postgresql-17 postgresql-server-dev-17
+          sudo apt-get install -y \
+            postgresql-${{ matrix.pg_major }} \
+            postgresql-server-dev-${{ matrix.pg_major }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -40,16 +45,21 @@ jobs:
         run: cargo install cargo-pgrx --version 0.19.1 --locked
 
       - name: Initialize pgrx
-        run: cargo pgrx init --pg17 "$PG_CONFIG"
+        run: cargo pgrx init --pg${{ matrix.pg_major }} "$PG_CONFIG"
 
       - name: Build package
-        run: cargo pgrx package --pg-config "$PG_CONFIG" --out-dir target/package
+        run: >-
+          cargo pgrx package
+          --pg-config "$PG_CONFIG"
+          --out-dir target/package
+          --no-default-features
+          --features pg${{ matrix.pg_major }}
 
       - name: Create release archive
         shell: bash
         run: |
           set -euxo pipefail
-          archive="shiba-${GITHUB_REF_NAME}-postgresql17.tar.gz"
+          archive="shiba-${GITHUB_REF_NAME}-postgresql${{ matrix.pg_major }}.tar.gz"
           tar -C target/package -czf "$archive" .
           sha256sum "$archive" > "${archive}.sha256"
 
@@ -58,6 +68,6 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            shiba-${{ github.ref_name }}-postgresql17.tar.gz
-            shiba-${{ github.ref_name }}-postgresql17.tar.gz.sha256
+            shiba-${{ github.ref_name }}-postgresql${{ matrix.pg_major }}.tar.gz
+            shiba-${{ github.ref_name }}-postgresql${{ matrix.pg_major }}.tar.gz.sha256
             install.sh

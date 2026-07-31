@@ -1,11 +1,14 @@
 # Contributing to Shiba
 
-Shiba targets PostgreSQL 17 and uses `cargo-pgrx 0.19.1`.
+Shiba targets PostgreSQL 17 and 18 and uses `cargo-pgrx 0.19.1`.
 
 ```bash
 cargo install cargo-pgrx --version 0.19.1
 cargo pgrx init --pg17 /path/to/pg_config
 ```
+
+For PostgreSQL 18, use `cargo pgrx init --pg18` and select the matching
+`pg18` Cargo feature for builds and tests.
 
 ## Design rules
 

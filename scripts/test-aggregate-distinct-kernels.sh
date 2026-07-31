@@ -5,7 +5,7 @@ set -euo pipefail
 # Correctness is always compared with a fresh PostgreSQL recomputation.
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-pg_config_path="${PG_CONFIG:-/opt/homebrew/opt/postgresql@17/bin/pg_config}"
+pg_config_path="${PG_CONFIG:-$("${project_root}/scripts/resolve-pg-config.sh")}"
 pg_bin_dir="$("${pg_config_path}" --bindir)"
 pg_data_dir="$(mktemp -d /tmp/shiba-aggregate-data.XXXXXX)"
 pg_socket_dir="$(mktemp -d /tmp/shiba-aggregate-socket.XXXXXX)"
@@ -14,6 +14,9 @@ pg_port="${SHIBA_AGGREGATE_TEST_PORT:-$((61000 + $$ % 2000))}"
 database_name="shiba_aggregate"
 wait_attempts="${SHIBA_AGGREGATE_WAIT_ATTEMPTS:-1200}"
 aggregate_rows="${SHIBA_AGGREGATE_TEST_ROWS:-80}"
+# PostgreSQL 18 reports one additional shared hit block for the same
+# conflict-arbiter path that is bounded at 64 blocks on PostgreSQL 17.
+distinct_conflict_block_budget=65
 
 psql_stateful() {
   PGOPTIONS="-c statement_timeout=60000 -c lock_timeout=10000" \
@@ -418,12 +421,14 @@ distinct_null_plan="$(psql_stateful -Atqc "
   ROLLBACK")"
 distinct_mapping_gate="$(EXACT_PLAN="${distinct_exact_plan}" \
   NULL_PLAN="${distinct_null_plan}" \
+  DISTINCT_CONFLICT_BLOCK_BUDGET="${distinct_conflict_block_budget}" \
   DISTINCT_STATE_INDEX="${distinct_plan_state_index}" \
   python3 -c '
 import json
 import os
 
 index_name = os.environ["DISTINCT_STATE_INDEX"]
+block_budget = int(os.environ["DISTINCT_CONFLICT_BLOCK_BUDGET"])
 
 def bounded_mapping(raw):
     root = json.loads(raw)[0]["Plan"]
@@ -448,7 +453,7 @@ def bounded_mapping(raw):
         and root.get("Tuples Inserted") == 0
         and root.get("Conflicting Tuples") == 1
         and not scans
-        and blocks <= 64
+        and blocks <= block_budget
     )
     return bounded, blocks
 

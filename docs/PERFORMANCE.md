@@ -73,7 +73,7 @@ and complex-DAG workloads in a single invocation.
 
 A JSON manifest is the normal interface. The repository's
 [`benchmarks/matrix.json`](../benchmarks/matrix.json) invokes the maintained
-PostgreSQL 17 harness. Commands may use `{profile}` and `{json_out}`
+PostgreSQL 17/18 harness. Commands may use `{profile}` and `{json_out}`
 placeholders. If they do not, the matrix appends the two contract arguments
 itself.
 
@@ -81,7 +81,7 @@ itself.
 {
   "cases": [
     {
-      "name": "postgresql17",
+      "name": "postgresql",
       "command": "./scripts/performance-benchmark.sh"
     }
   ]
@@ -98,7 +98,7 @@ For an exploratory one-case run, no manifest is needed:
 
 ```bash
 ./scripts/performance-matrix.py run \
-  --case postgresql17='./scripts/performance-benchmark.sh' \
+  --case postgresql='./scripts/performance-benchmark.sh' \
   --profile smoke --output artifacts/ingress.json
 ```
 

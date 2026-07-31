@@ -14,7 +14,7 @@ use crate::planner::WorkBudget;
 use planner::*;
 
 pub(crate) use provision::provision;
-#[cfg(feature = "pg17")]
+#[cfg(any(feature = "pg17", feature = "pg18"))]
 pub(crate) use runtime::execution::step;
 
 pub(crate) const KERNEL: crate::execution::KernelFn = crate::execution::KernelFn::new(
