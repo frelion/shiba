@@ -404,7 +404,7 @@ Read the installation order in [`src/lib.rs`](../src/lib.rs):
 | `sql/10_runtime.sql` | Runtime locks, triggers, and source validation primitives |
 | `sql/11_ingress.sql` | ingress header and finalization primitives |
 | `sql/12_effect_stream.sql` | shared stream append/cursor/GC primitives |
-| `sql/25_introspection.sql` | dataflow inspection |
+| `sql/25_introspection.sql` | dataflow inspection and Runtime observability |
 | `sql/30_registration.sql` | SQL-visible registration boundary and grants |
 | `sql/40_lifecycle.sql` | progress, index, and generated-storage drop primitives |
 

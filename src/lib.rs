@@ -158,6 +158,22 @@ mod tests {
     }
 
     #[pg_test]
+    fn observability_surfaces_are_queryable() {
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM shiba.runtime_status()")
+                .expect("Runtime status should be queryable"),
+            Some(1)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM shiba.runtime_metrics()")
+                .expect("Runtime metrics should be queryable"),
+            Some(14)
+        );
+        Spi::run("SELECT count(*) FROM shiba.dataflow_status()")
+            .expect("dataflow status should be queryable");
+    }
+
+    #[pg_test]
     fn deactivation_retires_generation_and_runtime_state() {
         install_test_ingress_generation();
         Spi::run("UPDATE shiba_internal.runtime_state SET active=true WHERE singleton")

@@ -109,6 +109,27 @@ The Compose setup configures logical replication and activates Shiba in the
 `shiba` database. It is intended for local development and evaluation, not as
 a production deployment.
 
+### Custom observability dashboard
+
+The standalone React dashboard lives in [`dashboard/`](dashboard/). It renders
+the current Shiba pipeline, each MV's DAG, stage state, backlog, and alerts.
+Run the read-only observation API and the frontend locally with:
+
+```bash
+cd dashboard
+bun install
+cp .env.example .env
+bun run api:dev
+# in another terminal
+bun run dev
+```
+
+The UI reads `GET /api/observability/snapshot`; the bundled API reads Shiba's
+read-only SQL observability functions and exposes a normalized snapshot. If the
+API is unavailable in development, the UI clearly labels its built-in topology
+as `DEMO FEED`. See [`dashboard/README.md`](dashboard/README.md) for the
+database configuration and contract.
+
 ### Install from source
 
 Requirements:
@@ -176,7 +197,18 @@ Inspect progress and execution state:
 ```sql
 SELECT * FROM shiba.progress('shiba.order_stats');
 SELECT shiba.explain_dataflow('shiba.order_stats');
+SELECT * FROM shiba.runtime_status();
+SELECT * FROM shiba.dataflow_status();
+SELECT * FROM shiba.runtime_metrics();
 ```
+
+`runtime_status()` reports worker health, logical-slot WAL retention, durable
+ingress frontiers, staged work, stream buffers, and backpressure.
+`dataflow_status()` reports per-result ready stages, pending input chunks,
+operator output buffers, and the slowest Sink frontier. These snapshots are
+derived from durable PostgreSQL state, so they remain useful during Runtime
+restart or recovery. `runtime_metrics()` exposes the database-wide numeric
+subset for lightweight polling or a SQL-based metrics exporter.
 
 The `shiba` schema is reserved for managed results. Native PostgreSQL
 materialized views keep their normal behavior. See [the SQL contract](docs/SQL.md)

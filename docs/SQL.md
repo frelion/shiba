@@ -235,6 +235,24 @@ For plan, stream, and checkpoint details:
 SELECT shiba.explain_dataflow('shiba.order_stats');
 ```
 
+Runtime and queue observability is available without reading private catalog
+tables:
+
+```sql
+SELECT * FROM shiba.runtime_status();
+SELECT * FROM shiba.dataflow_status();
+SELECT * FROM shiba.runtime_metrics();
+```
+
+`runtime_status()` returns the Runtime worker state, heartbeat age, replication
+slot WAL retention, durable ingress frontiers, staged ingress work, stream
+buffers, and backpressure count. `dataflow_status()` returns one row per result
+table visible to the caller, including ready stages, pending input chunks,
+buffered operator output, and the slowest Sink frontier. These snapshots are
+computed from durable state and therefore remain useful while the Runtime is
+restarting. `runtime_metrics()` returns a compact database-wide name/value set
+for polling integrations.
+
 ## Result ownership and permissions
 
 The `shiba` schema is reserved for managed results. Ordinary
