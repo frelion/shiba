@@ -4,6 +4,16 @@ set -euo pipefail
 # End-to-end gate for the generic resumable Join kernel.
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if ! grep -Fq 'FILTER (WHERE ({condition}) IS TRUE)' \
+  "${project_root}/src/execution/join/runtime.rs" ||
+   ! grep -Fq 'FILTER (WHERE ({condition}) IS NULL)' \
+  "${project_root}/src/execution/join/runtime.rs"; then
+  printf '%s\n' \
+    'Join static gate failed: generic theta own-state counts do not share filtered scan' >&2
+  exit 1
+fi
+
 pg_config_path="${PG_CONFIG:-/opt/homebrew/opt/postgresql@17/bin/pg_config}"
 pg_bin_dir="$("${pg_config_path}" --bindir)"
 pg_data_dir="$(mktemp -d /tmp/shiba-fanout-data.XXXXXX)"

@@ -42,7 +42,7 @@ load_event 和 load_own_expectation 通过 payload 主键/row_key 定位当前�
 设当前事件数为 E、对侧 arrangement 行数为 N、复合 index 命中的候选数为 H、每页候选数为 P、生成结果为 F：
 
 - typed equality path 的严格候选访问约为 `O(log N + H)`，NULL 候选分支额外为可能含 NULL key 的 `N_null`；跨页时为 `O(log N + H + N_null + F)`；无 NULL 的选择性 miss 近似 `O(log N)`；
-- generic theta path 最坏仍为 `O(N)`，E 个事件最坏为 `O(E*N + F)`；
+- generic theta path 最坏仍为 `O(N)`，E 个事件最坏为 `O(E*N + F)`；在更新 own arrangement 时，TRUE/UNKNOWN 两个计数通过一次对侧 state scan 的两个 `FILTER` 聚合得到，避免为相同候选集合重复扫描；
 - key path 仍会计算 residual condition，因此不能把索引命中误认为完整 SQL Join 语义已经由 key 替代。
 
 索引维护的成本是每个 keyed state row 多一个 typed key index entry；当匹配选择性低、对侧状态很大时，避免全表候选扫描的收益应超过该存储和写入成本。

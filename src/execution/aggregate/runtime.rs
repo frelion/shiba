@@ -90,14 +90,9 @@ pub(crate) fn step(
             &continuation_relation,
             stored,
         ),
-        AggregatePhase::DrainEmit { .. } => step_emit(
-            transaction,
-            plan,
-            stage,
-            spec,
-            &continuation_relation,
-            stored,
-        ),
+        AggregatePhase::DrainEmit { .. } => {
+            step_emit(transaction, spec, &continuation_relation, stored)
+        }
         AggregatePhase::Frontier => {
             step_frontier(transaction, spec, &continuation_relation, stored)
         }
@@ -1680,8 +1675,6 @@ fn step_rebuild(
 
 fn step_emit(
     transaction: &mut StepContext<'_, '_>,
-    plan: &DataflowPlan,
-    stage: &DataflowStage,
     spec: &AggregateSpec,
     continuation_relation: &RelationRef,
     stored: StoredAggregate,
@@ -1708,11 +1701,10 @@ fn step_emit(
         EmitLeg::Decide => {
             let expression = aggregate_output_expression(
                 transaction,
-                plan,
-                stage,
                 spec,
                 &output_attributes,
                 &output_storage.row_type,
+                &groups,
                 &dirty,
                 &bag,
             )?;
@@ -2587,44 +2579,21 @@ fn aggregate_rebuild_page(
 #[allow(clippy::too_many_arguments)]
 fn aggregate_output_expression(
     transaction: &mut StepContext<'_, '_>,
-    plan: &DataflowPlan,
-    stage: &DataflowStage,
     spec: &AggregateSpec,
     output_attributes: &[AttributeRef],
     output_type: &TypeRef,
+    groups: &RelationRef,
     dirty: &RelationRef,
     bag: &RelationRef,
 ) -> Result<AggregateOutputExpression, String> {
-    let input = transaction.input(0)?.clone();
-    let input_storage = transaction.payload_storage(input.stream_id)?;
     let mut values = Vec::with_capacity(spec.groups.len() + spec.aggregates.len());
-    let mut from = format!("{} AS dirty", dirty.sql());
+    let mut from = format!(
+        "{} AS dirty JOIN {} AS groups\n                ON groups.group_state_id=dirty.group_state_id",
+        dirty.sql(),
+        groups.sql(),
+    );
     if !spec.groups.is_empty() {
-        let bindings = compile_stage_bindings(
-            transaction,
-            plan,
-            stage,
-            &[BindingInput {
-                row_type: &input_storage.row_type,
-                alias: "representative",
-            }],
-        )?;
-        values.extend(
-            spec.groups
-                .iter()
-                .map(|group| compile_scalar_expression(&group.key.expr, &bindings))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        from.push_str(&format!(
-            " JOIN LATERAL (
-                SELECT bag.row_value
-                FROM {bag} AS bag
-                WHERE bag.group_state_id=dirty.group_state_id
-                ORDER BY bag.row_id
-                LIMIT 1
-              ) AS representative ON true",
-            bag = bag.sql(),
-        ));
+        values.extend((1..=spec.groups.len()).map(|index| format!("groups.group_{index}")));
     }
     for (index, aggregate) in spec.aggregates.iter().enumerate() {
         let alias = format!("work_{}", index + 1);

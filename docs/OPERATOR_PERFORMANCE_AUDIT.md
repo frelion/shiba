@@ -45,7 +45,7 @@
 
 Aggregate 以 dirty group 为单位重建 aggregate transition，约为 O(A*G)；Window 对 dirty partition 经过 enumeration/peers/frames/fold/diff 多阶段，约为 O(P*W+K)；TopN 每次 generation selection 仍需遍历 active input，约为 O(N+K)。continuation 只把这些工作切成小事务，并没有消除总工作。
 
-Aggregate representative lookup 已从逐 group 的 LATERAL point lookup 改为 dirty page 的 bag-index batch join；TopN 的 `has_more` 已复用 bounded terminal row；Window Fold 已复用 interval 阶段的 typed row，避免再次按 entry_id 回查 input。建议把这些工作负载加入独立 benchmark：hot group、large partition、large OFFSET/WITH TIES、频繁更新排序边界，并记录 pages、最大 step 时间、state bytes、output rows/s 和 post-commit convergence。
+Aggregate Emit 已直接复用持久化 `group_state_id/group_N`，不再为每个 dirty group 查 representative 或重编译 group expression；Distinct representative 已从逐 group 的 LATERAL point lookup 改为 dirty page 的 `DISTINCT ON` batch join；TopN 的 `has_more` 已复用 bounded terminal row；Window Fold/Evaluate 已复用 interval/source 阶段的 typed row，避免再次按 entry_id 回查 input；Join generic theta own-state 的 TRUE/UNKNOWN 计数已合并为一次对侧 state scan 的两个 FILTER 聚合。建议把这些工作负载加入独立 benchmark：hot group、large partition、large OFFSET/WITH TIES、generic theta miss/fanout、频繁更新排序边界，并记录 pages、最大 step 时间、state bytes、output rows/s 和 post-commit convergence。
 
 ### P1：固定 step/transaction 成本
 

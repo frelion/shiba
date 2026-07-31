@@ -133,6 +133,22 @@ fn group_page_batches_representative_lookup_through_the_bag_index() {
 }
 
 #[test]
+fn aggregate_emit_reuses_persisted_group_identity() {
+    let production = include_str!("runtime.rs");
+    let expression = production
+        .split_once("fn aggregate_output_expression(")
+        .expect("Aggregate must build an output expression")
+        .1
+        .split_once("fn aggregate_emit_row(")
+        .expect("Aggregate output expression must end before emission")
+        .0;
+    assert!(expression.contains("groups.group_state_id=dirty.group_state_id"));
+    assert!(expression.contains("format!(\"groups.group_{index}\")"));
+    assert!(!expression.contains("JOIN LATERAL"));
+    assert!(!expression.contains("compile_stage_bindings"));
+}
+
+#[test]
 fn an_uncommitted_action_replays_from_the_same_durable_state() {
     let machine = AggregateMachine::new(2).unwrap();
     let durable = AggregateContinuation {

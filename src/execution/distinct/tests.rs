@@ -246,7 +246,7 @@ fn replacement_queues_two_legs_under_a_one_row_output_budget() {
 }
 
 #[test]
-fn sql_contract_checks_both_negative_prefixes_and_bounds_representative_lookup() {
+fn sql_contract_checks_both_negative_prefixes_and_batches_representatives() {
     let production = [
         include_str!("mod.rs"),
         include_str!("runtime.rs"),
@@ -294,9 +294,12 @@ fn sql_contract_checks_both_negative_prefixes_and_bounds_representative_lookup()
                 LIMIT 1
                 FOR UPDATE"
     ));
+    assert!(reconcile.contains("representatives AS MATERIALIZED"));
     assert!(reconcile.contains(
-        "WHERE bag.group_state_id=locked.group_state_id
-                ORDER BY bag.output_key
-                LIMIT 1"
+        "SELECT DISTINCT ON (bag.group_state_id)
+                     bag.group_state_id,bag.output_key,bag.output_row"
     ));
+    assert!(reconcile.contains("ORDER BY bag.group_state_id,bag.output_key"));
+    assert!(reconcile.contains("LEFT JOIN representatives AS representative USING(group_state_id)"));
+    assert!(!reconcile.contains("LEFT JOIN LATERAL"));
 }

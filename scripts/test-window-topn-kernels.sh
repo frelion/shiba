@@ -45,6 +45,15 @@ static_require src/execution/window/provision.rs \
 static_require src/execution/window/provision.rs \
   'window_visible_page_' \
   'Window has no partition/visible page index'
+static_require src/execution/window/output.rs \
+  'JOIN source AS source_row' \
+  'Window output does not reuse the materialized source page'
+if grep -Fq 'ON input_row.entry_id=updated.entry_id' \
+  "${project_root}/src/execution/window/output.rs"; then
+  printf '%s\n' \
+    'Window/TopN static gate failed: output phase re-queries input for updated rows' >&2
+  exit 1
+fi
 static_require src/execution/window/mod.rs \
   'WINDOW_FOLD_WORK_ITEM_CAP' \
   'Window aggregate Fold has no explicit empty-frame work-item cap'
@@ -63,7 +72,7 @@ for interval in 1 2 3; do
     "Window aggregate frame interval ${interval} is not independently bounded"
 done
 static_require src/execution/window/primitives.rs \
-  'SELECT \(selected\.row_value\)\.\*' \
+  'SELECT selected\.row_value AS row_value' \
   'Window aggregate Fold does not reuse the interval row payload'
 if grep -Fq 'ON current_input.entry_id=selected.entry_id' \
   "${project_root}/src/execution/window/primitives.rs"; then

@@ -533,10 +533,10 @@ fn run_prefix(
         return Err("Distinct Apply exceeded its per-input state bound".into());
     }
 
-    // A new SPI statement observes the bag mutations. State rows are locked by
-    // one ordered join; the representative lookup still performs one
-    // `(group_state_id,output_key) LIMIT 1` probe per touched SQL group, so a
-    // group with many SQL-equal physical representations remains bounded.
+    // A new SPI statement observes the bag mutations. State rows and their
+    // representatives are resolved by ordered batch joins; the bag index
+    // still bounds the representative scan for touched groups with many
+    // SQL-equal physical representations.
     let reconciled =
         reconcile_representatives(transaction, state, bag, queue, touched, output_type, &lsn)?;
     if reconciled.queued_effects > input_rows.saturating_mul(2) {
@@ -584,6 +584,13 @@ fn reconcile_representatives(
               ORDER BY groups.group_state_id
               FOR UPDATE OF groups
             ),
+            representatives AS MATERIALIZED (
+              SELECT DISTINCT ON (bag.group_state_id)
+                     bag.group_state_id,bag.output_key,bag.output_row
+              FROM locked
+              JOIN {bag} AS bag USING(group_state_id)
+              ORDER BY bag.group_state_id,bag.output_key
+            ),
             desired AS MATERIALIZED (
               SELECT locked.group_state_id,locked.output_key AS old_output_key,
                      locked.output_row AS old_output_row,
@@ -593,13 +600,7 @@ fn reconcile_representatives(
                      representative.output_key,representative.output_row
               FROM locked
               JOIN touched_page USING(group_state_id)
-              LEFT JOIN LATERAL (
-                SELECT bag.output_key,bag.output_row
-                FROM {bag} AS bag
-                WHERE bag.group_state_id=locked.group_state_id
-                ORDER BY bag.output_key
-                LIMIT 1
-              ) AS representative ON true
+              LEFT JOIN representatives AS representative USING(group_state_id)
             ),
             validation AS MATERIALIZED (
               SELECT CASE WHEN EXISTS (

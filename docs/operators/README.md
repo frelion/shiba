@@ -7,10 +7,10 @@
 | 逻辑/物理算子 | 实现页 | 代码入口 | 当前性能判断 |
 | --- | --- | --- | --- |
 | Scan / Filter / Project（Linear） | [linear.md](linear.md) | execution/linear | 线性热路径；固定 step/SQL 开销仍明显 |
-| Join | [join.md](join.md) | execution/join | 有界 fanout；当前候选探测最坏为全 arrangement 扫描 |
-| Distinct | [distinct.md](distinct.md) | execution/distinct | key/state 已批量锁定；代表行仍按 bag index 选择 |
-| Aggregate | [aggregate.md](aggregate.md) | execution/aggregate | representative 已按 dirty page 批量读取；dirty group 仍按 aggregate 重建 |
-| Window | [window.md](window.md) | execution/window | Fold 复用 interval payload；大 partition 仍多阶段重建 |
+| Join | [join.md](join.md) | execution/join | 有界 fanout；generic own-state 的 TRUE/UNKNOWN 计数共享一次扫描 |
+| Distinct | [distinct.md](distinct.md) | execution/distinct | key/state 和 representative 均按 page 批量 join |
+| Aggregate | [aggregate.md](aggregate.md) | execution/aggregate | Emit 直接复用持久 group identity；dirty group 仍按 aggregate 重建 |
+| Window | [window.md](window.md) | execution/window | Fold/Evaluate 复用已物化 payload；大 partition 仍多阶段重建 |
 | TopN | [topn.md](topn.md) | execution/topn | selection 已复用 bounded terminal row；每次 dirty update 仍重做排名选择 |
 | Sink | [sink.md](sink.md) | execution/sink | 负向 page 已批量 ctid ranking；无 identity index 时仍需扫描结果表 |
 

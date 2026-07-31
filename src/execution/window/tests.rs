@@ -522,6 +522,37 @@ fn missing_window_frame_is_not_an_empty_frame() {
 }
 
 #[test]
+fn output_reuses_the_materialized_source_row_value() {
+    let production = include_str!("output.rs");
+    let evaluate = production
+        .split_once("pub(super) fn run_window_evaluate(")
+        .expect("Window must evaluate functions")
+        .1
+        .split_once("pub(super) fn run_window_diff(")
+        .expect("Window evaluation must end before diff")
+        .0;
+    assert!(evaluate.contains("JOIN source AS source_row"));
+    assert!(evaluate.contains("ON source_row.ordinal=updated.ordinal"));
+    assert!(evaluate.contains("SELECT source_row.row_value AS row_value"));
+    assert!(!evaluate.contains("ON input_row.entry_id=updated.entry_id"));
+}
+
+#[test]
+fn aggregate_fold_reuses_the_materialized_source_row_value() {
+    let production = include_str!("primitives.rs");
+    let fold = production
+        .split_once("pub(super) fn window_fold_page(")
+        .expect("Window must have aggregate Fold")
+        .1
+        .split_once("pub(super) fn window_finalize_fold(")
+        .expect("Window Fold page must end before finalization")
+        .0;
+    assert!(fold.contains("SELECT selected.row_value AS row_value"));
+    assert!(!fold.contains("SELECT (selected.row_value).*"));
+    assert!(!fold.contains("ON current_input.entry_id=selected.entry_id"));
+}
+
+#[test]
 fn frontier_waits_for_both_diff_legs_and_cleanup() {
     let machine = native_machine();
     let mut continuation = WindowContinuation {

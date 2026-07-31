@@ -35,7 +35,7 @@ Window 先按 partition/order 把输入变成可定位的逻辑行，再计算 p
 
 Admission 更新 partition/input，并保存下一输入位置。Enumeration、Peers、Frames 使用 ordinal/keyset cursor 构造 ordered/peer/frame state。Fold 以有限 work-item 预算推进 aggregate state；Diff 按 visible/candidate identity page 生成 -old/+new 差分；Cleanup 删除已经完成的 partition work。
 
-设 dirty partition 逻辑行数为 P、窗口函数/aggregate 数为 W、可见输出为 K：一次 dirty partition 的总工作通常是 O(P*W + K)，frame interval 查找还会增加按 order key 的索引查找与 PostgreSQL expression CPU。Aggregate Fold 的三个 interval CTE 各自有 row/byte 上界；interval 阶段已经取出的 typed `row_value` 会随 selected row 传入递归 fold，fold 不再按 `entry_id` 对 input relation 做第二次回查，只在 SQL 内展开复合值供 transition/filter 表达式使用。Continuation 让单页有界，但不消除同一 partition 的多阶段重建成本。
+设 dirty partition 逻辑行数为 P、窗口函数/aggregate 数为 W、可见输出为 K：一次 dirty partition 的总工作通常是 O(P*W + K)，frame interval 查找还会增加按 order key 的索引查找与 PostgreSQL expression CPU。Aggregate Fold 的三个 interval CTE 各自有 row/byte 上界；interval 阶段已经取出的 typed `row_value` 会随 selected row 传入递归 fold，fold 不再按 `entry_id` 对 input relation 做第二次回查，只在 SQL 内展开复合值供 transition/filter 表达式使用。最终 Evaluate 在 `source` 页已物化时，按 `ordinal` 直接复用 `source.row_value` 作为 `input_row` 的 typed payload，也不再按 `entry_id` 回查 input relation。Continuation 让单页有界，但不消除同一 partition 的多阶段重建成本。
 
 ## 5. 事务与恢复
 

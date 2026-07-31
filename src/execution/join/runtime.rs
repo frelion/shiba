@@ -960,6 +960,65 @@ pub(super) mod execution {
         let state = layout.state(side);
         let match_key_join = key_join_sql(layout, side, opposite_alias, false)?;
         let unknown_key_join = key_join_sql(layout, side, opposite_alias, true)?;
+        let counts_join = if layout.keyed() {
+            String::new()
+        } else {
+            format!(
+                r#"
+                  LEFT JOIN LATERAL (
+                    SELECT coalesce(sum({opposite_alias}.multiplicity)
+                                      FILTER (WHERE ({condition}) IS TRUE),0)::bigint
+                               AS match_count,
+                           coalesce(sum({opposite_alias}.multiplicity)
+                                      FILTER (WHERE ({condition}) IS NULL),0)::bigint
+                               AS unknown_count
+                    FROM {opposite_state} AS {opposite_alias}
+                  ) AS counts ON TRUE
+                "#,
+                opposite_state = layout.state(side.opposite()).sql(),
+                condition = layout.condition,
+            )
+        };
+        let match_count = if layout.keyed() {
+            format!(
+                r#"coalesce((
+                           SELECT sum({opposite_alias}.multiplicity)::bigint
+                           FROM LATERAL (
+                             SELECT collapsed.row_value
+                           ) AS {current_alias}
+                           JOIN {opposite_state} AS {opposite_alias}
+                             ON ({condition}) IS TRUE
+                           {match_key_join}
+                         ),0)::bigint"#,
+                opposite_state = layout.state(side.opposite()).sql(),
+                opposite_alias = opposite_alias,
+                current_alias = current_alias,
+                condition = layout.condition,
+                match_key_join = match_key_join,
+            )
+        } else {
+            "counts.match_count".into()
+        };
+        let unknown_count = if layout.keyed() {
+            format!(
+                r#"coalesce((
+                           SELECT sum({opposite_alias}.multiplicity)::bigint
+                           FROM LATERAL (
+                             SELECT collapsed.row_value
+                           ) AS {current_alias}
+                           JOIN {opposite_state} AS {opposite_alias}
+                             ON ({condition}) IS NULL
+                           {unknown_key_join}
+                         ),0)::bigint"#,
+                opposite_state = layout.state(side.opposite()).sql(),
+                opposite_alias = opposite_alias,
+                current_alias = current_alias,
+                condition = layout.condition,
+                unknown_key_join = unknown_key_join,
+            )
+        } else {
+            "counts.unknown_count".into()
+        };
         let key_columns = layout
             .key_exprs(side)
             .iter()
@@ -1021,28 +1080,13 @@ pub(super) mod execution {
                   SELECT collapsed.*{key_projection},
                          own.row_id,
                          coalesce(own.multiplicity,0)::bigint AS old_multiplicity,
-                         coalesce((
-                           SELECT sum({opposite_alias}.multiplicity)::bigint
-                           FROM LATERAL (
-                             SELECT collapsed.row_value
-                           ) AS {current_alias}
-                           JOIN {opposite_state} AS {opposite_alias}
-                             ON ({condition}) IS TRUE
-                           {match_key_join}
-                         ),0)::bigint AS match_count,
-                         coalesce((
-                           SELECT sum({opposite_alias}.multiplicity)::bigint
-                           FROM LATERAL (
-                             SELECT collapsed.row_value
-                           ) AS {current_alias}
-                           JOIN {opposite_state} AS {opposite_alias}
-                             ON ({condition}) IS NULL
-                           {unknown_key_join}
-                         ),0)::bigint AS unknown_count
+                         {match_count} AS match_count,
+                         {unknown_count} AS unknown_count
                   FROM collapsed
                   CROSS JOIN LATERAL (
                     SELECT collapsed.row_value
                   ) AS {current_alias}
+                  {counts_join}
                   LEFT JOIN {state} AS own USING(row_key)
                 ),
                 valid AS MATERIALIZED (
@@ -1083,10 +1127,10 @@ pub(super) mod execution {
                          +(SELECT count(*)::bigint FROM inserted)
                 "#,
                 current_payload = layout.input_payload(side).relation.sql(),
-                opposite_state = layout.state(side.opposite()).sql(),
-                condition = layout.condition,
-                match_key_join = match_key_join,
-                unknown_key_join = unknown_key_join,
+                current_alias = current_alias,
+                match_count = match_count,
+                unknown_count = unknown_count,
+                counts_join = counts_join,
                 key_projection = key_projection,
                 insert_columns = insert_columns,
                 insert_values = insert_values,

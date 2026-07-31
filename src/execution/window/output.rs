@@ -157,8 +157,11 @@ pub(super) fn run_window_evaluate(
               SELECT updated.ordinal,
                      ROW({outputs})::{output_type} AS output_row
               FROM updated
-              JOIN {input} AS input_row
-                ON input_row.entry_id=updated.entry_id
+              JOIN source AS source_row
+                ON source_row.ordinal=updated.ordinal
+              CROSS JOIN LATERAL (
+                SELECT source_row.row_value AS row_value
+              ) AS input_row
             ),
             keyed AS MATERIALIZED (
               SELECT output_rows.*,
@@ -189,7 +192,6 @@ pub(super) fn run_window_evaluate(
             "#,
             outputs = expressions.outputs,
             output_type = storage.output_type.sql(),
-            input = storage.input.sql(),
             candidate = storage.candidate.sql(),
             output_key = output_key,
         )

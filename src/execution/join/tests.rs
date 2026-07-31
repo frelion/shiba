@@ -20,6 +20,24 @@ fn budget(input_rows: usize, output_rows: usize, output_bytes: usize) -> WorkBud
     WorkBudget::new(input_rows, 1_000, output_rows, output_bytes)
 }
 
+#[test]
+fn generic_theta_state_counts_share_one_filtered_scan() {
+    let production = include_str!("runtime.rs");
+    let own_state = production
+        .split_once("fn apply_inner_page_own_state(")
+        .expect("Join must apply its own state")
+        .1
+        .split_once("fn load_continuation(")
+        .expect("Join own-state SQL must end before continuation loading")
+        .0;
+    assert!(own_state.contains("let counts_join = if layout.keyed()"));
+    assert!(own_state.contains("FILTER (WHERE ({condition}) IS TRUE)"));
+    assert!(own_state.contains("FILTER (WHERE ({condition}) IS NULL)"));
+    assert!(own_state.contains("FROM {opposite_state} AS {opposite_alias}"));
+    assert!(own_state.contains("counts.match_count"));
+    assert!(own_state.contains("counts.unknown_count"));
+}
+
 fn candidate(
     row_id: i64,
     multiplicity: u64,

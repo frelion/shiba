@@ -24,9 +24,9 @@ Apply 只吸收一个 input prefix，更新 group/bag/touched；如果产生代�
 
 ## 4. Primitive 与复杂度
 
-run_prefix 按 input chunk/ordinal 取 bounded page，按 key 聚合 signed weight，通过 state key index 找 group，并更新 bag/touched。reconcile_representatives 先删除并物化 touched page，再按 `group_state_id` 有序批量 join 状态表并锁定 group；这避免对每个 touched group 单独执行一次 `LIMIT 1` 主键点查，同时保持并发事务一致的锁顺序。代表行仍通过 `(group_state_id,output_key)` 索引为每个 touched group 做一个有界首行探测，必要时入队负向旧代表和正向新代表。drain_queue 通过 queue_id keyset 取页，输出后原子删除相同 queue 行。
+run_prefix 按 input chunk/ordinal 取 bounded page，按 key 聚合 signed weight，通过 state key index 找 group，并更新 bag/touched。reconcile_representatives 先删除并物化 touched page，再按 `group_state_id` 有序批量 join 状态表并锁定 group；随后用 `DISTINCT ON (group_state_id)` 和 `(group_state_id,output_key)` bag index 一次性选出本页 representatives，避免每个 touched group 单独执行一次 `LATERAL ... LIMIT 1`，同时保持并发事务一致的锁顺序。必要时入队负向旧代表和正向新代表。drain_queue 通过 queue_id keyset 取页，输出后原子删除相同 queue 行。
 
-设 input page 为 P、touched key 数为 T、状态表行数为 G、每个 key 的物理候选数为 B、待发效果为 Q：Apply 约为 O(P log T) 加索引更新；reconcile 的状态锁定是一次批量 join（由 PostgreSQL 在 touched/page 基数与 G 之间选择 join 算法），代表选择约为 O(sum log B_t)，而非 T 次独立状态点查；Drain 总成本为 O(Q)。最坏仍受单个高重复 key 的 bag 扫描影响。队列按 identity page，不使用 OFFSET，恢复 cursor 不会随前缀删除而漂移。
+设 input page 为 P、touched key 数为 T、状态表行数为 G、每个 key 的物理候选数为 B、待发效果为 Q：Apply 约为 O(P log T) 加索引更新；reconcile 的状态锁定和 representative 选择都是批量 join（由 PostgreSQL 在 touched/page 基数与 G/B 之间选择 join 算法），代表阶段约为 O(B_page + T)，而非 T 次独立 point lookup；Drain 总成本为 O(Q)。最坏仍受单个高重复 key 的 bag 扫描影响。队列按 identity page，不使用 OFFSET，恢复 cursor 不会随前缀删除而漂移。
 
 ## 5. 事务与恢复
 

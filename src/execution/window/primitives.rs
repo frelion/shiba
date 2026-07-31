@@ -1550,7 +1550,7 @@ pub(super) fn window_fold_page(
           FROM fold
           JOIN selected ON selected.page_ordinal=fold.step+1
           CROSS JOIN LATERAL (
-            SELECT (selected.row_value).*
+            SELECT selected.row_value AS row_value
           ) AS current_input
         ),
         final_fold AS MATERIALIZED (

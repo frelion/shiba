@@ -21,13 +21,13 @@ Aggregate 支持 grouped/global aggregate、多个 aggregate expression、FILTER
       -> DrainEmit(unchanged / insert / delete / replacement legs)
       -> resume Apply or Frontier
 
-Apply 更新 bag 和 dirty group。Rebuild 对每个 aggregate 按 durable cursor 重新折叠 group 的 bag；所有 aggregate rebuild 完成后，Emit 比较 pending/published typed output，必要时先发旧值 -1，再发新值 +1。global aggregate 在空输入的 frontier 路径中也必须创建并 materialize 空 group。
+Apply 更新 bag 和 dirty group。Rebuild 对每个 aggregate 按 durable cursor 重新折叠 group 的 bag；所有 aggregate rebuild 完成后，Emit 比较 pending/published typed output，必要时先发旧值 -1，再发新值 +1。Grouped Emit 直接通过 `dirty.group_state_id=groups.group_state_id` 读取已持久化的 `groups.group_N`，不再重新编译 group expression 或从 bag 选 representative；bag 只保留给 aggregate `present` 判断和 work state。global aggregate 在空输入的 frontier 路径中也必须创建并 materialize 空 group。
 
 ## 4. Primitive 与复杂度
 
-step_apply 按 input row/byte budget 更新 dynamic typed transition state 和 dirty queue。aggregate_rebuild_page 使用 group/order index 取一个 keyset page，更新 transition state 和 cursor；aggregate_append_output 只处理一个 group 的一个可见差分。Grouped page rebuild 还会先把本页 dirty group 物化，再通过 `(group_state_id,row_id)` bag index 的 `DISTINCT ON` 批量选 representative，避免对每个 group 单独执行一次 `LATERAL ... LIMIT 1`。每页工作 bounded，但 group 重建不是增量 delta fold。
+step_apply 按 input row/byte budget 更新 dynamic typed transition state 和 dirty queue。aggregate_rebuild_page 使用 group/order index 取一个 keyset page，更新 transition state 和 cursor；aggregate_append_output 只处理一个 group 的一个可见差分。Grouped Emit 只 join 一次 groups identity，避免每个 dirty group 的 representative `LATERAL ... LIMIT 1` 和重复 group expression 编译；每页工作 bounded，但 group 重建不是增量 delta fold。
 
-设 dirty group 大小为 G、aggregate 数为 A、一个 rebuild page 为 P、输出差分数为 K：单次 group 更新的重建总成本约为 O(A*G)（每个 aggregate 还可能有 ORDER BY/DISTINCT index 和 transition 函数 CPU），Emit 约为 O(K)。representative 批量选择对本页 group 是一次 join 加 bag index 顺序访问，约为 O(G_page + B_page)，而不是 G_page 次独立状态/representative lookup。因此 hot group 是主要性能风险；扩大 step 只改变 commit 次数，不改变 A*G 总工作。
+设 dirty group 大小为 G、aggregate 数为 A、一个 rebuild page 为 P、输出差分数为 K：单次 group 更新的重建总成本约为 O(A*G)（每个 aggregate 还可能有 ORDER BY/DISTINCT index 和 transition 函数 CPU），Emit 的 group identity 读取约为 O(P)，之后仍按 K 产生差分。取消 representative lookup 不改变结果语义，只减少 Emit 的 bag 随机访问和 group expression 重编译。因此 hot group 是主要性能风险；扩大 step 只改变 commit 次数，不改变 A*G 总工作。
 
 ## 5. 事务与恢复
 
