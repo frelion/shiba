@@ -67,7 +67,7 @@ jobs:
             --csv artifacts/performance-smoke.csv
 
       - name: Upload performance artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: performance-smoke-pg${{ matrix.pg_major }}
           path: artifacts/
