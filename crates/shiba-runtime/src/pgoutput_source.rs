@@ -14,6 +14,7 @@ pub(crate) enum SourceShape {
     KeyOnly,
     NullableInt8Payload,
     CompositeInt8,
+    TextPayload,
 }
 
 impl SourceShape {
@@ -21,7 +22,7 @@ impl SourceShape {
         match self {
             Self::Empty => 0,
             Self::KeyOnly => 1,
-            Self::NullableInt8Payload | Self::CompositeInt8 => 2,
+            Self::NullableInt8Payload | Self::CompositeInt8 | Self::TextPayload => 2,
         }
     }
 }
@@ -72,6 +73,19 @@ impl PgoutputSource {
             slot_generation,
             relation_id,
             SourceShape::CompositeInt8,
+        )
+    }
+    #[must_use]
+    pub const fn with_text_payload(
+        source_id: SourceId,
+        slot_generation: SlotGeneration,
+        relation_id: u32,
+    ) -> Self {
+        Self::with_shape(
+            source_id,
+            slot_generation,
+            relation_id,
+            SourceShape::TextPayload,
         )
     }
     const fn with_shape(

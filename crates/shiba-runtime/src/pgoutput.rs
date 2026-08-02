@@ -3,13 +3,14 @@ use core::fmt;
 use shiba_protocol::{IngressTransactionId, InputSequence, PostgresLsn, SourceTransactionId};
 
 use crate::{
-    SourceChange, SourceInsert, SourceTransaction, SourceUpdate,
+    SourceChange, SourceInsert, SourceTransaction, SourceUpdate, SourceUpdatePayload,
     pgoutput_source::{PgoutputSource, SourceShape},
     pgoutput_tuple::{DecodedChange, decode_delete, decode_insert, decode_update},
     pgoutput_wire::Cursor,
 };
 
 const INT8_OID: u32 = 20;
+const TEXT_OID: u32 = 25;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PgoutputError {
@@ -117,7 +118,15 @@ pub fn decode_committed_changes(
                     SourceChange::Insert(SourceInsert::composite(sequence, key1, key2))
                 }
                 DecodedChange::Update(row_id, payload) => {
-                    SourceChange::Update(SourceUpdate::new(sequence, row_id, payload))
+                    let update = match payload {
+                        SourceUpdatePayload::Int8(value) => {
+                            SourceUpdate::new(sequence, row_id, value)
+                        }
+                        SourceUpdatePayload::UnchangedText => {
+                            SourceUpdate::unchanged_text(sequence, row_id)
+                        }
+                    };
+                    SourceChange::Update(update)
                 }
                 DecodedChange::Delete(source_row_id) => SourceChange::Delete {
                     input_sequence: sequence,
@@ -135,21 +144,22 @@ fn decode_relation(cursor: &mut Cursor<'_>, source: PgoutputSource) -> Result<()
     }
     cursor.string()?;
     cursor.string()?;
-    let key_flags: &[u8] = match source.shape {
+    let columns: &[(u8, u32)] = match source.shape {
         SourceShape::Empty => &[],
-        SourceShape::KeyOnly => &[1],
-        SourceShape::NullableInt8Payload => &[1, 0],
-        SourceShape::CompositeInt8 => &[1, 1],
+        SourceShape::KeyOnly => &[(1, INT8_OID)],
+        SourceShape::NullableInt8Payload => &[(1, INT8_OID), (0, INT8_OID)],
+        SourceShape::CompositeInt8 => &[(1, INT8_OID), (1, INT8_OID)],
+        SourceShape::TextPayload => &[(1, INT8_OID), (0, TEXT_OID)],
     };
-    if cursor.byte()? != b'd' || usize::from(cursor.u16()?) != key_flags.len() {
+    if cursor.byte()? != b'd' || usize::from(cursor.u16()?) != columns.len() {
         return Err(PgoutputError::RelationShape);
     }
-    for expected_key_flag in key_flags {
+    for (expected_key_flag, expected_oid) in columns {
         if cursor.byte()? != *expected_key_flag {
             return Err(PgoutputError::RelationShape);
         }
         cursor.string()?;
-        if cursor.u32()? != INT8_OID {
+        if cursor.u32()? != *expected_oid {
             return Err(PgoutputError::RelationType);
         }
         cursor.u32()?;

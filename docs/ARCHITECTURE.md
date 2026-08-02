@@ -78,6 +78,12 @@ shape: none for empty, key for single-key, key/non-key for nullable payload,
 and two keys for composite identity. This adds no durable state or writer. A
 live `FULL` relation is rejected before the processor owns a transaction.
 
+M5.1 extends the same `applied_insert` row with `payload_text`; it does not add
+a table or authority. A text INSERT writes the exact UTF-8 value. An
+unchanged-TOAST UPDATE carries only a `u` token, so the processor validates that
+the target is an existing text row and retains its durable value. Row state,
+unchanged count/result, and continuation still share one processor transaction.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -88,7 +94,7 @@ evidence inputs, not implementation dependencies.
 
 **Unproved:** production replication transport and slot ownership, admission
 for `D + O` or replica identity `FULL`, composite DELETE, key-changing UPDATE
-and old tuples,
-TOAST, streaming transactions, catalog binding inspection, concurrency,
+and old tuples, new/incompressible TOAST values, NULL text, TOAST keys,
+streaming transactions, catalog binding inspection, concurrency,
 generation changes, multiple sources, general operators, and recovery workers
 remain.

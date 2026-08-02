@@ -47,10 +47,15 @@ accepting any PostgreSQL setting. The four frozen shapes require default
 replica identity and their exact key-column flags. A live change to `FULL`
 therefore fails during decode before Apply can write or advance continuation.
 
-**Not proved.** M4.6 has no production replication transport/slot lifecycle,
+M5.1 adds one real text-payload path to that same current-state authority. A
+text INSERT stores the exact value; an UPDATE whose pgoutput payload is `u`
+retains that committed value while count/result remain unchanged and
+continuation advances in the same processor transaction.
+
+**Not proved.** M5.1 has no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, composite DELETE,
-key-changing UPDATE, UPDATE
-old tuples, TOAST, streaming transaction, slot-generation change, multiple
+key-changing UPDATE, UPDATE old tuples, new/incompressible TOAST values, NULL
+text, TOAST keys, streaming transaction, slot-generation change, multiple
 sources, DDL invalidation, external effect, compatibility path, alias, fallback,
 or dual write.
 

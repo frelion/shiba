@@ -1,5 +1,5 @@
 use crate::{
-    PgoutputError, SourcePayload,
+    PgoutputError, SourcePayload, SourceUpdatePayload,
     pgoutput_source::{PgoutputSource, SourceShape},
     pgoutput_wire::Cursor,
 };
@@ -8,7 +8,7 @@ pub(crate) enum DecodedChange {
     EmptyInsert,
     RowInsert(i64, SourcePayload),
     CompositeInsert(i64, i64),
-    Update(i64, Option<i64>),
+    Update(i64, SourceUpdatePayload),
     Delete(i64),
 }
 
@@ -35,6 +35,18 @@ pub(crate) fn decode_insert(
             decode_int8(cursor)?,
             decode_int8(cursor)?,
         )),
+        SourceShape::TextPayload => {
+            let key = decode_int8(cursor)?;
+            let format = cursor.byte()?;
+            if format != b't' {
+                return Err(PgoutputError::TupleTag(format));
+            }
+            let length = usize::try_from(cursor.u32()?).map_err(|_| PgoutputError::Truncated)?;
+            let payload = std::str::from_utf8(cursor.take(length)?)
+                .map_err(|_| PgoutputError::TupleValue)?
+                .to_owned();
+            Ok(DecodedChange::RowInsert(key, SourcePayload::Text(payload)))
+        }
     }
 }
 
@@ -42,14 +54,28 @@ pub(crate) fn decode_update(
     cursor: &mut Cursor<'_>,
     source: PgoutputSource,
 ) -> Result<DecodedChange, PgoutputError> {
-    if source.shape != SourceShape::NullableInt8Payload {
-        return Err(PgoutputError::TupleShape);
+    match source.shape {
+        SourceShape::NullableInt8Payload => {
+            tuple_header(cursor, source, b'N', 2)?;
+            Ok(DecodedChange::Update(
+                decode_int8(cursor)?,
+                SourceUpdatePayload::Int8(decode_optional_int8(cursor)?),
+            ))
+        }
+        SourceShape::TextPayload => {
+            tuple_header(cursor, source, b'N', 2)?;
+            let key = decode_int8(cursor)?;
+            let format = cursor.byte()?;
+            if format != b'u' {
+                return Err(PgoutputError::TupleTag(format));
+            }
+            Ok(DecodedChange::Update(
+                key,
+                SourceUpdatePayload::UnchangedText,
+            ))
+        }
+        _ => Err(PgoutputError::TupleShape),
     }
-    tuple_header(cursor, source, b'N', 2)?;
-    Ok(DecodedChange::Update(
-        decode_int8(cursor)?,
-        decode_optional_int8(cursor)?,
-    ))
 }
 
 pub(crate) fn decode_delete(

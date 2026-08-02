@@ -85,3 +85,10 @@ live FULL-identity `D + O` transaction therefore cannot open the processor
 transaction. Apply row, private count, public result, and continuation all stay
 at their last committed values, and the pipeline must stop rather than skip the
 unadmitted source transaction.
+
+M5.1 treats pgoutput `u` as an update instruction against the existing durable
+text row, never as replacement data. The processor verifies that row shape,
+retains `payload_text`, writes the unchanged count/result, and inserts
+continuation last in its existing transaction. Backend termination after that
+continuation INSERT proves the text, count, result, and continuation all remain
+old; retry advances once and exact replay is a no-op.

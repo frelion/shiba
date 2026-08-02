@@ -1,6 +1,6 @@
 # Tuple contract
 
-## Admitted shapes through M4.6
+## Admitted shapes through M5.1
 
 M4 accepts exactly four INSERT relation shapes:
 
@@ -33,12 +33,18 @@ the exact key flags of the admitted shape. It observes but rejects a live FULL
 identity relation and its `D + O` tuple before tuple decoding or Apply. No old
 row representation is added.
 
+M5.1 additionally admits `(key int8 NOT NULL, payload text NOT NULL)`. INSERT
+owns the complete UTF-8 text bytes from a `t` tuple value. UPDATE admits only
+`(key=t, payload=u)`: `u` is an instruction to preserve the existing durable
+text, not a payload value and not NULL. Other payload tags fail closed.
+
 ## Apply representation and ownership
 
 `SourcePayload::Absent` means the admitted relation has no payload column;
-`Null` and `Int8` mean the column is present. The existing
+`Null`, `Int8`, and `Text` mean the column is present. The existing
 `shiba_internal.applied_insert` row stores this as `payload_present` plus
-`payload_int8`, preserving the distinction between absent and SQL NULL.
+mutually exclusive `payload_int8`/`payload_text`, preserving absent, SQL NULL,
+int8, and text without a second row-state authority.
 For an empty tuple, `source_row_id` is NULL and payload is `Absent`. Multiple
 empty rows remain distinct through the Apply fact's cause primary key; no
 synthetic row identity is created.
@@ -62,7 +68,7 @@ authority.
 ## Deferred boundary
 
 Admission for `D + O`, replica identity `FULL`, composite DELETE, key-changing
-UPDATE, UPDATE old tuples, TOAST, binary transfer, streaming transactions,
-multiple sources, generation changes, and broader schema drift is not admitted
-through M4.6. Composite
+UPDATE, UPDATE old tuples, new/incompressible TOAST values, NULL text, TOAST
+keys, binary transfer, streaming transactions, multiple sources, generation
+changes, and broader schema drift is not admitted through M5.1. Composite
 identities beyond the existing fixed INSERT shape are also excluded.

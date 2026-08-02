@@ -16,4 +16,6 @@ pub use error::M2Error;
 pub use pgoutput::{PgoutputError, decode_committed_changes};
 pub use pgoutput_source::PgoutputSource;
 pub use processor::{ProcessOutcome, process};
-pub use transaction::{SourceChange, SourceInsert, SourcePayload, SourceTransaction, SourceUpdate};
+pub use transaction::{
+    SourceChange, SourceInsert, SourcePayload, SourceTransaction, SourceUpdate, SourceUpdatePayload,
+};

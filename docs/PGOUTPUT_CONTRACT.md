@@ -91,6 +91,18 @@ A live `ALTER TABLE ... REPLICA IDENTITY FULL` followed by DELETE emits
 rejects it. It does not decode `O`, add a FULL-row identity, or advance the
 existing continuation past the rejected transaction.
 
+## M5.1 unchanged TOAST extension
+
+`PgoutputSource::with_text_payload` admits one default-identity relation with
+key flags `[1, 0]` and built-in type OIDs `[int8, text]`. INSERT requires a
+canonical text-format int8 key and a present text-format UTF-8 payload. UPDATE
+requires the same key followed by exactly `u`; the token means retain the
+previously applied text value and carries no replacement bytes.
+
+`u` on INSERT, `n`/`t`/`b` as the UPDATE payload, invalid UTF-8, old/key tuples,
+and other relation shapes fail during pure decode. M5.1 does not admit a new
+text value in UPDATE or infer data from the source table outside pgoutput.
+
 ## M3.2 acknowledgement crash point
 
 The recovery gate deliberately separates database visibility from replication
@@ -121,4 +133,6 @@ exact key decoding, atomic current-state deletion and count publication,
 failure rollback, crash/retry, and exact replay on both supported PostgreSQL
 majors. M4.6 proves default identity/key-flag admission and live FULL drift
 rejection before writes. Admission of broader identity, DELETE/UPDATE forms,
-TOAST, and streaming remain out of scope.
+new/incompressible TOAST values, NULL text, TOAST keys, and streaming remain
+out of scope. M5.1 proves exact text INSERT plus a real unchanged-TOAST `u`
+UPDATE, including crash/retry/replay with the retained value.

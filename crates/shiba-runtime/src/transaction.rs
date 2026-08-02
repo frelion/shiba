@@ -4,14 +4,15 @@ use shiba_protocol::{InputSequence, SourceTransactionId};
 
 use crate::M2Error;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SourcePayload {
     Absent,
     Null,
     Int8(i64),
+    Text(String),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceInsert {
     pub input_sequence: InputSequence,
     pub source_row_id: Option<i64>,
@@ -20,10 +21,16 @@ pub struct SourceInsert {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceUpdatePayload {
+    Int8(Option<i64>),
+    UnchangedText,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceUpdate {
     pub input_sequence: InputSequence,
     pub source_row_id: i64,
-    pub source_payload: Option<i64>,
+    pub source_payload: SourceUpdatePayload,
 }
 
 impl SourceUpdate {
@@ -36,12 +43,21 @@ impl SourceUpdate {
         Self {
             input_sequence,
             source_row_id,
-            source_payload,
+            source_payload: SourceUpdatePayload::Int8(source_payload),
+        }
+    }
+
+    #[must_use]
+    pub const fn unchanged_text(input_sequence: InputSequence, source_row_id: i64) -> Self {
+        Self {
+            input_sequence,
+            source_row_id,
+            source_payload: SourceUpdatePayload::UnchangedText,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SourceChange {
     Insert(SourceInsert),
     Update(SourceUpdate),

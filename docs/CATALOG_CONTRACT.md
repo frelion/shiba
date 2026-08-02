@@ -32,3 +32,7 @@ INSERT causes, deterministic count state, and committed continuation history.
 separate facts with one logical writer and one commit point, not alternative
 authorities for the same decision. PUBLIC receives only result `SELECT`; all
 internal access and result mutation remain revoked.
+
+Later tuple slices alter only the existing current-state table. M5.1 adds
+`payload_text` with int8/text mutual exclusion; it creates no fifth table,
+source registry, change log, alias, or second writer.

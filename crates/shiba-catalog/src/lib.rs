@@ -35,6 +35,12 @@
     requires = ["empty_insert"]
 );
 
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/006_text_payload.sql",
+    name = "text_payload",
+    requires = ["composite_insert"]
+);
+
 #[cfg(test)]
 mod tests {
     const CATALOG_SQL: &str = include_str!("../../../sql/v2/001_catalog_identity.sql");
@@ -42,6 +48,7 @@ mod tests {
     const M4_SQL: &str = include_str!("../../../sql/v2/003_nullable_insert.sql");
     const M4_EMPTY_SQL: &str = include_str!("../../../sql/v2/004_empty_insert.sql");
     const M4_COMPOSITE_SQL: &str = include_str!("../../../sql/v2/005_composite_insert.sql");
+    const M5_TEXT_SQL: &str = include_str!("../../../sql/v2/006_text_payload.sql");
 
     fn normalized_sql() -> String {
         CATALOG_SQL.to_ascii_lowercase()
@@ -91,12 +98,13 @@ mod tests {
     #[test]
     fn installation_has_no_dynamic_or_compatibility_mechanism() {
         let sql = format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             normalized_sql(),
             M2_SQL.to_ascii_lowercase(),
             M4_SQL.to_ascii_lowercase(),
             M4_EMPTY_SQL.to_ascii_lowercase(),
-            M4_COMPOSITE_SQL.to_ascii_lowercase()
+            M4_COMPOSITE_SQL.to_ascii_lowercase(),
+            M5_TEXT_SQL.to_ascii_lowercase()
         );
         for forbidden in [
             "create trigger",
@@ -112,5 +120,14 @@ mod tests {
                 "forbidden SQL surface: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn text_payload_extends_only_current_row_state() {
+        let sql = M5_TEXT_SQL.to_ascii_lowercase();
+        assert_eq!(sql.matches("create table ").count(), 0);
+        assert!(sql.contains("alter table shiba_internal.applied_insert"));
+        assert!(sql.contains("add column payload_text text"));
+        assert!(sql.contains("payload_int8 is null or payload_text is null"));
     }
 }

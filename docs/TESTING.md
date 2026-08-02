@@ -25,6 +25,8 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m4-delete.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m4-replica-identity.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m4-replica-identity.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m5-toast.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m5-toast.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -92,6 +94,14 @@ exact replay. It then changes the live source to replica identity FULL and
 captures a real `RELATION f` plus `D + O` DELETE. The decoder rejects before
 Apply, leaving the existing row, private count, public result, and continuation
 unchanged on PostgreSQL 17 and 18.
+
+`test-m5-toast.sh` stores a deterministic 64 KiB UTF-8 value in a source text
+column forced to `STORAGE EXTERNAL`, verifies its TOAST relation has storage,
+and applies the real INSERT into `payload_text`. A no-key-change UPDATE is
+captured as `U + N` with canonical key `t` and payload `u`. The gate proves bad
+payload-tag rejection before writes, continuation-after-insert crash rollback,
+exact text retention, retry once, replay no-op, and unchanged private/public
+count on PostgreSQL 17 and 18.
 
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.
