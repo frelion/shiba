@@ -197,7 +197,7 @@ scripts = [
         "m7-concurrent-ddl", "m8-multi-source", "m8-concurrent-sources",
         "m8-bounded-decode", "m8-performance", "m9-registration",
         "m9-count-sum", "m9-operator-concurrency", "m9-operator-performance",
-        "m10-committed-ingress",
+        "m10-committed-ingress", "m10-streaming-ingress",
     )
 ]
 for path in scripts:

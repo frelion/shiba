@@ -177,8 +177,40 @@ M10.2 enables feedback only through a durable token returned after Runtime
 commit or exact replay. PG17/18 prove COMMIT `end_lsn` advances the slot's
 `confirmed_flush_lsn` exactly; `commit_lsn`, outer/keepalive `wal_end`, and
 newest received bytes are never ACK coordinates. Decode and Operator failures
-leave slot and computation state old. Protocol-v2 production assembly and
-abort feedback remain deferred to M10.3.
+leave slot and computation state old.
+
+M10.3 adds production protocol-v2 transport assembly without adding another
+semantic decoder. `S`, streamed `R/I`, `E`, `c`, and `A` are framed across
+arbitrary XLogData chunk boundaries; only a complete matching `c` is handed to
+the existing `decode_streamed_changes`. The admitted transaction remains the
+M6 top-level single-XID, key-only INSERT shape and is still bounded by 16 MiB
+and 10,000 changes. Partial segments and `E` never Apply or ACK. A matching
+`A` is not a Runtime input and creates no Shiba durable state; because protocol
+v2 `A` has no LSN field, its safe ACK coordinate is the outer XLogData
+`dataStart` carrying that complete terminal frame. Slot replay, not a Shiba
+spool, recovers a crash before either terminal is acknowledged.
+
+Protocol v2 can also emit a committed transaction with no change visible to the
+selected publication. It is admitted only as the exact
+`S(first=true) E (S(first=false) E)* c` sequence, with at least one complete
+empty segment, one nonzero top-level XID, zero commit flags, valid commit/end
+coordinates, and no other frame or trailing byte. This yields
+`EmptyCommitted(end_lsn)`, never a `SourceTransaction`; explicit empty ACK is
+required. The structure proves publication output is empty, not that the
+publication still denotes the registered source. Publication alter/drop,
+remove/re-add, and same-name recreation therefore remain M10.4 drift/lifecycle
+boundaries and must not be silently authorized as empty work.
+
+The recognizer needs constant structural state, with all bytes still subject to
+the 16 MiB transaction bound. A legal streamed `R` or `I` frame selects the
+non-empty path and the complete terminal commit must pass the sole existing
+Runtime decoder. Other messages or malformed ordering cannot be reclassified
+as publication-empty.
+
+The terminal authorization set is closed: `Applied(end_lsn)`,
+`AlreadyApplied(end_lsn)`, strict `EmptyCommitted(end_lsn)`, or legal top-level
+`Aborted(ack_lsn)`. Partial input, `E`, outer `wal_end`, and keepalive progress
+are not members of that set.
 
 The wire layout follows the PostgreSQL 17/18 logical replication protocol and
 message-format documentation. The test uses each major's own `pg_recvlogical`
@@ -221,7 +253,8 @@ Partial input, mixed XIDs, invalid first-segment flags, stream abort, ordinary
 BEGIN/COMMIT mixing, trailing bytes, and unsupported changes fail before Apply.
 Segments are held only in decoder memory and are never durable or visible.
 M6.1 adds no spool, transport, interleaving, recovery worker, or acknowledgement
-authority. The layouts follow the PostgreSQL
+authority. M10.3 later transports this exact admitted language in production;
+it does not broaden the decoder. The layouts follow the PostgreSQL
 [17 protocol documentation](https://www.postgresql.org/docs/17/protocol-logicalrep-message-formats.html)
 and [18 protocol documentation](https://www.postgresql.org/docs/18/protocol-logicalrep-message-formats.html).
 
@@ -229,9 +262,11 @@ and [18 protocol documentation](https://www.postgresql.org/docs/18/protocol-logi
 
 A real protocol-v2 stream abort remains outside the admitted transaction
 language: completed segments followed by matching `A` still return no
-`SourceTransaction`. After receiver feedback covers the abort and the same slot
-is restarted, a later independent streamed commit is decoded and applied under
-its own identity. No aborted row or continuation becomes visible.
+`SourceTransaction`. M10.3 production ingress discards the volatile matching
+assembly and acknowledges only the outer XLogData `dataStart` of that terminal
+abort; the abort never enters Runtime. After feedback covers the abort and the
+same slot is restarted, a later independent streamed commit is decoded and
+applied under its own identity. No aborted row or continuation becomes visible.
 
 ## M7.1 Apply admission after decode
 

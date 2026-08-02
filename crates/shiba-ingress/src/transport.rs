@@ -2,6 +2,12 @@ use libpq::{Connection, Status, connection::Info};
 
 use crate::{IngressError, encode_feedback};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplicationMode {
+    Committed,
+    Streamed,
+}
+
 /// Synchronous replication transport with no in-process queue or slot authority.
 pub struct ReplicationTransport {
     connection: Connection,
@@ -34,12 +40,22 @@ impl ReplicationTransport {
     /// # Errors
     /// Rejects unsafe names, command failures, and responses other than
     /// `CopyBoth`.
-    pub fn start(&self, slot: &str, publication: &str, start_lsn: u64) -> Result<(), IngressError> {
+    pub fn start(
+        &self,
+        slot: &str,
+        publication: &str,
+        start_lsn: u64,
+        mode: ReplicationMode,
+    ) -> Result<(), IngressError> {
         validate_slot(slot)?;
         validate_identifier(publication, "publication")?;
+        let options = match mode {
+            ReplicationMode::Committed => "proto_version '1'",
+            ReplicationMode::Streamed => "proto_version '2', streaming 'on'",
+        };
         let query = format!(
             "START_REPLICATION SLOT {} LOGICAL {} \
-             (proto_version '1', publication_names '{}')",
+             ({options}, publication_names '{}')",
             quote_identifier(slot),
             format_lsn(start_lsn),
             publication,

@@ -48,6 +48,27 @@ Runtime decoder remains the only semantic pgoutput decoder and revalidates the
 complete assembled transaction, including the 16 MiB wire and 10,000-change
 limits.
 
+Protocol-v2 uses the same boundary. The scanner recognizes streamed frame
+lengths and XIDs across arbitrary XLogData chunks, but only a complete stream
+commit enters the existing Runtime streamed decoder. Partial segments and `E`
+are nonterminal. A matching abort bypasses Runtime; its safe feedback coordinate
+is the enclosing XLogData `dataStart`, because protocol-v2 `A` contains no LSN.
+No partial stream is persisted: slot replay is the recovery mechanism and no
+second spool authority exists.
+
+Feedback authorization is a closed set: Runtime `Applied`, Runtime
+`AlreadyApplied`, strict `EmptyCommitted`, or legal top-level `Aborted`.
+`EmptyCommitted` requires exactly
+`S(first=true) E (S(first=false) E)* c`: at least one complete empty segment,
+the same nonzero XID, zero flags, valid commit/end positions, and no other frame
+or trailing byte. Recognition uses constant state within the 16 MiB bound. A
+legal `R/I` selects the non-empty path through the sole Runtime decoder; every
+other form fails closed. Empty commit requires an explicit ACK and creates no
+continuation.
+This proves only empty output for the process-selected publication. M10.4 must
+bind and validate publication identity so mutation, removal/re-add, drop, or
+same-name recreation cannot be mistaken for a legitimate empty transaction.
+
 ## Feedback decision
 
 The safe committed coordinate is the pgoutput terminal transaction `end_lsn`,
@@ -74,7 +95,7 @@ This choice adds one production dependency with a narrow boundary and a system
 `libpq` requirement. The binding exposes a defective raw-handle `Clone`; Shiba
 therefore keeps the connection private, exclusive, and never clones it. M10
 must still prove disconnect behavior, async server
-errors during COPY, graceful shutdown, protocol-v2 abort coordinates, slot and
+errors during COPY, graceful shutdown, slot and
 publication validation, least privilege, buffer peaks, and PG17/18 parity.
 Failure of those gates reopens this ADR; it does not authorize a CLI receiver,
 raw wire implementation, second decoder, or compatibility path.

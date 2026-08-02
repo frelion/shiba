@@ -82,10 +82,42 @@ flushes libpq output, and an independent SQL connection polls the slot to the
 exact terminal coordinate. Requested keepalive replies are observed with the
 previous durable coordinate in all three walsender status fields.
 
-Protocol-v2 segments remain volatile and cannot enter Runtime before their
-terminal commit. Disconnect discards partial assembly so the slot can replay
-it. A terminal abort may advance transport feedback only after its exact safe
-coordinate is proved on PG17 and PG18; it creates no Shiba durable state.
+M10.3 keeps protocol-v2 segments volatile and outside Runtime until a complete
+matching stream commit. Stream stop (`E`) is only a segment boundary: it cannot
+Apply or ACK. On terminal commit, the existing streamed decoder revalidates the
+complete single-XID, key-only INSERT transaction and Runtime uses the same
+row/operator/result/continuation transaction and COMMIT `end_lsn` ACK rule as
+protocol v1.
+
+A matching terminal abort never enters Runtime and creates no row,
+operator/result, or continuation. Protocol-v2 `A` carries no feedback LSN, so
+its safe coordinate is the outer XLogData `dataStart` that carries the complete
+abort. Only an exact private abort token can report that coordinate. Disconnect
+or crash before commit/abort feedback discards the bounded assembly, reports
+nothing, and lets the PostgreSQL slot replay. There is no durable spool or
+second recovery authority. Corruption, unknown/mismatched XID, wrong terminal,
+16 MiB overflow, or more than 10,000 decoded changes fails closed without
+Apply or ACK.
+
+An empty protocol-v2 commit also bypasses Runtime, but only for the exact
+`S(first=true) E (S(first=false) E)* c` form: at least one complete empty
+segment, one nonzero top-level XID, flags zero, valid commit/end coordinates,
+no change frame, and no trailing byte. The
+receiver exposes a private `EmptyCommitted(end_lsn)` authorization and requires
+an explicit empty acknowledgement. It does not create a continuation because
+no source transaction exists. This is safe only as a statement about the
+selected publication's output, not source identity. Before M10.4 publication
+identity/drift enforcement, an invalidated publication cannot be allowed to
+turn an unexpectedly empty stream into feedback.
+
+The empty recognition state remains constant inside the 16 MiB bound. A legal
+`R` or `I` makes the commit non-empty and sends its complete bytes to the sole
+Runtime decoder; it cannot fall back to the empty path. Every other grammar or
+semantic error fails closed.
+
+Thus the only feedback authorizations are Runtime `Applied`, Runtime
+`AlreadyApplied`, strict `EmptyCommitted`, and legal terminal `Aborted`. No WAL
+position or nonterminal message can substitute for one of those proofs.
 
 M4.1 payload presence/value is inserted into the existing Apply row before the
 operator and continuation writes. Invalid tuple tags or shapes fail during pure

@@ -2,7 +2,7 @@ use std::{num::NonZeroU64, sync::mpsc, thread, time::Duration};
 
 use postgres::{Client, NoTls};
 use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_ingress::SourceReceiver;
+use shiba_ingress::{ReplicationMode, SourceReceiver};
 use shiba_operator::OperatorId;
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{PgoutputSource, ProcessOutcome, compile_and_register};
@@ -104,6 +104,7 @@ fn production_copy_both_acknowledges_only_durable_apply() {
         &replication_url,
         SLOT,
         PUBLICATION,
+        ReplicationMode::Committed,
         initial_slot_lsn,
         initial_slot_lsn,
     )
@@ -138,6 +139,7 @@ fn production_copy_both_acknowledges_only_durable_apply() {
         &replication_url,
         SLOT,
         PUBLICATION,
+        ReplicationMode::Committed,
         initial_slot_lsn,
         initial_slot_lsn,
     )
@@ -167,6 +169,7 @@ fn production_copy_both_acknowledges_only_durable_apply() {
         &replication_url,
         SLOT,
         PUBLICATION,
+        ReplicationMode::Committed,
         first.end_lsn(),
         first.end_lsn(),
     )
@@ -184,6 +187,7 @@ fn production_copy_both_acknowledges_only_durable_apply() {
         &replication_url,
         SLOT,
         PUBLICATION,
+        ReplicationMode::Committed,
         first.end_lsn(),
         first.end_lsn(),
     )
@@ -212,6 +216,7 @@ fn production_copy_both_acknowledges_only_durable_apply() {
         &replication_url,
         SLOT,
         PUBLICATION,
+        ReplicationMode::Committed,
         replay_end_lsn,
         replay_end_lsn,
     )
@@ -226,6 +231,7 @@ fn production_copy_both_acknowledges_only_durable_apply() {
         &replication_url,
         SLOT,
         PUBLICATION,
+        ReplicationMode::Committed,
         replay_end_lsn,
         replay_end_lsn,
     )
@@ -257,6 +263,7 @@ fn production_copy_both_acknowledges_only_durable_apply() {
         &replication_url,
         SLOT,
         PUBLICATION,
+        ReplicationMode::Committed,
         decoder_retry_lsn,
         decoder_retry_lsn,
     )
@@ -274,6 +281,7 @@ fn production_copy_both_acknowledges_only_durable_apply() {
         &replication_url,
         SLOT,
         PUBLICATION,
+        ReplicationMode::Committed,
         decoder_retry_lsn,
         decoder_retry_lsn,
     )

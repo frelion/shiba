@@ -10,7 +10,7 @@ operator, effect, and sink contracts.
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
 | Catalog | Version, source bindings/invalidation, operator definition/state/result | Binding rebuild lifecycle |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
-| Source Ingress | Production protocol-v1 COPY BOTH, bounded assembly, durable feedback and crash restart; protocol-v2 decoder evidence | Production streaming assembly and slot lifecycle |
+| Source Ingress | Production protocol-v1 COPY BOTH, bounded assembly, durable feedback/crash restart; protocol-v2 production contract under M10.3 proof | Complete M10.3 evidence, then slot/config/generation lifecycle |
 | Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
 | EffectStream | Non-durable transaction-local EffectBatch | Persisted effects intentionally absent |
 | Runtime | Replay/recovery plus ordered registered-operator execution | Production ingress lifecycle and broader operators |
@@ -28,7 +28,15 @@ has been removed.
 
 ## Still unproved
 
-Production streamed assembly and abort feedback, persisted partial-stream
-recovery, source binding rebuild and generation lifecycle, SQL frontend,
+Source binding rebuild and generation lifecycle, SQL frontend,
 non-aggregate operators, non-bigint result shapes, sustained throughput,
 empirical heap peak, and contention tail latency remain outside M9.2.
+
+M10.3 deliberately does not add persisted partial-stream recovery: partial
+stream bytes are volatile and PostgreSQL's replication slot replays them after
+restart. Its pending gate includes strict `Applied`, `AlreadyApplied`,
+`EmptyCommitted`, and `Aborted` terminal authorization. Empty-stream structure
+proves only empty output from the selected publication; publication identity
+and drift are not proved until M10.4. Also unproved are slot/config lifecycle,
+least-privilege production roles, operational disconnect/TLS behavior, and the
+final ingress performance matrix.

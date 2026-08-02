@@ -9,6 +9,24 @@ pub(crate) enum FrameStatus {
     },
 }
 
+pub(crate) enum StreamFrameStatus {
+    NeedMore,
+    Complete {
+        len: usize,
+        tag: u8,
+        xid: Option<u32>,
+        first_segment: Option<bool>,
+        commit: Option<StreamCommit>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct StreamCommit {
+    pub(crate) flags: u8,
+    pub(crate) commit_lsn: u64,
+    pub(crate) end_lsn: u64,
+}
+
 pub(crate) fn frame_status(input: &[u8]) -> Result<FrameStatus, IngressError> {
     let Some(&tag) = input.first() else {
         return Ok(FrameStatus::NeedMore);
@@ -37,6 +55,48 @@ pub(crate) fn frame_status(input: &[u8]) -> Result<FrameStatus, IngressError> {
     })
 }
 
+pub(crate) fn stream_frame_status(input: &[u8]) -> Result<StreamFrameStatus, IngressError> {
+    let Some(&tag) = input.first() else {
+        return Ok(StreamFrameStatus::NeedMore);
+    };
+    let end = match tag {
+        b'S' => fixed_end(input, 6),
+        b'E' => fixed_end(input, 1),
+        b'c' => fixed_end(input, 30),
+        b'A' => fixed_end(input, 9),
+        b'R' => streamed_relation_end(input)?,
+        b'I' => streamed_insert_end(input)?,
+        _ => return Err(IngressError::InvalidFrame),
+    };
+    let Some(len) = end else {
+        return Ok(StreamFrameStatus::NeedMore);
+    };
+    let xid = if tag == b'E' {
+        None
+    } else {
+        Some(read_u32(input, 1).expect("complete streamed frame XID"))
+    };
+    if tag == b'A' && read_u32(input, 5) != xid {
+        return Err(IngressError::MessageOrder);
+    }
+    let first_segment = (tag == b'S').then(|| input[5] == 1);
+    if tag == b'S' && input[5] > 1 {
+        return Err(IngressError::InvalidFrame);
+    }
+    let commit = (tag == b'c').then(|| StreamCommit {
+        flags: input[5],
+        commit_lsn: read_u64(input, 6).expect("complete stream COMMIT LSN"),
+        end_lsn: read_u64(input, 14).expect("complete stream end LSN"),
+    });
+    Ok(StreamFrameStatus::Complete {
+        len,
+        tag,
+        xid,
+        first_segment,
+        commit,
+    })
+}
+
 fn fixed_end(input: &[u8], len: usize) -> Option<usize> {
     (input.len() >= len).then_some(len)
 }
@@ -45,41 +105,65 @@ fn relation_end(input: &[u8]) -> Result<Option<usize>, IngressError> {
     let Some(mut at) = advance(input, 1, 4)? else {
         return Ok(None);
     };
-    let Some(next) = cstring_end(input, at)? else {
+    relation_body_end(input, &mut at)
+}
+
+fn streamed_relation_end(input: &[u8]) -> Result<Option<usize>, IngressError> {
+    let Some(mut at) = advance(input, 1, 8)? else {
         return Ok(None);
     };
-    at = next;
-    let Some(next) = cstring_end(input, at)? else {
+    relation_body_end(input, &mut at)
+}
+
+fn relation_body_end(input: &[u8], at: &mut usize) -> Result<Option<usize>, IngressError> {
+    let Some(next) = cstring_end(input, *at)? else {
         return Ok(None);
     };
-    at = next;
-    let Some(next) = advance(input, at, 1)? else {
+    *at = next;
+    let Some(next) = cstring_end(input, *at)? else {
         return Ok(None);
     };
-    at = next;
-    let Some(columns) = read_u16(input, at) else {
+    *at = next;
+    let Some(next) = advance(input, *at, 1)? else {
         return Ok(None);
     };
-    at = checked_add(at, 2)?;
+    *at = next;
+    let Some(columns) = read_u16(input, *at) else {
+        return Ok(None);
+    };
+    *at = checked_add(*at, 2)?;
     for _ in 0..columns {
-        let Some(next) = advance(input, at, 1)? else {
+        let Some(next) = advance(input, *at, 1)? else {
             return Ok(None);
         };
-        at = next;
-        let Some(next) = cstring_end(input, at)? else {
+        *at = next;
+        let Some(next) = cstring_end(input, *at)? else {
             return Ok(None);
         };
-        at = next;
-        let Some(next) = advance(input, at, 8)? else {
+        *at = next;
+        let Some(next) = advance(input, *at, 8)? else {
             return Ok(None);
         };
-        at = next;
+        *at = next;
     }
-    Ok(Some(at))
+    Ok(Some(*at))
 }
 
 fn insert_end(input: &[u8]) -> Result<Option<usize>, IngressError> {
     let Some(at) = advance(input, 1, 4)? else {
+        return Ok(None);
+    };
+    let Some(&tuple_tag) = input.get(at) else {
+        return Ok(None);
+    };
+    if tuple_tag != b'N' {
+        return Err(IngressError::InvalidFrame);
+    }
+    tuple_end(input, checked_add(at, 1)?)
+}
+
+fn streamed_insert_end(input: &[u8]) -> Result<Option<usize>, IngressError> {
+    let Some(at) = advance(input, 1, 8)? else {
         return Ok(None);
     };
     let Some(&tuple_tag) = input.get(at) else {

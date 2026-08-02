@@ -20,7 +20,7 @@ WAL until Runtime returns, so a slow Runtime directly backpressures transport.
 PostgreSQL logical slot (transport cursor authority)
   -> libpq COPY BOTH (complete CopyData payloads)
   -> w/k replication-envelope validation
-  -> bounded incremental pgoutput frame assembly
+  -> bounded incremental pgoutput frame assembly (protocol v1 or v2)
   -> existing complete-transaction decoder
   -> Runtime::process (Apply -> EffectBatch -> Operators -> Result Sink)
   -> committed Applied | committed AlreadyApplied
@@ -36,6 +36,22 @@ Apply input.
 
 ## ACK and recovery invariants
 
+Feedback requires one of exactly four terminal authorizations:
+
+1. `Applied(end_lsn)`: Runtime durably committed the decoded transaction.
+2. `AlreadyApplied(end_lsn)`: Runtime proved exact continuation replay.
+3. `EmptyCommitted(end_lsn)`: protocol v2 contained exactly
+   `S(first=true) E (S(first=false) E)* c` for the same nonzero top-level XID,
+   commit flags were zero, commit/end coordinates were valid, at least one
+   complete empty segment existed, and there was no other frame or trailing
+   byte. It requires an explicit `acknowledge_empty` call.
+4. `Aborted(ack_lsn)`: a complete, legal top-level terminal `A` closed the
+   matching stream and requires an explicit `acknowledge_abort` call.
+
+These are exact terminal authorizations, not interchangeable LSN observations.
+Outer `wal_end`, keepalive progress, a partial frame, and `E` alone authorize
+nothing.
+
 - Receive before Apply crash: no feedback; the slot replays after restart.
 - Apply commit before feedback crash: replay reaches Runtime, which returns
   `AlreadyApplied`; only then may feedback advance.
@@ -44,9 +60,13 @@ Apply input.
 - Decode, Apply, or Operator error: no computation state and no feedback advance.
 - Keepalive with reply requested: reply immediately with the last durable Apply
   position, never the newest received `wal_end`.
-- Protocol-v2 stream stop is not terminal. No segment is decoded, applied, or
-  acknowledged before a matching stream commit. A matching abort discards the
-  volatile assembly; its safe feedback boundary requires PG17/18 proof.
+- Protocol-v2 stream stop (`E`) is not terminal. Neither a partial segment nor
+  `E` can be decoded, applied, or acknowledged. Only a matching stream commit
+  (`c`) can enter the existing Runtime streamed decoder.
+- A matching stream abort (`A`) discards the volatile assembly without entering
+  Runtime or creating a continuation. Its feedback boundary is the outer
+  XLogData `dataStart` that carried the complete abort, not a pgoutput field
+  (protocol v2's abort message has no LSN field).
 
 M10.2 implements ACK as an explicit state transition. `receive_one` yields a
 non-constructible volatile input and blocks any second receive. `apply_received`
@@ -80,6 +100,50 @@ before any source transaction exists.
 The receiver never persists a partial transaction or a second WAL spool. A
 crash loses only volatile assembly and PostgreSQL replays from the slot. This
 is bounded-memory recovery, not persisted partial-stream recovery.
+
+## Protocol-v2 streaming boundary
+
+Streaming mode is selected explicitly at replication startup and requests
+pgoutput protocol version 2 with streaming enabled. Production assembly accepts
+arbitrary transport chunk boundaries: a pgoutput frame may span XLogData
+payloads, and one payload may contain several frames. It retains at most one
+single-XID transaction within the same 16 MiB wire bound; the existing Runtime
+decoder independently enforces the 10,000-change bound.
+
+The admitted semantic shape remains M6's top-level, single-XID, key-only
+`INSERT`: `S ... (R/I ... E)+ ... c`. Streaming assembly adds no nullable
+payload, UPDATE, DELETE, subtransaction, or interleaved-XID language. It scans
+frame structure and XID consistency only; the unchanged Runtime
+`decode_streamed_changes` remains the sole semantic relation/tuple decoder and
+revalidates the complete terminal commit before Apply.
+
+Partial segments and stream stop never produce an Apply token. A terminal abort
+produces a private transport token only after the matching complete `A`; it is
+not sent to Runtime, writes no Shiba state, and may be acknowledged only at that
+abort frame's outer XLogData `dataStart`. A crash before either commit feedback
+or abort feedback drops the volatile bytes and lets the PostgreSQL slot replay
+them. Corruption, an unknown/mismatched XID, an invalid terminal, or either
+admission limit poisons the receiver and advances no feedback.
+
+A strictly empty committed stream is the one exception to Runtime delivery. It
+has the exact `S(first=true) E (S(first=false) E)* c` structure above and yields a private
+`EmptyCommitted(end_lsn)` token; it never manufactures an empty
+`SourceTransaction` or continuation. This proves only that the currently
+selected publication emitted no changes for that committed transaction. It
+does not prove source identity or that publication membership has not drifted.
+Until M10.4 validates durable publication identity, an invalidated publication
+must never authorize empty feedback. `ALTER/DROP PUBLICATION`, remove/re-add,
+and same-name recreation must be prevented by role permissions or durably
+invalidate configuration before any later `EmptyCommitted` ACK.
+
+> A strictly validated publication-empty terminal commit may authorize feedback whether it contains one or multiple complete empty stream segments.
+
+The empty recognizer uses constant structural state inside the existing 16 MiB
+transaction bound; it does not retain a segment list. Any legal `R` or `I`
+frame makes the transaction non-empty and routes the complete commit through
+the sole Runtime streamed decoder. Any other frame, ordering, XID, terminal,
+flag, coordinate, or trailing-byte shape fails closed. There is deliberately no
+rule that authorizes feedback merely because decoding yielded no rows.
 
 ## Lifecycle boundary
 

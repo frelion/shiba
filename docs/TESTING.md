@@ -33,6 +33,8 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m5-composite-delete.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m10-committed-ingress.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m10-committed-ingress.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m10-streaming-ingress.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m10-streaming-ingress.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -200,6 +202,40 @@ LSN; receive-before-Apply drop changes neither computation nor slot; Runtime
 commit-before-feedback restarts as `AlreadyApplied`; explicit feedback flushes
 the exact COMMIT `end_lsn`; decoder and Operator failures poison the receiver,
 roll back all state, and do not advance the slot; clean restart retries once.
+
+`test-m10-streaming-ingress.sh` runs the production receiver in explicit
+protocol-v2 streaming mode with 64 KiB logical-decoding memory. The gate is
+defined to prove real
+multi-segment 10,000-change `S/R/I/E...c` delivery crosses arbitrary transport
+chunk boundaries yet enters the existing Runtime decoder only after terminal
+commit. Partial input and `E` produce neither Apply nor feedback; a crash during
+partial assembly relies on slot replay and later applies exactly once. A real
+matching `A` bypasses Runtime, leaves every Shiba durable fact absent, and may
+advance only to the outer XLogData `dataStart` carrying that abort. Corruption,
+unknown/mismatched XID, wrong terminal, 16 MiB overflow, and 10,001 changes fail
+closed without feedback. Acceptance requires the same gate to pass on
+PostgreSQL 17 and 18; no CLI may be used by the production receiver and no
+persisted spool may be created.
+
+The same M10.3 gate must exercise the closed terminal-authorization set:
+Runtime `Applied`, exact-replay `AlreadyApplied`, strict `EmptyCommitted`, and
+legal top-level `Aborted`. An empty commit must have exactly
+`S(first=true) E (S(first=false) E)* c`, at least one complete segment, one XID,
+flags zero, valid commit/end LSNs, and no other frame/trailing byte; it advances
+only through explicit empty ACK and creates no continuation. Legal `R/I`
+traffic must instead reach the sole Runtime decoder, and every other shape must
+fail closed. This is structural evidence about the selected
+publication's empty output only. Publication identity, mutation/recreation
+drift, and rejection of empty ACK after invalidation remain M10.4 tests and are
+not claimed by the M10.3 gate.
+
+The first PG17 run exposed a real multi-segment publication-empty commit and
+failed the former single-segment assumption. The corrected constant-state
+recognizer then passed the same production COPY BOTH gate on PG17.10 and
+PG18.4. Those runs prove a real segment count greater than one, exact terminal
+LSNs, pre-ACK replay, no empty-feedback loop, unchanged operator/continuation
+state, later source Apply, streamed abort, partial-stream restart, the 10,000
+change admission boundary, and rejection of change 10,001 without feedback.
 
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and

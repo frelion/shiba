@@ -1,151 +1,118 @@
 use postgres::Client;
 use shiba_runtime::{
-    PgoutputSource, ProcessOutcome, SourceTransaction, decode_committed_changes, process,
+    PgoutputSource, SourceTransaction, decode_committed_changes, decode_streamed_changes, process,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_EMPTY_AUTHORIZATION: AtomicU64 = AtomicU64::new(1);
 
 use crate::{
-    CommittedAssembler, IngressError, ReplicationMessage, ReplicationTransport,
-    parse_replication_message,
+    CommittedAssembler, IngressError, ReplicationMode, ReplicationTransport,
+    feedback::FeedbackState,
+    streamed::{StreamTerminal, StreamedAssembler},
+    tokens::{
+        AbortedTransaction, DurableTransaction, EmptyCommitted, ReceivedInput, StreamedInput,
+    },
 };
 
-/// A decoded committed input held in the receive-before-Apply crash window.
-///
-/// Private fields prevent callers from manufacturing an input that bypasses
-/// this receiver's outstanding-LSN check.
-#[derive(Debug)]
-pub struct ReceivedInput {
-    transaction: SourceTransaction,
-    end_lsn: u64,
-}
-
-impl ReceivedInput {
-    #[must_use]
-    pub const fn transaction(&self) -> &SourceTransaction {
-        &self.transaction
-    }
-
-    #[must_use]
-    pub const fn end_lsn(&self) -> u64 {
-        self.end_lsn
-    }
-}
-
-/// Proof that Runtime durably handled one exact terminal commit LSN.
-///
-/// Creating this token never sends replication feedback; acknowledgment is a
-/// separate explicit state transition.
-#[derive(Debug)]
-pub struct DurableTransaction {
-    outcome: ProcessOutcome,
-    end_lsn: u64,
-}
-
-impl DurableTransaction {
-    #[must_use]
-    pub const fn outcome(&self) -> ProcessOutcome {
-        self.outcome
-    }
-
-    #[must_use]
-    pub const fn end_lsn(&self) -> u64 {
-        self.end_lsn
-    }
+pub(super) enum Assembly {
+    Committed(CommittedAssembler),
+    Streamed(StreamedAssembler),
 }
 
 /// Exclusive, synchronous owner of one logical-replication connection.
 pub struct SourceReceiver {
-    transport: ReplicationTransport,
-    assembler: CommittedAssembler,
-    last_acknowledged_lsn: u64,
+    pub(super) transport: ReplicationTransport,
+    pub(super) assembly: Assembly,
+    pub(super) feedback: FeedbackState,
+    empty_authorization: u64,
     outstanding_lsn: Option<u64>,
-    pending_feedback: Option<u64>,
     failed: bool,
 }
 
 impl SourceReceiver {
-    /// Opens one exclusive replication connection and enters COPY BOTH.
-    ///
-    /// `last_acknowledged_lsn` is the already confirmed position read from the
-    /// validated `PostgreSQL` slot at startup. It is not a Shiba cursor. It is
-    /// the only position reported until a later explicit [`Self::acknowledge`]
-    /// succeeds.
+    /// Opens an explicit protocol-v1 committed or protocol-v2 streamed session.
     ///
     /// # Errors
-    /// Rejects invalid configuration, connection failure, or a non-COPY-BOTH
-    /// replication response.
+    /// Rejects invalid configuration, connection failure, or non-COPY-BOTH.
     pub fn connect(
         conninfo: &str,
         slot: &str,
         publication: &str,
+        mode: ReplicationMode,
         start_lsn: u64,
         last_acknowledged_lsn: u64,
     ) -> Result<Self, IngressError> {
+        let empty_authorization = NEXT_EMPTY_AUTHORIZATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| IngressError::LimitExceeded)?;
         let transport = ReplicationTransport::connect(conninfo)?;
-        transport.start(slot, publication, start_lsn)?;
+        transport.start(slot, publication, start_lsn, mode)?;
+        let assembly = match mode {
+            ReplicationMode::Committed => Assembly::Committed(CommittedAssembler::new()),
+            ReplicationMode::Streamed => Assembly::Streamed(StreamedAssembler::new()),
+        };
         Ok(Self {
             transport,
-            assembler: CommittedAssembler::new(),
-            last_acknowledged_lsn,
+            assembly,
+            feedback: FeedbackState::new(last_acknowledged_lsn),
+            empty_authorization,
             outstanding_lsn: None,
-            pending_feedback: None,
             failed: false,
         })
     }
 
-    /// Receives and decodes one committed source transaction without applying
-    /// or acknowledging it.
+    /// Receives one protocol-v1 committed transaction without applying it.
     ///
     /// # Errors
-    /// Refuses a second receive while an input or durable feedback is pending,
-    /// and fails closed on transport, framing, or semantic decode errors.
+    /// Fails closed on mode, state, transport, framing, or decode errors.
     pub fn receive_one(&mut self, source: PgoutputSource) -> Result<ReceivedInput, IngressError> {
-        if self.failed {
-            return Err(IngressError::ReceiverFailed);
+        self.ready()?;
+        if !matches!(self.assembly, Assembly::Committed(_)) {
+            return Err(IngressError::InvalidEnvelope(
+                "receiver is in streamed mode",
+            ));
         }
-        if self.outstanding_lsn.is_some() || self.pending_feedback.is_some() {
-            return Err(IngressError::FeedbackPending);
-        }
-
-        let result = self.receive_one_inner(source);
+        let result = self.receive_committed_wire().and_then(|assembled| {
+            let transaction = decode_committed_changes(&assembled.bytes, source)?;
+            Ok(self.set_outstanding(transaction, assembled.end_lsn))
+        });
         if result.is_err() {
             self.failed = true;
         }
         result
     }
 
-    fn receive_one_inner(&mut self, source: PgoutputSource) -> Result<ReceivedInput, IngressError> {
-        loop {
-            if let Some(assembled) = self.assembler.push(&[])? {
-                return self.decode_received(source, &assembled);
-            }
-
-            let copy_data = self.transport.receive()?;
-            match parse_replication_message(&copy_data)? {
-                ReplicationMessage::XLogData { data, .. } => {
-                    if let Some(assembled) = self.assembler.push(data)? {
-                        return self.decode_received(source, &assembled);
-                    }
-                }
-                ReplicationMessage::Keepalive {
-                    reply_requested: true,
-                    ..
-                } => self.transport.send_feedback(self.last_acknowledged_lsn)?,
-                ReplicationMessage::Keepalive {
-                    reply_requested: false,
-                    ..
-                } => {}
-            }
-        }
-    }
-
-    /// Applies one exact outstanding input through Runtime.
-    ///
-    /// On Runtime failure the outstanding receive is consumed without changing
-    /// acknowledged or pending feedback state.
+    /// Receives one protocol-v2 committed stream or terminal stream abort.
     ///
     /// # Errors
-    /// Rejects inputs that do not match the receiver's exact outstanding LSN,
-    /// or returns Runtime's atomic apply failure.
+    /// Partial segments remain internal. Invalid framing/order/XID, limits, and
+    /// semantic decode errors poison the receiver.
+    pub fn receive_streamed_one(
+        &mut self,
+        source: PgoutputSource,
+    ) -> Result<StreamedInput, IngressError> {
+        self.ready()?;
+        if !matches!(self.assembly, Assembly::Streamed(_)) {
+            return Err(IngressError::InvalidEnvelope(
+                "receiver is in committed mode",
+            ));
+        }
+        let result = self
+            .receive_stream_terminal()
+            .and_then(|terminal| self.handle_stream_terminal(source, terminal));
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Applies one exact outstanding committed input through Runtime.
+    ///
+    /// # Errors
+    /// Mismatch or Runtime failure fails closed without advancing feedback.
     pub fn apply_received(
         &mut self,
         apply: &mut Client,
@@ -154,11 +121,10 @@ impl SourceReceiver {
         if self.failed {
             return Err(IngressError::ReceiverFailed);
         }
-        if self.outstanding_lsn != Some(input.end_lsn) || self.pending_feedback.is_some() {
+        if self.outstanding_lsn != Some(input.end_lsn()) || self.feedback.has_pending() {
             return Err(IngressError::FeedbackMismatch);
         }
-
-        let outcome = match process(apply, &input.transaction) {
+        let outcome = match process(apply, input.raw_transaction()) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.failed = true;
@@ -166,18 +132,14 @@ impl SourceReceiver {
             }
         };
         self.outstanding_lsn = None;
-        self.pending_feedback = Some(input.end_lsn);
-        Ok(DurableTransaction {
-            outcome,
-            end_lsn: input.end_lsn,
-        })
+        self.feedback.mark_applied(input.end_lsn());
+        Ok(DurableTransaction::new(outcome, input.end_lsn()))
     }
 
-    /// Convenience composition of [`Self::receive_one`] and
-    /// [`Self::apply_received`]. It still does not acknowledge feedback.
+    /// Receives and applies one protocol-v1 transaction without acknowledging.
     ///
     /// # Errors
-    /// Returns either receive/decode or Runtime apply failure.
+    /// Returns receive/decode or Runtime failure.
     pub fn receive_and_apply_one(
         &mut self,
         apply: &mut Client,
@@ -187,27 +149,55 @@ impl SourceReceiver {
         self.apply_received(apply, &input)
     }
 
-    /// Sends feedback for one exact durable token, then advances in-memory ACK
-    /// state. A transport error leaves the pending token unchanged for retry.
+    /// Acknowledges one exact durably applied transaction.
     ///
     /// # Errors
-    /// Rejects stale or foreign tokens and propagates feedback transport errors.
+    /// Rejects the wrong token kind/coordinate or feedback transport failure.
     pub fn acknowledge(&mut self, token: &DurableTransaction) -> Result<(), IngressError> {
         if self.failed {
             return Err(IngressError::ReceiverFailed);
         }
-        if self.pending_feedback != Some(token.end_lsn) || self.outstanding_lsn.is_some() {
+        if self.outstanding_lsn.is_some() {
             return Err(IngressError::FeedbackMismatch);
         }
-        self.transport.send_feedback(token.end_lsn)?;
-        self.last_acknowledged_lsn = token.end_lsn;
-        self.pending_feedback = None;
-        Ok(())
+        self.feedback.require_applied(token.end_lsn())?;
+        self.send_ack(token.end_lsn())
+    }
+
+    /// Acknowledges one exact abort without invoking Runtime.
+    ///
+    /// # Errors
+    /// Rejects the wrong token kind/coordinate or feedback transport failure.
+    pub fn acknowledge_abort(&mut self, token: &AbortedTransaction) -> Result<(), IngressError> {
+        if self.failed {
+            return Err(IngressError::ReceiverFailed);
+        }
+        if self.outstanding_lsn.is_some() {
+            return Err(IngressError::FeedbackMismatch);
+        }
+        self.feedback.require_aborted(token.acknowledgment_lsn())?;
+        self.send_ack(token.acknowledgment_lsn())
+    }
+
+    /// Acknowledges one exact empty commit without invoking Runtime.
+    ///
+    /// # Errors
+    /// Rejects the wrong token kind/coordinate or feedback transport failure.
+    pub fn acknowledge_empty(&mut self, token: &EmptyCommitted) -> Result<(), IngressError> {
+        if self.failed {
+            return Err(IngressError::ReceiverFailed);
+        }
+        if self.outstanding_lsn.is_some() {
+            return Err(IngressError::FeedbackMismatch);
+        }
+        self.feedback
+            .require_empty(token.end_lsn(), token.authorization())?;
+        self.send_ack(token.end_lsn())
     }
 
     #[must_use]
     pub const fn last_acknowledged_lsn(&self) -> u64 {
-        self.last_acknowledged_lsn
+        self.feedback.last_acknowledged_lsn()
     }
 
     #[must_use]
@@ -217,19 +207,66 @@ impl SourceReceiver {
 
     #[must_use]
     pub const fn pending_feedback_lsn(&self) -> Option<u64> {
-        self.pending_feedback
+        self.feedback.pending_lsn()
     }
 
-    fn decode_received(
+    fn ready(&self) -> Result<(), IngressError> {
+        if self.failed {
+            return Err(IngressError::ReceiverFailed);
+        }
+        if self.outstanding_lsn.is_some() || self.feedback.has_pending() {
+            return Err(IngressError::FeedbackPending);
+        }
+        Ok(())
+    }
+
+    fn handle_stream_terminal(
         &mut self,
         source: PgoutputSource,
-        assembled: &crate::AssembledTransaction,
-    ) -> Result<ReceivedInput, IngressError> {
-        let transaction = decode_committed_changes(&assembled.bytes, source)?;
-        self.outstanding_lsn = Some(assembled.end_lsn);
-        Ok(ReceivedInput {
-            transaction,
-            end_lsn: assembled.end_lsn,
-        })
+        terminal: StreamTerminal,
+    ) -> Result<StreamedInput, IngressError> {
+        match terminal {
+            StreamTerminal::Committed(assembled) => {
+                let transaction = decode_streamed_changes(&assembled.bytes, source)?;
+                Ok(StreamedInput::Transaction(
+                    self.set_outstanding(transaction, assembled.end_lsn),
+                ))
+            }
+            StreamTerminal::EmptyCommitted {
+                xid,
+                commit_lsn,
+                end_lsn,
+                segment_count,
+            } => {
+                self.feedback.mark_empty(end_lsn, self.empty_authorization);
+                Ok(StreamedInput::EmptyCommitted(EmptyCommitted::new(
+                    xid,
+                    commit_lsn,
+                    end_lsn,
+                    segment_count,
+                    self.empty_authorization,
+                )))
+            }
+            StreamTerminal::Aborted { acknowledgment_lsn } => {
+                self.feedback.mark_aborted(acknowledgment_lsn);
+                Ok(StreamedInput::Aborted(AbortedTransaction::new(
+                    acknowledgment_lsn,
+                )))
+            }
+        }
+    }
+
+    fn set_outstanding(&mut self, transaction: SourceTransaction, end_lsn: u64) -> ReceivedInput {
+        self.outstanding_lsn = Some(end_lsn);
+        ReceivedInput::new(transaction, end_lsn)
+    }
+
+    fn send_ack(&mut self, lsn: u64) -> Result<(), IngressError> {
+        if self.failed {
+            return Err(IngressError::ReceiverFailed);
+        }
+        self.transport.send_feedback(lsn)?;
+        self.feedback.complete(lsn);
+        Ok(())
     }
 }

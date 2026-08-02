@@ -3,7 +3,7 @@ use crate::{
     frame::{FrameStatus, frame_status},
 };
 
-const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct AssembledTransaction {

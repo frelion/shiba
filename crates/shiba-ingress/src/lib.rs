@@ -6,13 +6,25 @@ use core::fmt;
 
 mod assembler;
 mod envelope;
+mod feedback;
+#[cfg(test)]
+mod feedback_tests;
 mod frame;
+mod receive_loop;
 mod receiver;
+mod streamed;
+#[cfg(test)]
+mod streamed_tests;
+mod tokens;
 mod transport;
 
 pub use assembler::{AssembledTransaction, CommittedAssembler};
 pub use envelope::{ReplicationMessage, encode_feedback, parse_replication_message};
-pub use receiver::{DurableTransaction, ReceivedInput, SourceReceiver};
+pub use receiver::SourceReceiver;
+pub use tokens::{
+    AbortedTransaction, DurableTransaction, EmptyCommitted, ReceivedInput, StreamedInput,
+};
+pub use transport::ReplicationMode;
 pub(crate) use transport::ReplicationTransport;
 
 #[derive(Debug)]
