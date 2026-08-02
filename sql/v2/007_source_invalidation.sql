@@ -2,17 +2,18 @@
 -- creation and DDL invalidation own separate immutable facts with one writer each.
 
 CREATE TABLE shiba_internal.source_binding (
-    source_id bigint PRIMARY KEY CHECK (source_id > 0),
+    source_id bigint NOT NULL CHECK (source_id > 0),
     address_classid oid NOT NULL CHECK (address_classid = 'pg_class'::regclass),
     address_objid oid NOT NULL,
-    address_objsubid integer NOT NULL CHECK (address_objsubid = 0),
+    address_objsubid integer NOT NULL CHECK (address_objsubid >= 0),
+    PRIMARY KEY (source_id, address_classid, address_objid, address_objsubid),
     CONSTRAINT source_binding_address_unique UNIQUE (
         address_classid, address_objid, address_objsubid
     )
 );
 
 CREATE TABLE shiba_internal.source_invalidation (
-    source_id bigint PRIMARY KEY REFERENCES shiba_internal.source_binding,
+    source_id bigint PRIMARY KEY,
     address_classid oid NOT NULL,
     address_objid oid NOT NULL,
     address_objsubid integer NOT NULL,
@@ -46,9 +47,15 @@ BEGIN
 
     INSERT INTO shiba_internal.source_binding (
         source_id, address_classid, address_objid, address_objsubid
-    ) VALUES (
-        requested_source_id, 'pg_class'::regclass, requested_relation, 0
-    );
+    )
+    SELECT requested_source_id, 'pg_class'::regclass, requested_relation, 0
+    UNION ALL
+    SELECT requested_source_id, 'pg_class'::regclass, requested_relation,
+           attribute.attnum::integer
+    FROM pg_catalog.pg_attribute AS attribute
+    WHERE attribute.attrelid = requested_relation
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped;
 END
 $function$;
 
@@ -98,6 +105,6 @@ CREATE EVENT TRIGGER shiba_source_sql_drop
     EXECUTE FUNCTION shiba_internal.invalidate_source_object();
 
 COMMENT ON TABLE shiba_internal.source_binding IS
-    'Immutable source-to-PostgreSQL-ObjectAddress binding authority';
+    'Immutable source relation and column ObjectAddress binding authority';
 COMMENT ON TABLE shiba_internal.source_invalidation IS
     'Exact ObjectAddress invalidation facts written in the owning DDL transaction';

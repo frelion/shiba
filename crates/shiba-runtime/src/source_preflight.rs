@@ -15,7 +15,8 @@ pub(crate) fn run(transaction: &mut Transaction<'_>, source_id: i64) -> Result<(
               AND class.relkind = 'r'
              LEFT JOIN pg_catalog.pg_namespace AS namespace
                ON namespace.oid = class.relnamespace
-             WHERE binding.source_id = $1",
+             WHERE binding.source_id = $1
+               AND binding.address_objsubid = 0",
             &[&source_id],
         )?
         .ok_or(M2Error::SourceBindingMissing)?;

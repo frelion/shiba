@@ -140,3 +140,8 @@ transaction remains applicable after `DROP TABLE` rollback because both the
 catalog removal and invalidation roll back. After committed DROP or schema
 CASCADE, the exact old ObjectAddress invalidation is durable; pending work fails
 before Apply, and same-name recreation cannot change that recovery decision.
+
+M7.3 registers relation and live-column addresses in one transaction. A rolled
+back column-type change rolls back invalidation and leaves pending work valid.
+A committed type change or column rename writes one exact bound cause; the
+processor's any-bound-address check rejects pending work before all Shiba writes.

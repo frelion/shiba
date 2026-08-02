@@ -86,13 +86,18 @@ code. Direct DROP rollback removes its invalidation atomically; committed DROP,
 schema CASCADE, and same-name recreation preserve the old exact ObjectAddress
 invalidation and cannot revive the source binding.
 
+M7.3 extends that same immutable binding row set with each live user-column
+ObjectAddress. Column-type rollback remains applicable; committed type change
+invalidates the relation address, while column rename records its exact positive
+attribute number. Either cause rejects pending work before Apply.
+
 **Not proved.** M7 has no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
 binding lifecycle/registration or replica-index drift observation without a
 RELATION message, streamed interleaving/subtransactions or bounded buffering,
 slot-generation change, multiple
-sources, column/type/index DDL coverage, external effect, compatibility path, alias, fallback,
+sources, replica-identity index DDL coverage, external effect, compatibility path, alias, fallback,
 or dual write.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),

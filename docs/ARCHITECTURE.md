@@ -116,8 +116,9 @@ real abort segments are discarded by the decoder, and restart feeds a later
 complete commit into the same sole processor writer.
 
 M7.1 adds two non-overlapping facts. `source_binding` is the immutable mapping
-from source ID to one relation ObjectAddress and is written only by the private
-registration function. `source_invalidation` is written only by one event
+from source ID to exact admitted object addresses and is written only by the private
+registration function. M7.3 makes that set one relation plus its live user
+columns; it does not add another authority. `source_invalidation` is written only by one event
 trigger function in the owning DDL transaction. For a non-replay transaction,
 the processor resolves the bound OID, acquires relation `ACCESS SHARE`, checks
 the exact invalidation, then performs Apply. The object lock is held through
@@ -127,6 +128,11 @@ M7.2 adds no authority or production path. PostgreSQL rolls back `sql_drop`
 facts with direct DROP, while committed direct DROP and schema CASCADE retain
 the old relation ObjectAddress. Recreating the same qualified name produces a
 different OID and cannot satisfy or replace the immutable binding.
+
+M7.3 proves PostgreSQL reports column rename by the exact column ObjectAddress
+and column type change by a bound relation address. The existing event writer
+handles both; the processor still locks only the unique relation row and rejects
+an invalidation of any address in the source's frozen binding set.
 
 ## Phase gates
 
@@ -139,6 +145,6 @@ evidence inputs, not implementation dependencies.
 **Unproved:** production replication transport and slot ownership, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
-streaming interleaving, column/type/index invalidation, concurrency,
+streaming interleaving, replica-identity index invalidation, concurrency,
 generation changes, multiple sources, general operators, and recovery workers
 remain.

@@ -144,6 +144,11 @@ exact old relation ObjectAddress retention, same-name/new-OID non-revival, and
 schema CASCADE invalidation on PostgreSQL 17 and 18. Pending work fails before
 row/count/result/continuation writes; historical exact replay remains a no-op.
 
+`test-m7-column-invalidation.sh` proves the registered binding set contains the
+relation and exact positive column attribute numbers. It covers type-change
+rollback/apply, committed type-change fail-closed behavior, and an isolated
+column rename whose durable cause is the exact column address on PG17 and PG18.
+
 `test-m5-source-binding.sh` binds the decoder to a real relation OID, applies an
 INSERT, renames both table and column, and applies another INSERT under the same
 OID. It then drops/recreates the original qualified name, proves the new OID is

@@ -101,7 +101,8 @@ fn m7_exact_object_address_invalidation_and_rollback() {
     let binding = client
         .query_one(
             "SELECT address_classid::bigint, address_objid::bigint, address_objsubid
-             FROM shiba_internal.source_binding WHERE source_id = 1",
+             FROM shiba_internal.source_binding
+             WHERE source_id = 1 AND address_objsubid = 0",
             &[],
         )
         .expect("query source ObjectAddress");
