@@ -1,7 +1,11 @@
 use crate::IngressError;
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 const XLOG_DATA_HEADER_BYTES: usize = 25;
 const KEEPALIVE_BYTES: usize = 18;
+const FEEDBACK_BYTES: usize = 34;
+const POSTGRES_EPOCH_UNIX_SECONDS: u64 = 946_684_800;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplicationMessage<'a> {
@@ -52,6 +56,37 @@ pub fn parse_replication_message(payload: &[u8]) -> Result<ReplicationMessage<'_
         Some(_) => Err(IngressError::InvalidEnvelope("unknown CopyData tag")),
         None => Err(IngressError::InvalidEnvelope("empty CopyData payload")),
     }
+}
+
+/// Encodes one `PostgreSQL` standby-status update for an already durable LSN.
+///
+/// # Errors
+/// Rejects timestamps before the `PostgreSQL` epoch or outside its signed
+/// microsecond representation.
+pub fn encode_feedback(
+    durable_lsn: u64,
+    now: SystemTime,
+) -> Result<[u8; FEEDBACK_BYTES], IngressError> {
+    let unix_duration = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| IngressError::InvalidEnvelope("feedback time predates Unix epoch"))?;
+    let postgres_duration = unix_duration
+        .checked_sub(std::time::Duration::from_secs(POSTGRES_EPOCH_UNIX_SECONDS))
+        .ok_or(IngressError::InvalidEnvelope(
+            "feedback time predates PostgreSQL epoch",
+        ))?;
+    let postgres_micros = i64::try_from(postgres_duration.as_micros()).map_err(|_| {
+        IngressError::InvalidEnvelope("feedback time exceeds PostgreSQL timestamp range")
+    })?;
+
+    let mut feedback = [0_u8; FEEDBACK_BYTES];
+    feedback[0] = b'r';
+    feedback[1..9].copy_from_slice(&durable_lsn.to_be_bytes());
+    feedback[9..17].copy_from_slice(&durable_lsn.to_be_bytes());
+    feedback[17..25].copy_from_slice(&durable_lsn.to_be_bytes());
+    feedback[25..33].copy_from_slice(&postgres_micros.to_be_bytes());
+    feedback[33] = 0;
+    Ok(feedback)
 }
 
 fn read_u64(bytes: &[u8], at: usize) -> Result<u64, IngressError> {

@@ -54,7 +54,9 @@ The safe committed coordinate is the pgoutput terminal transaction `end_lsn`,
 not its `commit_lsn`, an XLogData `wal_end`, or a keepalive `wal_end`.
 PostgreSQL defines `end_lsn` as the transaction end position and standby status
 positions as the last durable WAL byte plus one. M10 will verify this mapping
-differentially on PG17 and PG18 before feedback code is accepted.
+differentially on PG17 and PG18 before feedback code is accepted. M10.2 has now
+passed that gate on both majors; the first failing test also established that
+`PQputCopyData` must be followed by an explicit libpq flush.
 
 For a commit, the receiver may advance its in-memory acknowledged position only
 after complete decode and after Runtime returns `Applied` or `AlreadyApplied`
@@ -69,7 +71,9 @@ mirror `confirmed_flush_lsn` in its catalog.
 ## Consequences and open proof
 
 This choice adds one production dependency with a narrow boundary and a system
-`libpq` requirement. M10 must still prove disconnect behavior, async server
+`libpq` requirement. The binding exposes a defective raw-handle `Clone`; Shiba
+therefore keeps the connection private, exclusive, and never clones it. M10
+must still prove disconnect behavior, async server
 errors during COPY, graceful shutdown, protocol-v2 abort coordinates, slot and
 publication validation, least privilege, buffer peaks, and PG17/18 parity.
 Failure of those gates reopens this ADR; it does not authorize a CLI receiver,

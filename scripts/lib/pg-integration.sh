@@ -22,6 +22,12 @@ shiba_pg_integration_setup() {
     echo "SHIBA_TEST_LOGICAL_DECODING_WORK_MEM only supports 64kB" >&2
     exit 64
   fi
+  SHIBA_TEST_WAL_SENDER_TIMEOUT="${SHIBA_TEST_WAL_SENDER_TIMEOUT:-0}"
+  if [[ "$SHIBA_TEST_WAL_SENDER_TIMEOUT" != "0" \
+    && "$SHIBA_TEST_WAL_SENDER_TIMEOUT" != "2s" ]]; then
+    echo "SHIBA_TEST_WAL_SENDER_TIMEOUT only supports 0 or 2s" >&2
+    exit 64
+  fi
 
   SHIBA_TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
   SHIBA_TEST_PG_BINDIR="$("$SHIBA_TEST_PG_CONFIG" --bindir)"
@@ -86,7 +92,7 @@ PY
   "$SHIBA_TEST_PG_BINDIR/initdb" -D "$SHIBA_TEST_DATA" \
     --no-locale --encoding=UTF8 --auth=trust >/dev/null
   printf '%s\n' 'wal_level=logical' 'max_replication_slots=4' 'max_wal_senders=4' \
-    'wal_sender_timeout=0' >> "$SHIBA_TEST_DATA/postgresql.conf"
+    "wal_sender_timeout=$SHIBA_TEST_WAL_SENDER_TIMEOUT" >> "$SHIBA_TEST_DATA/postgresql.conf"
   if [[ -n "${SHIBA_TEST_LOGICAL_DECODING_WORK_MEM:-}" ]]; then
     printf 'logical_decoding_work_mem=%s\n' "$SHIBA_TEST_LOGICAL_DECODING_WORK_MEM" \
       >> "$SHIBA_TEST_DATA/postgresql.conf"

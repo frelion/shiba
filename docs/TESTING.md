@@ -190,10 +190,16 @@ key-only CountRows shape; M9 does not add nullable-payload streaming admission.
 links the selected libpq for the requested PostgreSQL major, enters real COPY
 BOTH without `pg_recvlogical`, receives protocol-v1 XLogData, assembles one
 transaction, invokes the existing decoder and Runtime on a separate Apply
-connection, and proves public CountRows=2, SumInt8=10 plus one continuation.
+connection, and proves public CountRows/SumInt8 plus continuation.
 Pure ingress tests independently split every byte boundary, coalesce frames and
-transactions, enforce the 16 MiB buffer bound, and validate `w`/`k`. M10.1 does
-not claim ACK or restart recovery.
+transactions, enforce the 16 MiB buffer bound, validate `w`/`k`, and freeze the
+34-byte status payload.
+
+The same gate now proves M10.2: requested keepalive reports only the old durable
+LSN; receive-before-Apply drop changes neither computation nor slot; Runtime
+commit-before-feedback restarts as `AlreadyApplied`; explicit feedback flushes
+the exact COMMIT `end_lsn`; decoder and Operator failures poison the receiver,
+roll back all state, and do not advance the slot; clean restart retries once.
 
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and

@@ -66,6 +66,22 @@ transaction. PostgreSQL retains transport history through the slot;
 `source_continuation` independently prevents duplicate computation. Neither
 authority mirrors or repairs the other.
 
+M10.2 proves each committed window on real PG17 and PG18. Dropping the receiver
+after `receive_one` leaves all Shiba state and slot progress old. Restart then
+applies once. Dropping it after Runtime commit but before `acknowledge` leaves
+the result visible while the slot remains old; restart receives the same
+transaction, Runtime returns `AlreadyApplied`, and only that durable token can
+advance feedback. Decoder and Operator failures poison the connection, roll
+back computation, and retain the old slot position until a clean restart and
+successful retry.
+
+The committed feedback coordinate is pgoutput COMMIT `end_lsn`, not
+`commit_lsn`, outer `wal_end`, or keepalive `wal_end`. `PQputCopyData` alone did
+not advance the live slot in the first failing test; production now explicitly
+flushes libpq output, and an independent SQL connection polls the slot to the
+exact terminal coordinate. Requested keepalive replies are observed with the
+previous durable coordinate in all three walsender status fields.
+
 Protocol-v2 segments remain volatile and cannot enter Runtime before their
 terminal commit. Disconnect discards partial assembly so the slot can replay
 it. A terminal abort may advance transport feedback only after its exact safe

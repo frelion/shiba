@@ -173,10 +173,12 @@ the only component that can construct `SourceTransaction`; Runtime then owns
 the one Apply transaction. PG17 and PG18 both prove the real path through
 CountRows=2 and SumInt8=10.
 
-M10.1 does not yet send feedback, reconnect, assemble protocol-v2 streaming, or
-own slot/config lifecycle. Its terminal scanner exposes the COMMIT `end_lsn` as
-a candidate transport coordinate, but M10.2 must prove that coordinate against
-slot `confirmed_flush_lsn` before ACK is enabled.
+M10.2 enables feedback only through a durable token returned after Runtime
+commit or exact replay. PG17/18 prove COMMIT `end_lsn` advances the slot's
+`confirmed_flush_lsn` exactly; `commit_lsn`, outer/keepalive `wal_end`, and
+newest received bytes are never ACK coordinates. Decode and Operator failures
+leave slot and computation state old. Protocol-v2 production assembly and
+abort feedback remain deferred to M10.3.
 
 The wire layout follows the PostgreSQL 17/18 logical replication protocol and
 message-format documentation. The test uses each major's own `pg_recvlogical`

@@ -11,8 +11,8 @@ mod receiver;
 mod transport;
 
 pub use assembler::{AssembledTransaction, CommittedAssembler};
-pub use envelope::{ReplicationMessage, parse_replication_message};
-pub use receiver::{ReceivedTransaction, SourceReceiver};
+pub use envelope::{ReplicationMessage, encode_feedback, parse_replication_message};
+pub use receiver::{DurableTransaction, ReceivedInput, SourceReceiver};
 pub(crate) use transport::ReplicationTransport;
 
 #[derive(Debug)]
@@ -22,6 +22,9 @@ pub enum IngressError {
     InvalidFrame,
     MessageOrder,
     LimitExceeded,
+    FeedbackPending,
+    FeedbackMismatch,
+    ReceiverFailed,
     Libpq(libpq::errors::Error),
     UnexpectedStatus(libpq::Status),
     Decode(shiba_runtime::PgoutputError),
@@ -38,6 +41,15 @@ impl fmt::Display for IngressError {
             Self::InvalidFrame => formatter.write_str("invalid pgoutput frame"),
             Self::MessageOrder => formatter.write_str("invalid pgoutput transaction order"),
             Self::LimitExceeded => formatter.write_str("ingress transaction limit exceeded"),
+            Self::FeedbackPending => {
+                formatter.write_str("durable replication feedback is still pending")
+            }
+            Self::FeedbackMismatch => {
+                formatter.write_str("replication receiver state does not match the token")
+            }
+            Self::ReceiverFailed => {
+                formatter.write_str("replication receiver failed closed and must restart")
+            }
             Self::Libpq(error) => {
                 write!(formatter, "logical replication transport failed: {error}")
             }

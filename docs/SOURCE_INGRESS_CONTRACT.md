@@ -48,13 +48,42 @@ Apply input.
   acknowledged before a matching stream commit. A matching abort discards the
   volatile assembly; its safe feedback boundary requires PG17/18 proof.
 
+M10.2 implements ACK as an explicit state transition. `receive_one` yields a
+non-constructible volatile input and blocks any second receive. `apply_received`
+calls Runtime and yields a non-constructible durable token only after
+`Applied` or `AlreadyApplied`. `acknowledge` accepts only the receiver's exact
+pending terminal `end_lsn`, sends write/flush/apply at that same coordinate,
+flushes libpq output, and only then advances its in-memory last-ACK value.
+Decoder or Runtime failure poisons the receiver: it cannot skip the failed
+transaction and must restart from the slot.
+
+```mermaid
+sequenceDiagram
+    participant PG as PostgreSQL slot
+    participant I as Source Ingress
+    participant R as Runtime
+    participant DB as Shiba transaction
+    PG->>I: XLogData through terminal COMMIT(end_lsn)
+    I->>R: one decoded SourceTransaction
+    R->>DB: Apply + Operators + Result + continuation
+    DB-->>R: COMMIT
+    R-->>I: Applied or AlreadyApplied
+    I->>PG: status write=flush=apply=end_lsn
+    Note over I,PG: crash before status means slot replay; Runtime returns AlreadyApplied
+```
+
+A requested keepalive follows the same rule but reports only the previous
+durable ACK, never the keepalive's `wal_end`. PG17 and PG18 tests use a 2-second
+walsender timeout and observe all three coordinates in `pg_stat_replication`
+before any source transaction exists.
+
 The receiver never persists a partial transaction or a second WAL spool. A
 crash loses only volatile assembly and PostgreSQL replays from the slot. This
 is bounded-memory recovery, not persisted partial-stream recovery.
 
 ## Lifecycle boundary
 
-M10.1 starts with one explicit receiver configuration: connection target,
+M10.1–M10.2 use one explicit receiver configuration: connection target,
 `source_id`, exact slot name, publication name, and slot generation. There is no
 environment/table fallback and no discovery by schema or relation name.
 M10.4 must replace this process-only lifecycle input with one catalog authority,

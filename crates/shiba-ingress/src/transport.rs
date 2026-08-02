@@ -1,6 +1,6 @@
 use libpq::{Connection, Status, connection::Info};
 
-use crate::IngressError;
+use crate::{IngressError, encode_feedback};
 
 /// Synchronous replication transport with no in-process queue or slot authority.
 pub struct ReplicationTransport {
@@ -61,6 +61,15 @@ impl ReplicationTransport {
             .copy_data(false)
             .map(|bytes| bytes.to_vec())
             .map_err(IngressError::Libpq)
+    }
+
+    /// Sends a blocking status update for the caller's durable LSN.
+    pub(crate) fn send_feedback(&self, durable_lsn: u64) -> Result<(), IngressError> {
+        let feedback = encode_feedback(durable_lsn, std::time::SystemTime::now())?;
+        self.connection
+            .put_copy_data(&feedback)
+            .map_err(IngressError::Libpq)?;
+        self.connection.flush().map_err(IngressError::Libpq)
     }
 }
 
