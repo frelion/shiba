@@ -120,3 +120,9 @@ abort, or XID mismatch cannot return a transaction, so continuation cannot pass
 an incomplete stream. After a complete stream commit, processor crash rollback,
 retry once, and exact replay are identical to the existing transaction path.
 Production receiver restart and persisted partial-stream recovery remain open.
+
+M6.2 observes real streamed segments before source ROLLBACK, then real `A`.
+After feedback covers the abort, receiver restart on the same slot emits a new
+committed stream; only that transaction can write row/count/result/continuation.
+Host crash before abort feedback and persisted partial-stream recovery remain
+unproved.

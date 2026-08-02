@@ -127,6 +127,12 @@ continuation transaction. It proves crash rollback, retry once, replay no-op,
 and that a live switch back to default identity is rejected before writes on
 PostgreSQL 17 and 18.
 
+`test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
+transaction, observes real segments while it is open, rolls it back, and
+requires real matching `A`. After abort feedback it restarts the same slot and
+applies/replays a later streamed commit, proving the aborted stream left no
+row/count/result/continuation state on PostgreSQL 17 and 18.
+
 `test-m5-source-binding.sh` binds the decoder to a real relation OID, applies an
 INSERT, renames both table and column, and applies another INSERT under the same
 OID. It then drops/recreates the original qualified name, proves the new OID is

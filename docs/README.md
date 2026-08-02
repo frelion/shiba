@@ -73,11 +73,14 @@ M6.1 admits one complete, non-interleaved streamed key-only INSERT transaction.
 No segment is visible before stream commit; the assembled transaction uses the
 existing Apply/count/result/continuation commit and replay boundary.
 
+M6.2 proves a real streamed abort is never visible and that restarting the same
+slot can subsequently deliver an independent streamed commit exactly once.
+
 **Not proved.** M6.1 has no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
 binding lifecycle/registration or replica-index drift observation without a
-RELATION message, streamed abort/restart/interleaving or bounded buffering,
+RELATION message, streamed interleaving/subtransactions or bounded buffering,
 slot-generation change, multiple
 sources, DDL invalidation, external effect, compatibility path, alias, fallback,
 or dual write.

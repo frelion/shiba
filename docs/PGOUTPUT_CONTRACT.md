@@ -198,3 +198,11 @@ M6.1 adds no spool, transport, interleaving, recovery worker, or acknowledgement
 authority. The layouts follow the PostgreSQL
 [17 protocol documentation](https://www.postgresql.org/docs/17/protocol-logicalrep-message-formats.html)
 and [18 protocol documentation](https://www.postgresql.org/docs/18/protocol-logicalrep-message-formats.html).
+
+## M6.2 streamed abort and receiver restart
+
+A real protocol-v2 stream abort remains outside the admitted transaction
+language: completed segments followed by matching `A` still return no
+`SourceTransaction`. After receiver feedback covers the abort and the same slot
+is restarted, a later independent streamed commit is decoded and applied under
+its own identity. No aborted row or continuation becomes visible.

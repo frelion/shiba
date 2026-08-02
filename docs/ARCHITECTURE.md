@@ -111,6 +111,10 @@ Segments have no durable authority and cannot call Apply; only stream commit
 creates the existing stable transaction identity and hands one complete value
 to the unchanged processor, sole writer, and PostgreSQL transaction owner.
 
+M6.2 adds no production component. The PostgreSQL slot/receiver is test ingress:
+real abort segments are discarded by the decoder, and restart feeds a later
+complete commit into the same sole processor writer.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction

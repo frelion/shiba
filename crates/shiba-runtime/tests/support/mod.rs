@@ -122,7 +122,7 @@ pub(super) fn strip_recvlogical_delimiters(capture: &[u8]) -> Vec<u8> {
     wire
 }
 
-fn strip_streamed_delimiters(capture: &[u8]) -> Vec<u8> {
+pub(super) fn strip_streamed_delimiters(capture: &[u8]) -> Vec<u8> {
     let mut wire = Vec::new();
     let mut start = 0;
     let mut in_segment = false;
@@ -139,6 +139,27 @@ fn strip_streamed_delimiters(capture: &[u8]) -> Vec<u8> {
         start = end + 1;
     }
     wire
+}
+
+pub(super) fn streamed_framed_terminal(capture: &[u8]) -> Option<u8> {
+    let mut start = 0;
+    let mut in_segment = false;
+    let mut terminal = None;
+    while start < capture.len() {
+        let tag = *capture.get(start)?;
+        let end = stream_message_end_checked(capture, start, in_segment)?;
+        if capture.get(end) != Some(&b'\n') {
+            return None;
+        }
+        in_segment = match tag {
+            b'S' => true,
+            b'E' => false,
+            _ => in_segment,
+        };
+        terminal = Some(tag);
+        start = end.checked_add(1)?;
+    }
+    terminal
 }
 
 pub(super) fn framed_message_count(capture: &[u8]) -> Option<usize> {
