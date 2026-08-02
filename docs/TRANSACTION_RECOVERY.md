@@ -10,6 +10,12 @@ checks continuation history, writes applied INSERT facts, updates private count
 state, updates the public result, and writes continuation last before one
 `COMMIT`. No intermediate fact is visible and no asynchronous repair exists.
 
+M3.1 decoding precedes that transaction and owns no durable state. A truncated,
+unsupported, mismatched, or uncommitted pgoutput buffer yields no
+`SourceTransaction`, so `process` cannot run and continuation cannot advance.
+Only a fully validated pgoutput COMMIT supplies the stable commit LSN and BEGIN
+XID used by M2 identity.
+
 The stable identity is `(source_id, slot_generation, commit_lsn,
 ingress_transaction_id)`. The database primary key reserves the first three as
 the source coordinate; a different ingress identity at that coordinate fails
@@ -29,3 +35,8 @@ has no recovery worker, concurrent source writer, slot-generation transition,
 or compare-and-swap protocol. Future concurrency/effect contracts must define
 those boundaries before code lands. DDL invalidation must use PostgreSQL
 `ObjectAddress` semantics rather than name matching.
+
+The M3.1 test restarts `pg_recvlogical` cleanly against the same test-only slot
+and applies the next transaction. It does not make the CLI, publication, or slot
+a production authority and does not yet prove an abnormal transport crash or
+acknowledgement recovery; that is the next transport-owned slice.

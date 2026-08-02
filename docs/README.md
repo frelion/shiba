@@ -2,7 +2,8 @@
 
 This worktree starts a new V2 on branch `codex/v2-cleanroom`. It is not a refactor
 of the previous V1 or V2 code. Phase 1 established Protocol and Catalog; M2 adds
-one transactional INSERT/count vertical path.
+one transactional INSERT/count vertical path; M3.1 replaces its synthetic input
+with a strict decoder fed by live PostgreSQL `pgoutput` version 1.
 
 ## Scope decision
 
@@ -20,11 +21,16 @@ One runtime-owned PostgreSQL transaction atomically applies INSERT facts,
 advances a deterministic count, publishes `shiba.count_result`, and records its
 continuation last. Exact replay is a no-op.
 
-**Not proved.** M2 has no Compiler, pgoutput Source Ingress, EffectStream,
-Registration, worker, UPDATE/DELETE, streaming transaction, DDL invalidation,
-concurrent source, external effect, publication, slot, compatibility path,
+M3.1 decodes a complete live `BEGIN → RELATION → INSERT+ → COMMIT` transaction
+for one admitted `int8` relation before invoking the unchanged M2 processor.
+Decode failures therefore cannot expose Apply, result, or continuation state.
+
+**Not proved.** M3.1 has no production replication transport/slot lifecycle,
+abnormal capture restart, UPDATE/DELETE, NULL, TOAST, streaming transaction,
+DDL invalidation, concurrent source, external effect, compatibility path,
 alias, fallback, or dual write.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),
 [catalog contract](CATALOG_CONTRACT.md), and the [reuse manifest](contracts/REUSE_MANIFEST.md)
-before extending the workspace.
+before extending the workspace. M3 work must also follow the
+[pgoutput contract](PGOUTPUT_CONTRACT.md).

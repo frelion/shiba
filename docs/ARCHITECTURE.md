@@ -29,6 +29,13 @@ M2 adds four purpose-specific facts: `applied_insert`, `count_state`,
 `source_continuation`, and public `shiba.count_result`. They have one logical
 writer, the M2 processor, and are never independently repaired or mirrored.
 
+M3.1 adds a pure Source Ingress decoder inside `shiba-runtime`. Its admitted
+relation OID, source ID, and slot generation are explicit input configuration;
+schema and relation names are decoded only for bounds checking and are not
+identity. The decoder owns no connection and no durable state. It produces an
+M2 `SourceTransaction` only after validating COMMIT, so the processor remains
+the only transaction owner and writer.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -37,7 +44,6 @@ No later code may use an old authority as a fallback. An implementation is
 accepted only after its clean-room tests prove its new contract; legacy tests are
 evidence inputs, not implementation dependencies.
 
-**Unproved:** catalog binding inspection, identity admission, compilation,
-pgoutput, concurrency, generation changes, general operators, and recovery
-workers remain future work. Production `SourceTransaction` is the future narrow
-ingress handoff, not a test adapter; only its construction is test-driven.
+**Unproved:** production replication transport and slot ownership, catalog
+binding inspection, concurrency, generation changes, non-INSERT tuple shapes,
+general operators, and recovery workers remain future work.

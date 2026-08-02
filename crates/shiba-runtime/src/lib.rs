@@ -9,9 +9,11 @@
 
 mod count;
 mod error;
+mod pgoutput;
 mod processor;
 mod transaction;
 
 pub use error::M2Error;
+pub use pgoutput::{PgoutputError, PgoutputSource, decode_committed_insert};
 pub use processor::{ProcessOutcome, process};
 pub use transaction::{SourceInsert, SourceTransaction};

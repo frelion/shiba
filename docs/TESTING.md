@@ -11,6 +11,8 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-empty-install.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m2.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m2.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m3.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m3.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -32,7 +34,14 @@ conflict, operator-error rollback, backend-termination rollback after the
 continuation write, reconnect/replay, and ordinary-role result-only access.
 Failure triggers are test objects and never ship in extension SQL.
 
-During development run fmt, check, the Runtime unit tests, one major's M2 test,
+`test-m3.sh` enables logical decoding in an isolated cluster, creates one
+test-only publication and `pgoutput` slot, and captures two real committed
+transactions with separate `pg_recvlogical` runs. The integration test removes
+only that client's per-XLogData delimiter, decodes pure pgoutput, applies through
+M2, and proves result `2`, exact replay `2`, corrupt/truncated input state
+unchanged, then restarted capture result `3`. PG17 and PG18 run the same gate.
+
+During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.
 
 ## Evidence handling
