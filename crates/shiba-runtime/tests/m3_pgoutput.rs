@@ -1,4 +1,10 @@
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Child, Command},
+    thread,
+    time::{Duration, Instant},
+};
 
 use postgres::{Client, NoTls};
 use shiba_protocol::{SlotGeneration, SourceId};
@@ -67,6 +73,99 @@ fn capture(client: &mut Client, name: &str) -> Vec<u8> {
         .expect("capture pgoutput");
     assert!(status.success(), "capture through end LSN {end_lsn}");
     strip_recvlogical_delimiters(&fs::read(output).expect("read captured pgoutput"))
+}
+
+struct StoppedCapture(Option<Child>);
+
+impl StoppedCapture {
+    fn crash(mut self) {
+        let mut child = self.0.take().expect("capture process");
+        child.kill().expect("kill capture before feedback");
+        child.wait().expect("reap killed capture");
+    }
+}
+
+impl Drop for StoppedCapture {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn capture_committed_row_without_ack(
+    client: &mut Client,
+    baseline: &str,
+    name: &str,
+) -> (Vec<u8>, StoppedCapture) {
+    let output = PathBuf::from(required("SHIBA_M3_CAPTURE_DIR")).join(name);
+    let child = command("pg_recvlogical")
+        .args(["-S", "shiba_m3_slot", "--start", "-f"])
+        .arg(&output)
+        .args([
+            "-n",
+            "-F",
+            "3600",
+            "-s",
+            "0",
+            "-o",
+            "proto_version=1",
+            "-o",
+            "publication_names=shiba_m3_pub",
+        ])
+        .spawn()
+        .expect("start non-acking capture");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = client
+            .query_one(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = 'shiba_m3_slot'",
+                &[],
+            )
+            .expect("read active slot");
+        if row.get::<_, bool>(0) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "capture did not claim slot");
+        thread::sleep(Duration::from_millis(10));
+    }
+    client
+        .execute("INSERT INTO source_m3.events VALUES (103)", &[])
+        .expect("commit row in unacknowledged window");
+    let capture = loop {
+        let bytes = fs::read(&output).unwrap_or_default();
+        if delimiter_count(&bytes) == 4 {
+            break bytes;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture did not receive transaction"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stop = Command::new("kill")
+        .args(["-STOP", &child.id().to_string()])
+        .status()
+        .expect("stop capture at crash point");
+    assert!(stop.success(), "stop capture at crash point");
+    let row = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text, active
+             FROM pg_replication_slots WHERE slot_name = 'shiba_m3_slot'",
+            &[],
+        )
+        .expect("read unacknowledged slot position");
+    assert_eq!(row.get::<_, &str>(0), baseline);
+    assert!(row.get::<_, bool>(1));
+    (
+        strip_recvlogical_delimiters(&capture),
+        StoppedCapture(Some(child)),
+    )
+}
+
+fn delimiter_count(bytes: &[u8]) -> usize {
+    bytes.split(|byte| *byte == b'\n').count().saturating_sub(1)
 }
 
 // pg_recvlogical appends one newline after every XLogData payload. Parse the
@@ -188,10 +287,15 @@ fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
     );
     assert_eq!(durable_state(&mut client), (2, 2, 2, 1));
 
-    client
-        .batch_execute("INSERT INTO source_m3.events VALUES (103)")
-        .expect("commit second real source transaction");
-    let second_wire = capture(&mut client, "second.pgoutput");
+    let slot_before: String = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = 'shiba_m3_slot'",
+            &[],
+        )
+        .expect("read slot position before crash window")
+        .get(0);
+    let (second_wire, stopped_capture) =
+        capture_committed_row_without_ack(&mut client, &slot_before, "unacked.pgoutput");
     let second = decode_committed_insert(&second_wire, source).expect("decode after restart");
     assert_ne!(first.identity, second.identity);
     assert_eq!(
@@ -199,6 +303,40 @@ fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
         ProcessOutcome::Applied
     );
     assert_eq!(durable_state(&mut client), (3, 3, 3, 2));
+    stopped_capture.crash();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = client
+            .query_one(
+                "SELECT confirmed_flush_lsn::text, active FROM pg_replication_slots WHERE slot_name = 'shiba_m3_slot'",
+                &[],
+            )
+            .expect("read slot position after crash");
+        assert_eq!(row.get::<_, &str>(0), slot_before);
+        if !row.get::<_, bool>(1) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "crashed capture remains active");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let replay_wire = capture(&mut client, "replayed.pgoutput");
+    let replay = decode_committed_insert(&replay_wire, source).expect("decode slot replay");
+    assert_eq!(second, replay);
+    assert_eq!(
+        process(&mut client, &replay).expect("apply slot replay"),
+        ProcessOutcome::AlreadyApplied
+    );
+    assert_eq!(durable_state(&mut client), (3, 3, 3, 2));
+    let acknowledged: bool = client
+        .query_one(
+            "SELECT confirmed_flush_lsn > $1::text::pg_lsn
+             FROM pg_replication_slots WHERE slot_name = 'shiba_m3_slot'",
+            &[&slot_before],
+        )
+        .expect("read acknowledged replay position")
+        .get(0);
+    assert!(acknowledged, "clean replay capture must acknowledge WAL");
     let result: i64 = client
         .query_one("SELECT row_count FROM shiba.count_result", &[])
         .expect("query SQL result")

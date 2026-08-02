@@ -36,7 +36,10 @@ or compare-and-swap protocol. Future concurrency/effect contracts must define
 those boundaries before code lands. DDL invalidation must use PostgreSQL
 `ObjectAddress` semantics rather than name matching.
 
-The M3.1 test restarts `pg_recvlogical` cleanly against the same test-only slot
-and applies the next transaction. It does not make the CLI, publication, or slot
-a production authority and does not yet prove an abnormal transport crash or
-acknowledgement recovery; that is the next transport-owned slice.
+M3.2 freezes a receiver after it has observed a complete transaction but before
+feedback. The processor commits the transaction while `confirmed_flush_lsn`
+still names the prior position, then the receiver is killed. Restart replays the
+same identity and the processor returns `AlreadyApplied`; result, operator state,
+Apply facts, and continuation stay unchanged. Thus retry starts at the PostgreSQL
+slot, but Shiba commit visibility remains authoritative. The CLI, publication,
+and slot are test infrastructure, not a second Shiba continuation.

@@ -36,6 +36,11 @@ identity. The decoder owns no connection and no durable state. It produces an
 M2 `SourceTransaction` only after validating COMMIT, so the processor remains
 the only transaction owner and writer.
 
+M3.2 adds no production state. PostgreSQL's slot may lag the committed Shiba
+continuation and replay an already visible transaction; the processor's durable
+identity check makes that replay a no-op. Slot feedback never writes Shiba state
+and cannot make a result visible.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction

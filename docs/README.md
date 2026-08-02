@@ -3,7 +3,8 @@
 This worktree starts a new V2 on branch `codex/v2-cleanroom`. It is not a refactor
 of the previous V1 or V2 code. Phase 1 established Protocol and Catalog; M2 adds
 one transactional INSERT/count vertical path; M3.1 replaces its synthetic input
-with a strict decoder fed by live PostgreSQL `pgoutput` version 1.
+with a strict decoder fed by live PostgreSQL `pgoutput` version 1. M3.2 proves
+safe slot replay across the post-result/pre-ack crash window.
 
 ## Scope decision
 
@@ -25,8 +26,8 @@ M3.1 decodes a complete live `BEGIN → RELATION → INSERT+ → COMMIT` transac
 for one admitted `int8` relation before invoking the unchanged M2 processor.
 Decode failures therefore cannot expose Apply, result, or continuation state.
 
-**Not proved.** M3.1 has no production replication transport/slot lifecycle,
-abnormal capture restart, UPDATE/DELETE, NULL, TOAST, streaming transaction,
+**Not proved.** M3 has no production replication transport/slot lifecycle,
+UPDATE/DELETE, NULL, TOAST, streaming transaction,
 DDL invalidation, concurrent source, external effect, compatibility path,
 alias, fallback, or dual write.
 

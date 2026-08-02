@@ -28,6 +28,17 @@ transaction. The existing M2 processor remains the sole writer and PostgreSQL
 transaction owner. A decode error cannot call Apply and cannot advance
 continuation.
 
+## M3.2 acknowledgement crash point
+
+The recovery gate deliberately separates database visibility from replication
+feedback. A receiver with periodic status disabled observes a complete second
+transaction, is stopped before feedback, and the M2 processor commits its Apply,
+count result, and continuation while the slot's `confirmed_flush_lsn` remains at
+the previous transaction. The receiver is then killed. Restarting the same slot
+re-emits the identical `SourceTransaction`; processing returns `AlreadyApplied`
+and all four durable facts remain unchanged. A later acknowledgement is therefore
+an optimization for WAL retention, not a second Shiba authority.
+
 ## Evidence and deferred boundary
 
 The wire layout follows the PostgreSQL 17/18 logical replication protocol and
@@ -36,6 +47,8 @@ and a disposable publication/slot. PostgreSQL's CLI appends a newline after each
 XLogData payload; a test-only framing helper removes exactly those delimiters
 before the production decoder sees the bytes.
 
-M3.1 proves a clean capture stop/restart and a subsequent transaction. Production
-transport ownership, slot admission, feedback/acknowledgement recovery, and an
-abnormally terminated capture remain M3.2 work. Streaming remains out of scope.
+M3.1 proves live decoding and clean capture restart. M3.2 proves the abnormal
+post-result/pre-ack crash window on PG17 and PG18 using the slot's own
+`confirmed_flush_lsn`. Production transport and slot lifecycle remain unproved;
+they cannot introduce another continuation or writer. Tuple shapes beyond the
+single non-null `int8` INSERT remain M4 work, and streaming remains out of scope.

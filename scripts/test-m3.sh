@@ -77,6 +77,7 @@ install -m 0755 "$library_source" "$installed_library"
 mkdir -p "$socket" "$capture"
 "$bindir/initdb" -D "$data" --no-locale --encoding=UTF8 --auth=trust >/dev/null
 printf '%s\n' 'wal_level=logical' 'max_replication_slots=4' 'max_wal_senders=4' \
+  'wal_sender_timeout=0' \
   >> "$data/postgresql.conf"
 "$bindir/pg_ctl" -D "$data" -o "-k '$socket' -p $port" -w start >/dev/null
 started=1

@@ -36,10 +36,13 @@ Failure triggers are test objects and never ship in extension SQL.
 
 `test-m3.sh` enables logical decoding in an isolated cluster, creates one
 test-only publication and `pgoutput` slot, and captures two real committed
-transactions with separate `pg_recvlogical` runs. The integration test removes
-only that client's per-XLogData delimiter, decodes pure pgoutput, applies through
-M2, and proves result `2`, exact replay `2`, corrupt/truncated input state
-unchanged, then restarted capture result `3`. PG17 and PG18 run the same gate.
+transactions. The integration test removes only that client's per-XLogData
+delimiter, decodes pure pgoutput, applies through M2, and proves result `2`,
+exact replay `2`, and corrupt/truncated input state unchanged. For the second
+transaction it disables periodic feedback, stops the receiver after complete
+COMMIT, applies result `3` while `confirmed_flush_lsn` is unchanged, kills the
+receiver, then proves slot replay is the identical transaction and is a no-op.
+PG17 and PG18 run the same gate.
 
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.
