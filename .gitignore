@@ -1,0 +1,4 @@
+/target/
+**/target/
+tests/artifacts/*
+!tests/artifacts/.gitkeep

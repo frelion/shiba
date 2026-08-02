@@ -1,0 +1,6 @@
+comment = 'Shiba V2 clean-room catalog identity'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'shiba_catalog'
+relocatable = false
+superuser = false
+trusted = false

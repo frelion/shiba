@@ -1,0 +1,1 @@
+{"protocol_version":1,"catalog_version":1,"message":{"kind":"cause","body":{"transaction":{"source_id":3,"slot_generation":7,"commit_lsn":"0/64","ingress_transaction_id":11},"input_sequence":2}}}
