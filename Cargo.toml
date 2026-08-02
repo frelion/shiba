@@ -2,6 +2,7 @@
 members = [
     "crates/shiba-catalog",
     "crates/shiba-protocol",
+    "crates/shiba-runtime",
 ]
 resolver = "3"
 

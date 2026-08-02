@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase-1 static and unit-test gate.  It intentionally has no PostgreSQL server
+# Static and unit-test gate. It intentionally has no PostgreSQL server
 # lifecycle; use test-empty-install.sh for database installation behavior.
 set -euo pipefail
 
@@ -21,10 +21,13 @@ feature="pg$pg_major"
 cargo fmt --all -- --check
 PG_CONFIG="$pg_config" cargo check -p shiba-protocol --all-targets
 PG_CONFIG="$pg_config" cargo check -p shiba-catalog --no-default-features --features "$feature" --all-targets
+PG_CONFIG="$pg_config" cargo check -p shiba-runtime --all-targets
 PG_CONFIG="$pg_config" cargo test -p shiba-protocol
 PG_CONFIG="$pg_config" cargo test -p shiba-catalog --no-default-features --features "$feature"
+PG_CONFIG="$pg_config" cargo test -p shiba-runtime --lib
 PG_CONFIG="$pg_config" cargo clippy -p shiba-protocol --all-targets -- -D warnings
 PG_CONFIG="$pg_config" cargo clippy -p shiba-catalog --no-default-features --features "$feature" --all-targets -- -D warnings
+PG_CONFIG="$pg_config" cargo clippy -p shiba-runtime --all-targets -- -D warnings
 git diff --check
 
 # An unborn branch has no tracked diff, so check every tracked-or-untracked
@@ -52,17 +55,32 @@ if errors:
     raise SystemExit("\n".join(errors))
 PY
 
-# No Phase-1 catalog SQL may smuggle in an old authority or a later-stage
-# component. Rust tests and comments deliberately name prohibited boundaries.
+# Keep the accepted M2 production budget executable rather than aspirational.
+python3 - <<'PY'
+import pathlib
+
+runtime_files = sorted(pathlib.Path("crates/shiba-runtime/src").glob("*.rs"))
+line_counts = {path: len(path.read_text().splitlines()) for path in runtime_files}
+too_large = [f"{path}: {count}" for path, count in line_counts.items() if count > 250]
+if too_large:
+    raise SystemExit("M2 production file exceeds 250 lines: " + ", ".join(too_large))
+if sum(line_counts.values()) > 600:
+    raise SystemExit("M2 Runtime production code exceeds its 600-line hard limit")
+sql_lines = len(pathlib.Path("sql/v2/002_insert_count.sql").read_text().splitlines())
+if sql_lines > 150:
+    raise SystemExit("M2 SQL exceeds its 150-line hard limit")
+PY
+
+# No production SQL may smuggle in an old authority or dynamic workflow.
 if rg -n -i \
   'source_publications|change[_ ]log|dual[-_ ]write|compatibility|fallback|alias|create trigger|execute format\(' \
   sql/v2; then
-  echo "forbidden Phase-1 implementation surface found" >&2
+  echo "forbidden implementation surface found" >&2
   exit 1
 fi
-if rg -n -i 'effectstream|source ingress|source apply|runtime|operator|result sink|registration' \
+if rg -n -i 'effectstream|source ingress|registration|publication|replication slot' \
   sql/v2; then
-  echo "future component leaked into the catalog implementation" >&2
+  echo "out-of-scope component leaked into production SQL" >&2
   exit 1
 fi
 

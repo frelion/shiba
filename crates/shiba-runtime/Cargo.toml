@@ -1,0 +1,15 @@
+[package]
+name = "shiba-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Clean-room M2 transactional insert-count walking skeleton"
+
+[dependencies]
+postgres = "0.19"
+shiba-protocol = { path = "../shiba-protocol" }
+
+[lints]
+workspace = true

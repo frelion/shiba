@@ -59,3 +59,11 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config \
 - This crate's isolated PostgreSQL 17/18 checks and empty-database installation
   gates prove only Phase-1 compilation and transactional installation. They do
   not elevate any deferred runtime claim.
+
+## M2 clean-room evidence
+
+M2 adds four independently written tables and no legacy SQL or Rust. The
+PG17/18 `scripts/test-m2.sh` gate proves their single-transaction INSERT/count
+path, replay, rollback, backend-termination recovery, and ordinary-role
+permissions. This does not reclassify legacy runtime or SQL workflows: they
+remain prohibited C-class material.

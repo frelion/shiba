@@ -8,23 +8,43 @@
 
 ::pgrx::extension_sql_file!(
     "../../../sql/v2/001_catalog_identity.sql",
-    name = "catalog_identity",
-    bootstrap
+    name = "catalog_identity"
+);
+
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/002_insert_count.sql",
+    name = "insert_count",
+    requires = ["catalog_identity"]
 );
 
 #[cfg(test)]
 mod tests {
     const CATALOG_SQL: &str = include_str!("../../../sql/v2/001_catalog_identity.sql");
+    const M2_SQL: &str = include_str!("../../../sql/v2/002_insert_count.sql");
 
     fn normalized_sql() -> String {
         CATALOG_SQL.to_ascii_lowercase()
     }
 
     #[test]
-    fn phase_one_owns_exactly_one_table() {
+    fn installation_identity_owns_exactly_one_table() {
         let sql = normalized_sql();
         assert_eq!(sql.matches("create table ").count(), 1);
         assert!(sql.contains("create table shiba_internal.catalog_identity"));
+    }
+
+    #[test]
+    fn m2_owns_only_its_four_required_tables() {
+        let sql = M2_SQL.to_ascii_lowercase();
+        assert_eq!(sql.matches("create table ").count(), 4);
+        for table in [
+            "shiba_internal.applied_insert",
+            "shiba_internal.count_state",
+            "shiba_internal.source_continuation",
+            "shiba.count_result",
+        ] {
+            assert!(sql.contains(&format!("create table {table}")));
+        }
     }
 
     #[test]
@@ -48,16 +68,13 @@ mod tests {
     }
 
     #[test]
-    fn phase_one_has_no_future_authority_or_dynamic_mechanism() {
-        let sql = normalized_sql();
+    fn installation_has_no_dynamic_or_compatibility_mechanism() {
+        let sql = format!("{}\n{}", normalized_sql(), M2_SQL.to_ascii_lowercase());
         for forbidden in [
             "create trigger",
             "execute format(",
-            "create table shiba_internal.source",
-            "create table shiba_internal.effect",
-            "create table shiba_internal.runtime",
-            "create table shiba_internal.operator",
-            "create table shiba_internal.result",
+            "create table shiba_internal.source (",
+            "create table shiba_internal.effect (",
             "compatibility",
             "fallback",
             "alias",

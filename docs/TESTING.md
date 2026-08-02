@@ -1,6 +1,6 @@
 # Testing strategy
 
-## Phase-1 gates
+## Milestone gates
 
 Run from `/Users/zzhang/Documents/Shiba-v2-cleanroom`:
 
@@ -9,10 +9,12 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@17/bin/pg_config ./scripts/test-l0.sh
 PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-empty-install.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-empty-install.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m2.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m2.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
-Protocol/Catalog checks and tests, clippy with warnings denied, `git diff
+Protocol/Catalog/Runtime checks and tests, clippy with warnings denied, `git diff
 --check`, forbidden-surface scans, the canonical fixture byte/digest check, and
 the deferred-evidence manifest completeness check.
 
@@ -23,6 +25,16 @@ access and private table denial for an ordinary role; and clean extension drop.
 This re-proves only the Phase-1 installation rollback boundary, not later
 component recovery.
 
+`test-m2.sh` creates another isolated cluster and packages the extension. Its
+test-only source schema commits two ordinary rows before constructing the Rust
+input. It proves result `2`, cross-schema placement, exact replay, identity
+conflict, operator-error rollback, backend-termination rollback after the
+continuation write, reconnect/replay, and ordinary-role result-only access.
+Failure triggers are test objects and never ship in extension SQL.
+
+During development run fmt, check, the Runtime unit tests, one major's M2 test,
+and clippy. Run both complete PG matrices only at the milestone boundary.
+
 ## Evidence handling
 
 Fixtures in `tests/fixtures` must be data, not copied executable implementation.
@@ -30,7 +42,8 @@ The canonical Protocol vector has the adjacent
 `tests/fixtures/protocol/canonical-v1.provenance.md`, including source, legacy
 commit, old command, and clean-room command. It has been re-proved. The
 `tests/fixtures/pg/deferred-evidence.json` file is only an A-class evidence
-index: rollback is `partially reproved` for extension installation and every
-other PG scenario remains `deferred`. Differential tests use the legacy
+index: legacy scenarios remain provenance until reproduced case by case. M2's
+independent rollback/crash tests do not claim equivalence to an old runtime.
+Differential tests use the legacy
 repository solely as an oracle and must never link it, load its SQL, or share a
 catalog authority.

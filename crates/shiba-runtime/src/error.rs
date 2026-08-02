@@ -1,0 +1,53 @@
+use core::fmt;
+
+#[derive(Debug)]
+pub enum M2Error {
+    CoordinateOutOfRange(&'static str),
+    CountOverflow,
+    DuplicateInputSequence(u64),
+    DuplicateSourceRow(i64),
+    EmptyTransaction,
+    IdentityConflict,
+    OutOfOrder,
+    Postgres(postgres::Error),
+    SourceScopeMismatch,
+}
+
+impl fmt::Display for M2Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CoordinateOutOfRange(field) => {
+                write!(formatter, "{field} exceeds PostgreSQL bigint range")
+            }
+            Self::CountOverflow => formatter.write_str("count exceeds PostgreSQL bigint range"),
+            Self::DuplicateInputSequence(value) => {
+                write!(formatter, "duplicate input sequence {value}")
+            }
+            Self::DuplicateSourceRow(value) => write!(formatter, "duplicate source row {value}"),
+            Self::EmptyTransaction => formatter.write_str("M2 requires at least one INSERT"),
+            Self::IdentityConflict => {
+                formatter.write_str("source coordinate has a different transaction identity")
+            }
+            Self::OutOfOrder => formatter.write_str("commit LSN is not strictly increasing"),
+            Self::Postgres(error) => write!(formatter, "PostgreSQL transaction failed: {error}"),
+            Self::SourceScopeMismatch => {
+                formatter.write_str("M2 accepts exactly one source and slot generation")
+            }
+        }
+    }
+}
+
+impl std::error::Error for M2Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Postgres(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<postgres::Error> for M2Error {
+    fn from(error: postgres::Error) -> Self {
+        Self::Postgres(error)
+    }
+}
