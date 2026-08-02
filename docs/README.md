@@ -133,15 +133,26 @@ processor transaction. Operator specifications are strict version-1 JSON;
 column names are resolved once and only ObjectAddress identity is durable. The
 old `count_state` and `count_result` authorities no longer exist.
 
-**Not proved.** There is no production replication transport/slot lifecycle,
+M9.2 proves the second compiled operator through that same path. One real
+10,000-row nullable-`int8` transaction uses IDs 1–10,000 and payload `NULL`
+when the ID is divisible by four, otherwise `2`; the same EffectBatch advances
+CountRows to 10,000 and SumInt8 to 15,000 in one processor transaction. The
+PG17 reference measured 9.56 ms decode, 836.72 ms Apply, and 0.171 ms replay,
+within the unchanged 2 s / 10 s / 2 s ceilings. An ordered test trigger observes
+operator 1 before failing operator 2; its audit, source row, both operator
+writes, result writes, and continuation all roll back.
+M9.2 is a bounded aggregate execution proof, not a complete V2 runtime.
+
+**Not proved.** There is no production receiver/restart or replication
+transport/slot lifecycle, nor persisted partial-stream recovery,
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
 binding lifecycle/registration or replica-index drift observation without a
 RELATION message, streamed interleaving/subtransactions, slot-generation
 change, production transport scheduling/backpressure or transport memory,
-multi-source contention/tail latency and sustained throughput,
-binding rebuild lifecycle, a proven second operator, non-aggregate operators,
-external effect, compatibility path, alias, fallback,
+multi-source contention/tail latency, sustained throughput, or heap evidence;
+binding rebuild lifecycle, SQL frontend, non-aggregate operators, external
+effect, compatibility path, alias, fallback,
 or dual write.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),

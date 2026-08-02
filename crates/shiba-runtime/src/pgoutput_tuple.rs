@@ -80,6 +80,14 @@ pub(crate) fn decode_delete(
             tuple_header(cursor, source, b'K', 1)?;
             Ok(DecodedChange::Delete(decode_int8(cursor)?, None))
         }
+        SourceShape::NullableInt8Payload => {
+            tuple_header(cursor, source, b'K', 2)?;
+            let key = decode_int8(cursor)?;
+            if cursor.byte()? != b'n' {
+                return Err(PgoutputError::TupleShape);
+            }
+            Ok(DecodedChange::Delete(key, None))
+        }
         SourceShape::CompositeInt8 => {
             tuple_header(cursor, source, b'K', 2)?;
             Ok(DecodedChange::Delete(

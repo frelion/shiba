@@ -193,3 +193,17 @@ Registration has its own single PostgreSQL transaction: binding lock,
 invalidation check, descriptor construction, pure compilation, definition,
 zero state, and zero result either all commit or all disappear. A failed or
 duplicate registration cannot become a partially executable operator.
+
+M9.2 applies CountRows and SumInt8 to the same transaction-local EffectBatch.
+The performance gate observes ascending operator update order with a test-only
+trigger: operator 1 is attempted before operator 2 raises. PostgreSQL then
+rolls back that audit row, the applied source row, both operator state/result
+writes, and continuation together. Exact replay of the successful 10,000-row
+transaction performs none of those writes.
+
+The fixed M9.2 scenario separately kills the backend after operator 1's public
+result update. Reconnection observes the old current rows, both old operator
+states/results, and old continuation; retry applies both operators once. An
+overflow in operator 2 has the same rollback boundary. Same-source processors
+serialize on the existing binding row and acquire operator states in ascending
+ID order; a paused source does not prevent an unrelated source from committing.

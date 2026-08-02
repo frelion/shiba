@@ -185,6 +185,14 @@ Multi-source CountRows results are source-scoped operator facts; a test may sum
 them to compare with the historical union observation, but that sum is not a
 new durable authority.
 
+M9.2 registers CountRows and SumInt8 for one nullable-int8 source. Source Apply
+builds one EffectBatch, then the runtime locks and updates operator IDs 1 and 2
+in ascending order inside the same transaction. The fixed 10,000-row sample
+produces count 10,000 and sum 15,000. A test-only ordered failure at operator 2
+proves the earlier operator write, source mutation, audit, result, and
+continuation are not independently visible. This adds no durable effect table,
+execution SQL, scheduler, or second transaction owner.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -196,8 +204,9 @@ evidence inputs, not implementation dependencies.
 **Unproved:** production replication transport and slot ownership, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
-streaming interleaving, binding rebuild lifecycle,
-generation changes, production transport backpressure and transport memory,
-sustained throughput/tail latency, a proven second/non-aggregate operator, and
-recovery workers
+streaming interleaving,
+generation changes, production receiver/restart and persisted partial-stream
+recovery, production transport backpressure and transport memory, binding
+rebuild, SQL frontend, non-aggregate operators, sustained throughput, empirical
+heap peak, contention tail latency, and recovery workers
 remain.

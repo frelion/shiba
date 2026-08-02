@@ -164,6 +164,26 @@ CountRows per source and query operator-keyed state/result; multi-source tests
 sum those independent public facts only to retain the historical union
 observation.
 
+`test-m9-operator-performance.sh` captures one real 10,000-row nullable-int8
+transaction: every fourth payload is NULL and every other payload is 2. One
+EffectBatch must publish CountRows=10,000 and SumInt8=15,000, then exact replay
+must be a no-op. The PG17 reference measured 9.56 ms decode, 836.72 ms Apply,
+and 0.171 ms replay under the unchanged 2 s / 10 s / 2 s ceilings. The closest
+M8 count-only PG17 run measured 8.21 ms, 853.28 ms, and 0.180 ms; the small
+mixed differences are recorded as single-run evidence, not an improvement
+claim or permission to hide regression. A test-only ordered operator-2 failure
+also proves the operator-1 attempt and all transaction-local effects roll back.
+
+`test-m9-count-sum.sh` proves the fixed two-operator INSERT/UPDATE/DELETE/NULL
+example, the nullable relation's real two-position `D + K`, missing-row and
+overflow rollback, crash after the first result, retry-once, exact-replay
+short-circuit, and pre-EffectBatch DDL invalidation. `test-m9-operator-concurrency.sh`
+holds source 1 at a test-only advisory lock: a second transaction for that
+source waits on the binding mutex while source 2 commits independently; after
+release, CountRows and SumInt8 finish in source order and all replays are no-op.
+The existing M6 gates remain the streaming regression proof for the admitted
+key-only CountRows shape; M9 does not add nullable-payload streaming admission.
+
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and
 requires real matching `A`. After abort feedback it restarts the same slot and

@@ -39,8 +39,11 @@ unchanged otherwise. Negative state, underflow, and overflow are errors.
 `SumInt8` treats SQL NULL as contribution zero, subtracts the before value, and
 adds the after value using checked arithmetic. `Absent` and `Text` fail closed:
 an operator compiled for an int8 column cannot silently consume another row
-shape. M9.1 integrates `CountRows`; M9.2 must prove `SumInt8` through the same
-batch and transaction before that execution path is considered complete.
+shape. M9.2 proves CountRows and SumInt8 consume the same 10,000-change batch,
+publish count 10,000 and sum 15,000 atomically, and roll back together when the
+second ordered operator update fails. The fixed row-by-row gate also proves
+NULL transitions, DELETE before images, SumInt8 overflow, crash between the two
+result updates, retry, and exact replay.
 
 ## Durable ownership
 

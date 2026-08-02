@@ -23,9 +23,12 @@ M4.4 additionally admits `UPDATE (key, payload)` only for the nullable-payload
 shape when PostgreSQL emits a new tuple and the key is unchanged. Its encoding
 rules are identical to INSERT. Old/key tuples and key mutation are excluded.
 
-M4.5 additionally admits `DELETE (key)` only for the single-key shape. The
-pgoutput DELETE must select a `K` tuple with exactly one column containing a
-canonical text `int8`. The relation OID and tuple selector are validated; NULL,
+M4.5 additionally admits `DELETE (key)` for the key-only source shape. M9.2
+admits the nullable-int8-payload relation's real `K` tuple with exactly two
+positions: a canonical text `int8` key and an `n` placeholder for its non-key
+payload. DELETE has no payload image, so Source Apply obtains the full before
+image from current row state. The relation OID, tuple selector, count, and both
+tags are validated; NULL key,
 unchanged-TOAST, binary, `O`, extra columns, and non-canonical text fail closed.
 
 M4.6 requires the enclosing RELATION to advertise default replica identity and

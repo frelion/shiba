@@ -61,9 +61,13 @@ INSERT and UPDATE of the same row in one transaction.
 
 ## M4.5 stable-key DELETE extension
 
-Only key-only mode admits DELETE. The exact protocol-version-1 wire shape is
-relation OID followed by tuple selector `K`, column count `1`, and one `t`
-column containing canonical decimal text for an `i64`. The decoder returns a
+M4.5 initially admits DELETE for key-only mode. Its exact protocol-version-1
+wire shape is relation OID followed by tuple selector `K`, column count `1`,
+and one `t` column containing canonical decimal text for an `i64`. M9.2 admits
+the nullable-int8-payload relation's real `D + K`: column count `2`, the same
+canonical `t` key, then an exact `n` placeholder for the non-key payload. This
+lets the fixed `(id bigint PRIMARY KEY, payload bigint NULL)` source complete
+INSERT/UPDATE/DELETE without inventing a DELETE payload. The decoder returns a
 DELETE change only after checking the admitted relation OID, selector, count,
 tuple tag, length, canonical key, transaction envelope, and trailing boundary.
 An invalid selector or tuple tag fails during pure decode, before the processor
@@ -186,6 +190,9 @@ single-column replica-index admission, atomic INSERT/DELETE recovery, and live
 default-identity drift rejection without adding a catalog authority.
 M5.5 proves relation and column names are not identity, while same-name
 drop/recreate OID drift fails before writes or continuation advancement.
+M9.2 proves that nullable-int8 mode accepts only its exact two-position,
+single-key `D + K` (`t` key plus `n` non-key placeholder); it does not admit an
+old tuple or broaden replica-identity semantics.
 
 ## M6.1 streamed commit admission
 
