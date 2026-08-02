@@ -5,7 +5,7 @@ use shiba_protocol::PostgresLsn;
 
 use crate::count;
 use crate::source_preflight;
-use crate::transaction::as_bigint;
+use crate::transaction::{as_bigint, check_transaction_change_limit};
 use crate::{M2Error, SourceChange, SourcePayload, SourceTransaction, SourceUpdatePayload};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,8 +15,9 @@ pub enum ProcessOutcome {
 }
 
 /// # Errors
-/// Returns a validation or database error; the transaction is rolled back.
+/// Returns a validation or database error; any opened transaction is rolled back.
 pub fn process(client: &mut Client, input: &SourceTransaction) -> Result<ProcessOutcome, M2Error> {
+    check_transaction_change_limit(input.changes.len())?;
     let mut transaction = client.transaction()?;
     let outcome = process_in_transaction(&mut transaction, input)?;
     match outcome {

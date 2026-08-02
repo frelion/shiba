@@ -7,12 +7,12 @@ use crate::{
     pgoutput_source::{PgoutputSource, SourceShape},
     pgoutput_tuple::{DecodedChange, decode_delete, decode_insert, decode_update},
     pgoutput_wire::Cursor,
+    transaction::MAX_TRANSACTION_CHANGES,
 };
 
 const INT8_OID: u32 = 20;
 const TEXT_OID: u32 = 25;
 pub(crate) const MAX_PGOUTPUT_INPUT_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_PGOUTPUT_CHANGES: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PgoutputError {
@@ -77,7 +77,7 @@ pub fn decode_committed_changes(
     let mut values = Vec::new();
     loop {
         let tag = cursor.byte()?;
-        if matches!(tag, b'I' | b'U' | b'D') && values.len() >= MAX_PGOUTPUT_CHANGES {
+        if matches!(tag, b'I' | b'U' | b'D') && values.len() >= MAX_TRANSACTION_CHANGES {
             return Err(PgoutputError::LimitExceeded);
         }
         match tag {

@@ -4,6 +4,8 @@ use shiba_protocol::{InputSequence, SourceTransactionId};
 
 use crate::M2Error;
 
+pub(crate) const MAX_TRANSACTION_CHANGES: usize = 10_000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SourcePayload {
     Absent,
@@ -134,6 +136,7 @@ impl SourceTransaction {
     /// # Errors
     /// Rejects invalid identity coordinates or INSERT facts.
     pub fn new(identity: SourceTransactionId, inserts: Vec<SourceInsert>) -> Result<Self, M2Error> {
+        check_transaction_change_limit(inserts.len())?;
         Self::from_changes(
             identity,
             inserts.into_iter().map(SourceChange::Insert).collect(),
@@ -146,6 +149,7 @@ impl SourceTransaction {
         identity: SourceTransactionId,
         changes: Vec<SourceChange>,
     ) -> Result<Self, M2Error> {
+        check_transaction_change_limit(changes.len())?;
         validate_coordinate("source_id", identity.source_id.get())?;
         validate_coordinate("slot_generation", identity.slot_generation.get())?;
         validate_coordinate(
@@ -193,10 +197,31 @@ impl SourceTransaction {
     }
 }
 
+pub(crate) fn check_transaction_change_limit(count: usize) -> Result<(), M2Error> {
+    if count > MAX_TRANSACTION_CHANGES {
+        return Err(M2Error::TransactionLimitExceeded);
+    }
+    Ok(())
+}
+
 pub(crate) fn as_bigint(field: &'static str, value: u64) -> Result<i64, M2Error> {
     i64::try_from(value).map_err(|_| M2Error::CoordinateOutOfRange(field))
 }
 
 fn validate_coordinate(field: &'static str, value: u64) -> Result<(), M2Error> {
     as_bigint(field, value).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transaction_change_limit_is_exact() {
+        assert!(check_transaction_change_limit(MAX_TRANSACTION_CHANGES).is_ok());
+        assert!(matches!(
+            check_transaction_change_limit(MAX_TRANSACTION_CHANGES + 1),
+            Err(M2Error::TransactionLimitExceeded)
+        ));
+    }
 }

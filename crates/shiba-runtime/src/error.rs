@@ -14,6 +14,7 @@ pub enum M2Error {
     SourceBindingMissing,
     SourceInvalidated,
     SlotGenerationMismatch,
+    TransactionLimitExceeded,
 }
 
 impl fmt::Display for M2Error {
@@ -40,6 +41,9 @@ impl fmt::Display for M2Error {
             Self::SourceInvalidated => formatter.write_str("source binding is invalidated"),
             Self::SlotGenerationMismatch => {
                 formatter.write_str("slot generation does not match source continuation")
+            }
+            Self::TransactionLimitExceeded => {
+                formatter.write_str("source transaction exceeds the 10,000-change limit")
             }
         }
     }

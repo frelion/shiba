@@ -172,3 +172,11 @@ a 10,001st change before decoding or appending it. Either path returns no
 `SourceTransaction`, never opens the processor transaction, and therefore
 cannot modify row state, count, result, or continuation. Exactly 10,000 changes
 remain inside the existing atomic Apply/replay boundary.
+
+M8.4 applies the same 10,000-change ceiling to every constructor and checks it
+again at the processor boundary. Even a forged public value with an exact
+already-committed identity returns `TransactionLimitExceeded` before replay
+lookup or `Client::transaction`; durable row state, count, result, and
+continuation therefore remain unchanged. Admitted work remains synchronous, so
+database blocking propagates to the caller rather than accumulating in a
+Runtime-owned queue.

@@ -148,6 +148,14 @@ test also proves both committed and streamed decoders reject input above 16 MiB.
 This is decoder admission evidence, not a production receiver or throughput
 claim.
 
+`test-m8-performance.sh` freezes a real 10,000-change PG17/18 regression budget:
+decode at most 2 seconds, first Apply at most 10 seconds, and exact replay at
+most 2 seconds. The originating clean-room runs measured approximately 8 ms,
+0.8 seconds, and 0.2 ms respectively. It also proves constructors reject 10,001
+changes and a forged public value fails before database state or replay can be
+reached. The threshold is a correctness regression gate, not a sustained-load,
+tail-latency, or cross-hardware benchmark.
+
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and
 requires real matching `A`. After abort feedback it restarts the same slot and

@@ -228,3 +228,17 @@ Limit rejection produces no `SourceTransaction`, so the processor, its
 PostgreSQL transaction, and continuation are never reached. These limits bound
 decoder-owned output and accepted borrowed input; they do not claim a bounded
 production receiver, transport queue, feedback loop, or throughput threshold.
+
+## M8.4 transaction workload and latency boundary
+
+The 10,000-change value is also the single `SourceTransaction` workload limit.
+Both constructors reject 10,001 before validation allocation, and `process`
+checks again before opening a PostgreSQL transaction because the public value
+can be constructed directly. Decoder rejection remains earlier so tuple 10,001
+is never decoded or appended.
+
+For a real 10,000-change committed key-only transaction, the PG17/18 regression
+ceilings are 2 seconds decode, 10 seconds first Apply, and 2 seconds exact
+replay. The processor is synchronous and owns no ingress queue; these ceilings
+do not define production transport buffering, sustained throughput, or tail
+latency under contention.

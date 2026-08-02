@@ -118,12 +118,20 @@ changes. Exact-limit committed and streamed transactions remain admitted; an
 oversized input or 10,001st change returns `LimitExceeded` without constructing
 a transaction or changing durable state. Runtime owns no ingress queue.
 
+M8.4 makes 10,000 changes the single transaction workload limit, including
+direct constructors and a defensive processor check before a database
+transaction opens. The synchronous processor owns no queue or worker, so lock
+and commit latency propagate to its caller. A real 10,000-change PG17/18 gate
+freezes regression ceilings of 2 seconds decode, 10 seconds first Apply, and 2
+seconds exact replay; current evidence is about 8 ms, 0.8 seconds, and 0.2 ms.
+
 **Not proved.** There is no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
 binding lifecycle/registration or replica-index drift observation without a
 RELATION message, streamed interleaving/subtransactions, slot-generation
-change, production ingress scheduling/backpressure or transport memory,
+change, production transport scheduling/backpressure or transport memory,
+multi-source contention/tail latency and sustained throughput,
 binding rebuild lifecycle, external effect, compatibility path, alias, fallback,
 or dual write.
 

@@ -161,6 +161,14 @@ The shared check rejects excess input before parsing; each decoder rejects the
 10,001st change before decoding or appending it. Rejection cannot reach the
 processor, so it adds no authority, writer, transaction, or recovery path.
 
+M8.4 centralizes the 10,000-change transaction limit. Constructors check it
+before validation allocation, decoders check it before decoding change 10,001,
+and the processor checks it before opening PostgreSQL state so a public struct
+literal cannot bypass the bound. `process` is a synchronous call borrowing one
+`Client` and owns no channel, queue, worker, or background buffer: database lock
+and commit waits directly stop that caller. The global count row remains the
+known cross-source serialization point.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -173,6 +181,6 @@ evidence inputs, not implementation dependencies.
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving, binding rebuild lifecycle,
-generation changes, production ingress/backpressure and transport memory,
-general operators, and recovery workers
+generation changes, production transport backpressure and transport memory,
+sustained throughput/tail latency, general operators, and recovery workers
 remain.
