@@ -1,7 +1,7 @@
 use shiba_protocol::{IngressTransactionId, InputSequence, PostgresLsn, SourceTransactionId};
 
 use crate::{
-    PgoutputError, SourceInsert, SourcePayload, SourceTransaction,
+    PgoutputError, PgoutputRelationState, SourceInsert, SourcePayload, SourceTransaction,
     pgoutput::{check_input_limit, decode_relation},
     pgoutput_source::{PgoutputSource, SourceShape},
     pgoutput_tuple::{DecodedChange, decode_insert},
@@ -14,6 +14,18 @@ use crate::{
 pub fn decode_streamed_changes(
     input: &[u8],
     source: PgoutputSource,
+) -> Result<SourceTransaction, PgoutputError> {
+    decode_streamed_changes_in_session(input, source, &mut PgoutputRelationState::new())
+}
+
+/// Decodes a streamed transaction with connection-local relation validation state.
+///
+/// # Errors
+/// Rejects a change before the first exact relation descriptor on the session.
+pub fn decode_streamed_changes_in_session(
+    input: &[u8],
+    source: PgoutputSource,
+    relation_state: &mut PgoutputRelationState,
 ) -> Result<SourceTransaction, PgoutputError> {
     check_input_limit(input)?;
     if source.shape != SourceShape::KeyOnly {
@@ -29,7 +41,8 @@ pub fn decode_streamed_changes(
         return Err(PgoutputError::InvalidIdentity);
     }
 
-    let mut relation_seen = false;
+    let mut relation_seen = relation_state.validated_for(source)?;
+    let mut relation_in_transaction = false;
     let mut row_ids = Vec::new();
     loop {
         loop {
@@ -38,6 +51,7 @@ pub fn decode_streamed_changes(
                     require_xid(&mut cursor, xid)?;
                     decode_relation(&mut cursor, source)?;
                     relation_seen = true;
+                    relation_in_transaction = true;
                 }
                 b'I' if relation_seen => {
                     if row_ids.len() >= MAX_TRANSACTION_CHANGES {
@@ -100,7 +114,12 @@ pub fn decode_streamed_changes(
             Ok(SourceInsert::new(sequence, row_id))
         })
         .collect::<Result<Vec<_>, PgoutputError>>()?;
-    SourceTransaction::new(identity, inserts).map_err(|_| PgoutputError::TupleValue)
+    let transaction =
+        SourceTransaction::new(identity, inserts).map_err(|_| PgoutputError::TupleValue)?;
+    if relation_in_transaction {
+        relation_state.mark_validated(source);
+    }
+    Ok(transaction)
 }
 
 fn require_xid(cursor: &mut Cursor<'_>, expected: u32) -> Result<(), PgoutputError> {

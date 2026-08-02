@@ -70,19 +70,20 @@ fn attach_session(database_url: &str, replication_url: &str) -> GovernedSourceSe
     .expect("attach governed streamed session")
 }
 
-fn wait_for_stream_output(client: &mut Client, baseline: u64) {
-    let baseline = format!("{:X}/{:X}", baseline >> 32, baseline & u64::from(u32::MAX));
+fn stream_count(client: &mut Client) -> i64 {
+    client
+        .query_one(
+            "SELECT stream_count FROM pg_stat_replication_slots WHERE slot_name = $1",
+            &[&SLOT],
+        )
+        .expect("query logical streaming count")
+        .get(0)
+}
+
+fn wait_for_stream_output(client: &mut Client, baseline: i64) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let sent = client
-            .query_opt(
-                "SELECT sent_lsn > $2::text::pg_lsn
-                 FROM pg_stat_replication WHERE application_name = $1",
-                &[&APPLICATION, &baseline],
-            )
-            .expect("query streamed sender progress")
-            .is_some_and(|row| row.get(0));
-        if sent {
+        if stream_count(client) > baseline {
             return;
         }
         assert!(
@@ -136,6 +137,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     let initial_lsn = slot_lsn(&mut observer, SLOT);
 
     let mut receiver = attach_session(&database_url, &replication_url);
+    let committed_stream_count = stream_count(&mut observer);
     let (terminal_tx, terminal_rx) = mpsc::channel();
     let terminal_thread = thread::spawn(move || {
         let input = receiver.receive_streamed_one();
@@ -151,7 +153,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
             &[&ROW_COUNT],
         )
         .expect("write 10,000-row transaction");
-    wait_for_stream_output(&mut observer, initial_lsn);
+    wait_for_stream_output(&mut observer, committed_stream_count);
     assert!(matches!(terminal_rx.try_recv(), Err(TryRecvError::Empty)));
     assert_eq!(durable_state(&mut observer), (0, 0, 0, 0, 0, 0));
     assert_eq!(slot_lsn(&mut observer, SLOT), initial_lsn);
@@ -254,6 +256,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     let first_empty_end = replayed_empty.end_lsn();
 
     let (empty_tx, empty_rx) = mpsc::channel();
+    let empty_stream_count = stream_count(&mut observer);
     let empty_thread = thread::spawn(move || {
         let input = receiver.receive_streamed_one();
         empty_tx
@@ -274,7 +277,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
             &[&ROW_COUNT],
         )
         .expect("write unpublished streamed transaction");
-    wait_for_stream_output(&mut observer, first_empty_end);
+    wait_for_stream_output(&mut observer, empty_stream_count);
     assert!(matches!(empty_rx.try_recv(), Err(TryRecvError::Empty)));
     assert_eq!(slot_lsn(&mut observer, SLOT), first_empty_end);
     transaction
@@ -309,6 +312,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     let second_empty_end = second_empty.end_lsn();
 
     let (abort_tx, abort_rx) = mpsc::channel();
+    let abort_stream_count = stream_count(&mut observer);
     let abort_thread = thread::spawn(move || {
         let input = receiver.receive_streamed_one();
         abort_tx
@@ -325,7 +329,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
             &[],
         )
         .expect("write aborted rows");
-    wait_for_stream_output(&mut observer, second_empty_end);
+    wait_for_stream_output(&mut observer, abort_stream_count);
     assert!(matches!(abort_rx.try_recv(), Err(TryRecvError::Empty)));
     transaction.rollback().expect("abort streamed transaction");
     let (mut receiver, aborted) = abort_rx
@@ -348,6 +352,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     drop(receiver);
 
     let mut receiver = attach_session(&database_url, &replication_url);
+    let crash_stream_count = stream_count(&mut observer);
     let (crash_tx, crash_rx) = mpsc::channel();
     let crash_thread = thread::spawn(move || {
         let input = receiver.receive_streamed_one();
@@ -361,7 +366,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
             &[],
         )
         .expect("write crash-window rows");
-    wait_for_stream_output(&mut observer, abort_lsn);
+    wait_for_stream_output(&mut observer, crash_stream_count);
     let terminated: bool = observer
         .query_one(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_replication

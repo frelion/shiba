@@ -1,6 +1,6 @@
 # ADR 0001: M10 logical-replication transport
 
-Status: accepted for M10 implementation
+Status: accepted; M10 evidence complete
 
 ## Decision
 
@@ -119,8 +119,13 @@ This choice adds one production dependency with a narrow boundary and a system
 therefore keeps the connection private, exclusive, and never clones it. PG17
 and PG18 now prove governed attach/detach, single ownership, split
 least-privilege roles, continuous publication revalidation, and exact two-
-connection ownership. M10 must still prove disconnect behavior, async server
-errors during COPY, blocking-receive cancellation, reconnect/backoff policy,
-and final buffer/performance measurements.
-Failure of those gates reopens this ADR; it does not authorize a CLI receiver,
-raw wire implementation, second decoder, or compatibility path.
+connection ownership. The final receive loop drains already-buffered libpq data
+before a bounded `PQsocketPoll`/`PQconsumeInput` wait, enabling cooperative idle
+shutdown without a worker or queue. Frozen PG17/18 gates prove 10,000-change
+source-commit-to-durable-Apply, backlog service percentiles, direct slow-Apply
+backpressure, replay, and sub-second idle shutdown under strict Rust bounds.
+
+M10 is complete for this ADR. Network/TLS policy, async COPY disconnect
+handling, shutdown during Apply, reconnect/backoff orchestration, allocator/RSS
+peaks, and cross-host soak remain future operational work; none authorizes a CLI
+receiver, queue, second decoder, cursor mirror, or compatibility path.

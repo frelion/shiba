@@ -1,13 +1,13 @@
-use core::str::FromStr;
 use std::time::Duration;
 
-use libpq::connection::Info;
-use postgres::{Client, Config, NoTls};
+use postgres::Client;
 use shiba_protocol::{SlotGeneration, SourceId};
 
 use crate::{
     AbortedTransaction, DurableTransaction, EmptyCommitted, IngressError, ReceivedInput,
-    ReplicationMode, SourceReceiver, StreamedInput, governance::GovernedConfig,
+    ReplicationMode, ShutdownHandle, SourceReceiver, StreamedInput,
+    connection_config::{open_apply, replication_database},
+    governance::GovernedConfig,
     limits::ActivePermit,
 };
 
@@ -52,6 +52,7 @@ pub struct GovernedSourceSession {
     apply: Client,
     config: GovernedConfig,
     advisory_key: i64,
+    shutdown: ShutdownHandle,
     _permit: ActivePermit,
 }
 
@@ -69,15 +70,11 @@ impl GovernedSourceSession {
         options: AttachOptions,
     ) -> Result<Self, IngressError> {
         let permit = ActivePermit::acquire()?;
-        let (mut apply_config, apply_database) = parse_apply_conninfo(apply_conninfo)?;
-        let replication_database = parse_replication_conninfo(replication_conninfo)?;
+        let (mut apply, apply_database) = open_apply(apply_conninfo, options.statement_timeout)?;
+        let replication_database = replication_database(replication_conninfo)?;
         if apply_database != replication_database {
             return Err(IngressError::Governance("connection databases differ"));
         }
-        apply_config.application_name("shiba-governed-apply");
-        let mut apply = apply_config.connect(NoTls)?;
-        set_statement_timeout(&mut apply, options.statement_timeout)?;
-
         let advisory_key = advisory_key(source_id)?;
         let acquired: bool = apply
             .query_one(
@@ -112,11 +109,13 @@ impl GovernedSourceSession {
             confirmed_lsn,
         )?;
         config.revalidate(&mut apply, true)?;
+        let shutdown = ShutdownHandle::new();
         Ok(Self {
             receiver: Some(receiver),
             apply,
             config,
             advisory_key,
+            shutdown,
             _permit: permit,
         })
     }
@@ -128,7 +127,8 @@ impl GovernedSourceSession {
     pub fn receive_one(&mut self) -> Result<ReceivedInput, IngressError> {
         self.revalidate()?;
         let source = self.config.source;
-        self.receiver_mut()?.receive_one(source)
+        let shutdown = self.shutdown.clone();
+        self.receiver_mut()?.receive_one(source, &shutdown)
     }
 
     /// Receives one governed protocol-v2 terminal.
@@ -138,7 +138,8 @@ impl GovernedSourceSession {
     pub fn receive_streamed_one(&mut self) -> Result<StreamedInput, IngressError> {
         self.revalidate()?;
         let source = self.config.source;
-        self.receiver_mut()?.receive_streamed_one(source)
+        let shutdown = self.shutdown.clone();
+        self.receiver_mut()?.receive_streamed_one(source, &shutdown)
     }
 
     /// Applies an exact received input with the session-owned Apply client.
@@ -224,6 +225,12 @@ impl GovernedSourceSession {
         self.config.generation
     }
 
+    /// Returns a signal that can interrupt a blocking receive from another thread.
+    #[must_use]
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        self.shutdown.clone()
+    }
+
     fn revalidate(&mut self) -> Result<(), IngressError> {
         self.config.revalidate(&mut self.apply, true)
     }
@@ -233,52 +240,6 @@ impl GovernedSourceSession {
             .as_mut()
             .ok_or(IngressError::Governance("source session is detached"))
     }
-}
-
-fn parse_apply_conninfo(conninfo: &str) -> Result<(Config, String), IngressError> {
-    let config = Config::from_str(conninfo)?;
-    if config.get_connect_timeout().is_none_or(Duration::is_zero) {
-        return Err(IngressError::Governance(
-            "apply connect_timeout is required",
-        ));
-    }
-    let database = config
-        .get_dbname()
-        .ok_or(IngressError::Governance("apply dbname is required"))?
-        .to_owned();
-    Ok((config, database))
-}
-
-fn parse_replication_conninfo(conninfo: &str) -> Result<String, IngressError> {
-    let options = Info::from(conninfo).map_err(IngressError::Libpq)?;
-    let value = |keyword: &str| {
-        options
-            .iter()
-            .find(|option| option.keyword == keyword)
-            .and_then(|option| option.val.as_deref())
-    };
-    let timeout = value("connect_timeout")
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .ok_or(IngressError::Governance(
-            "replication connect_timeout is required",
-        ))?;
-    let _ = timeout;
-    if value("replication") != Some("database") {
-        return Err(IngressError::Governance("replication=database is required"));
-    }
-    value("dbname")
-        .map(str::to_owned)
-        .ok_or(IngressError::Governance("replication dbname is required"))
-}
-
-fn set_statement_timeout(client: &mut Client, timeout: Duration) -> Result<(), IngressError> {
-    let millis = timeout.as_millis().to_string();
-    client.query_one(
-        "SELECT pg_catalog.set_config('statement_timeout', $1, false)",
-        &[&format!("{millis}ms")],
-    )?;
-    Ok(())
 }
 
 fn advisory_key(source_id: SourceId) -> Result<i64, IngressError> {

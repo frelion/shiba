@@ -17,11 +17,14 @@ mod streamed_pgoutput;
 mod transaction;
 
 pub use error::M2Error;
-pub use pgoutput::{PgoutputError, decode_committed_changes};
+pub use pgoutput::{
+    PgoutputError, PgoutputRelationState, decode_committed_changes,
+    decode_committed_changes_in_session,
+};
 pub use pgoutput_source::PgoutputSource;
 pub use processor::{ProcessOutcome, process};
 pub use registration::{RegistrationError, compile_and_register};
-pub use streamed_pgoutput::decode_streamed_changes;
+pub use streamed_pgoutput::{decode_streamed_changes, decode_streamed_changes_in_session};
 pub use transaction::{
     SourceChange, SourceInsert, SourcePayload, SourceTransaction, SourceUpdate, SourceUpdatePayload,
 };

@@ -18,14 +18,10 @@ fn attach_options_require_bounded_statement_timeout() {
 
 #[test]
 fn conninfo_requires_explicit_database_and_positive_timeout() {
-    assert!(parse_apply_conninfo("host=/tmp dbname=test connect_timeout=1").is_ok());
-    assert!(parse_apply_conninfo("host=/tmp dbname=test").is_err());
-    assert!(parse_apply_conninfo("host=/tmp connect_timeout=1").is_err());
-
     let valid = "host=/tmp dbname=test replication=database connect_timeout=1";
-    assert_eq!(parse_replication_conninfo(valid).unwrap(), "test");
-    assert!(parse_replication_conninfo("host=/tmp dbname=test replication=database").is_err());
-    assert!(parse_replication_conninfo("host=/tmp dbname=test connect_timeout=1").is_err());
+    assert_eq!(replication_database(valid).unwrap(), "test");
+    assert!(replication_database("host=/tmp dbname=test replication=database").is_err());
+    assert!(replication_database("host=/tmp dbname=test connect_timeout=1").is_err());
 }
 
 #[test]

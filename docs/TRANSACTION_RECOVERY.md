@@ -158,8 +158,28 @@ session ownership, after which the same catalog generation reattaches. It also
 receives and durably applies 10,000 streamed changes under split least-privilege
 roles. Publication remove/re-add after an empty token is received causes the
 subsequent empty ACK to fail; operator result and slot position remain at their
-last durable values. Automated reconnect/backoff and cancellation of a blocked
-receive are still outside this synchronous recovery boundary.
+last durable values. Automated reconnect/backoff and cancellation during
+Runtime Apply remain outside this synchronous recovery boundary.
+
+M10's cooperative idle shutdown checks a process-local handle between 100 ms
+socket-poll intervals. The transport must attempt asynchronous
+`PQgetCopyData` before polling: libpq may already hold a complete `CopyData`
+even when the socket is no longer readable. After no buffered data remains,
+`PQsocketPoll` and `PQconsumeInput` refill libpq. This ordering fixed the first
+failure-oriented backlog run without adding a queue or alternate transport.
+
+PG17/18 interrupt idle receive in 42.262/76.950 ms, return only
+`ShutdownRequested`, preserve row/operator/result/continuation and slot LSN,
+and allow detach/reattach. A transaction already handed to Runtime still obeys
+Runtime's atomic commit/rollback rules, but cancellation requested during that
+Apply is not implemented. Neither are automatic reconnect or retry backoff.
+
+Relation metadata recovery is scoped to the live replication connection. A
+constant-size `PgoutputRelationState` admits omission only after an exact `R`
+for the same source was validated on that connection; repeated `R` is always
+checked. Restart begins with empty relation state and therefore requires fresh
+metadata before changes. No relation frame cache, spool, second decoder, or
+durable recovery authority exists.
 
 M4.1 payload presence/value is inserted into the existing Apply row before the
 operator and continuation writes. Invalid tuple tags or shapes fail during pure
@@ -236,13 +256,15 @@ M6.1 keeps streamed segments outside PostgreSQL durable Shiba state. Truncation,
 abort, or XID mismatch cannot return a transaction, so continuation cannot pass
 an incomplete stream. After a complete stream commit, processor crash rollback,
 retry once, and exact replay are identical to the existing transaction path.
-Production receiver restart and persisted partial-stream recovery remain open.
+M6.1 did not yet prove production receiver restart; M10 now does so by dropping
+volatile assembly and relying on slot replay. A separate persisted partial-
+stream recovery authority remains deliberately absent.
 
 M6.2 observes real streamed segments before source ROLLBACK, then real `A`.
 After feedback covers the abort, receiver restart on the same slot emits a new
 committed stream; only that transaction can write row/count/result/continuation.
-Host crash before abort feedback and persisted partial-stream recovery remain
-unproved.
+M10.3 later proves pre-feedback abort replay through the production receiver.
+Persisted partial-stream recovery remains deliberately absent.
 
 M7.1 orders each non-replay step as relation ObjectAddress lookup, relation
 `ACCESS SHARE` lock, exact invalidation check, Apply, result, and continuation.

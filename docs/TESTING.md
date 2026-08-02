@@ -39,6 +39,10 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m10-catalog-ingress.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m10-governed-ingress.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m10-governed-ingress.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m10-performance-ingress.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m10-performance-ingress.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m10-shutdown-ingress.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m10-shutdown-ingress.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -278,6 +282,37 @@ Runtime preflight takes `ACCESS SHARE`; Runtime does not read source rows. Its
 replay check uses `SELECT ... FOR UPDATE`. The receiver role has `REPLICATION`
 plus source-schema `USAGE` and source-table `SELECT`, and no Shiba internal
 write grants. Swapping the roles in either connection fails safely.
+
+`test-m10-performance-ingress.sh` freezes limits before accepting results:
+15 s for a real 10,000-change source-commit-to-durable-Apply path, 2 s replay,
+20 tx/s for 100 ready transactions, service p50/p95/p99 limits of
+250/500/1,000 ms, a 300 ms slow-Apply floor, and 250 ms outstanding-receive
+rejection. PG17 measures 860.865 ms E2E, 29.350 ms replay, 622.987 ms backlog
+service, 160.52 tx/s, 6.216/6.355/6.533 ms service percentiles, 1.393 ms
+rejection, and 357.969 ms slow Apply. PG18 measures 867.479 ms, 31.085 ms,
+739.298 ms, 135.26 tx/s, 7.375/7.585/7.776 ms, 1.836 ms, and 358.370 ms.
+
+The E2E timer starts before committing the 10,000-row source INSERT and stops
+after durable Apply. The 100-transaction timer starts only after all ten-row
+transactions are committed; those percentiles are receiver service latency
+against a precommitted backlog, not source-commit latency. The same test freezes
+Rust bounds of 16,777,216 assembly bytes, 10,000 decoded changes, two
+connections per source, one outstanding input, and no queue. It does not measure
+allocator/RSS peaks or cross-host soak.
+
+`test-m10-shutdown-ingress.sh` proves cooperative idle shutdown through the
+asynchronous libpq receive loop. PG17 returns in 42.262 ms and PG18 in
+76.950 ms, both below 1 s, with no terminal token, ACK, Shiba write, or slot-LSN
+advance; detach/reattach then succeeds. Its failure evidence fixes the receive
+order: drain already-buffered libpq `CopyData` before socket polling, then use
+`PQsocketPoll`/`PQconsumeInput`. Shutdown during Runtime Apply and automatic
+reconnect/backoff remain outside the gate.
+
+Pure Runtime session tests cover connection-scoped relation metadata: the first
+transaction requires an exact `R`, repeated `R` is revalidated, a later omission
+is admitted only for the same source, and a changed source/mismatch fails. The
+constant-size `PgoutputRelationState` retains no relation frame list or bytes and
+does not replace the semantic decoder.
 
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and

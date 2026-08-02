@@ -5,6 +5,7 @@
 use core::fmt;
 
 mod assembler;
+mod connection_config;
 mod envelope;
 mod feedback;
 #[cfg(test)]
@@ -16,6 +17,7 @@ mod limits;
 mod publication;
 mod receive_loop;
 mod receiver;
+mod shutdown;
 mod source_shape;
 mod streamed;
 #[cfg(test)]
@@ -28,6 +30,7 @@ pub use envelope::{ReplicationMessage, encode_feedback, parse_replication_messag
 pub use governed::{AttachOptions, GovernedSourceSession};
 pub use limits::{CONNECTIONS_PER_SOURCE, MAX_ACTIVE_CONNECTIONS, MAX_ACTIVE_SOURCES};
 pub(crate) use receiver::SourceReceiver;
+pub use shutdown::ShutdownHandle;
 pub use tokens::{
     AbortedTransaction, DurableTransaction, EmptyCommitted, ReceivedInput, StreamedInput,
 };
@@ -44,6 +47,7 @@ pub enum IngressError {
     FeedbackPending,
     FeedbackMismatch,
     ReceiverFailed,
+    ShutdownRequested,
     Governance(&'static str),
     Database(postgres::Error),
     Libpq(libpq::errors::Error),
@@ -71,6 +75,7 @@ impl fmt::Display for IngressError {
             Self::ReceiverFailed => {
                 formatter.write_str("replication receiver failed closed and must restart")
             }
+            Self::ShutdownRequested => formatter.write_str("source ingress shutdown requested"),
             Self::Governance(reason) => write!(formatter, "source governance failed: {reason}"),
             Self::Database(error) => write!(formatter, "governance database failed: {error}"),
             Self::Libpq(error) => {

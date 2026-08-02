@@ -199,6 +199,7 @@ scripts = [
         "m9-count-sum", "m9-operator-concurrency", "m9-operator-performance",
         "m10-committed-ingress", "m10-streaming-ingress",
         "m10-catalog-ingress", "m10-governed-ingress",
+        "m10-performance-ingress", "m10-shutdown-ingress",
     )
 ]
 for path in scripts:

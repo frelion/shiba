@@ -1,13 +1,14 @@
 use postgres::Client;
 use shiba_runtime::{
-    PgoutputSource, SourceTransaction, decode_committed_changes, decode_streamed_changes, process,
+    PgoutputRelationState, PgoutputSource, SourceTransaction, decode_committed_changes_in_session,
+    decode_streamed_changes_in_session, process,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_EMPTY_AUTHORIZATION: AtomicU64 = AtomicU64::new(1);
 
 use crate::{
-    CommittedAssembler, IngressError, ReplicationMode, ReplicationTransport,
+    CommittedAssembler, IngressError, ReplicationMode, ReplicationTransport, ShutdownHandle,
     feedback::FeedbackState,
     streamed::{StreamTerminal, StreamedAssembler},
     tokens::{
@@ -26,6 +27,7 @@ pub(crate) struct SourceReceiver {
     pub(super) assembly: Assembly,
     pub(super) feedback: FeedbackState,
     empty_authorization: u64,
+    relation_state: PgoutputRelationState,
     outstanding_lsn: Option<u64>,
     failed: bool,
 }
@@ -59,6 +61,7 @@ impl SourceReceiver {
             assembly,
             feedback: FeedbackState::new(last_acknowledged_lsn),
             empty_authorization,
+            relation_state: PgoutputRelationState::new(),
             outstanding_lsn: None,
             failed: false,
         })
@@ -68,15 +71,23 @@ impl SourceReceiver {
     ///
     /// # Errors
     /// Fails closed on mode, state, transport, framing, or decode errors.
-    pub fn receive_one(&mut self, source: PgoutputSource) -> Result<ReceivedInput, IngressError> {
+    pub fn receive_one(
+        &mut self,
+        source: PgoutputSource,
+        shutdown: &ShutdownHandle,
+    ) -> Result<ReceivedInput, IngressError> {
         self.ready()?;
         if !matches!(self.assembly, Assembly::Committed(_)) {
             return Err(IngressError::InvalidEnvelope(
                 "receiver is in streamed mode",
             ));
         }
-        let result = self.receive_committed_wire().and_then(|assembled| {
-            let transaction = decode_committed_changes(&assembled.bytes, source)?;
+        let result = self.receive_committed_wire(shutdown).and_then(|assembled| {
+            let transaction = decode_committed_changes_in_session(
+                &assembled.bytes,
+                source,
+                &mut self.relation_state,
+            )?;
             Ok(self.set_outstanding(transaction, assembled.end_lsn))
         });
         if result.is_err() {
@@ -93,6 +104,7 @@ impl SourceReceiver {
     pub fn receive_streamed_one(
         &mut self,
         source: PgoutputSource,
+        shutdown: &ShutdownHandle,
     ) -> Result<StreamedInput, IngressError> {
         self.ready()?;
         if !matches!(self.assembly, Assembly::Streamed(_)) {
@@ -101,7 +113,7 @@ impl SourceReceiver {
             ));
         }
         let result = self
-            .receive_stream_terminal()
+            .receive_stream_terminal(shutdown)
             .and_then(|terminal| self.handle_stream_terminal(source, terminal));
         if result.is_err() {
             self.failed = true;
@@ -199,7 +211,11 @@ impl SourceReceiver {
     ) -> Result<StreamedInput, IngressError> {
         match terminal {
             StreamTerminal::Committed(assembled) => {
-                let transaction = decode_streamed_changes(&assembled.bytes, source)?;
+                let transaction = decode_streamed_changes_in_session(
+                    &assembled.bytes,
+                    source,
+                    &mut self.relation_state,
+                )?;
                 Ok(StreamedInput::Transaction(
                     self.set_outstanding(transaction, assembled.end_lsn),
                 ))

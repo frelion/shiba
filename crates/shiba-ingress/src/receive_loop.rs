@@ -1,11 +1,14 @@
 use crate::{
-    AssembledTransaction, IngressError, ReplicationMessage, SourceReceiver,
+    AssembledTransaction, IngressError, ReplicationMessage, ShutdownHandle, SourceReceiver,
     parse_replication_message, receiver::Assembly, streamed::StreamTerminal,
 };
 
 /// Blocking COPY-BOTH receive loops, separated from receiver state transitions.
 impl SourceReceiver {
-    pub(super) fn receive_committed_wire(&mut self) -> Result<AssembledTransaction, IngressError> {
+    pub(super) fn receive_committed_wire(
+        &mut self,
+        shutdown: &ShutdownHandle,
+    ) -> Result<AssembledTransaction, IngressError> {
         loop {
             let Assembly::Committed(assembler) = &mut self.assembly else {
                 return Err(IngressError::MessageOrder);
@@ -13,7 +16,7 @@ impl SourceReceiver {
             if let Some(assembled) = assembler.push(&[])? {
                 return Ok(assembled);
             }
-            let copy_data = self.transport.receive()?;
+            let copy_data = self.transport.receive(shutdown)?;
             match parse_replication_message(&copy_data)? {
                 ReplicationMessage::XLogData { data, .. } => {
                     if let Some(assembled) = assembler.push(data)? {
@@ -31,7 +34,10 @@ impl SourceReceiver {
         }
     }
 
-    pub(super) fn receive_stream_terminal(&mut self) -> Result<StreamTerminal, IngressError> {
+    pub(super) fn receive_stream_terminal(
+        &mut self,
+        shutdown: &ShutdownHandle,
+    ) -> Result<StreamTerminal, IngressError> {
         loop {
             let Assembly::Streamed(assembler) = &mut self.assembly else {
                 return Err(IngressError::MessageOrder);
@@ -39,7 +45,7 @@ impl SourceReceiver {
             if let Some(terminal) = assembler.poll()? {
                 return Ok(terminal);
             }
-            let copy_data = self.transport.receive()?;
+            let copy_data = self.transport.receive(shutdown)?;
             match parse_replication_message(&copy_data)? {
                 ReplicationMessage::XLogData {
                     wal_start, data, ..

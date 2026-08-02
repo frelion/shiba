@@ -14,6 +14,31 @@ const INT8_OID: u32 = 20;
 const TEXT_OID: u32 = 25;
 pub(crate) const MAX_PGOUTPUT_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Constant-size, connection-local proof that one exact relation descriptor was validated.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PgoutputRelationState {
+    source: Option<PgoutputSource>,
+}
+
+impl PgoutputRelationState {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { source: None }
+    }
+
+    pub(crate) fn validated_for(&self, source: PgoutputSource) -> Result<bool, PgoutputError> {
+        match self.source {
+            None => Ok(false),
+            Some(validated) if validated == source => Ok(true),
+            Some(_) => Err(PgoutputError::RelationMismatch),
+        }
+    }
+
+    pub(crate) fn mark_validated(&mut self, source: PgoutputSource) {
+        self.source = Some(source);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PgoutputError {
     Truncated,
@@ -57,7 +82,21 @@ pub fn decode_committed_changes(
     input: &[u8],
     source: PgoutputSource,
 ) -> Result<SourceTransaction, PgoutputError> {
+    decode_committed_changes_in_session(input, source, &mut PgoutputRelationState::new())
+}
+
+/// Decodes a committed transaction using relation metadata validated earlier on this connection.
+///
+/// # Errors
+/// The first transaction must contain an exact `RELATION`; later transactions
+/// may omit it, while every repeated descriptor is validated again.
+pub fn decode_committed_changes_in_session(
+    input: &[u8],
+    source: PgoutputSource,
+    relation_state: &mut PgoutputRelationState,
+) -> Result<SourceTransaction, PgoutputError> {
     check_input_limit(input)?;
+    let relation_previously_validated = relation_state.validated_for(source)?;
     let mut cursor = Cursor::new(input);
     if cursor.byte()? != b'B' {
         return Err(PgoutputError::MessageOrder);
@@ -69,10 +108,13 @@ pub fn decode_committed_changes(
         return Err(PgoutputError::InvalidIdentity);
     }
 
-    if cursor.byte()? != b'R' {
+    let relation_in_transaction = cursor.peek()? == b'R';
+    if relation_in_transaction {
+        cursor.byte()?;
+        decode_relation(&mut cursor, source)?;
+    } else if !relation_previously_validated {
         return Err(PgoutputError::MessageOrder);
     }
-    decode_relation(&mut cursor, source)?;
 
     let mut values = Vec::new();
     loop {
@@ -147,7 +189,12 @@ pub fn decode_committed_changes(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    SourceTransaction::from_changes(identity, changes).map_err(|_| PgoutputError::TupleValue)
+    let transaction = SourceTransaction::from_changes(identity, changes)
+        .map_err(|_| PgoutputError::TupleValue)?;
+    if relation_in_transaction {
+        relation_state.mark_validated(source);
+    }
+    Ok(transaction)
 }
 
 pub(crate) fn check_input_limit(input: &[u8]) -> Result<(), PgoutputError> {

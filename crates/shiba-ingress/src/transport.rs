@@ -1,6 +1,9 @@
 use libpq::{Connection, Status, connection::Info};
 
-use crate::{IngressError, encode_feedback};
+use crate::{IngressError, ShutdownHandle, assembler::MAX_TRANSACTION_BYTES, encode_feedback};
+
+const COPY_DATA_ENVELOPE_BYTES: usize = 25;
+const RECEIVE_POLL_MICROS: i64 = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplicationMode {
@@ -72,11 +75,31 @@ impl ReplicationTransport {
     ///
     /// # Errors
     /// Returns the libpq error when COPY ends or the connection fails.
-    pub fn receive(&self) -> Result<Vec<u8>, IngressError> {
-        self.connection
-            .copy_data(false)
-            .map(|bytes| bytes.to_vec())
-            .map_err(IngressError::Libpq)
+    pub fn receive(&self, shutdown: &ShutdownHandle) -> Result<Vec<u8>, IngressError> {
+        loop {
+            if shutdown.is_requested() {
+                return Err(IngressError::ShutdownRequested);
+            }
+            match self.connection.copy_data(true) {
+                Ok(bytes) => {
+                    if bytes.len() > MAX_TRANSACTION_BYTES + COPY_DATA_ENVELOPE_BYTES {
+                        return Err(IngressError::LimitExceeded);
+                    }
+                    return Ok(bytes.to_vec());
+                }
+                Err(libpq::errors::Error::Backend(message))
+                    if message == "COPY still in progress" => {}
+                Err(error) => return Err(IngressError::Libpq(error)),
+            }
+            let deadline = libpq::current_time_usec()
+                .checked_add(RECEIVE_POLL_MICROS)
+                .ok_or(IngressError::LimitExceeded)?;
+            match self.connection.socket_poll(true, false, Some(deadline)) {
+                Ok(()) => self.connection.consume_input()?,
+                Err(libpq::errors::Error::Timeout) => {}
+                Err(error) => return Err(IngressError::Libpq(error)),
+            }
+        }
     }
 
     /// Sends a blocking status update for the caller's durable LSN.

@@ -231,6 +231,22 @@ not a row lookup, and continuation `UPDATE` permits the latest-row `FOR UPDATE`
 check. The receiver role has `REPLICATION` plus source schema `USAGE` and table
 `SELECT`, but no Shiba-state write authority.
 
+The final M10 receive loop is synchronous and bounded: one owned `CopyData`
+vector is at most 16 MiB plus 25 envelope bytes, assembly is at most 16 MiB,
+decoded changes are at most 10,000, and there is one outstanding transaction
+with no queue. One constant-size connection-local relation state validates the
+first and every repeated `R`, permitting later omission only for the same exact
+source. It stores no frames and creates no decoder or durable authority.
+
+Idle shutdown drains libpq-buffered `CopyData` before polling the socket, then
+uses asynchronous `PQgetCopyData`, `PQsocketPoll`, and `PQconsumeInput` on a
+bounded cycle. PG17/18 prove shutdown within 42.262/76.950 ms against a 1 s
+limit with no ACK, durable-state change, or LSN advance, followed by successful
+detach/reattach. The frozen local performance gates prove 10,000-change source-
+commit-to-durable-Apply in 860.865/867.479 ms and direct slow-Apply
+backpressure. M10 is complete at this production-ingress scope, not a claim
+that Shiba V2 is complete.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -239,13 +255,12 @@ No later code may use an old authority as a fallback. An implementation is
 accepted only after its clean-room tests prove its new contract; legacy tests are
 evidence inputs, not implementation dependencies.
 
-**Unproved:** network/TLS and blocking-receive cancellation behavior,
-reconnect daemon/backoff policy, admission
+**Unproved:** network/TLS behavior, shutdown during Apply, reconnect daemon/
+backoff policy, allocator/RSS peaks, cross-host soak, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving,
-production receiver failover and persisted partial-stream recovery, production
-transport backpressure and transport memory, binding
-rebuild, SQL frontend, non-aggregate operators, sustained throughput, empirical
+production failover and persisted partial-stream recovery, binding rebuild,
+SQL frontend, non-aggregate operators, cross-host sustained soak, empirical
 heap peak, contention tail latency, and recovery workers
 remain.

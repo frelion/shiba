@@ -27,6 +27,13 @@ impl<'a> Cursor<'a> {
         Ok(self.take(1)?[0])
     }
 
+    pub(crate) fn peek(&self) -> Result<u8, PgoutputError> {
+        self.input
+            .get(self.offset)
+            .copied()
+            .ok_or(PgoutputError::Truncated)
+    }
+
     pub(crate) fn u16(&mut self) -> Result<u16, PgoutputError> {
         Ok(u16::from_be_bytes(
             self.take(2)?.try_into().expect("fixed width"),

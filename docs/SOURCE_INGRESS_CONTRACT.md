@@ -197,6 +197,20 @@ catalog untouched. An in-flight blocking receive, transport interruption/TLS
 policy, and cross-process graceful-stop orchestration remain operational proof
 outside the M10.4 catalog contract.
 
+The production transport uses cooperative idle-receive shutdown. It first
+drains any `CopyData` already buffered by libpq with asynchronous
+`PQgetCopyData`; only when none is buffered does it wait through
+`PQsocketPoll`, call `PQconsumeInput`, and retry. A shutdown handle is checked
+on each bounded poll cycle. This ordering is a correctness requirement: the
+first failure-oriented performance run showed that polling the socket before
+draining libpq could sleep while a complete transaction was already buffered.
+
+PG17 and PG18 idle gates complete in 42.262 ms and 76.950 ms respectively,
+below the frozen 1 s limit. Shutdown returns no transaction or ACK, changes no
+row/operator/result/continuation state or slot LSN, then permits explicit
+detach/reattach. Shutdown requested during Runtime Apply, automatic reconnect/
+backoff, and process orchestration remain outside this cooperative boundary.
+
 ## Production roles
 
 PG17 and PG18 gates prove split, non-superuser roles. The synchronous Apply role
@@ -225,12 +239,51 @@ cannot perform governed Apply, and neither role is superuser. These grants prove
 the current single-database topology; secret distribution, TLS policy, and role
 rotation remain deployment responsibilities.
 
+## Relation metadata and strict resource bounds
+
+pgoutput relation metadata is connection-scoped and need not be repeated in
+every transaction. The receiver therefore owns one constant-size
+`PgoutputRelationState`: the first `R` must validate the exact configured
+source; every repeated `R` is revalidated; only a later transaction on that
+same connection and exact source may omit it. A missing first descriptor,
+changed source, or mismatching repeated descriptor fails closed. This is no
+frame cache, second decoder, durable authority, or cross-connection fallback.
+
+Rust-owned memory has explicit structural bounds:
+
+- one owned `CopyData` vector is at most 16 MiB plus its 25-byte replication
+  envelope;
+- transaction assembly is at most 16 MiB;
+- semantic decode owns at most 10,000 changes;
+- synchronous delivery permits one outstanding transaction and no queue.
+
+These are code-enforced allocation bounds, not a claim about allocator
+overhead, process RSS, PostgreSQL memory, or cross-host soak behavior.
+
+## Frozen PG17/18 performance evidence
+
+The 10,000-change measurement starts before the source INSERT commit and ends
+only after production receive and durable Runtime Apply. It is true
+source-commit-to-durable-Apply E2E: 860.865 ms on PG17 and 867.479 ms on PG18.
+Exact replay is 29.350 ms and 31.085 ms.
+
+The sustained sample has a different meaning: 100 ten-row transactions are
+precommitted before timing, so its percentiles measure receiver service latency
+against a ready backlog, not source commit latency. PG17 services the backlog in
+622.987 ms at 160.52 tx/s with p50/p95/p99 of
+6.216/6.355/6.533 ms. PG18 takes 739.298 ms at 135.26 tx/s with
+7.375/7.585/7.776 ms. Slow Apply lasts 357.969/358.370 ms and an attempted
+second receive is rejected in 1.393/1.836 ms, proving direct backpressure rather
+than queue growth. Allocator/RSS peaks and cross-host sustained soak remain
+unproved.
+
 ## M10 admission boundary
 
 M10 reuses the already admitted pgoutput v1 and v2 transaction shapes. It does
 not add SQL parsing, source discovery, new tuple shapes, a second decoder,
 receiver-written results, automatic slot administration, persisted WAL, or
 binding rebuild. Production receiver/feedback, streaming assembly, governed
-lifecycle, and split-role permissions have PG17/18 evidence. Final sustained
-performance, TLS/disconnect behavior, blocked-receive cancellation, and
-reconnect orchestration remain open.
+lifecycle, split-role permissions, bounded idle shutdown, and the frozen local
+performance gate have PG17/18 evidence. M10 is complete at this declared scope.
+TLS/disconnect behavior, shutdown during Apply, reconnect/backoff orchestration,
+allocator/RSS measurement, and cross-host soak remain future work.
