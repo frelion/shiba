@@ -15,6 +15,8 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m3.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m4.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m4.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m4-empty.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m4-empty.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -50,6 +52,10 @@ PG17 and PG18 run the same gate.
 `int8` value. It proves operator-error rollback after payload Apply, exact Apply
 facts, count result, replay no-op, and a precisely corrupted key tuple tag
 failing before any durable state appears.
+
+`test-m4-empty.sh` captures two zero-column INSERTs committed together. It
+proves two NULL-key/absent-payload Apply facts, count `2`, replay no-op, and a
+corrupt nonzero tuple column count failing with zero durable state.
 
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.

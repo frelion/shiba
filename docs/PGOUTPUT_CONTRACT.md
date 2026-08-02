@@ -36,6 +36,13 @@ The pgoutput `n` tag becomes `SourcePayload::Null`; canonical text becomes
 `Int8`. Key NULL and `u`/`b` tuple tags fail closed. The original constructor
 retains the exact M3 single-key shape and produces `SourcePayload::Absent`.
 
+## M4.2 empty tuple extension
+
+`PgoutputSource::empty` admits only a zero-column RELATION and zero-column new
+tuple. Each INSERT becomes a cause-scoped `SourceInsert::empty`; any advertised
+or encoded column fails closed. No synthetic key is derived from names, order,
+or WAL position.
+
 ## M3.2 acknowledgement crash point
 
 The recovery gate deliberately separates database visibility from replication
@@ -58,5 +65,6 @@ before the production decoder sees the bytes.
 M3.1 proves live decoding and clean capture restart. M3.2 proves the abnormal
 post-result/pre-ack crash window on PG17 and PG18 using the slot's own
 `confirmed_flush_lsn`. Production transport and slot lifecycle remain unproved;
-they cannot introduce another continuation or writer. Tuple shapes beyond the
-single non-null `int8` INSERT remain M4 work, and streaming remains out of scope.
+they cannot introduce another continuation or writer. M4.1/M4.2 prove nullable
+payload and empty INSERT shapes; composite identity, UPDATE/DELETE, TOAST, and
+streaming remain out of scope.

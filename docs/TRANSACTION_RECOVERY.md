@@ -49,3 +49,8 @@ operator and continuation writes. Invalid tuple tags or shapes fail during pure
 decode and cannot open a database transaction. A PostgreSQL error after payload
 Apply still rolls back payload, count, result, and continuation together under
 the unchanged M2 transaction owner.
+
+M4.2 empty rows use the same cause primary key as keyed rows. Allowing a NULL
+`source_row_id` does not weaken replay identity: exact replay is still decided
+by committed transaction identity, and all empty Apply facts roll back with the
+operator, result, and continuation.

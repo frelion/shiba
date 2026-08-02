@@ -60,6 +60,19 @@ impl<'a> Cursor<'a> {
         Ok(value)
     }
 
+    pub(crate) fn int8_text(&mut self) -> Result<i64, PgoutputError> {
+        let length = usize::try_from(self.u32()?).map_err(|_| PgoutputError::Truncated)?;
+        let encoded =
+            std::str::from_utf8(self.take(length)?).map_err(|_| PgoutputError::TupleValue)?;
+        let value = encoded
+            .parse::<i64>()
+            .map_err(|_| PgoutputError::TupleValue)?;
+        if value.to_string() != encoded {
+            return Err(PgoutputError::TupleValue);
+        }
+        Ok(value)
+    }
+
     pub(crate) fn finished(&self) -> bool {
         self.offset == self.input.len()
     }

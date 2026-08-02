@@ -47,6 +47,11 @@ present SQL NULL without creating another Apply table or authority. The decoder
 admits only key-only or key-plus-nullable-int8 shapes; the same processor writes
 the payload, count state, result, and continuation in one transaction.
 
+M4.2 represents a zero-column INSERT with no `source_row_id`. Its durable cause
+identity remains transaction plus input sequence, so multiple empty rows in one
+transaction are distinct without a synthetic key. The existing Apply table and
+writer remain unchanged; keyed paths continue to require a non-null key.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -55,6 +60,6 @@ No later code may use an old authority as a fallback. An implementation is
 accepted only after its clean-room tests prove its new contract; legacy tests are
 evidence inputs, not implementation dependencies.
 
-**Unproved:** production replication transport and slot ownership, empty and
-composite identities, UPDATE/DELETE, TOAST, catalog binding inspection,
+**Unproved:** production replication transport and slot ownership, composite
+identity, UPDATE/DELETE, TOAST, catalog binding inspection,
 concurrency, generation changes, general operators, and recovery workers remain.

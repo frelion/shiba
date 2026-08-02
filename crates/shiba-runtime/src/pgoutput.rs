@@ -18,11 +18,36 @@ pub struct PgoutputSource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceShape {
+    Empty,
     KeyOnly,
     NullableInt8Payload,
 }
 
+impl SourceShape {
+    const fn columns(self) -> u16 {
+        match self {
+            Self::Empty => 0,
+            Self::KeyOnly => 1,
+            Self::NullableInt8Payload => 2,
+        }
+    }
+}
+
 impl PgoutputSource {
+    #[must_use]
+    pub const fn empty(
+        source_id: SourceId,
+        slot_generation: SlotGeneration,
+        relation_id: u32,
+    ) -> Self {
+        Self {
+            source_id,
+            slot_generation,
+            relation_id,
+            shape: SourceShape::Empty,
+        }
+    }
+
     #[must_use]
     pub const fn new(
         source_id: SourceId,
@@ -90,7 +115,7 @@ impl std::error::Error for PgoutputError {}
 /// Decodes one complete, non-streaming pgoutput protocol-v1 transaction.
 ///
 /// # Errors
-/// Returns [`PgoutputError`] unless it has the exact admitted M4.1 shape.
+/// Returns [`PgoutputError`] unless it has an exact admitted M4.2 shape.
 pub fn decode_committed_insert(
     input: &[u8],
     source: PgoutputSource,
@@ -143,13 +168,18 @@ pub fn decode_committed_insert(
     let inserts = values
         .into_iter()
         .enumerate()
-        .map(|(index, (source_row_id, payload))| {
+        .map(|(index, row)| {
             let sequence = u64::try_from(index)
                 .ok()
                 .and_then(|value| value.checked_add(1))
                 .and_then(|value| InputSequence::new(value).ok())
                 .ok_or(PgoutputError::InvalidIdentity)?;
-            Ok(SourceInsert::with_payload(sequence, source_row_id, payload))
+            Ok(match row {
+                None => SourceInsert::empty(sequence),
+                Some((source_row_id, payload)) => {
+                    SourceInsert::with_payload(sequence, source_row_id, payload)
+                }
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     SourceTransaction::new(identity, inserts).map_err(|_| PgoutputError::TupleValue)
@@ -161,10 +191,7 @@ fn decode_relation(cursor: &mut Cursor<'_>, source: PgoutputSource) -> Result<()
     }
     cursor.string()?;
     cursor.string()?;
-    let columns = match source.shape {
-        SourceShape::KeyOnly => 1,
-        SourceShape::NullableInt8Payload => 2,
-    };
+    let columns = source.shape.columns();
     if !matches!(cursor.byte()?, b'd' | b'n' | b'f' | b'i') || cursor.u16()? != columns {
         return Err(PgoutputError::RelationShape);
     }
@@ -184,27 +211,28 @@ fn decode_relation(cursor: &mut Cursor<'_>, source: PgoutputSource) -> Result<()
 fn decode_insert(
     cursor: &mut Cursor<'_>,
     source: PgoutputSource,
-) -> Result<(i64, SourcePayload), PgoutputError> {
+) -> Result<Option<(i64, SourcePayload)>, PgoutputError> {
     if cursor.u32()? != source.relation_id {
         return Err(PgoutputError::RelationMismatch);
     }
-    let columns = match source.shape {
-        SourceShape::KeyOnly => 1,
-        SourceShape::NullableInt8Payload => 2,
-    };
+    let columns = source.shape.columns();
     if cursor.byte()? != b'N' || cursor.u16()? != columns {
         return Err(PgoutputError::TupleShape);
     }
+    if source.shape == SourceShape::Empty {
+        return Ok(None);
+    }
     let source_row_id = decode_int8(cursor)?;
     let payload = match source.shape {
+        SourceShape::Empty => return Err(PgoutputError::TupleShape),
         SourceShape::KeyOnly => SourcePayload::Absent,
         SourceShape::NullableInt8Payload => match cursor.byte()? {
             b'n' => SourcePayload::Null,
-            b't' => SourcePayload::Int8(decode_int8_text(cursor)?),
+            b't' => SourcePayload::Int8(cursor.int8_text()?),
             tag => return Err(PgoutputError::TupleTag(tag)),
         },
     };
-    Ok((source_row_id, payload))
+    Ok(Some((source_row_id, payload)))
 }
 
 fn decode_int8(cursor: &mut Cursor<'_>) -> Result<i64, PgoutputError> {
@@ -212,18 +240,5 @@ fn decode_int8(cursor: &mut Cursor<'_>) -> Result<i64, PgoutputError> {
     if format != b't' {
         return Err(PgoutputError::TupleTag(format));
     }
-    decode_int8_text(cursor)
-}
-
-fn decode_int8_text(cursor: &mut Cursor<'_>) -> Result<i64, PgoutputError> {
-    let length = usize::try_from(cursor.u32()?).map_err(|_| PgoutputError::Truncated)?;
-    let encoded =
-        std::str::from_utf8(cursor.take(length)?).map_err(|_| PgoutputError::TupleValue)?;
-    let value = encoded
-        .parse::<i64>()
-        .map_err(|_| PgoutputError::TupleValue)?;
-    if value.to_string() != encoded {
-        return Err(PgoutputError::TupleValue);
-    }
-    Ok(value)
+    cursor.int8_text()
 }

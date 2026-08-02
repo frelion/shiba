@@ -14,7 +14,7 @@ pub enum SourcePayload {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceInsert {
     pub input_sequence: InputSequence,
-    pub source_row_id: i64,
+    pub source_row_id: Option<i64>,
     pub source_payload: SourcePayload,
 }
 
@@ -23,7 +23,7 @@ impl SourceInsert {
     pub const fn new(input_sequence: InputSequence, source_row_id: i64) -> Self {
         Self {
             input_sequence,
-            source_row_id,
+            source_row_id: Some(source_row_id),
             source_payload: SourcePayload::Absent,
         }
     }
@@ -36,8 +36,17 @@ impl SourceInsert {
     ) -> Self {
         Self {
             input_sequence,
-            source_row_id,
+            source_row_id: Some(source_row_id),
             source_payload,
+        }
+    }
+
+    #[must_use]
+    pub const fn empty(input_sequence: InputSequence) -> Self {
+        Self {
+            input_sequence,
+            source_row_id: None,
+            source_payload: SourcePayload::Absent,
         }
     }
 }
@@ -74,8 +83,10 @@ impl SourceTransaction {
             if !sequences.insert(sequence) {
                 return Err(M2Error::DuplicateInputSequence(sequence));
             }
-            if !rows.insert(insert.source_row_id) {
-                return Err(M2Error::DuplicateSourceRow(insert.source_row_id));
+            if let Some(source_row_id) = insert.source_row_id
+                && !rows.insert(source_row_id)
+            {
+                return Err(M2Error::DuplicateSourceRow(source_row_id));
             }
         }
         Ok(Self { identity, inserts })

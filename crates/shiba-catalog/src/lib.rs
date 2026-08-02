@@ -23,11 +23,18 @@
     requires = ["insert_count"]
 );
 
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/004_empty_insert.sql",
+    name = "empty_insert",
+    requires = ["nullable_insert"]
+);
+
 #[cfg(test)]
 mod tests {
     const CATALOG_SQL: &str = include_str!("../../../sql/v2/001_catalog_identity.sql");
     const M2_SQL: &str = include_str!("../../../sql/v2/002_insert_count.sql");
     const M4_SQL: &str = include_str!("../../../sql/v2/003_nullable_insert.sql");
+    const M4_EMPTY_SQL: &str = include_str!("../../../sql/v2/004_empty_insert.sql");
 
     fn normalized_sql() -> String {
         CATALOG_SQL.to_ascii_lowercase()
@@ -77,10 +84,11 @@ mod tests {
     #[test]
     fn installation_has_no_dynamic_or_compatibility_mechanism() {
         let sql = format!(
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             normalized_sql(),
             M2_SQL.to_ascii_lowercase(),
-            M4_SQL.to_ascii_lowercase()
+            M4_SQL.to_ascii_lowercase(),
+            M4_EMPTY_SQL.to_ascii_lowercase()
         );
         for forbidden in [
             "create trigger",
