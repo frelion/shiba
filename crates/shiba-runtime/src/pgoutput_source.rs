@@ -35,7 +35,6 @@ impl PgoutputSource {
     ) -> Self {
         Self::with_shape(source_id, slot_generation, relation_id, SourceShape::Empty)
     }
-
     #[must_use]
     pub const fn new(
         source_id: SourceId,
@@ -49,7 +48,6 @@ impl PgoutputSource {
             SourceShape::KeyOnly,
         )
     }
-
     #[must_use]
     pub const fn with_nullable_int8_payload(
         source_id: SourceId,
@@ -63,7 +61,6 @@ impl PgoutputSource {
             SourceShape::NullableInt8Payload,
         )
     }
-
     #[must_use]
     pub const fn composite_int8(
         source_id: SourceId,
@@ -77,7 +74,6 @@ impl PgoutputSource {
             SourceShape::CompositeInt8,
         )
     }
-
     const fn with_shape(
         source_id: SourceId,
         slot_generation: SlotGeneration,

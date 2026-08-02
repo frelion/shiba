@@ -8,6 +8,7 @@ pub enum M2Error {
     DuplicateSourceRow(i64),
     EmptyTransaction,
     IdentityConflict,
+    MissingSourceRow,
     OutOfOrder,
     Postgres(postgres::Error),
     SourceScopeMismatch,
@@ -28,6 +29,7 @@ impl fmt::Display for M2Error {
             Self::IdentityConflict => {
                 formatter.write_str("source coordinate has a different transaction identity")
             }
+            Self::MissingSourceRow => formatter.write_str("source change targets no applied row"),
             Self::OutOfOrder => formatter.write_str("commit LSN is not strictly increasing"),
             Self::Postgres(error) => write!(formatter, "PostgreSQL transaction failed: {error}"),
             Self::SourceScopeMismatch => {

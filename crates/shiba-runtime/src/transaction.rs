@@ -19,6 +19,33 @@ pub struct SourceInsert {
     pub source_payload: SourcePayload,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceUpdate {
+    pub input_sequence: InputSequence,
+    pub source_row_id: i64,
+    pub source_payload: Option<i64>,
+}
+
+impl SourceUpdate {
+    #[must_use]
+    pub const fn new(
+        input_sequence: InputSequence,
+        source_row_id: i64,
+        source_payload: Option<i64>,
+    ) -> Self {
+        Self {
+            input_sequence,
+            source_row_id,
+            source_payload,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceChange {
+    Insert(SourceInsert),
+    Update(SourceUpdate),
+}
+
 impl SourceInsert {
     #[must_use]
     pub const fn new(input_sequence: InputSequence, source_row_id: i64) -> Self {
@@ -29,7 +56,6 @@ impl SourceInsert {
             source_payload: SourcePayload::Absent,
         }
     }
-
     #[must_use]
     pub const fn with_payload(
         input_sequence: InputSequence,
@@ -43,7 +69,6 @@ impl SourceInsert {
             source_payload,
         }
     }
-
     #[must_use]
     pub const fn empty(input_sequence: InputSequence) -> Self {
         Self {
@@ -53,7 +78,6 @@ impl SourceInsert {
             source_payload: SourcePayload::Absent,
         }
     }
-
     #[must_use]
     pub const fn composite(input_sequence: InputSequence, first: i64, second: i64) -> Self {
         Self {
@@ -64,46 +88,63 @@ impl SourceInsert {
         }
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceTransaction {
     pub identity: SourceTransactionId,
-    pub inserts: Vec<SourceInsert>,
+    pub changes: Vec<SourceChange>,
 }
 
 impl SourceTransaction {
-    /// Constructs the admitted committed source transaction.
-    ///
     /// # Errors
-    ///
-    /// Rejects an empty transaction, duplicate cause sequence, duplicate source
-    /// row, or an identity coordinate `PostgreSQL` `bigint` cannot represent.
+    /// Rejects invalid identity coordinates or INSERT facts.
     pub fn new(identity: SourceTransactionId, inserts: Vec<SourceInsert>) -> Result<Self, M2Error> {
+        Self::from_changes(
+            identity,
+            inserts.into_iter().map(SourceChange::Insert).collect(),
+        )
+    }
+    /// # Errors
+    /// Rejects empty, duplicate, or out-of-range changes.
+    pub fn from_changes(
+        identity: SourceTransactionId,
+        changes: Vec<SourceChange>,
+    ) -> Result<Self, M2Error> {
         validate_coordinate("source_id", identity.source_id.get())?;
         validate_coordinate("slot_generation", identity.slot_generation.get())?;
         validate_coordinate(
             "ingress_transaction_id",
             identity.ingress_transaction_id.get(),
         )?;
-        if inserts.is_empty() {
+        if changes.is_empty() {
             return Err(M2Error::EmptyTransaction);
         }
 
-        let mut sequences = HashSet::with_capacity(inserts.len());
-        let mut rows = HashSet::with_capacity(inserts.len());
-        for insert in &inserts {
-            let sequence = insert.input_sequence.get();
+        let mut sequences = HashSet::with_capacity(changes.len());
+        let mut rows = HashSet::with_capacity(changes.len());
+        for change in &changes {
+            let (sequence, row) = match change {
+                SourceChange::Insert(insert) => (
+                    insert.input_sequence.get(),
+                    insert
+                        .source_row_id
+                        .map(|key| (key, insert.source_row_sub_id)),
+                ),
+                SourceChange::Update(update) => (
+                    update.input_sequence.get(),
+                    Some((update.source_row_id, None)),
+                ),
+            };
             validate_coordinate("input_sequence", sequence)?;
             if !sequences.insert(sequence) {
                 return Err(M2Error::DuplicateInputSequence(sequence));
             }
-            if let Some(source_row_id) = insert.source_row_id
-                && !rows.insert((source_row_id, insert.source_row_sub_id))
+            if let Some((source_row_id, sub_id)) = row
+                && !rows.insert((source_row_id, sub_id))
             {
                 return Err(M2Error::DuplicateSourceRow(source_row_id));
             }
         }
-        Ok(Self { identity, inserts })
+        Ok(Self { identity, changes })
     }
 }
 

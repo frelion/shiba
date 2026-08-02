@@ -1,5 +1,5 @@
-//! Clean-room single-source transactional walking skeleton through M4.1.
-//! Strict decoding feeds the sole writer and `PostgreSQL` transaction owner.
+//! Clean-room single-source transaction pipeline through M4.4; strict pgoutput
+//! decoding feeds the sole writer and `PostgreSQL` transaction owner.
 
 #![forbid(unsafe_code)]
 
@@ -12,7 +12,7 @@ mod processor;
 mod transaction;
 
 pub use error::M2Error;
-pub use pgoutput::{PgoutputError, decode_committed_insert};
+pub use pgoutput::{PgoutputError, decode_committed_changes};
 pub use pgoutput_source::PgoutputSource;
 pub use processor::{ProcessOutcome, process};
-pub use transaction::{SourceInsert, SourcePayload, SourceTransaction};
+pub use transaction::{SourceChange, SourceInsert, SourcePayload, SourceTransaction, SourceUpdate};

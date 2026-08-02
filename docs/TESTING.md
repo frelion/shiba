@@ -19,6 +19,8 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m4-empty.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m4-composite.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m4-composite.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m4-update.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m4-update.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -62,6 +64,12 @@ corrupt nonzero tuple column count failing with zero durable state.
 `test-m4-composite.sh` captures two rows sharing key-1 but differing in key-2.
 It proves exact two-part Apply facts, count `2`, replay no-op, and a precisely
 corrupted second-key tag failing with zero durable state.
+
+`test-m4-update.sh` applies a real INSERT and then captures an unchanged-key
+UPDATE whose nullable payload becomes SQL NULL. It proves count stays `1`, the
+Apply payload changes exactly once, a corrupt key tag fails before writes, and
+backend termination after continuation INSERT rolls payload and continuation
+back together before a successful retry and replay no-op.
 
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.

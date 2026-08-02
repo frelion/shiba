@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf, process::Command};
 
 use postgres::{Client, NoTls};
 use shiba_protocol::{SlotGeneration, SourceId};
-use shiba_runtime::{M2Error, PgoutputSource, ProcessOutcome, decode_committed_insert, process};
+use shiba_runtime::{M2Error, PgoutputSource, ProcessOutcome, decode_committed_changes, process};
 
 fn required(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("scripts/test-m4.sh must provide {name}"))
@@ -187,10 +187,10 @@ fn m4_real_pgoutput_nullable_payload_and_bad_key_tag() {
     let key_tag = first_key_tuple_tag(&bad_key);
     assert_eq!(bad_key[key_tag], b't');
     bad_key[key_tag] = b'n';
-    assert!(decode_committed_insert(&bad_key, source).is_err());
+    assert!(decode_committed_changes(&bad_key, source).is_err());
     assert_eq!(durable_state(&mut client), (0, 0, 0, 0));
 
-    let transaction = decode_committed_insert(&wire, source).expect("decode payload transaction");
+    let transaction = decode_committed_changes(&wire, source).expect("decode payload transaction");
     client
         .batch_execute(
             "CREATE SCHEMA m4_test;

@@ -5,7 +5,7 @@ use shiba_protocol::PostgresLsn;
 
 use crate::count;
 use crate::transaction::as_bigint;
-use crate::{M2Error, SourcePayload, SourceTransaction};
+use crate::{M2Error, SourceChange, SourcePayload, SourceTransaction};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessOutcome {
@@ -13,9 +13,8 @@ pub enum ProcessOutcome {
     AlreadyApplied,
 }
 
-/// Atomically applies one committed source transaction and advances its result.
 /// # Errors
-/// Fails on identity/order, overflow, or `PostgreSQL` errors; all facts roll back.
+/// Returns a validation or database error; the transaction is rolled back.
 pub fn process(client: &mut Client, input: &SourceTransaction) -> Result<ProcessOutcome, M2Error> {
     let mut transaction = client.transaction()?;
     let outcome = process_in_transaction(&mut transaction, input)?;
@@ -74,32 +73,14 @@ fn process_in_transaction(
         }
     }
 
-    for insert in &input.inserts {
-        let sequence = as_bigint("input_sequence", insert.input_sequence.get())?;
-        let (payload_present, payload_int8) = match insert.source_payload {
-            SourcePayload::Absent => (false, None),
-            SourcePayload::Null => (true, None),
-            SourcePayload::Int8(value) => (true, Some(value)),
-        };
-        transaction.execute(
-            "INSERT INTO shiba_internal.applied_insert (
-                 source_id, slot_generation, commit_lsn,
-                 ingress_transaction_id, input_sequence, source_row_id,
-                 source_row_sub_id, payload_present, payload_int8
-             ) VALUES ($1, $2, $3::text::pg_lsn, $4, $5, $6, $7, $8, $9)",
-            &[
-                &source_id,
-                &generation,
-                &commit_lsn,
-                &ingress_id,
-                &sequence,
-                &insert.source_row_id,
-                &insert.source_row_sub_id,
-                &payload_present,
-                &payload_int8,
-            ],
-        )?;
-    }
+    let insert_count = apply_changes(
+        transaction,
+        input,
+        source_id,
+        generation,
+        ingress_id,
+        &commit_lsn,
+    )?;
 
     let row = transaction.query_one(
         "SELECT row_count
@@ -108,7 +89,7 @@ fn process_in_transaction(
          FOR UPDATE",
         &[],
     )?;
-    let next_count = count::advance(row.get(0), input.inserts.len())?;
+    let next_count = count::advance(row.get(0), insert_count)?;
     transaction.execute(
         "UPDATE shiba_internal.count_state SET row_count = $1 WHERE singleton = 1",
         &[&next_count],
@@ -125,4 +106,59 @@ fn process_in_transaction(
     )?;
 
     Ok(ProcessOutcome::Applied)
+}
+
+fn apply_changes(
+    transaction: &mut Transaction<'_>,
+    input: &SourceTransaction,
+    source_id: i64,
+    generation: i64,
+    ingress_id: i64,
+    commit_lsn: &str,
+) -> Result<usize, M2Error> {
+    let mut inserts = 0;
+    for change in &input.changes {
+        match change {
+            SourceChange::Insert(insert) => {
+                inserts += 1;
+                let sequence = as_bigint("input_sequence", insert.input_sequence.get())?;
+                let (payload_present, payload_int8) = match insert.source_payload {
+                    SourcePayload::Absent => (false, None),
+                    SourcePayload::Null => (true, None),
+                    SourcePayload::Int8(value) => (true, Some(value)),
+                };
+                transaction.execute(
+                    "INSERT INTO shiba_internal.applied_insert (
+                         source_id, slot_generation, commit_lsn,
+                         ingress_transaction_id, input_sequence, source_row_id,
+                         source_row_sub_id, payload_present, payload_int8
+                     ) VALUES ($1, $2, $3::text::pg_lsn, $4, $5, $6, $7, $8, $9)",
+                    &[
+                        &source_id,
+                        &generation,
+                        &commit_lsn,
+                        &ingress_id,
+                        &sequence,
+                        &insert.source_row_id,
+                        &insert.source_row_sub_id,
+                        &payload_present,
+                        &payload_int8,
+                    ],
+                )?;
+            }
+            SourceChange::Update(update) => {
+                let changed = transaction.execute(
+                    "UPDATE shiba_internal.applied_insert
+                     SET payload_present = true, payload_int8 = $1
+                     WHERE source_id = $2 AND source_row_id = $3
+                       AND source_row_sub_id IS NULL",
+                    &[&update.source_payload, &source_id, &update.source_row_id],
+                )?;
+                if changed != 1 {
+                    return Err(M2Error::MissingSourceRow);
+                }
+            }
+        }
+    }
+    Ok(inserts)
 }

@@ -1,6 +1,6 @@
 # Tuple contract
 
-## Admitted shapes through M4.3
+## Admitted shapes through M4.4
 
 M4 accepts exactly four INSERT relation shapes:
 
@@ -19,6 +19,10 @@ table owns `NOT NULL` and the decoder independently rejects a NULL key.
 The zero-column shape has no source row key; it is identified only by the
 transaction identity and input sequence of its INSERT cause.
 
+M4.4 additionally admits `UPDATE (key, payload)` only for the nullable-payload
+shape when PostgreSQL emits a new tuple and the key is unchanged. Its encoding
+rules are identical to INSERT. Old/key tuples and key mutation are excluded.
+
 ## Apply representation and ownership
 
 `SourcePayload::Absent` means the admitted relation has no payload column;
@@ -36,8 +40,13 @@ count operator state, public result, and continuation commit or roll back
 together. Replay uses the unchanged transaction identity and never re-applies a
 payload.
 
+For UPDATE the existing Apply row is current source state: only its payload is
+mutated. The original INSERT cause remains stable, continuation records the
+UPDATE transaction, and count state/result do not change. All remain under the
+same writer and PostgreSQL transaction.
+
 ## Deferred boundary
 
-UPDATE, DELETE, replica identity changes, TOAST, binary transfer, and schema
-drift are not admitted through M4.3. Composite identities beyond two built-in
-`int8` columns are also excluded.
+DELETE, key-changing UPDATE, old/key tuples, replica identity changes, TOAST,
+binary transfer, and schema drift are not admitted through M4.4. Composite
+identities beyond two built-in `int8` columns are also excluded.

@@ -8,7 +8,7 @@ use std::{
 
 use postgres::{Client, NoTls};
 use shiba_protocol::{SlotGeneration, SourceId};
-use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_insert, process};
+use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_changes, process};
 
 fn required(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("scripts/test-m3.sh must provide {name}"))
@@ -269,17 +269,17 @@ fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
         .batch_execute("INSERT INTO source_m3.events VALUES (101), (102)")
         .expect("commit first real source transaction");
     let first_wire = capture(&mut client, "first.pgoutput");
-    let first = decode_committed_insert(&first_wire, source).expect("decode first transaction");
+    let first = decode_committed_changes(&first_wire, source).expect("decode first transaction");
     assert_eq!(
         process(&mut client, &first).expect("apply first"),
         ProcessOutcome::Applied
     );
     assert_eq!(durable_state(&mut client), (2, 2, 2, 1));
 
-    assert!(decode_committed_insert(&first_wire[..first_wire.len() - 1], source).is_err());
+    assert!(decode_committed_changes(&first_wire[..first_wire.len() - 1], source).is_err());
     let mut corrupt = first_wire.clone();
     corrupt[0] = b'X';
-    assert!(decode_committed_insert(&corrupt, source).is_err());
+    assert!(decode_committed_changes(&corrupt, source).is_err());
     assert_eq!(durable_state(&mut client), (2, 2, 2, 1));
     assert_eq!(
         process(&mut client, &first).expect("exact replay"),
@@ -296,7 +296,7 @@ fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
         .get(0);
     let (second_wire, stopped_capture) =
         capture_committed_row_without_ack(&mut client, &slot_before, "unacked.pgoutput");
-    let second = decode_committed_insert(&second_wire, source).expect("decode after restart");
+    let second = decode_committed_changes(&second_wire, source).expect("decode after restart");
     assert_ne!(first.identity, second.identity);
     assert_eq!(
         process(&mut client, &second).expect("apply second"),
@@ -321,7 +321,7 @@ fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
         thread::sleep(Duration::from_millis(10));
     }
     let replay_wire = capture(&mut client, "replayed.pgoutput");
-    let replay = decode_committed_insert(&replay_wire, source).expect("decode slot replay");
+    let replay = decode_committed_changes(&replay_wire, source).expect("decode slot replay");
     assert_eq!(second, replay);
     assert_eq!(
         process(&mut client, &replay).expect("apply slot replay"),

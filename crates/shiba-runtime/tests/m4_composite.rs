@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf, process::Command};
 
 use postgres::{Client, NoTls};
 use shiba_protocol::{SlotGeneration, SourceId};
-use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_insert, process};
+use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_changes, process};
 
 fn required(name: &str) -> String {
     std::env::var(name)
@@ -203,10 +203,11 @@ fn m4_real_pgoutput_composite_keys_and_bad_second_key_tag() {
     let second_tag = first_insert_second_key_tag(&bad_second_key);
     assert_eq!(bad_second_key[second_tag], b't');
     bad_second_key[second_tag] = b'n';
-    assert!(decode_committed_insert(&bad_second_key, source).is_err());
+    assert!(decode_committed_changes(&bad_second_key, source).is_err());
     assert_eq!(durable_state(&mut client), (0, 0, 0, 0));
 
-    let transaction = decode_committed_insert(&wire, source).expect("decode composite transaction");
+    let transaction =
+        decode_committed_changes(&wire, source).expect("decode composite transaction");
     assert_eq!(
         process(&mut client, &transaction).expect("apply composite transaction"),
         ProcessOutcome::Applied

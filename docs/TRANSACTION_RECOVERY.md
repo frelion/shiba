@@ -58,3 +58,9 @@ operator, result, and continuation.
 M4.3 composite uniqueness is checked by PostgreSQL inside the processor-owned
 transaction. A conflicting pair rolls back every fact; exact transaction replay
 still short-circuits at continuation before any key write.
+
+M4.4 mutates an existing single-key Apply row before writing continuation. A
+missing row fails closed. Backend termination after continuation INSERT proves
+that payload, count state, result, and continuation all remain at their prior
+committed values. Retry applies the UPDATE once; exact replay then returns
+`AlreadyApplied` before mutation. Slot feedback remains outside this authority.

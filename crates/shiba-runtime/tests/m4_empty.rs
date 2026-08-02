@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf, process::Command};
 
 use postgres::{Client, NoTls};
 use shiba_protocol::{SlotGeneration, SourceId};
-use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_insert, process};
+use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_changes, process};
 
 fn required(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("scripts/test-m4-empty.sh must provide {name}"))
@@ -198,10 +198,10 @@ fn m4_real_pgoutput_empty_tuples_and_bad_column_count() {
     let count = first_insert_column_count(&bad_columns);
     assert_eq!(&bad_columns[count..count + 2], &[0, 0]);
     bad_columns[count + 1] = 1;
-    assert!(decode_committed_insert(&bad_columns, source).is_err());
+    assert!(decode_committed_changes(&bad_columns, source).is_err());
     assert_eq!(durable_state(&mut client), (0, 0, 0, 0));
 
-    let transaction = decode_committed_insert(&wire, source).expect("decode empty transaction");
+    let transaction = decode_committed_changes(&wire, source).expect("decode empty transaction");
     assert_eq!(
         process(&mut client, &transaction).expect("apply empty transaction"),
         ProcessOutcome::Applied

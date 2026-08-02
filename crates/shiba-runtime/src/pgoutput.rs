@@ -3,17 +3,18 @@ use core::fmt;
 use shiba_protocol::{IngressTransactionId, InputSequence, PostgresLsn, SourceTransactionId};
 
 use crate::{
-    SourceInsert, SourcePayload, SourceTransaction,
+    SourceChange, SourceInsert, SourcePayload, SourceTransaction, SourceUpdate,
     pgoutput_source::{PgoutputSource, SourceShape},
     pgoutput_wire::Cursor,
 };
 
 const INT8_OID: u32 = 20;
 
-enum DecodedInsert {
-    Empty,
-    Row(i64, SourcePayload),
-    Composite(i64, i64),
+enum DecodedChange {
+    EmptyInsert,
+    RowInsert(i64, SourcePayload),
+    CompositeInsert(i64, i64),
+    Update(i64, Option<i64>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,11 +52,9 @@ impl fmt::Display for PgoutputError {
 
 impl std::error::Error for PgoutputError {}
 
-/// Decodes one complete, non-streaming pgoutput protocol-v1 transaction.
-///
 /// # Errors
-/// Returns [`PgoutputError`] unless it has an exact admitted M4.3 shape.
-pub fn decode_committed_insert(
+/// Rejects input that is not one complete admitted M4.4 transaction.
+pub fn decode_committed_changes(
     input: &[u8],
     source: PgoutputSource,
 ) -> Result<SourceTransaction, PgoutputError> {
@@ -80,6 +79,7 @@ pub fn decode_committed_insert(
         let tag = cursor.byte()?;
         match tag {
             b'I' => values.push(decode_insert(&mut cursor, source)?),
+            b'U' => values.push(decode_update(&mut cursor, source)?),
             b'C' if !values.is_empty() => break,
             b'C' => return Err(PgoutputError::MessageOrder),
             other => return Err(PgoutputError::UnknownMessage(other)),
@@ -104,7 +104,7 @@ pub fn decode_committed_insert(
         IngressTransactionId::new(u64::from(xid)).map_err(|_| PgoutputError::InvalidIdentity)?,
     )
     .map_err(|_| PgoutputError::InvalidIdentity)?;
-    let inserts = values
+    let changes = values
         .into_iter()
         .enumerate()
         .map(|(index, row)| {
@@ -114,17 +114,20 @@ pub fn decode_committed_insert(
                 .and_then(|value| InputSequence::new(value).ok())
                 .ok_or(PgoutputError::InvalidIdentity)?;
             Ok(match row {
-                DecodedInsert::Empty => SourceInsert::empty(sequence),
-                DecodedInsert::Row(source_row_id, payload) => {
-                    SourceInsert::with_payload(sequence, source_row_id, payload)
+                DecodedChange::EmptyInsert => SourceChange::Insert(SourceInsert::empty(sequence)),
+                DecodedChange::RowInsert(row_id, payload) => {
+                    SourceChange::Insert(SourceInsert::with_payload(sequence, row_id, payload))
                 }
-                DecodedInsert::Composite(key1, key2) => {
-                    SourceInsert::composite(sequence, key1, key2)
+                DecodedChange::CompositeInsert(key1, key2) => {
+                    SourceChange::Insert(SourceInsert::composite(sequence, key1, key2))
+                }
+                DecodedChange::Update(row_id, payload) => {
+                    SourceChange::Update(SourceUpdate::new(sequence, row_id, payload))
                 }
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    SourceTransaction::new(identity, inserts).map_err(|_| PgoutputError::TupleValue)
+    SourceTransaction::from_changes(identity, changes).map_err(|_| PgoutputError::TupleValue)
 }
 
 fn decode_relation(cursor: &mut Cursor<'_>, source: PgoutputSource) -> Result<(), PgoutputError> {
@@ -153,7 +156,7 @@ fn decode_relation(cursor: &mut Cursor<'_>, source: PgoutputSource) -> Result<()
 fn decode_insert(
     cursor: &mut Cursor<'_>,
     source: PgoutputSource,
-) -> Result<DecodedInsert, PgoutputError> {
+) -> Result<DecodedChange, PgoutputError> {
     if cursor.u32()? != source.relation_id {
         return Err(PgoutputError::RelationMismatch);
     }
@@ -162,26 +165,49 @@ fn decode_insert(
         return Err(PgoutputError::TupleShape);
     }
     match source.shape {
-        SourceShape::Empty => Ok(DecodedInsert::Empty),
-        SourceShape::KeyOnly => Ok(DecodedInsert::Row(
+        SourceShape::Empty => Ok(DecodedChange::EmptyInsert),
+        SourceShape::KeyOnly => Ok(DecodedChange::RowInsert(
             decode_int8(cursor)?,
             SourcePayload::Absent,
         )),
         SourceShape::NullableInt8Payload => {
             let key = decode_int8(cursor)?;
-            match cursor.byte()? {
-                b'n' => Ok(DecodedInsert::Row(key, SourcePayload::Null)),
-                b't' => Ok(DecodedInsert::Row(
-                    key,
-                    SourcePayload::Int8(cursor.int8_text()?),
-                )),
-                tag => Err(PgoutputError::TupleTag(tag)),
-            }
+            let payload = match decode_optional_int8(cursor)? {
+                None => SourcePayload::Null,
+                Some(value) => SourcePayload::Int8(value),
+            };
+            Ok(DecodedChange::RowInsert(key, payload))
         }
-        SourceShape::CompositeInt8 => Ok(DecodedInsert::Composite(
+        SourceShape::CompositeInt8 => Ok(DecodedChange::CompositeInsert(
             decode_int8(cursor)?,
             decode_int8(cursor)?,
         )),
+    }
+}
+
+fn decode_update(
+    cursor: &mut Cursor<'_>,
+    source: PgoutputSource,
+) -> Result<DecodedChange, PgoutputError> {
+    if source.shape != SourceShape::NullableInt8Payload {
+        return Err(PgoutputError::TupleShape);
+    }
+    if cursor.u32()? != source.relation_id {
+        return Err(PgoutputError::RelationMismatch);
+    }
+    if cursor.byte()? != b'N' || cursor.u16()? != 2 {
+        return Err(PgoutputError::TupleShape);
+    }
+    let row_id = decode_int8(cursor)?;
+    let payload = decode_optional_int8(cursor)?;
+    Ok(DecodedChange::Update(row_id, payload))
+}
+
+fn decode_optional_int8(cursor: &mut Cursor<'_>) -> Result<Option<i64>, PgoutputError> {
+    match cursor.byte()? {
+        b'n' => Ok(None),
+        b't' => Ok(Some(cursor.int8_text()?)),
+        tag => Err(PgoutputError::TupleTag(tag)),
     }
 }
 

@@ -57,6 +57,12 @@ partial `NULLS NOT DISTINCT` unique index covers only keyed rows, preserving
 single-key uniqueness, composite-pair uniqueness, and multiple cause-identified
 empty rows. The processor is still the sole writer and transaction owner.
 
+M4.4 updates the nullable payload in that existing Apply row; it creates no
+UPDATE log or second authority. The original INSERT cause remains attached to
+the row, while `source_continuation` durably records each committed source
+transaction. UPDATE does not advance count. Apply mutation, unchanged count
+state/result, and continuation are owned by the same processor transaction.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -66,5 +72,6 @@ accepted only after its clean-room tests prove its new contract; legacy tests ar
 evidence inputs, not implementation dependencies.
 
 **Unproved:** production replication transport and slot ownership,
-UPDATE/DELETE, replica-identity changes, TOAST, catalog binding inspection,
-concurrency, generation changes, general operators, and recovery workers remain.
+DELETE, key-changing UPDATE, replica-identity changes, TOAST, catalog binding
+inspection, concurrency, generation changes, general operators, and recovery
+workers remain.
