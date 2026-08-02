@@ -27,6 +27,15 @@ closed. Durable binding registration, DDL invalidation, source catalog rows,
 and any multi-writer lifecycle remain unproved. See
 [transaction and recovery](TRANSACTION_RECOVERY.md).
 
+## M7.1 source ObjectAddress authority
+
+`source_binding` stores one immutable relation ObjectAddress per registered
+source. The private registration function is its only logical writer.
+`source_invalidation` stores the exact matching address reported by PostgreSQL
+event-trigger helpers; one event-trigger function is its only writer for both
+`ddl_command_end` and `sql_drop`. Names and rendered object identities are not
+stored or compared. Both tables remain inaccessible to ordinary roles.
+
 ## M2 execution facts
 
 The extension installs exactly four M2 tables. Three private tables own applied

@@ -133,6 +133,12 @@ requires real matching `A`. After abort feedback it restarts the same slot and
 applies/replays a later streamed commit, proving the aborted stream left no
 row/count/result/continuation state on PostgreSQL 17 and 18.
 
+All live Apply tests register their source relation through the private M7.1
+function; there is no unbound production test path. `test-m7-ddl-invalidation.sh`
+proves exact relation ObjectAddress storage, unrelated-DDL isolation, rename
+rollback, committed-rename invalidation, pre-Apply failure, historical replay,
+and ordinary-role denial on PostgreSQL 17 and 18.
+
 `test-m5-source-binding.sh` binds the decoder to a real relation OID, applies an
 INSERT, renames both table and column, and applies another INSERT under the same
 OID. It then drops/recreates the original qualified name, proves the new OID is

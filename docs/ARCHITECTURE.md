@@ -115,6 +115,14 @@ M6.2 adds no production component. The PostgreSQL slot/receiver is test ingress:
 real abort segments are discarded by the decoder, and restart feeds a later
 complete commit into the same sole processor writer.
 
+M7.1 adds two non-overlapping facts. `source_binding` is the immutable mapping
+from source ID to one relation ObjectAddress and is written only by the private
+registration function. `source_invalidation` is written only by one event
+trigger function in the owning DDL transaction. For a non-replay transaction,
+the processor resolves the bound OID, acquires relation `ACCESS SHARE`, checks
+the exact invalidation, then performs Apply. The object lock is held through
+commit, closing the DDL/check-to-Apply race without a second runtime writer.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -126,6 +134,6 @@ evidence inputs, not implementation dependencies.
 **Unproved:** production replication transport and slot ownership, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
-streaming transactions, durable catalog binding inspection, concurrency,
+streaming interleaving, column/type/index/drop invalidation, concurrency,
 generation changes, multiple sources, general operators, and recovery workers
 remain.

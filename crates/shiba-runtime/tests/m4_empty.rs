@@ -4,7 +4,7 @@ use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_changes, pr
 
 mod support;
 
-use support::{PgoutputCapture, message_end, read_u16};
+use support::{PgoutputCapture, message_end, read_u16, register_source};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m4-empty.sh",
@@ -66,6 +66,7 @@ fn m4_real_pgoutput_empty_tuples_and_bad_column_count() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
+    register_source(&mut client, "source_m4_empty.events");
     CAPTURE.create_slot();
     client
         .batch_execute(

@@ -41,6 +41,12 @@
     requires = ["composite_insert"]
 );
 
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/007_source_invalidation.sql",
+    name = "source_invalidation",
+    requires = ["text_payload"]
+);
+
 #[cfg(test)]
 mod tests {
     const CATALOG_SQL: &str = include_str!("../../../sql/v2/001_catalog_identity.sql");
@@ -49,6 +55,7 @@ mod tests {
     const M4_EMPTY_SQL: &str = include_str!("../../../sql/v2/004_empty_insert.sql");
     const M4_COMPOSITE_SQL: &str = include_str!("../../../sql/v2/005_composite_insert.sql");
     const M5_TEXT_SQL: &str = include_str!("../../../sql/v2/006_text_payload.sql");
+    const M7_SOURCE_SQL: &str = include_str!("../../../sql/v2/007_source_invalidation.sql");
 
     fn normalized_sql() -> String {
         CATALOG_SQL.to_ascii_lowercase()
@@ -98,13 +105,14 @@ mod tests {
     #[test]
     fn installation_has_no_dynamic_or_compatibility_mechanism() {
         let sql = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             normalized_sql(),
             M2_SQL.to_ascii_lowercase(),
             M4_SQL.to_ascii_lowercase(),
             M4_EMPTY_SQL.to_ascii_lowercase(),
             M4_COMPOSITE_SQL.to_ascii_lowercase(),
-            M5_TEXT_SQL.to_ascii_lowercase()
+            M5_TEXT_SQL.to_ascii_lowercase(),
+            M7_SOURCE_SQL.to_ascii_lowercase()
         );
         for forbidden in [
             "create trigger",
@@ -129,5 +137,17 @@ mod tests {
         assert!(sql.contains("alter table shiba_internal.applied_insert"));
         assert!(sql.contains("add column payload_text text"));
         assert!(sql.contains("payload_int8 is null or payload_text is null"));
+    }
+
+    #[test]
+    fn source_invalidation_uses_exact_object_addresses() {
+        let sql = M7_SOURCE_SQL.to_ascii_lowercase();
+        assert_eq!(sql.matches("create table ").count(), 2);
+        for field in ["address_classid", "address_objid", "address_objsubid"] {
+            assert!(sql.contains(field));
+        }
+        assert!(sql.contains("pg_event_trigger_ddl_commands()"));
+        assert!(sql.contains("pg_event_trigger_dropped_objects()"));
+        assert!(!sql.contains("object_identity"));
     }
 }

@@ -4,7 +4,7 @@ use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_changes, pr
 
 mod support;
 
-use support::{PgoutputCapture, message_end, read_u16};
+use support::{PgoutputCapture, message_end, read_u16, register_source};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m4-update.sh",
@@ -99,6 +99,7 @@ fn m4_real_pgoutput_update_replay_decode_failure_and_crash() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
+    register_source(&mut client, "source_m4_update.events");
     CAPTURE.create_slot();
 
     client

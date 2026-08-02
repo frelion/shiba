@@ -4,7 +4,7 @@ use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_streamed_changes, pro
 
 mod support;
 
-use support::{PgoutputCapture, read_u32, stream_message_end};
+use support::{PgoutputCapture, read_u32, register_source, stream_message_end};
 
 const ROW_COUNT: i64 = 10_000;
 const CAPTURE: PgoutputCapture = PgoutputCapture {
@@ -117,6 +117,7 @@ fn m6_real_stream_commit_crash_retry_and_replay() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
+    register_source(&mut client, "source_m6_stream.events");
     CAPTURE.create_slot();
 
     client

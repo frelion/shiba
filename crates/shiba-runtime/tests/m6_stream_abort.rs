@@ -13,7 +13,7 @@ use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_streamed_changes, pro
 mod support;
 
 use support::{
-    PgoutputCapture, read_u32, stream_message_end, streamed_framed_terminal,
+    PgoutputCapture, read_u32, register_source, stream_message_end, streamed_framed_terminal,
     strip_streamed_delimiters,
 };
 
@@ -203,6 +203,7 @@ fn m6_real_stream_abort_never_applies_then_slot_commits() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
+    register_source(&mut client, "source_m6_abort.events");
     CAPTURE.create_slot();
 
     let output = CAPTURE.capture_path("streamed-abort.pgoutput");

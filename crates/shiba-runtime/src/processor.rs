@@ -4,6 +4,7 @@ use postgres::{Client, Transaction};
 use shiba_protocol::PostgresLsn;
 
 use crate::count;
+use crate::source_preflight;
 use crate::transaction::as_bigint;
 use crate::{M2Error, SourceChange, SourcePayload, SourceTransaction, SourceUpdatePayload};
 
@@ -52,6 +53,8 @@ fn process_in_transaction(
             Err(M2Error::IdentityConflict)
         };
     }
+
+    source_preflight::run(transaction, source_id)?;
 
     if let Some(row) = transaction.query_opt(
         "SELECT source_id, slot_generation, commit_lsn::text

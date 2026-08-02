@@ -4,7 +4,7 @@ use shiba_runtime::{M2Error, PgoutputSource, ProcessOutcome, decode_committed_ch
 
 mod support;
 
-use support::{PgoutputCapture, message_end, read_u16, read_u32};
+use support::{PgoutputCapture, message_end, read_u16, read_u32, register_source};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m5-composite-delete.sh",
@@ -131,6 +131,7 @@ fn m5_real_composite_delete_crash_retry_replay_and_missing_row() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
+    register_source(&mut client, "source_m5_composite_delete.events");
     CAPTURE.create_slot();
 
     client

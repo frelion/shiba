@@ -4,7 +4,7 @@ use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_changes, pr
 
 mod support;
 
-use support::{PgoutputCapture, message_end, read_u16, read_u32};
+use support::{PgoutputCapture, message_end, read_u16, read_u32, register_source};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m5-toast.sh",
@@ -112,6 +112,7 @@ fn m5_real_unchanged_toast_crash_retry_and_replay() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
+    register_source(&mut client, "source_m5_toast.events");
     CAPTURE.create_slot();
 
     let payload = deterministic_payload();

@@ -4,7 +4,7 @@ use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_changes, pr
 
 mod support;
 
-use support::{PgoutputCapture, cstring_end, message_end, read_u16, read_u32};
+use support::{PgoutputCapture, cstring_end, message_end, read_u16, read_u32, register_source};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m4-replica-identity.sh",
@@ -86,6 +86,7 @@ fn m4_replica_identity_full_delete_stops_before_apply() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
+    register_source(&mut client, "source_m4_replica.events");
     CAPTURE.create_slot();
 
     client

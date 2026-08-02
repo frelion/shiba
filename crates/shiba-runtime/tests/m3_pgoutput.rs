@@ -11,7 +11,9 @@ use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_changes, pr
 
 mod support;
 
-use support::{PgoutputCapture, framed_message_count, strip_recvlogical_delimiters};
+use support::{
+    PgoutputCapture, framed_message_count, register_source, strip_recvlogical_delimiters,
+};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m3.sh",
@@ -150,6 +152,7 @@ fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
+    register_source(&mut client, "source_m3.events");
     CAPTURE.create_slot();
 
     client

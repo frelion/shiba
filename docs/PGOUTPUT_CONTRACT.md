@@ -206,3 +206,10 @@ language: completed segments followed by matching `A` still return no
 `SourceTransaction`. After receiver feedback covers the abort and the same slot
 is restarted, a later independent streamed commit is decoded and applied under
 its own identity. No aborted row or continuation becomes visible.
+
+## M7.1 Apply admission after decode
+
+Relation OID admission remains pure, but decoding alone no longer authorizes a
+new Apply. The processor requires the source's immutable ObjectAddress binding,
+holds the relation lock, and rejects an exact durable DDL invalidation before
+writing. Exact replay is still decided by continuation first.

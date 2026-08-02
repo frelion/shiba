@@ -7,6 +7,15 @@ use std::{fs, path::PathBuf, process::Command};
 
 use postgres::Client;
 
+pub(super) fn register_source(client: &mut Client, relation_name: &str) {
+    client
+        .query_one(
+            "SELECT shiba_internal.register_source(1, $1::text::regclass)",
+            &[&relation_name],
+        )
+        .expect("register source relation");
+}
+
 pub(super) struct PgoutputCapture {
     pub script: &'static str,
     pub env_prefix: &'static str,

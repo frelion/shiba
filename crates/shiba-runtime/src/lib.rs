@@ -10,6 +10,7 @@ mod pgoutput_source;
 mod pgoutput_tuple;
 mod pgoutput_wire;
 mod processor;
+mod source_preflight;
 mod streamed_pgoutput;
 mod transaction;
 

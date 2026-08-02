@@ -11,6 +11,8 @@ pub enum M2Error {
     MissingSourceRow,
     OutOfOrder,
     Postgres(postgres::Error),
+    SourceBindingMissing,
+    SourceInvalidated,
     SourceScopeMismatch,
 }
 
@@ -34,6 +36,8 @@ impl fmt::Display for M2Error {
             Self::MissingSourceRow => formatter.write_str("source change targets no applied row"),
             Self::OutOfOrder => formatter.write_str("commit LSN is not strictly increasing"),
             Self::Postgres(error) => write!(formatter, "PostgreSQL transaction failed: {error}"),
+            Self::SourceBindingMissing => formatter.write_str("source binding is missing"),
+            Self::SourceInvalidated => formatter.write_str("source binding is invalidated"),
             Self::SourceScopeMismatch => {
                 formatter.write_str("M2 accepts exactly one source and slot generation")
             }

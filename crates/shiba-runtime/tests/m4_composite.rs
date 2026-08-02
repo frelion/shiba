@@ -4,7 +4,7 @@ use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_changes, pr
 
 mod support;
 
-use support::{PgoutputCapture, message_end, read_u16, read_u32};
+use support::{PgoutputCapture, message_end, read_u16, read_u32, register_source};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m4-composite.sh",
@@ -73,6 +73,7 @@ fn m4_real_pgoutput_composite_keys_and_bad_second_key_tag() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
+    register_source(&mut client, "source_m4_composite.events");
     CAPTURE.create_slot();
     client
         .batch_execute("INSERT INTO source_m4_composite.events VALUES (10, 201), (10, 202)")

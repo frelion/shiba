@@ -1,12 +1,12 @@
 use postgres::{Client, NoTls};
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{
-    PgoutputError, PgoutputSource, ProcessOutcome, decode_committed_changes, process,
+    M2Error, PgoutputError, PgoutputSource, ProcessOutcome, decode_committed_changes, process,
 };
 
 mod support;
 
-use support::{PgoutputCapture, message_end, read_u32};
+use support::{PgoutputCapture, message_end, read_u32, register_source};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m5-source-binding.sh",
@@ -59,25 +59,6 @@ fn relation_id(client: &mut Client, name: &str) -> u32 {
     .expect("relation OID fits u32")
 }
 
-fn install_crash_trigger(client: &mut Client) {
-    client
-        .batch_execute(
-            "CREATE SCHEMA m5_source_binding_test;
-             CREATE FUNCTION m5_source_binding_test.crash_after_continuation()
-             RETURNS trigger LANGUAGE plpgsql AS $$
-             BEGIN
-                 PERFORM pg_terminate_backend(pg_backend_pid());
-                 RETURN NEW;
-             END
-             $$;
-             CREATE TRIGGER m5_source_binding_crash
-             AFTER INSERT ON shiba_internal.source_continuation
-             FOR EACH ROW EXECUTE FUNCTION
-                 m5_source_binding_test.crash_after_continuation();",
-        )
-        .expect("install continuation crash point");
-}
-
 #[test]
 #[ignore = "requires the isolated logical PostgreSQL cluster from scripts/test-m5-source-binding.sh"]
 fn m5_relation_oid_survives_rename_and_rejects_same_name_recreation() {
@@ -98,6 +79,7 @@ fn m5_relation_oid_survives_rename_and_rejects_same_name_recreation() {
         SlotGeneration::new(1).expect("non-zero generation"),
         original_oid,
     );
+    register_source(&mut client, "source_m5_binding.events");
     CAPTURE.create_slot();
 
     client
@@ -132,24 +114,12 @@ fn m5_relation_oid_survives_rename_and_rejects_same_name_recreation() {
     let renamed_wire = CAPTURE.capture(&mut client, "renamed.pgoutput");
     assert_eq!(wire_relation_id(&renamed_wire), original_oid);
     let renamed = decode_committed_changes(&renamed_wire, source).expect("decode renamed insert");
-    install_crash_trigger(&mut client);
-    assert!(process(&mut client, &renamed).is_err());
-    let mut client = Client::connect(&connection, NoTls).expect("reconnect after crash");
+    assert!(matches!(
+        process(&mut client, &renamed),
+        Err(M2Error::SourceInvalidated)
+    ));
     assert_eq!(durable_state(&mut client), (1, 1, 1, 1));
     assert_eq!(applied_ids(&mut client), vec![1001]);
-    client
-        .batch_execute("DROP SCHEMA m5_source_binding_test CASCADE")
-        .expect("remove crash point");
-    assert_eq!(
-        process(&mut client, &renamed).expect("retry renamed insert"),
-        ProcessOutcome::Applied
-    );
-    assert_eq!(durable_state(&mut client), (2, 2, 2, 2));
-    assert_eq!(
-        process(&mut client, &renamed).expect("replay renamed insert"),
-        ProcessOutcome::AlreadyApplied
-    );
-    assert_eq!(durable_state(&mut client), (2, 2, 2, 2));
 
     client
         .batch_execute(
@@ -169,7 +139,7 @@ fn m5_relation_oid_survives_rename_and_rejects_same_name_recreation() {
         decode_committed_changes(&recreated_wire, source),
         Err(PgoutputError::RelationMismatch)
     ));
-    assert_eq!(durable_state(&mut client), (2, 2, 2, 2));
+    assert_eq!(durable_state(&mut client), (1, 1, 1, 1));
 
     let recreated_source = PgoutputSource::new(
         SourceId::new(1).expect("non-zero source"),
@@ -178,5 +148,5 @@ fn m5_relation_oid_survives_rename_and_rejects_same_name_recreation() {
     );
     let _ = decode_committed_changes(&recreated_wire, recreated_source)
         .expect("same wire is valid for the recreated OID");
-    assert_eq!(durable_state(&mut client), (2, 2, 2, 2));
+    assert_eq!(durable_state(&mut client), (1, 1, 1, 1));
 }

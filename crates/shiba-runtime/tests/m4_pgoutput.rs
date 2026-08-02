@@ -4,7 +4,7 @@ use shiba_runtime::{M2Error, PgoutputSource, ProcessOutcome, decode_committed_ch
 
 mod support;
 
-use support::{PgoutputCapture, message_end, read_u16};
+use support::{PgoutputCapture, message_end, read_u16, register_source};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m4.sh",
@@ -66,6 +66,7 @@ fn m4_real_pgoutput_nullable_payload_and_bad_key_tag() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
+    register_source(&mut client, "source_m4.events");
     CAPTURE.create_slot();
     client
         .batch_execute("INSERT INTO source_m4.events VALUES (201, NULL), (202, 42)")

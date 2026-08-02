@@ -152,6 +152,12 @@ fn m2_transaction_replay_failure_crash_and_permissions() {
         .expect("query committed source fixture")
         .get(0);
     assert_eq!(source_count, 2);
+    client
+        .query_one(
+            "SELECT shiba_internal.register_source(1, 'source_a.events'::regclass)",
+            &[],
+        )
+        .expect("register M2 source relation");
 
     let first = input(0x64, 7, &[(1, 101), (2, 102)]);
     assert_eq!(

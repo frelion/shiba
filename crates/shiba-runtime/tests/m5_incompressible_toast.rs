@@ -4,7 +4,7 @@ use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_changes, pr
 
 mod support;
 
-use support::{PgoutputCapture, message_end, read_u16, read_u32};
+use support::{PgoutputCapture, message_end, read_u16, read_u32, register_source};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m5-incompressible-toast.sh",
@@ -136,6 +136,7 @@ fn m5_real_incompressible_toast_update_crash_retry_and_replay() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
+    register_source(&mut client, "source_m5_incompressible.events");
     CAPTURE.create_slot();
 
     let first_payload = high_entropy_payload(0x4d59_5df4_d0f3_3173);

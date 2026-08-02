@@ -126,3 +126,11 @@ After feedback covers the abort, receiver restart on the same slot emits a new
 committed stream; only that transaction can write row/count/result/continuation.
 Host crash before abort feedback and persisted partial-stream recovery remain
 unproved.
+
+M7.1 orders each non-replay step as relation ObjectAddress lookup, relation
+`ACCESS SHARE` lock, exact invalidation check, Apply, result, and continuation.
+Conflicting DDL either waits for the processor commit or completes first and
+publishes invalidation in its own transaction. A DDL rollback rolls its
+invalidation back too. A narrow rename/drop race during lock acquisition may
+return a PostgreSQL error rather than `SourceInvalidated`, but still precedes
+all Shiba writes. Exact committed replay remains a no-op without relocking.
