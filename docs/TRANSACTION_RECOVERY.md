@@ -106,9 +106,10 @@ no change frame, and no trailing byte. The
 receiver exposes a private `EmptyCommitted(end_lsn)` authorization and requires
 an explicit empty acknowledgement. It does not create a continuation because
 no source transaction exists. This is safe only as a statement about the
-selected publication's output, not source identity. Before M10.4 publication
-identity/drift enforcement, an invalidated publication cannot be allowed to
-turn an unexpectedly empty stream into feedback.
+selected publication's output, not source identity. M10.4 therefore revalidates
+the exact publication OID, frozen semantic snapshot, durable invalidation, slot,
+and generation before empty acknowledgement. Any historical or current drift
+rejects the token and leaves feedback old.
 
 The empty recognition state remains constant inside the 16 MiB bound. A legal
 `R` or `I` makes the commit non-empty and sends its complete bytes to the sole
@@ -118,6 +119,47 @@ semantic error fails closed.
 Thus the only feedback authorizations are Runtime `Applied`, Runtime
 `AlreadyApplied`, strict `EmptyCommitted`, and legal terminal `Aborted`. No WAL
 position or nonterminal message can substitute for one of those proofs.
+
+## M10.4 lifecycle recovery boundary
+
+Ingress configuration is durable but transport progress is not duplicated.
+`source_ingress_config` freezes the current database, publication ObjectAddress
+and semantics, exact source binding, existing slot name, and generation.
+`source_ingress_invalidation` permanently records committed publication drift.
+PostgreSQL's slot owns `confirmed_flush_lsn`; `source_continuation` owns compute
+replay. Neither table stores or repairs the other's cursor.
+
+Attach takes two explicit connections. The Apply connection first obtains the
+source's session advisory lock, reads catalog and live authorities in a
+read-only repeatable-read snapshot, and requires the slot inactive. The separate
+replication connection attaches; the Apply connection then revalidates the same
+config with that slot active. A failed step drops connections and releases the
+session lock without changing config, slot, continuation, or results. Waiting
+for WAL holds no Apply transaction or row lock.
+
+Receive, Apply, and each of `acknowledge`, `acknowledge_empty`, and
+`acknowledge_abort` revalidate governance. Thus publication drift after attach
+but before delivery or feedback cannot advance the slot. In particular, a
+structurally valid empty commit is not sufficient after membership removal,
+remove/re-add, drop/recreate, or semantic drift. The pending transport token is
+not converted into another authority; recovery restarts from the unchanged
+slot position after configuration is explicitly rebuilt.
+
+Slot rotation is allowed only while the source has no continuation or current
+rows. A row lock and expected-generation comparison serialize contenders; a
+stale caller fails, while one successful caller selects a different existing
+inactive `pgoutput` slot in the same database and increments generation once.
+No slot is created or dropped. Any non-pristine source requires the future
+binding-rebuild lifecycle, so old generation computation cannot be relabeled as
+new history.
+
+The PG17/18 governed restart gate proves detach releases both active slot and
+session ownership, after which the same catalog generation reattaches. It also
+receives and durably applies 10,000 streamed changes under split least-privilege
+roles. Publication remove/re-add after an empty token is received causes the
+subsequent empty ACK to fail; operator result and slot position remain at their
+last durable values. Automated reconnect/backoff and cancellation of a blocked
+receive are still outside this synchronous recovery boundary.
 
 M4.1 payload presence/value is inserted into the existing Apply row before the
 operator and continuation writes. Invalid tuple tags or shapes fail during pure

@@ -198,6 +198,7 @@ scripts = [
         "m8-bounded-decode", "m8-performance", "m9-registration",
         "m9-count-sum", "m9-operator-concurrency", "m9-operator-performance",
         "m10-committed-ingress", "m10-streaming-ingress",
+        "m10-catalog-ingress", "m10-governed-ingress",
     )
 ]
 for path in scripts:
@@ -215,9 +216,10 @@ if rg -n -i \
   echo "forbidden implementation surface found" >&2
   exit 1
 fi
-if rg -n -i 'effectstream|source ingress|publication|replication slot' \
+if rg -n -i \
+  'confirmed_flush_lsn|restart_lsn|active_pid|pg_create_logical_replication_slot|pg_drop_replication_slot' \
   sql/v2; then
-  echo "out-of-scope component leaked into production SQL" >&2
+  echo "dynamic slot state or automatic slot administration leaked into production SQL" >&2
   exit 1
 fi
 

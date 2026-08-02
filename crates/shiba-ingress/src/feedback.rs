@@ -25,6 +25,7 @@ impl FeedbackState {
         self.last_acknowledged_lsn
     }
 
+    #[cfg(test)]
     pub(crate) const fn pending_lsn(&self) -> Option<u64> {
         match self.pending {
             Some(

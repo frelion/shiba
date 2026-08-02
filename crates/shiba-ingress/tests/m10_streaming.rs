@@ -7,10 +7,10 @@ use std::{
 
 use postgres::{Client, NoTls};
 use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_ingress::{ReplicationMode, SourceReceiver, StreamedInput};
+use shiba_ingress::{AttachOptions, GovernedSourceSession, ReplicationMode, StreamedInput};
 use shiba_operator::OperatorId;
 use shiba_protocol::{SlotGeneration, SourceId};
-use shiba_runtime::{PgoutputSource, ProcessOutcome, compile_and_register};
+use shiba_runtime::{ProcessOutcome, compile_and_register};
 
 mod support;
 
@@ -58,20 +58,16 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
     )
 }
 
-fn connect_receiver(
-    replication_url: &str,
-    start_lsn: u64,
-    acknowledged_lsn: u64,
-) -> SourceReceiver {
-    SourceReceiver::connect(
+fn attach_session(database_url: &str, replication_url: &str) -> GovernedSourceSession {
+    GovernedSourceSession::attach(
+        database_url,
         replication_url,
-        SLOT,
-        PUBLICATION,
-        ReplicationMode::Streamed,
-        start_lsn,
-        acknowledged_lsn,
+        SourceId::new(1).expect("source ID"),
+        SlotGeneration::new(1).expect("slot generation"),
+        AttachOptions::new(ReplicationMode::Streamed, Duration::from_secs(5))
+            .expect("attach options"),
     )
-    .expect("connect streamed receiver")
+    .expect("attach governed streamed session")
 }
 
 fn wait_for_stream_output(client: &mut Client, baseline: u64) {
@@ -105,7 +101,6 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     let replication_url = required("SHIBA_M10_STREAMING_REPLICATION_URL");
     let mut admin = Client::connect(&database_url, NoTls).expect("connect source database");
     let mut observer = Client::connect(&database_url, NoTls).expect("connect state observer");
-    let mut apply = Client::connect(&database_url, NoTls).expect("connect Apply client");
     admin
         .batch_execute(&format!(
             "CREATE EXTENSION shiba_catalog;
@@ -119,27 +114,31 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
         .expect("install streamed source and binding");
     compile_and_register(&mut admin, &spec(1, OperatorOperationV1::CountRows))
         .expect("register CountRows");
-    let relation_oid: i64 = admin
-        .query_one("SELECT 'source.events'::regclass::oid::bigint", &[])
-        .expect("read relation OID")
-        .get(0);
-    let source = PgoutputSource::new(
-        SourceId::new(1).expect("source ID"),
-        SlotGeneration::new(1).expect("slot generation"),
-        u32::try_from(relation_oid).expect("OID fits u32"),
-    );
     admin
         .query_one(
             "SELECT slot_name FROM pg_create_logical_replication_slot($1, 'pgoutput')",
             &[&SLOT],
         )
         .expect("create streamed slot");
+    let publication_oid: u32 = admin
+        .query_one(
+            "SELECT oid FROM pg_publication WHERE pubname = $1",
+            &[&PUBLICATION],
+        )
+        .expect("read publication OID")
+        .get(0);
+    admin
+        .execute(
+            "SELECT shiba_internal.configure_source_ingress(1, $1, $2, 1)",
+            &[&publication_oid, &SLOT],
+        )
+        .expect("configure governed streamed ingress");
     let initial_lsn = slot_lsn(&mut observer, SLOT);
 
-    let mut receiver = connect_receiver(&replication_url, initial_lsn, initial_lsn);
+    let mut receiver = attach_session(&database_url, &replication_url);
     let (terminal_tx, terminal_rx) = mpsc::channel();
     let terminal_thread = thread::spawn(move || {
-        let input = receiver.receive_streamed_one(source);
+        let input = receiver.receive_streamed_one();
         terminal_tx
             .send((receiver, input))
             .expect("return committed terminal");
@@ -167,7 +166,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     assert_eq!(durable_state(&mut observer), (0, 0, 0, 0, 0, 0));
     assert_eq!(slot_lsn(&mut observer, SLOT), initial_lsn);
     let applied = receiver
-        .apply_received(&mut apply, &input)
+        .apply_received(&input)
         .expect("apply committed stream");
     assert_eq!(applied.outcome(), ProcessOutcome::Applied);
     assert_eq!(
@@ -178,9 +177,9 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     let commit_lsn = applied.end_lsn();
     drop(receiver);
 
-    let mut receiver = connect_receiver(&replication_url, initial_lsn, initial_lsn);
+    let mut receiver = attach_session(&database_url, &replication_url);
     let replay = match receiver
-        .receive_streamed_one(source)
+        .receive_streamed_one()
         .expect("receive unacknowledged committed replay")
     {
         StreamedInput::Transaction(input) => input,
@@ -188,7 +187,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
         StreamedInput::Aborted(_) => panic!("replay returned abort token"),
     };
     let replay = receiver
-        .apply_received(&mut apply, &replay)
+        .apply_received(&replay)
         .expect("apply exact streamed replay");
     assert_eq!(replay.outcome(), ProcessOutcome::AlreadyApplied);
     assert_eq!(replay.end_lsn(), commit_lsn);
@@ -196,9 +195,9 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     wait_for_slot_lsn(&mut observer, SLOT, commit_lsn);
     drop(receiver);
 
-    let mut receiver = connect_receiver(&replication_url, commit_lsn, commit_lsn);
+    let mut receiver = attach_session(&database_url, &replication_url);
     let first_empty = match receiver
-        .receive_streamed_one(source)
+        .receive_streamed_one()
         .expect("receive Runtime Apply empty commit")
     {
         StreamedInput::EmptyCommitted(token) => token,
@@ -212,7 +211,6 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
         first_empty.segment_count() > 1,
         "real Runtime Apply WAL must produce a multi-segment empty commit"
     );
-    assert_eq!(receiver.pending_feedback_lsn(), Some(first_empty.end_lsn()));
     assert!(receiver.acknowledge(&replay).is_err(), "wrong token kind");
     assert_eq!(
         durable_state(&mut observer),
@@ -227,9 +225,9 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     );
     drop(receiver);
 
-    let mut receiver = connect_receiver(&replication_url, commit_lsn, commit_lsn);
+    let mut receiver = attach_session(&database_url, &replication_url);
     let replayed_empty = match receiver
-        .receive_streamed_one(source)
+        .receive_streamed_one()
         .expect("replay unacknowledged empty commit")
     {
         StreamedInput::EmptyCommitted(token) => token,
@@ -257,7 +255,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
 
     let (empty_tx, empty_rx) = mpsc::channel();
     let empty_thread = thread::spawn(move || {
-        let input = receiver.receive_streamed_one(source);
+        let input = receiver.receive_streamed_one();
         empty_tx
             .send((receiver, input))
             .expect("return explicit empty commit");
@@ -312,7 +310,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
 
     let (abort_tx, abort_rx) = mpsc::channel();
     let abort_thread = thread::spawn(move || {
-        let input = receiver.receive_streamed_one(source);
+        let input = receiver.receive_streamed_one();
         abort_tx
             .send((receiver, input))
             .expect("return abort terminal");
@@ -349,10 +347,10 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     wait_for_slot_lsn(&mut observer, SLOT, abort_lsn);
     drop(receiver);
 
-    let mut receiver = connect_receiver(&replication_url, abort_lsn, abort_lsn);
+    let mut receiver = attach_session(&database_url, &replication_url);
     let (crash_tx, crash_rx) = mpsc::channel();
     let crash_thread = thread::spawn(move || {
-        let input = receiver.receive_streamed_one(source);
+        let input = receiver.receive_streamed_one();
         crash_tx.send(input).expect("return crashed receive");
     });
     let mut transaction = admin.transaction().expect("begin crash-window stream");
@@ -387,9 +385,9 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     assert_eq!(slot_lsn(&mut observer, SLOT), abort_lsn);
     transaction.commit().expect("commit after receiver crash");
 
-    let mut receiver = connect_receiver(&replication_url, abort_lsn, abort_lsn);
+    let mut receiver = attach_session(&database_url, &replication_url);
     let retry = match receiver
-        .receive_streamed_one(source)
+        .receive_streamed_one()
         .expect("restart and receive full committed stream")
     {
         StreamedInput::Transaction(input) => input,
@@ -397,7 +395,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
         StreamedInput::Aborted(_) => panic!("crash retry returned abort"),
     };
     let retry = receiver
-        .apply_received(&mut apply, &retry)
+        .apply_received(&retry)
         .expect("apply crash-window retry");
     assert_eq!(retry.outcome(), ProcessOutcome::Applied);
     receiver.acknowledge(&retry).expect("ack crash retry");
@@ -406,12 +404,11 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
         durable_state(&mut observer),
         (20_000, 0, 20_000, 0, 20_000, 2)
     );
-    let retry_lsn = retry.end_lsn();
     drop(receiver);
 
-    let mut receiver = connect_receiver(&replication_url, retry_lsn, retry_lsn);
+    let mut receiver = attach_session(&database_url, &replication_url);
     let retry_apply_empty = match receiver
-        .receive_streamed_one(source)
+        .receive_streamed_one()
         .expect("receive crash-retry Apply empty commit")
     {
         StreamedInput::EmptyCommitted(token) => token,
@@ -452,9 +449,9 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
         )
         .expect("write post-Sum unpublished transaction");
     transaction.commit().expect("commit post-Sum empty stream");
-    let mut receiver = connect_receiver(&replication_url, limit_baseline, limit_baseline);
+    let mut receiver = attach_session(&database_url, &replication_url);
     let post_sum_empty = match receiver
-        .receive_streamed_one(source)
+        .receive_streamed_one()
         .expect("receive post-Sum empty commit")
     {
         StreamedInput::EmptyCommitted(token) => token,
@@ -485,9 +482,8 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
             &[],
         )
         .expect("commit 10,001-row rejected transaction");
-    let mut receiver = connect_receiver(&replication_url, limit_baseline, limit_baseline);
-    assert!(receiver.receive_streamed_one(source).is_err());
-    assert_eq!(receiver.pending_feedback_lsn(), None);
+    let mut receiver = attach_session(&database_url, &replication_url);
+    assert!(receiver.receive_streamed_one().is_err());
     assert_eq!(slot_lsn(&mut observer, SLOT), limit_baseline);
     assert_eq!(
         durable_state(&mut observer),

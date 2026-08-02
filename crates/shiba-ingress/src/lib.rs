@@ -10,8 +10,13 @@ mod feedback;
 #[cfg(test)]
 mod feedback_tests;
 mod frame;
+mod governance;
+mod governed;
+mod limits;
+mod publication;
 mod receive_loop;
 mod receiver;
+mod source_shape;
 mod streamed;
 #[cfg(test)]
 mod streamed_tests;
@@ -20,7 +25,9 @@ mod transport;
 
 pub use assembler::{AssembledTransaction, CommittedAssembler};
 pub use envelope::{ReplicationMessage, encode_feedback, parse_replication_message};
-pub use receiver::SourceReceiver;
+pub use governed::{AttachOptions, GovernedSourceSession};
+pub use limits::{CONNECTIONS_PER_SOURCE, MAX_ACTIVE_CONNECTIONS, MAX_ACTIVE_SOURCES};
+pub(crate) use receiver::SourceReceiver;
 pub use tokens::{
     AbortedTransaction, DurableTransaction, EmptyCommitted, ReceivedInput, StreamedInput,
 };
@@ -37,6 +44,8 @@ pub enum IngressError {
     FeedbackPending,
     FeedbackMismatch,
     ReceiverFailed,
+    Governance(&'static str),
+    Database(postgres::Error),
     Libpq(libpq::errors::Error),
     UnexpectedStatus(libpq::Status),
     Decode(shiba_runtime::PgoutputError),
@@ -62,6 +71,8 @@ impl fmt::Display for IngressError {
             Self::ReceiverFailed => {
                 formatter.write_str("replication receiver failed closed and must restart")
             }
+            Self::Governance(reason) => write!(formatter, "source governance failed: {reason}"),
+            Self::Database(error) => write!(formatter, "governance database failed: {error}"),
             Self::Libpq(error) => {
                 write!(formatter, "logical replication transport failed: {error}")
             }
@@ -91,5 +102,11 @@ impl From<shiba_runtime::PgoutputError> for IngressError {
 impl From<shiba_runtime::M2Error> for IngressError {
     fn from(value: shiba_runtime::M2Error) -> Self {
         Self::Runtime(value)
+    }
+}
+
+impl From<postgres::Error> for IngressError {
+    fn from(value: postgres::Error) -> Self {
+        Self::Database(value)
     }
 }

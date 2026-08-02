@@ -128,13 +128,13 @@ admission limit poisons the receiver and advances no feedback.
 A strictly empty committed stream is the one exception to Runtime delivery. It
 has the exact `S(first=true) E (S(first=false) E)* c` structure above and yields a private
 `EmptyCommitted(end_lsn)` token; it never manufactures an empty
-`SourceTransaction` or continuation. This proves only that the currently
-selected publication emitted no changes for that committed transaction. It
-does not prove source identity or that publication membership has not drifted.
-Until M10.4 validates durable publication identity, an invalidated publication
-must never authorize empty feedback. `ALTER/DROP PUBLICATION`, remove/re-add,
-and same-name recreation must be prevented by role permissions or durably
-invalidate configuration before any later `EmptyCommitted` ACK.
+`SourceTransaction` or continuation. This proves only that the configured
+publication emitted no changes for that committed transaction. It is safe to
+acknowledge only while M10.4 governance also proves the exact publication
+identity and its frozen membership snapshot remain valid. `ALTER/DROP
+PUBLICATION`, remove/re-add, same-name recreation, flag changes, column-list
+changes, and row-filter changes persistently invalidate the source. Every empty
+acknowledgement revalidates that fact first.
 
 > A strictly validated publication-empty terminal commit may authorize feedback whether it contains one or multiple complete empty stream segments.
 
@@ -147,32 +147,90 @@ rule that authorizes feedback merely because decoding yielded no rows.
 
 ## Lifecycle boundary
 
-M10.1–M10.2 use one explicit receiver configuration: connection target,
-`source_id`, exact slot name, publication name, and slot generation. There is no
-environment/table fallback and no discovery by schema or relation name.
-M10.4 must replace this process-only lifecycle input with one catalog authority,
-validate the live database, slot, publication, binding, and generation, and
-exclude a second active receiver. Ordinary startup never creates, drops, or
-replaces a slot.
+M10.4 adds one database-local `source_ingress_config` authority per source. It
+binds the current database OID, exact `pg_publication` ObjectAddress, frozen
+publication name/semantic flags/normalized published attribute numbers, the
+existing source relation binding, slot name, and slot generation. Publication
+OID is identity; the frozen name is only a transport locator and drift signal.
+Neither schema/table names nor a newly created publication with the old name can
+resume a source.
 
-The catalog must not store connection secrets, receiver PID/status, dynamic slot
-progress, or `confirmed_flush_lsn`. PostgreSQL owns the physical slot and its
-progress. A future generation rotation is a compare-and-swap operation; until
-binding rebuild is implemented, a non-pristine source cannot rotate safely.
+The single event-trigger writer records persistent
+`source_ingress_invalidation` when the exact publication is dropped or its live
+snapshot differs. Snapshot comparison is required because PostgreSQL 17 emits
+no command-address row for some publication-membership changes. Once recorded,
+remove-then-add cannot revive the binding. Governance revalidates the database,
+source binding and invalidation, publication OID/snapshot, generation, and live
+slot immediately before every receive, Apply, and terminal ACK. Consequently an
+invalidated publication cannot authorize `EmptyCommitted` or `Aborted` feedback.
+
+`pg_replication_slots` is the physical slot and transport-progress authority.
+Shiba does not mirror `confirmed_flush_lsn`, receiver PID/status, connection
+secrets, or dynamic slot progress. Attach accepts only a pre-existing,
+persistent, inactive logical `pgoutput` slot in the configured database; after
+COPY BOTH starts it revalidates that the same slot is active. Startup never
+creates, drops, replaces, or silently discovers a slot.
+
+Slot replacement is a private compare-and-swap operation. It locks the config,
+requires the expected generation and a different pre-existing inactive
+`pgoutput` slot in the same database, and increments generation exactly once.
+It rejects active slots, stale callers, publication invalidation, and any source
+with current rows or continuation. The latter requires an explicit future
+binding rebuild rather than pretending old computation belongs to new history.
 
 ## Connection and shutdown budget
 
 Each active source has exactly two connections: one replication connection and
-one synchronous Apply connection. The process configuration must state a finite
-maximum active-source count and connection timeout. No implicit per-source pool
-is permitted. Shutdown stops accepting new WAL, finishes or rolls back the one
-in-flight Apply, sends feedback only for a committed result, and then detaches
-without creating or dropping the slot.
+one synchronous Apply connection. The process hard cap is 32 active sources
+(64 connections); there is no implicit pool or unbounded connection creation.
+Both conninfo strings must name the same explicit database and set a positive
+`connect_timeout`; Apply also receives an explicit positive
+`statement_timeout`.
+
+A process-local permit enforces the source cap. A session advisory lock plus
+the slot's active state excludes a second receiver for the same source. The
+advisory lock is lifecycle coordination, not source or cursor authority.
+Waiting for WAL retains that session lock but no Apply transaction, row lock,
+or in-flight query. Detach is explicit between receives: it closes the
+replication connection, releases the advisory lock, and leaves the slot and
+catalog untouched. An in-flight blocking receive, transport interruption/TLS
+policy, and cross-process graceful-stop orchestration remain operational proof
+outside the M10.4 catalog contract.
+
+## Production roles
+
+PG17 and PG18 gates prove split, non-superuser roles. The synchronous Apply role
+is `NOREPLICATION`; it receives schema usage and the narrow internal
+SELECT/INSERT/UPDATE/DELETE grants needed by governance and Runtime. Its source
+schema `USAGE` and source-table `SELECT` are required solely because Runtime
+preflight acquires `ACCESS SHARE`; Source Apply never queries the source table.
+Its `UPDATE` on `source_continuation` is required by the latest-continuation
+`SELECT ... FOR UPDATE`, not by a second continuation writer.
+
+The proved Apply grants are:
+
+- schema `USAGE` on `shiba_internal`, `shiba`, and the bound source schema;
+- `SELECT, UPDATE` on `source_binding` for preflight and its source mutex;
+- `SELECT` on source/ingress invalidations, ingress config, and
+  `operator_definition`;
+- `SELECT, INSERT, UPDATE` on `source_continuation`;
+- `SELECT, INSERT, UPDATE, DELETE` on the current-row table `applied_insert`;
+- `SELECT, UPDATE` on `operator_state` and public `operator_result`;
+- `SELECT` on the bound source table solely for the relation lock above.
+
+The receiver role has PostgreSQL `REPLICATION`, source schema `USAGE`, and
+published source table `SELECT`. It has no authority to write Shiba internal
+state. The Apply role cannot open the replication connection, the receiver role
+cannot perform governed Apply, and neither role is superuser. These grants prove
+the current single-database topology; secret distribution, TLS policy, and role
+rotation remain deployment responsibilities.
 
 ## M10 admission boundary
 
 M10 reuses the already admitted pgoutput v1 and v2 transaction shapes. It does
 not add SQL parsing, source discovery, new tuple shapes, a second decoder,
 receiver-written results, automatic slot administration, persisted WAL, or
-binding rebuild. Production receiver/feedback, streaming assembly, lifecycle,
-permissions, and performance become proven only when their PG17/18 gates pass.
+binding rebuild. Production receiver/feedback, streaming assembly, governed
+lifecycle, and split-role permissions have PG17/18 evidence. Final sustained
+performance, TLS/disconnect behavior, blocked-receive cancellation, and
+reconnect orchestration remain open.

@@ -35,6 +35,10 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m10-committed-ingress.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m10-streaming-ingress.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m10-streaming-ingress.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m10-catalog-ingress.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m10-catalog-ingress.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m10-governed-ingress.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m10-governed-ingress.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -226,8 +230,8 @@ only through explicit empty ACK and creates no continuation. Legal `R/I`
 traffic must instead reach the sole Runtime decoder, and every other shape must
 fail closed. This is structural evidence about the selected
 publication's empty output only. Publication identity, mutation/recreation
-drift, and rejection of empty ACK after invalidation remain M10.4 tests and are
-not claimed by the M10.3 gate.
+drift, and rejection of empty ACK after invalidation are proved separately by
+M10.4; they are not consequences of the M10.3 grammar alone.
 
 The first PG17 run exposed a real multi-segment publication-empty commit and
 failed the former single-segment assumption. The corrected constant-state
@@ -236,6 +240,44 @@ PG18.4. Those runs prove a real segment count greater than one, exact terminal
 LSNs, pre-ACK replay, no empty-feedback loop, unchanged operator/continuation
 state, later source Apply, streamed abort, partial-stream restart, the 10,000
 change admission boundary, and rejection of change 10,001 without feedback.
+
+`test-m10-catalog-ingress.sh` is the M10.4 catalog-governance gate. On PG17 and
+PG18 it configures one exact source/publication/existing-slot tuple and proves
+atomic duplicate rejection, wrong/missing/active/plugin/database slot failure,
+publication shape admission, PUBLIC denial, and that configuration never
+creates or drops a physical slot. It exercises publication ALTER rollback and
+commit, remove-then-add persistence, drop plus same-name recreation, source
+invalidation, pristine slot rotation, stale generation CAS, active/wrong/
+non-pristine replacement rejection, and absence of dynamic progress columns.
+
+The first PG17 publication-membership test failed because
+`pg_event_trigger_ddl_commands()` returned no ObjectAddress for `ALTER
+PUBLICATION ... DROP TABLE`. The accepted implementation retains the single
+event writer but compares every configured publication OID and frozen snapshot
+to live catalogs at `ddl_command_end`; the corrected gate passes independently
+on PG17.10 and PG18.4. This is failure evidence for persistent publication
+history, not permission to match by name or globally invalidate unrelated
+sources.
+
+`test-m10-governed-ingress.sh` is the separate governed-session gate and is
+green on PG17.10 and PG18.4. It proves wrong role/generation and active-slot
+failure, advisory ownership exclusion, exactly one Apply plus one replication
+connection, detach/reattach, least-privilege streamed receive/Apply/ACK of
+10,000 changes, and revalidation that rejects an already pending
+`EmptyCommitted` after publication remove/re-add while CountRows and the slot
+LSN remain at their last durable values. Pure tests freeze the advertised
+32-source/64-connection cap and validate required explicit database, positive
+connection timeouts, and positive Apply statement timeout. Neither gate creates
+or drops a slot during ordinary session attach/detach.
+
+The gate uses two distinct non-superuser roles. The Apply role has
+`NOREPLICATION`, schema usage, and only the internal table privileges required
+by governance and Runtime. Its `SELECT` on `source.events` exists solely because
+Runtime preflight takes `ACCESS SHARE`; Runtime does not read source rows. Its
+`UPDATE` privilege on `source_continuation` is required because the latest-row
+replay check uses `SELECT ... FOR UPDATE`. The receiver role has `REPLICATION`
+plus source-schema `USAGE` and source-table `SELECT`, and no Shiba internal
+write grants. Swapping the roles in either connection fails safely.
 
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and

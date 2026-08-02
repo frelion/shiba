@@ -11,6 +11,7 @@ description = "Bounded production logical-replication ingress for Shiba"
 libpq = "=6.0.1"
 postgres = "0.19"
 shiba-runtime = { path = "../shiba-runtime" }
+shiba-protocol = { path = "../shiba-protocol" }
 
 [dev-dependencies]
 shiba-compiler = { path = "../shiba-compiler" }

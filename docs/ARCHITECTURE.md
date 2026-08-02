@@ -203,8 +203,33 @@ transaction or lock, and slow Apply stops further reads without a queue.
 PostgreSQL's replication slot is the transport-cursor authority;
 `source_continuation` remains the computation/replay authority. Ingress may
 report a terminal end position only after Runtime returns `Applied` or
-`AlreadyApplied`. It cannot write current rows, operator state/results, or
-continuation, and Shiba does not mirror slot progress.
+`AlreadyApplied`, or after another strictly classified terminal authorization.
+It cannot write current rows, operator state/results, or continuation, and
+Shiba does not mirror slot progress.
+
+M10.4 makes ingress attachment catalog-governed without creating another
+cursor. `source_ingress_config` binds database OID, exact publication OID plus a
+frozen semantic snapshot, exact source binding, existing slot name, and slot
+generation. One persistent invalidation writer prevents publication membership
+history, drop/recreate, or same-name replacement from reviving the binding.
+Ingress revalidates this authority and the live slot before receive, Apply, and
+each ACK. PostgreSQL `pg_replication_slots` remains the physical slot authority;
+no LSN, receiver-status, or WAL-spool mirror is added.
+
+Each governed source has exactly two connections: a replication connection and
+an Apply connection. A process cap admits 32 sources, a source-specific advisory
+lock plus slot exclusivity admits one receiver, and both conninfo values require
+an explicit matching database and positive connection timeout. Waiting for WAL
+holds no Apply transaction or row lock. Slot rotation is an explicit
+pristine-only generation CAS over existing inactive slots, never automatic
+create/drop/discovery.
+
+PG17/18 governed gates prove the two connections use distinct least-privilege
+roles. The `NOREPLICATION` Apply role receives only Runtime/governance grants;
+its source-table `SELECT` exists solely for the preflight `ACCESS SHARE` lock,
+not a row lookup, and continuation `UPDATE` permits the latest-row `FOR UPDATE`
+check. The receiver role has `REPLICATION` plus source schema `USAGE` and table
+`SELECT`, but no Shiba-state write authority.
 
 ## Phase gates
 
@@ -214,13 +239,13 @@ No later code may use an old authority as a fallback. An implementation is
 accepted only after its clean-room tests prove its new contract; legacy tests are
 evidence inputs, not implementation dependencies.
 
-**Unproved:** M10 production replication transport and slot ownership until its
-PG17/18 gates pass, admission
+**Unproved:** network/TLS and blocking-receive cancellation behavior,
+reconnect daemon/backoff policy, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving,
-generation changes, production receiver/restart and persisted partial-stream
-recovery, production transport backpressure and transport memory, binding
+production receiver failover and persisted partial-stream recovery, production
+transport backpressure and transport memory, binding
 rebuild, SQL frontend, non-aggregate operators, sustained throughput, empirical
 heap peak, contention tail latency, and recovery workers
 remain.

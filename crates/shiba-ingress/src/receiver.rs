@@ -21,7 +21,7 @@ pub(super) enum Assembly {
 }
 
 /// Exclusive, synchronous owner of one logical-replication connection.
-pub struct SourceReceiver {
+pub(crate) struct SourceReceiver {
     pub(super) transport: ReplicationTransport,
     pub(super) assembly: Assembly,
     pub(super) feedback: FeedbackState,
@@ -35,7 +35,7 @@ impl SourceReceiver {
     ///
     /// # Errors
     /// Rejects invalid configuration, connection failure, or non-COPY-BOTH.
-    pub fn connect(
+    pub(crate) fn connect(
         conninfo: &str,
         slot: &str,
         publication: &str,
@@ -136,19 +136,6 @@ impl SourceReceiver {
         Ok(DurableTransaction::new(outcome, input.end_lsn()))
     }
 
-    /// Receives and applies one protocol-v1 transaction without acknowledging.
-    ///
-    /// # Errors
-    /// Returns receive/decode or Runtime failure.
-    pub fn receive_and_apply_one(
-        &mut self,
-        apply: &mut Client,
-        source: PgoutputSource,
-    ) -> Result<DurableTransaction, IngressError> {
-        let input = self.receive_one(source)?;
-        self.apply_received(apply, &input)
-    }
-
     /// Acknowledges one exact durably applied transaction.
     ///
     /// # Errors
@@ -193,21 +180,6 @@ impl SourceReceiver {
         self.feedback
             .require_empty(token.end_lsn(), token.authorization())?;
         self.send_ack(token.end_lsn())
-    }
-
-    #[must_use]
-    pub const fn last_acknowledged_lsn(&self) -> u64 {
-        self.feedback.last_acknowledged_lsn()
-    }
-
-    #[must_use]
-    pub const fn outstanding_lsn(&self) -> Option<u64> {
-        self.outstanding_lsn
-    }
-
-    #[must_use]
-    pub const fn pending_feedback_lsn(&self) -> Option<u64> {
-        self.feedback.pending_lsn()
     }
 
     fn ready(&self) -> Result<(), IngressError> {

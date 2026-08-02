@@ -84,3 +84,47 @@ and zero result are created atomically by explicit registration.
 Later tuple slices alter only the existing current-state table. M5.1 adds
 `payload_text` with int8/text mutual exclusion; it creates no fifth table,
 source registry, change log, alias, or second writer.
+
+## M10.4 source-ingress authority
+
+`source_ingress_config` is the sole database-local ingress definition for a
+source. Its private configuration writer locks an existing source binding,
+rejects source invalidation, resolves the current database and exact
+`pg_publication` OID, normalizes the publication's live column list to ordered
+attribute numbers, and validates an existing inactive persistent logical
+`pgoutput` slot in that database. It inserts the complete definition atomically
+and never overwrites a duplicate source.
+
+The publication ObjectAddress is durable identity. Its name, insert/update/
+delete/truncate/via-root flags, and normalized attribute numbers are a frozen
+semantic snapshot and transport locator, not a name-based identity fallback.
+The admitted publication has exactly the bound relation, no row filter, all
+required change operations, and no publish-via-root policy. Drift in any frozen
+field is fail closed.
+
+`source_ingress_invalidation` is the persistent publication-history fact. The
+existing single DDL event writer owns it as well as source invalidation. Exact
+drop addresses cover publication removal; on every DDL command end it compares
+each configured OID and snapshot against the live catalogs. This scan is
+necessary because a real PostgreSQL 17 `ALTER PUBLICATION ... DROP TABLE`
+produced no command ObjectAddress. A committed membership/flag/column/filter/
+name change, remove-then-add, drop, or same-name recreation therefore cannot
+revive the old configuration. Rollback rolls back its invalidation too.
+
+The private slot-rotation writer is a pristine-only generation CAS. It requires
+the expected generation, locks the row, rejects invalidated or non-pristine
+sources and active/current slots, validates a different existing inactive
+`pgoutput` slot in the same database, then changes slot and increments generation
+once. It never creates or drops a physical slot. Binding rebuild remains a
+separate unimplemented lifecycle.
+
+PostgreSQL `pg_replication_slots` remains physical slot/progress authority.
+The catalog deliberately contains no `confirmed_flush_lsn`, receiver PID,
+active flag, connection secret, transport status, WAL spool, or cursor mirror.
+Ingress config/invalidation are inaccessible to PUBLIC, and ordinary startup is
+not a definition writer.
+
+Source Ingress is a transport owner, not another state writer. Governance
+revalidates catalog/live publication and slot state before receive, Apply, and
+every ACK; an invalidation cannot be bypassed by an empty commit. Ingress cannot
+write current rows, operator state/results, or continuation.

@@ -2,18 +2,18 @@ use std::{num::NonZeroU64, sync::mpsc, thread, time::Duration};
 
 use postgres::{Client, NoTls};
 use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_ingress::{ReplicationMode, SourceReceiver};
+use shiba_ingress::{AttachOptions, GovernedSourceSession, ReplicationMode};
 use shiba_operator::OperatorId;
 use shiba_protocol::{SlotGeneration, SourceId};
-use shiba_runtime::{PgoutputSource, ProcessOutcome, compile_and_register};
-
-const SLOT: &str = "shiba_m10_committed_slot";
-const PUBLICATION: &str = "shiba_m10_committed_pub";
-const APPLICATION: &str = "shiba_m10_receiver";
+use shiba_runtime::{ProcessOutcome, compile_and_register};
 
 mod support;
 
 use support::{slot_lsn, wait_for_keepalive_reply, wait_for_slot_lsn};
+
+const SLOT: &str = "shiba_m10_committed_slot";
+const PUBLICATION: &str = "shiba_m10_committed_pub";
+const APPLICATION: &str = "shiba_m10_receiver";
 
 fn required(name: &str) -> String {
     std::env::var(name)
@@ -27,6 +27,18 @@ fn spec(operator_id: u64, operation: OperatorOperationV1) -> OperatorSpecV1 {
         source_id: SourceId::new(1).expect("non-zero source"),
         operation,
     }
+}
+
+fn attach(database_url: &str, replication_url: &str) -> GovernedSourceSession {
+    GovernedSourceSession::attach(
+        database_url,
+        replication_url,
+        SourceId::new(1).expect("source ID"),
+        SlotGeneration::new(1).expect("slot generation"),
+        AttachOptions::new(ReplicationMode::Committed, Duration::from_secs(5))
+            .expect("attach options"),
+    )
+    .expect("attach governed committed session")
 }
 
 fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
@@ -54,20 +66,18 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
 
 #[test]
 #[ignore = "requires scripts/test-m10-committed-ingress.sh"]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one ordered slot-feedback and crash-window proof"
-)]
-fn production_copy_both_acknowledges_only_durable_apply() {
+#[allow(clippy::too_many_lines, reason = "one ordered governed crash proof")]
+fn governed_committed_apply_ack_replay_and_rollback() {
     let database_url = required("SHIBA_M10_DATABASE_URL");
     let replication_url = required("SHIBA_M10_REPLICATION_URL");
-    let mut admin = Client::connect(&database_url, NoTls).expect("connect admin/apply database");
+    let mut admin = Client::connect(&database_url, NoTls).expect("connect admin database");
     admin
         .batch_execute(&format!(
             "CREATE EXTENSION shiba_catalog;
              CREATE SCHEMA source;
              CREATE TABLE source.events (id bigint PRIMARY KEY, payload bigint NULL);
-             CREATE PUBLICATION {PUBLICATION} FOR TABLE source.events;
+             CREATE PUBLICATION {PUBLICATION} FOR TABLE source.events
+                 WITH (publish = 'insert, update, delete, truncate');
              SELECT shiba_internal.register_source(1, 'source.events'::regclass);"
         ))
         .expect("install source and binding");
@@ -83,170 +93,70 @@ fn production_copy_both_acknowledges_only_durable_apply() {
         ),
     )
     .expect("register SumInt8");
-    let relation_oid = admin
-        .query_one("SELECT 'source.events'::regclass::oid::bigint", &[])
-        .expect("read relation OID")
-        .get::<_, i64>(0);
     admin
         .query_one(
             "SELECT slot_name FROM pg_create_logical_replication_slot($1, 'pgoutput')",
             &[&SLOT],
         )
         .expect("create test-owned slot");
+    let publication_oid: u32 = admin
+        .query_one(
+            "SELECT oid FROM pg_publication WHERE pubname = $1",
+            &[&PUBLICATION],
+        )
+        .expect("read publication OID")
+        .get(0);
+    admin
+        .execute(
+            "SELECT shiba_internal.configure_source_ingress(1, $1, $2, 1)",
+            &[&publication_oid, &SLOT],
+        )
+        .expect("configure governed ingress");
 
-    let source = PgoutputSource::with_nullable_int8_payload(
-        SourceId::new(1).expect("source ID"),
-        SlotGeneration::new(1).expect("slot generation"),
-        u32::try_from(relation_oid).expect("OID fits u32"),
-    );
-    let initial_slot_lsn = slot_lsn(&mut admin, SLOT);
-    let mut idle_receiver = SourceReceiver::connect(
-        &replication_url,
-        SLOT,
-        PUBLICATION,
-        ReplicationMode::Committed,
-        initial_slot_lsn,
-        initial_slot_lsn,
-    )
-    .expect("connect production replication receiver");
+    let initial_lsn = slot_lsn(&mut admin, SLOT);
+    let mut session = attach(&database_url, &replication_url);
+    assert_eq!(session.source_id().get(), 1);
+    assert_eq!(session.slot_generation().get(), 1);
     let (received_tx, received_rx) = mpsc::channel();
     let receiver_thread = thread::spawn(move || {
-        let result = idle_receiver.receive_one(source);
+        let input = session.receive_one();
         received_tx
-            .send((idle_receiver, result))
-            .expect("return receiver and volatile input");
+            .send((session, input))
+            .expect("return governed volatile input");
     });
-    wait_for_keepalive_reply(&mut admin, APPLICATION, initial_slot_lsn);
+    wait_for_keepalive_reply(&mut admin, APPLICATION, initial_lsn);
     admin
         .batch_execute("INSERT INTO source.events VALUES (1, 10), (2, NULL)")
         .expect("commit first source transaction");
-    let (preapply_receiver, volatile_input) = received_rx
+    let (preapply_session, volatile_input) = received_rx
         .recv_timeout(Duration::from_secs(10))
-        .expect("receive after requested keepalive");
-    receiver_thread.join().expect("receiver thread exits");
-    let volatile_input = volatile_input.expect("receive first committed transaction");
-    let received_end_lsn = volatile_input.end_lsn();
-    assert!(received_end_lsn > initial_slot_lsn);
-    assert_eq!(preapply_receiver.outstanding_lsn(), Some(received_end_lsn));
-    assert_eq!(preapply_receiver.pending_feedback_lsn(), None);
-    assert_eq!(slot_lsn(&mut admin, SLOT), initial_slot_lsn);
+        .expect("receive committed input");
+    receiver_thread.join().expect("join receive thread");
+    let received_end = volatile_input.expect("decode committed input").end_lsn();
+    assert!(received_end > initial_lsn);
     assert_eq!(durable_state(&mut admin), (0, 0, 0, 0, 0, 0));
-    drop(volatile_input);
-    drop(preapply_receiver);
+    assert_eq!(slot_lsn(&mut admin, SLOT), initial_lsn);
+    drop(preapply_session);
 
-    let mut apply = Client::connect(&database_url, NoTls).expect("connect Apply client");
-    let mut receiver = SourceReceiver::connect(
-        &replication_url,
-        SLOT,
-        PUBLICATION,
-        ReplicationMode::Committed,
-        initial_slot_lsn,
-        initial_slot_lsn,
-    )
-    .expect("restart after receive-before-Apply crash window");
-    let first = receiver
-        .receive_and_apply_one(&mut apply, source)
+    let mut session = attach(&database_url, &replication_url);
+    let first = session
+        .receive_and_apply_one()
         .expect("apply replay after receive-before-Apply crash");
     assert_eq!(first.outcome(), ProcessOutcome::Applied);
-    assert_eq!(first.end_lsn(), received_end_lsn);
-    assert_eq!(receiver.pending_feedback_lsn(), Some(first.end_lsn()));
-    assert_eq!(receiver.last_acknowledged_lsn(), initial_slot_lsn);
-    assert_eq!(slot_lsn(&mut admin, SLOT), initial_slot_lsn);
+    assert_eq!(first.end_lsn(), received_end);
     assert_eq!(durable_state(&mut admin), (2, 10, 2, 10, 2, 1));
+    assert_eq!(slot_lsn(&mut admin, SLOT), initial_lsn);
+    drop(session);
 
-    receiver
-        .acknowledge(&first)
-        .expect("ack durable first apply");
-    assert_eq!(receiver.last_acknowledged_lsn(), first.end_lsn());
-    assert_eq!(receiver.pending_feedback_lsn(), None);
-    wait_for_slot_lsn(&mut admin, SLOT, first.end_lsn());
-    drop(receiver);
-
-    admin
-        .batch_execute("INSERT INTO source.events VALUES (3, 5)")
-        .expect("commit restart-window transaction");
-    let mut receiver = SourceReceiver::connect(
-        &replication_url,
-        SLOT,
-        PUBLICATION,
-        ReplicationMode::Committed,
-        first.end_lsn(),
-        first.end_lsn(),
-    )
-    .expect("connect receiver before unacknowledged restart");
-    let unacknowledged = receiver
-        .receive_and_apply_one(&mut apply, source)
-        .expect("durably apply without feedback");
-    assert_eq!(unacknowledged.outcome(), ProcessOutcome::Applied);
-    assert_eq!(slot_lsn(&mut admin, SLOT), first.end_lsn());
-    assert_eq!(durable_state(&mut admin), (3, 15, 3, 15, 3, 2));
-    let replay_end_lsn = unacknowledged.end_lsn();
-    drop(receiver);
-
-    let mut receiver = SourceReceiver::connect(
-        &replication_url,
-        SLOT,
-        PUBLICATION,
-        ReplicationMode::Committed,
-        first.end_lsn(),
-        first.end_lsn(),
-    )
-    .expect("restart receiver from last acknowledged LSN");
-    let replay = receiver
-        .receive_and_apply_one(&mut apply, source)
-        .expect("replay durable transaction");
+    let mut session = attach(&database_url, &replication_url);
+    let replay = session
+        .receive_and_apply_one()
+        .expect("replay applied transaction");
     assert_eq!(replay.outcome(), ProcessOutcome::AlreadyApplied);
-    assert_eq!(replay.end_lsn(), replay_end_lsn);
-    assert_eq!(durable_state(&mut admin), (3, 15, 3, 15, 3, 2));
-    receiver
-        .acknowledge(&replay)
-        .expect("acknowledge idempotent replay");
-    wait_for_slot_lsn(&mut admin, SLOT, replay_end_lsn);
-    drop(receiver);
-
-    admin
-        .batch_execute("INSERT INTO source.events VALUES (4, 7)")
-        .expect("commit decoder-failure transaction");
-    let wrong_source = PgoutputSource::with_nullable_int8_payload(
-        SourceId::new(1).expect("source ID"),
-        SlotGeneration::new(1).expect("slot generation"),
-        u32::try_from(relation_oid).expect("OID fits u32") + 1,
-    );
-    let mut receiver = SourceReceiver::connect(
-        &replication_url,
-        SLOT,
-        PUBLICATION,
-        ReplicationMode::Committed,
-        replay_end_lsn,
-        replay_end_lsn,
-    )
-    .expect("connect decoder-failure receiver");
-    assert!(receiver.receive_one(wrong_source).is_err());
-    assert_eq!(receiver.pending_feedback_lsn(), None);
-    assert_eq!(slot_lsn(&mut admin, SLOT), replay_end_lsn);
-    assert_eq!(durable_state(&mut admin), (3, 15, 3, 15, 3, 2));
-    drop(receiver);
-
-    let mut receiver = SourceReceiver::connect(
-        &replication_url,
-        SLOT,
-        PUBLICATION,
-        ReplicationMode::Committed,
-        replay_end_lsn,
-        replay_end_lsn,
-    )
-    .expect("restart after decoder failure");
-    let decoded_retry = receiver
-        .receive_and_apply_one(&mut apply, source)
-        .expect("retry decoder-failure transaction");
-    assert_eq!(decoded_retry.outcome(), ProcessOutcome::Applied);
-    receiver
-        .acknowledge(&decoded_retry)
-        .expect("acknowledge decoder retry");
-    wait_for_slot_lsn(&mut admin, SLOT, decoded_retry.end_lsn());
-    assert_eq!(durable_state(&mut admin), (4, 22, 4, 22, 4, 3));
-    let decoder_retry_lsn = decoded_retry.end_lsn();
-    drop(receiver);
+    assert_eq!(replay.end_lsn(), received_end);
+    session.acknowledge(&replay).expect("ack exact replay");
+    wait_for_slot_lsn(&mut admin, SLOT, received_end);
+    session.detach().expect("detach replay session");
 
     admin
         .batch_execute(
@@ -256,43 +166,37 @@ fn production_copy_both_acknowledges_only_durable_apply() {
              CREATE TRIGGER m10_fail_operator BEFORE UPDATE
              ON shiba_internal.operator_state FOR EACH ROW
              EXECUTE FUNCTION m10_test.fail_operator();
-             INSERT INTO source.events VALUES (5, 11);",
+             INSERT INTO source.events VALUES (3, 11);",
         )
-        .expect("install failure point and commit operator-failure transaction");
-    let mut receiver = SourceReceiver::connect(
-        &replication_url,
-        SLOT,
-        PUBLICATION,
-        ReplicationMode::Committed,
-        decoder_retry_lsn,
-        decoder_retry_lsn,
-    )
-    .expect("connect operator-failure receiver");
-    assert!(receiver.receive_and_apply_one(&mut apply, source).is_err());
-    assert_eq!(receiver.pending_feedback_lsn(), None);
-    assert_eq!(slot_lsn(&mut admin, SLOT), decoder_retry_lsn);
-    assert_eq!(durable_state(&mut admin), (4, 22, 4, 22, 4, 3));
-    drop(receiver);
-
+        .expect("install failure point and commit source transaction");
+    let mut session = attach(&database_url, &replication_url);
+    let input = session
+        .receive_one()
+        .expect("receive operator-failure input");
+    assert!(session.apply_received(&input).is_err());
+    assert_eq!(durable_state(&mut admin), (2, 10, 2, 10, 2, 1));
+    assert_eq!(slot_lsn(&mut admin, SLOT), received_end);
+    drop(session);
     admin
         .batch_execute("DROP SCHEMA m10_test CASCADE")
-        .expect("remove test-only operator failure point");
-    let mut receiver = SourceReceiver::connect(
-        &replication_url,
-        SLOT,
-        PUBLICATION,
-        ReplicationMode::Committed,
-        decoder_retry_lsn,
-        decoder_retry_lsn,
-    )
-    .expect("restart after operator failure");
-    let operator_retry = receiver
-        .receive_and_apply_one(&mut apply, source)
-        .expect("retry rolled-back operator transaction");
-    assert_eq!(operator_retry.outcome(), ProcessOutcome::Applied);
-    receiver
-        .acknowledge(&operator_retry)
-        .expect("acknowledge operator retry");
-    wait_for_slot_lsn(&mut admin, SLOT, operator_retry.end_lsn());
-    assert_eq!(durable_state(&mut admin), (5, 33, 5, 33, 5, 4));
+        .expect("remove failure point");
+
+    let mut session = attach(&database_url, &replication_url);
+    let retry = session
+        .receive_and_apply_one()
+        .expect("retry rolled-back transaction");
+    assert_eq!(retry.outcome(), ProcessOutcome::Applied);
+    session.acknowledge(&retry).expect("ack operator retry");
+    wait_for_slot_lsn(&mut admin, SLOT, retry.end_lsn());
+    assert_eq!(durable_state(&mut admin), (3, 21, 3, 21, 3, 2));
+    let durable_lsn = retry.end_lsn();
+    session.detach().expect("detach governed session");
+
+    admin
+        .batch_execute("TRUNCATE source.events")
+        .expect("commit unsupported published TRUNCATE");
+    let mut session = attach(&database_url, &replication_url);
+    assert!(session.receive_one().is_err());
+    assert_eq!(slot_lsn(&mut admin, SLOT), durable_lsn);
+    assert_eq!(durable_state(&mut admin), (3, 21, 3, 21, 3, 2));
 }

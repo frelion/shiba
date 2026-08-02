@@ -65,9 +65,11 @@ or trailing byte. Recognition uses constant state within the 16 MiB bound. A
 legal `R/I` selects the non-empty path through the sole Runtime decoder; every
 other form fails closed. Empty commit requires an explicit ACK and creates no
 continuation.
-This proves only empty output for the process-selected publication. M10.4 must
-bind and validate publication identity so mutation, removal/re-add, drop, or
-same-name recreation cannot be mistaken for a legitimate empty transaction.
+This proves only empty output for the selected publication. M10.4 binds its
+exact OID plus frozen name/flags/normalized attribute numbers, persists
+membership/drop/recreate drift, and revalidates before every terminal ACK. A
+name alone never restores validity, and an invalidated empty token cannot
+advance feedback.
 
 ## Feedback decision
 
@@ -89,13 +91,36 @@ PostgreSQL's replication slot is the transport cursor authority.
 `source_continuation` remains the computation/replay authority. Shiba does not
 mirror `confirmed_flush_lsn` in its catalog.
 
+## Lifecycle decision
+
+M10.4 adds one database-local ingress config, not a cursor mirror. It binds an
+exact source to a current database, publication ObjectAddress and frozen
+semantic snapshot, existing persistent `pgoutput` slot, and generation.
+PostgreSQL `pg_replication_slots` remains physical authority. Startup validates
+an inactive slot, attaches through the separate replication connection, then
+revalidates it active; receive, Apply, and all ACK variants revalidate catalog,
+publication, generation, and slot again.
+
+Each source owns exactly one replication and one Apply connection. The process
+admits at most 32 sources, requires an explicit matching database and positive
+timeouts, and uses a source advisory lock plus slot exclusivity to reject a
+second receiver. Waiting for WAL does not retain an Apply transaction. Startup
+and shutdown never create, drop, or replace a slot.
+
+Replacement is a pristine-only expected-generation CAS over a different
+pre-existing inactive slot in the same database. A non-pristine source requires
+future binding rebuild. This preserves old-history isolation without an alias,
+fallback, LSN table, or automatic slot administrator.
+
 ## Consequences and open proof
 
 This choice adds one production dependency with a narrow boundary and a system
 `libpq` requirement. The binding exposes a defective raw-handle `Clone`; Shiba
-therefore keeps the connection private, exclusive, and never clones it. M10
-must still prove disconnect behavior, async server
-errors during COPY, graceful shutdown, slot and
-publication validation, least privilege, buffer peaks, and PG17/18 parity.
+therefore keeps the connection private, exclusive, and never clones it. PG17
+and PG18 now prove governed attach/detach, single ownership, split
+least-privilege roles, continuous publication revalidation, and exact two-
+connection ownership. M10 must still prove disconnect behavior, async server
+errors during COPY, blocking-receive cancellation, reconnect/backoff policy,
+and final buffer/performance measurements.
 Failure of those gates reopens this ADR; it does not authorize a CLI receiver,
 raw wire implementation, second decoder, or compatibility path.
