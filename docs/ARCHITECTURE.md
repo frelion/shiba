@@ -106,6 +106,11 @@ preserves admission, while same-name drop/recreate changes the OID and fails
 before the processor owns a transaction. Registration, discovery, and DDL
 observation are not introduced.
 
+M6.1 adds a pure decoder for one complete streamed protocol-v2 transaction.
+Segments have no durable authority and cannot call Apply; only stream commit
+creates the existing stable transaction identity and hands one complete value
+to the unchanged processor, sole writer, and PostgreSQL transaction owner.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction

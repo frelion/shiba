@@ -142,7 +142,10 @@ pub fn decode_committed_changes(
     SourceTransaction::from_changes(identity, changes).map_err(|_| PgoutputError::TupleValue)
 }
 
-fn decode_relation(cursor: &mut Cursor<'_>, source: PgoutputSource) -> Result<(), PgoutputError> {
+pub(crate) fn decode_relation(
+    cursor: &mut Cursor<'_>,
+    source: PgoutputSource,
+) -> Result<(), PgoutputError> {
     if source.relation_id == 0 || cursor.u32()? != source.relation_id {
         return Err(PgoutputError::RelationMismatch);
     }

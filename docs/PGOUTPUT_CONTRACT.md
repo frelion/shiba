@@ -183,3 +183,18 @@ single-column replica-index admission, atomic INSERT/DELETE recovery, and live
 default-identity drift rejection without adding a catalog authority.
 M5.5 proves relation and column names are not identity, while same-name
 drop/recreate OID drift fails before writes or continuation advancement.
+
+## M6.1 streamed commit admission
+
+`decode_streamed_changes` accepts one complete protocol-v2 transaction for the
+existing key-only INSERT shape. Stream start/stop segments and every streamed
+RELATION/INSERT XID must agree; only a final matching stream commit with a valid
+commit LSN can produce a `SourceTransaction`. Input sequence spans segments.
+
+Partial input, mixed XIDs, invalid first-segment flags, stream abort, ordinary
+BEGIN/COMMIT mixing, trailing bytes, and unsupported changes fail before Apply.
+Segments are held only in decoder memory and are never durable or visible.
+M6.1 adds no spool, transport, interleaving, recovery worker, or acknowledgement
+authority. The layouts follow the PostgreSQL
+[17 protocol documentation](https://www.postgresql.org/docs/17/protocol-logicalrep-message-formats.html)
+and [18 protocol documentation](https://www.postgresql.org/docs/18/protocol-logicalrep-message-formats.html).

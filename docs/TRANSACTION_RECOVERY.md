@@ -114,3 +114,9 @@ source catalog and a later admitted INSERT commits through the existing Apply
 path. After same-name drop/recreate, relation-OID mismatch fails during pure
 decode; row state, count/result, and continuation retain their last committed
 values. Recovery of a future durable binding registry is not claimed.
+
+M6.1 keeps streamed segments outside PostgreSQL durable Shiba state. Truncation,
+abort, or XID mismatch cannot return a transaction, so continuation cannot pass
+an incomplete stream. After a complete stream commit, processor crash rollback,
+retry once, and exact replay are identical to the existing transaction path.
+Production receiver restart and persisted partial-stream recovery remain open.

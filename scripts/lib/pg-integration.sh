@@ -17,6 +17,11 @@ shiba_pg_integration_setup() {
     echo "only PostgreSQL 17 or 18 is supported (got: $SHIBA_TEST_PG_MAJOR)" >&2
     exit 64
   fi
+  if [[ -n "${SHIBA_TEST_LOGICAL_DECODING_WORK_MEM:-}" \
+    && "$SHIBA_TEST_LOGICAL_DECODING_WORK_MEM" != "64kB" ]]; then
+    echo "SHIBA_TEST_LOGICAL_DECODING_WORK_MEM only supports 64kB" >&2
+    exit 64
+  fi
 
   SHIBA_TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
   SHIBA_TEST_PG_BINDIR="$("$SHIBA_TEST_PG_CONFIG" --bindir)"
@@ -82,6 +87,10 @@ PY
     --no-locale --encoding=UTF8 --auth=trust >/dev/null
   printf '%s\n' 'wal_level=logical' 'max_replication_slots=4' 'max_wal_senders=4' \
     'wal_sender_timeout=0' >> "$SHIBA_TEST_DATA/postgresql.conf"
+  if [[ -n "${SHIBA_TEST_LOGICAL_DECODING_WORK_MEM:-}" ]]; then
+    printf 'logical_decoding_work_mem=%s\n' "$SHIBA_TEST_LOGICAL_DECODING_WORK_MEM" \
+      >> "$SHIBA_TEST_DATA/postgresql.conf"
+  fi
   "$SHIBA_TEST_PG_BINDIR/pg_ctl" -D "$SHIBA_TEST_DATA" \
     -o "-k '$SHIBA_TEST_SOCKET' -p $SHIBA_TEST_PORT" -w start >/dev/null
   SHIBA_TEST_STARTED=1

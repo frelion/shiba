@@ -133,6 +133,13 @@ OID. It then drops/recreates the original qualified name, proves the new OID is
 different and the wire is otherwise valid, and verifies the old binding rejects
 before row/count/result/continuation writes on PostgreSQL 17 and 18.
 
+`test-m6-stream-commit.sh` sets isolated-cluster logical decoding memory to
+64 KiB and captures a 10,000-row protocol-v2 transaction with streaming on. It
+requires at least two matching `S ... E` segments and terminal `c`, proves no
+prefix/abort-shaped input is visible, then proves post-continuation crash rolls
+all rows/count/result/continuation back before retry-once and replay no-op on
+PostgreSQL 17 and 18.
+
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.
 
