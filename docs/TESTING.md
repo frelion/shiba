@@ -29,6 +29,8 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m5-toast.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m5-incompressible-toast.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m5-incompressible-toast.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m5-composite-delete.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m5-composite-delete.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -111,6 +113,12 @@ source values are out-of-line and uncompressed, then verifies the replacement
 UPDATE carries exact `t` bytes and atomically replaces `payload_text` while
 count/result stay `1`. A binary-tag corruption, post-continuation crash, retry,
 and exact replay prove the failure and recovery boundaries on PG17/18.
+
+`test-m5-composite-delete.sh` applies two composite-key rows sharing key1,
+captures one real `D + K` with two canonical int8 fields, and proves only the
+exact pair is removed while count/result decrement once. It also proves bad
+second-key rejection, a valid missing-pair rollback, continuation-after-insert
+crash rollback, retry, and replay on PostgreSQL 17 and 18.
 
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.

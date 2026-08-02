@@ -131,9 +131,10 @@ pub fn decode_committed_changes(
                     };
                     SourceChange::Update(update)
                 }
-                DecodedChange::Delete(source_row_id) => SourceChange::Delete {
+                DecodedChange::Delete(source_row_id, source_row_sub_id) => SourceChange::Delete {
                     input_sequence: sequence,
                     source_row_id,
+                    source_row_sub_id,
                 },
             })
         })

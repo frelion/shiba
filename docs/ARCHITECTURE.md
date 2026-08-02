@@ -89,6 +89,11 @@ wire owns the new UTF-8 bytes; the processor overwrites only `payload_text`,
 keeps count/result stable, and records continuation in the same transaction.
 No TOAST store, fetcher, or alternate value authority is introduced.
 
+M5.3 carries the existing composite pair into DELETE without introducing a
+general row-identity layer. The same current-state row stores both components;
+the processor matches both (including NULL-safe single-key handling), deletes
+exactly one row, decrements count/result, and commits continuation atomically.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -98,8 +103,8 @@ accepted only after its clean-room tests prove its new contract; legacy tests ar
 evidence inputs, not implementation dependencies.
 
 **Unproved:** production replication transport and slot ownership, admission
-for `D + O` or replica identity `FULL`, composite DELETE, key-changing UPDATE
-and old tuples, NULL text, binary payloads, TOAST keys,
+for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
+tuples, NULL text, binary payloads, TOAST keys,
 streaming transactions, catalog binding inspection, concurrency,
 generation changes, multiple sources, general operators, and recovery workers
 remain.

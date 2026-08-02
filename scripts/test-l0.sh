@@ -152,6 +152,7 @@ scripts = [
     for name in (
         "m3", "m4", "m4-empty", "m4-composite", "m4-update", "m4-delete",
         "m4-replica-identity", "m5-toast", "m5-incompressible-toast",
+        "m5-composite-delete",
     )
 ]
 for path in scripts:
@@ -240,7 +241,7 @@ manifest = pathlib.Path("docs/contracts/REUSE_MANIFEST.md").read_text()
 header = "| 成果 | 来源 | 分类A/B/C | 复用方式 | 证据 | 未证明边界 |"
 if header not in manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks the required audit-table header")
-for required in ("Protocol JSON/schema", "canonical digest", "PG17/18", "Phase 1", "M3.1", "M3.2", "M4.1", "M4.2", "M4.3", "M4.4", "M4.5", "M4.6", "M5.1", "M5.2"):
+for required in ("Protocol JSON/schema", "canonical digest", "PG17/18", "Phase 1", "M3.1", "M3.2", "M4.1", "M4.2", "M4.3", "M4.4", "M4.5", "M4.6", "M5.1", "M5.2", "M5.3"):
     if required not in manifest:
         raise SystemExit(f"REUSE_MANIFEST.md lacks required Phase-1 contract: {required}")
 PY

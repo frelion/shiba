@@ -97,3 +97,8 @@ M5.2 applies a complete `t` replacement under the same ordering. A crash after
 continuation INSERT exposes the previous text and previous continuation; retry
 publishes the replacement once, and replay cannot replace it again. The source
 TOAST table never participates in the processor transaction or recovery path.
+
+M5.3 uses the same DELETE ordering for a two-component key. Decode failure
+writes nothing; a missing pair or backend termination rolls back pair deletion,
+count, result, and continuation. Retry removes the pair once, and exact replay
+short-circuits before row lookup.

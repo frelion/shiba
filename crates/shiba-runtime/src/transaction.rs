@@ -74,6 +74,7 @@ pub enum SourceChange {
     Delete {
         input_sequence: InputSequence,
         source_row_id: i64,
+        source_row_sub_id: Option<i64>,
     },
 }
 
@@ -172,7 +173,11 @@ impl SourceTransaction {
                 SourceChange::Delete {
                     input_sequence,
                     source_row_id,
-                } => (input_sequence.get(), Some((*source_row_id, None))),
+                    source_row_sub_id,
+                } => (
+                    input_sequence.get(),
+                    Some((*source_row_id, *source_row_sub_id)),
+                ),
             };
             validate_coordinate("input_sequence", sequence)?;
             if !sequences.insert(sequence) {

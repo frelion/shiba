@@ -56,9 +56,13 @@ M5.2 admits a present text-format replacement on that same UPDATE path. A real
 default-EXTENDED, out-of-line and uncompressed payload is replaced exactly;
 row state, unchanged count/result, and continuation still commit together.
 
+M5.3 extends the already admitted two-int8 primary-key shape through DELETE.
+Both key components identify one current-state row; deleting one pair leaves a
+row sharing key1 untouched and atomically decrements count/result.
+
 **Not proved.** M5.1 has no production replication transport/slot lifecycle,
-admission for `D + O` or replica identity `FULL`, composite DELETE,
-key-changing UPDATE, UPDATE old tuples, NULL text, binary payloads, TOAST keys,
+admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
+UPDATE old tuples, NULL text, binary payloads, TOAST keys,
 streaming transaction, slot-generation change, multiple
 sources, DDL invalidation, external effect, compatibility path, alias, fallback,
 or dual write.

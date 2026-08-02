@@ -178,12 +178,16 @@ fn apply_changes(
                     return Err(M2Error::MissingSourceRow);
                 }
             }
-            SourceChange::Delete { source_row_id, .. } => {
+            SourceChange::Delete {
+                source_row_id,
+                source_row_sub_id,
+                ..
+            } => {
                 let changed = transaction.execute(
                     "DELETE FROM shiba_internal.applied_insert
                      WHERE source_id = $1 AND source_row_id = $2
-                       AND source_row_sub_id IS NULL",
-                    &[&source_id, source_row_id],
+                       AND source_row_sub_id IS NOT DISTINCT FROM $3",
+                    &[&source_id, source_row_id, source_row_sub_id],
                 )?;
                 if changed != 1 {
                     return Err(M2Error::MissingSourceRow);

@@ -9,7 +9,7 @@ pub(crate) enum DecodedChange {
     RowInsert(i64, SourcePayload),
     CompositeInsert(i64, i64),
     Update(i64, SourceUpdatePayload),
-    Delete(i64),
+    Delete(i64, Option<i64>),
 }
 
 pub(crate) fn decode_insert(
@@ -75,11 +75,20 @@ pub(crate) fn decode_delete(
     cursor: &mut Cursor<'_>,
     source: PgoutputSource,
 ) -> Result<DecodedChange, PgoutputError> {
-    if source.shape != SourceShape::KeyOnly {
-        return Err(PgoutputError::TupleShape);
+    match source.shape {
+        SourceShape::KeyOnly => {
+            tuple_header(cursor, source, b'K', 1)?;
+            Ok(DecodedChange::Delete(decode_int8(cursor)?, None))
+        }
+        SourceShape::CompositeInt8 => {
+            tuple_header(cursor, source, b'K', 2)?;
+            Ok(DecodedChange::Delete(
+                decode_int8(cursor)?,
+                Some(decode_int8(cursor)?),
+            ))
+        }
+        _ => Err(PgoutputError::TupleShape),
     }
-    tuple_header(cursor, source, b'K', 1)?;
-    Ok(DecodedChange::Delete(decode_int8(cursor)?))
 }
 
 fn tuple_header(
