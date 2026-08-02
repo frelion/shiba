@@ -52,6 +52,11 @@ identity remains transaction plus input sequence, so multiple empty rows in one
 transaction are distinct without a synthetic key. The existing Apply table and
 writer remain unchanged; keyed paths continue to require a non-null key.
 
+M4.3 stores a fixed second `int8` key component in the same Apply fact. A
+partial `NULLS NOT DISTINCT` unique index covers only keyed rows, preserving
+single-key uniqueness, composite-pair uniqueness, and multiple cause-identified
+empty rows. The processor is still the sole writer and transaction owner.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -60,6 +65,6 @@ No later code may use an old authority as a fallback. An implementation is
 accepted only after its clean-room tests prove its new contract; legacy tests are
 evidence inputs, not implementation dependencies.
 
-**Unproved:** production replication transport and slot ownership, composite
-identity, UPDATE/DELETE, TOAST, catalog binding inspection,
+**Unproved:** production replication transport and slot ownership,
+UPDATE/DELETE, replica-identity changes, TOAST, catalog binding inspection,
 concurrency, generation changes, general operators, and recovery workers remain.

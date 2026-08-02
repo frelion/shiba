@@ -55,7 +55,7 @@ if errors:
     raise SystemExit("\n".join(errors))
 PY
 
-# Keep the accepted M4.2 production budget executable rather than aspirational.
+# Keep the accepted M4.3 production budget executable rather than aspirational.
 python3 - <<'PY'
 import pathlib
 
@@ -63,15 +63,15 @@ runtime_files = sorted(pathlib.Path("crates/shiba-runtime/src").glob("*.rs"))
 line_counts = {path: len(path.read_text().splitlines()) for path in runtime_files}
 too_large = [f"{path}: {count}" for path, count in line_counts.items() if count > 250]
 if too_large:
-    raise SystemExit("M4.2 production file exceeds 250 lines: " + ", ".join(too_large))
+    raise SystemExit("M4.3 production file exceeds 250 lines: " + ", ".join(too_large))
 if sum(line_counts.values()) > 700:
-    raise SystemExit("M4.2 Runtime production code exceeds its 700-line hard limit")
+    raise SystemExit("M4.3 Runtime production code exceeds its 700-line hard limit")
 sql_counts = {
     path: len(path.read_text().splitlines()) for path in pathlib.Path("sql/v2").glob("*.sql")
 }
 too_large_sql = [f"{path}: {count}" for path, count in sql_counts.items() if count > 150]
 if too_large_sql:
-    raise SystemExit("M4.2 SQL file exceeds 150 lines: " + ", ".join(too_large_sql))
+    raise SystemExit("M4.3 SQL file exceeds 150 lines: " + ", ".join(too_large_sql))
 PY
 
 # No production SQL may smuggle in an old authority or dynamic workflow.
@@ -152,7 +152,7 @@ manifest = pathlib.Path("docs/contracts/REUSE_MANIFEST.md").read_text()
 header = "| 成果 | 来源 | 分类A/B/C | 复用方式 | 证据 | 未证明边界 |"
 if header not in manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks the required audit-table header")
-for required in ("Protocol JSON/schema", "canonical digest", "PG17/18", "Phase 1", "M3.1", "M3.2", "M4.1", "M4.2"):
+for required in ("Protocol JSON/schema", "canonical digest", "PG17/18", "Phase 1", "M3.1", "M3.2", "M4.1", "M4.2", "M4.3"):
     if required not in manifest:
         raise SystemExit(f"REUSE_MANIFEST.md lacks required Phase-1 contract: {required}")
 PY

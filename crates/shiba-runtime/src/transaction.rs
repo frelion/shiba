@@ -15,6 +15,7 @@ pub enum SourcePayload {
 pub struct SourceInsert {
     pub input_sequence: InputSequence,
     pub source_row_id: Option<i64>,
+    pub source_row_sub_id: Option<i64>,
     pub source_payload: SourcePayload,
 }
 
@@ -24,6 +25,7 @@ impl SourceInsert {
         Self {
             input_sequence,
             source_row_id: Some(source_row_id),
+            source_row_sub_id: None,
             source_payload: SourcePayload::Absent,
         }
     }
@@ -37,6 +39,7 @@ impl SourceInsert {
         Self {
             input_sequence,
             source_row_id: Some(source_row_id),
+            source_row_sub_id: None,
             source_payload,
         }
     }
@@ -46,6 +49,17 @@ impl SourceInsert {
         Self {
             input_sequence,
             source_row_id: None,
+            source_row_sub_id: None,
+            source_payload: SourcePayload::Absent,
+        }
+    }
+
+    #[must_use]
+    pub const fn composite(input_sequence: InputSequence, first: i64, second: i64) -> Self {
+        Self {
+            input_sequence,
+            source_row_id: Some(first),
+            source_row_sub_id: Some(second),
             source_payload: SourcePayload::Absent,
         }
     }
@@ -84,7 +98,7 @@ impl SourceTransaction {
                 return Err(M2Error::DuplicateInputSequence(sequence));
             }
             if let Some(source_row_id) = insert.source_row_id
-                && !rows.insert(source_row_id)
+                && !rows.insert((source_row_id, insert.source_row_sub_id))
             {
                 return Err(M2Error::DuplicateSourceRow(source_row_id));
             }

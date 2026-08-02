@@ -7,6 +7,7 @@ with a strict decoder fed by live PostgreSQL `pgoutput` version 1. M3.2 proves
 safe slot replay across the post-result/pre-ack crash window. M4.1 adds a fixed
 nullable `int8` payload while retaining the stable non-null `int8` row key.
 M4.2 admits zero-column INSERT tuples without inventing a row identity.
+M4.3 adds a fixed two-`int8` composite row identity.
 
 ## Scope decision
 
@@ -28,8 +29,8 @@ M3.1 decodes a complete live `BEGIN → RELATION → INSERT+ → COMMIT` transac
 for one admitted `int8` relation before invoking the unchanged M2 processor.
 Decode failures therefore cannot expose Apply, result, or continuation state.
 
-**Not proved.** M4.2 has no production replication transport/slot lifecycle,
-composite identity, UPDATE/DELETE, TOAST, streaming transaction,
+**Not proved.** M4.3 has no production replication transport/slot lifecycle,
+UPDATE/DELETE, replica-identity changes, TOAST, streaming transaction,
 DDL invalidation, concurrent source, external effect, compatibility path,
 alias, fallback, or dual write.
 

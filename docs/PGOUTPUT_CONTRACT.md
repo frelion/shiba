@@ -43,6 +43,13 @@ tuple. Each INSERT becomes a cause-scoped `SourceInsert::empty`; any advertised
 or encoded column fails closed. No synthetic key is derived from names, order,
 or WAL position.
 
+## M4.3 composite identity extension
+
+`PgoutputSource::composite_int8` admits exactly two built-in `int8` key columns.
+Both tuple values must be canonical text and non-NULL; the decoder returns one
+two-part row identity. This mode is explicit and cannot be confused with the
+same-width nullable-payload mode.
+
 ## M3.2 acknowledgement crash point
 
 The recovery gate deliberately separates database visibility from replication
@@ -65,6 +72,6 @@ before the production decoder sees the bytes.
 M3.1 proves live decoding and clean capture restart. M3.2 proves the abnormal
 post-result/pre-ack crash window on PG17 and PG18 using the slot's own
 `confirmed_flush_lsn`. Production transport and slot lifecycle remain unproved;
-they cannot introduce another continuation or writer. M4.1/M4.2 prove nullable
-payload and empty INSERT shapes; composite identity, UPDATE/DELETE, TOAST, and
-streaming remain out of scope.
+they cannot introduce another continuation or writer. M4.1–M4.3 prove nullable,
+empty, and fixed composite INSERT shapes; UPDATE/DELETE, TOAST, and streaming
+remain out of scope.

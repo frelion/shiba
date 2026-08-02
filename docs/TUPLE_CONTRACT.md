@@ -1,13 +1,14 @@
 # Tuple contract
 
-## Admitted shapes through M4.2
+## Admitted shapes through M4.3
 
-M4 accepts exactly three INSERT relation shapes:
+M4 accepts exactly four INSERT relation shapes:
 
 ```text
 ()
 (key int8 NOT NULL)
 (key int8 NOT NULL, payload int8 NULL)
+(key1 int8 NOT NULL, key2 int8 NOT NULL)
 ```
 
 Both columns must be advertised as built-in `int8`. The key must use canonical
@@ -27,6 +28,8 @@ transaction identity and input sequence of its INSERT cause.
 For an empty tuple, `source_row_id` is NULL and payload is `Absent`. Multiple
 empty rows remain distinct through the Apply fact's cause primary key; no
 synthetic row identity is created.
+For a composite identity, `source_row_id` and `source_row_sub_id` store the two
+components. Keyed-row uniqueness covers the pair; empty tuples are excluded.
 
 The M2 processor remains the only writer and transaction owner. Payload Apply,
 count operator state, public result, and continuation commit or roll back
@@ -35,5 +38,6 @@ payload.
 
 ## Deferred boundary
 
-Composite identity, UPDATE, DELETE, replica identity selection, TOAST, binary
-transfer, and schema drift are not admitted through M4.2.
+UPDATE, DELETE, replica identity changes, TOAST, binary transfer, and schema
+drift are not admitted through M4.3. Composite identities beyond two built-in
+`int8` columns are also excluded.

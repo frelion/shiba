@@ -1,80 +1,19 @@
 use core::fmt;
 
-use shiba_protocol::{
-    IngressTransactionId, InputSequence, PostgresLsn, SlotGeneration, SourceId, SourceTransactionId,
-};
+use shiba_protocol::{IngressTransactionId, InputSequence, PostgresLsn, SourceTransactionId};
 
-use crate::{SourceInsert, SourcePayload, SourceTransaction, pgoutput_wire::Cursor};
+use crate::{
+    SourceInsert, SourcePayload, SourceTransaction,
+    pgoutput_source::{PgoutputSource, SourceShape},
+    pgoutput_wire::Cursor,
+};
 
 const INT8_OID: u32 = 20;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PgoutputSource {
-    source_id: SourceId,
-    slot_generation: SlotGeneration,
-    relation_id: u32,
-    shape: SourceShape,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SourceShape {
+enum DecodedInsert {
     Empty,
-    KeyOnly,
-    NullableInt8Payload,
-}
-
-impl SourceShape {
-    const fn columns(self) -> u16 {
-        match self {
-            Self::Empty => 0,
-            Self::KeyOnly => 1,
-            Self::NullableInt8Payload => 2,
-        }
-    }
-}
-
-impl PgoutputSource {
-    #[must_use]
-    pub const fn empty(
-        source_id: SourceId,
-        slot_generation: SlotGeneration,
-        relation_id: u32,
-    ) -> Self {
-        Self {
-            source_id,
-            slot_generation,
-            relation_id,
-            shape: SourceShape::Empty,
-        }
-    }
-
-    #[must_use]
-    pub const fn new(
-        source_id: SourceId,
-        slot_generation: SlotGeneration,
-        relation_id: u32,
-    ) -> Self {
-        Self {
-            source_id,
-            slot_generation,
-            relation_id,
-            shape: SourceShape::KeyOnly,
-        }
-    }
-
-    #[must_use]
-    pub const fn with_nullable_int8_payload(
-        source_id: SourceId,
-        slot_generation: SlotGeneration,
-        relation_id: u32,
-    ) -> Self {
-        Self {
-            source_id,
-            slot_generation,
-            relation_id,
-            shape: SourceShape::NullableInt8Payload,
-        }
-    }
+    Row(i64, SourcePayload),
+    Composite(i64, i64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,7 +54,7 @@ impl std::error::Error for PgoutputError {}
 /// Decodes one complete, non-streaming pgoutput protocol-v1 transaction.
 ///
 /// # Errors
-/// Returns [`PgoutputError`] unless it has an exact admitted M4.2 shape.
+/// Returns [`PgoutputError`] unless it has an exact admitted M4.3 shape.
 pub fn decode_committed_insert(
     input: &[u8],
     source: PgoutputSource,
@@ -175,9 +114,12 @@ pub fn decode_committed_insert(
                 .and_then(|value| InputSequence::new(value).ok())
                 .ok_or(PgoutputError::InvalidIdentity)?;
             Ok(match row {
-                None => SourceInsert::empty(sequence),
-                Some((source_row_id, payload)) => {
+                DecodedInsert::Empty => SourceInsert::empty(sequence),
+                DecodedInsert::Row(source_row_id, payload) => {
                     SourceInsert::with_payload(sequence, source_row_id, payload)
+                }
+                DecodedInsert::Composite(key1, key2) => {
+                    SourceInsert::composite(sequence, key1, key2)
                 }
             })
         })
@@ -211,7 +153,7 @@ fn decode_relation(cursor: &mut Cursor<'_>, source: PgoutputSource) -> Result<()
 fn decode_insert(
     cursor: &mut Cursor<'_>,
     source: PgoutputSource,
-) -> Result<Option<(i64, SourcePayload)>, PgoutputError> {
+) -> Result<DecodedInsert, PgoutputError> {
     if cursor.u32()? != source.relation_id {
         return Err(PgoutputError::RelationMismatch);
     }
@@ -219,20 +161,28 @@ fn decode_insert(
     if cursor.byte()? != b'N' || cursor.u16()? != columns {
         return Err(PgoutputError::TupleShape);
     }
-    if source.shape == SourceShape::Empty {
-        return Ok(None);
+    match source.shape {
+        SourceShape::Empty => Ok(DecodedInsert::Empty),
+        SourceShape::KeyOnly => Ok(DecodedInsert::Row(
+            decode_int8(cursor)?,
+            SourcePayload::Absent,
+        )),
+        SourceShape::NullableInt8Payload => {
+            let key = decode_int8(cursor)?;
+            match cursor.byte()? {
+                b'n' => Ok(DecodedInsert::Row(key, SourcePayload::Null)),
+                b't' => Ok(DecodedInsert::Row(
+                    key,
+                    SourcePayload::Int8(cursor.int8_text()?),
+                )),
+                tag => Err(PgoutputError::TupleTag(tag)),
+            }
+        }
+        SourceShape::CompositeInt8 => Ok(DecodedInsert::Composite(
+            decode_int8(cursor)?,
+            decode_int8(cursor)?,
+        )),
     }
-    let source_row_id = decode_int8(cursor)?;
-    let payload = match source.shape {
-        SourceShape::Empty => return Err(PgoutputError::TupleShape),
-        SourceShape::KeyOnly => SourcePayload::Absent,
-        SourceShape::NullableInt8Payload => match cursor.byte()? {
-            b'n' => SourcePayload::Null,
-            b't' => SourcePayload::Int8(cursor.int8_text()?),
-            tag => return Err(PgoutputError::TupleTag(tag)),
-        },
-    };
-    Ok(Some((source_row_id, payload)))
 }
 
 fn decode_int8(cursor: &mut Cursor<'_>) -> Result<i64, PgoutputError> {

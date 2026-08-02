@@ -54,3 +54,7 @@ M4.2 empty rows use the same cause primary key as keyed rows. Allowing a NULL
 `source_row_id` does not weaken replay identity: exact replay is still decided
 by committed transaction identity, and all empty Apply facts roll back with the
 operator, result, and continuation.
+
+M4.3 composite uniqueness is checked by PostgreSQL inside the processor-owned
+transaction. A conflicting pair rolls back every fact; exact transaction replay
+still short-circuits at continuation before any key write.

@@ -85,8 +85,8 @@ fn process_in_transaction(
             "INSERT INTO shiba_internal.applied_insert (
                  source_id, slot_generation, commit_lsn,
                  ingress_transaction_id, input_sequence, source_row_id,
-                 payload_present, payload_int8
-             ) VALUES ($1, $2, $3::text::pg_lsn, $4, $5, $6, $7, $8)",
+                 source_row_sub_id, payload_present, payload_int8
+             ) VALUES ($1, $2, $3::text::pg_lsn, $4, $5, $6, $7, $8, $9)",
             &[
                 &source_id,
                 &generation,
@@ -94,6 +94,7 @@ fn process_in_transaction(
                 &ingress_id,
                 &sequence,
                 &insert.source_row_id,
+                &insert.source_row_sub_id,
                 &payload_present,
                 &payload_int8,
             ],

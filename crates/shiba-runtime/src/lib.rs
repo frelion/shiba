@@ -6,11 +6,13 @@
 mod count;
 mod error;
 mod pgoutput;
+mod pgoutput_source;
 mod pgoutput_wire;
 mod processor;
 mod transaction;
 
 pub use error::M2Error;
-pub use pgoutput::{PgoutputError, PgoutputSource, decode_committed_insert};
+pub use pgoutput::{PgoutputError, decode_committed_insert};
+pub use pgoutput_source::PgoutputSource;
 pub use processor::{ProcessOutcome, process};
 pub use transaction::{SourceInsert, SourcePayload, SourceTransaction};
