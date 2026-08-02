@@ -161,3 +161,8 @@ preserves the historical no-lock path; a second probe after the mutex closes the
 concurrent duplicate race. Continuation ordering and fixed generation are
 source-local, while row changes and the global aggregate still commit together.
 A backend crash on source 2 leaves source 1 and the aggregate at their old values.
+
+M8.2 starts two exact duplicate calls before either commits. The second waits on
+the source mutex, then the post-lock replay probe returns `AlreadyApplied`; no
+duplicate row, count, result, or continuation is written. A transaction for a
+different source commits while source 1 is paused, proving recovery isolation.

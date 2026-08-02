@@ -150,6 +150,11 @@ lock, probes replay again, then validates DDL and source-local continuation
 order. `count_state` and `count_result` remain one global aggregate over the
 union of admitted sources and are still written in the same processor transaction.
 
+M8.2 adds no production component. Database wait events prove same-source work
+queues on the binding-row mutex and is resolved by the post-lock replay probe;
+a different source has a different mutex and can progress to the global count
+transaction independently.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction

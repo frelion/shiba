@@ -137,6 +137,10 @@ and publications. It proves source-local continuation/replay, the shared union
 count/result, source-2 crash isolation and retry, and generation mismatch
 rollback on PostgreSQL 17 and 18.
 
+`test-m8-concurrent-sources.sh` uses real captures, wait-event polling, and
+bounded channel receives to prove one-Apply duplicate CAS and independent
+source progress with exact global/per-source state on PostgreSQL 17 and 18.
+
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and
 requires real matching `A`. After abort feedback it restarts the same slot and

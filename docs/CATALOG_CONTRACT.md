@@ -61,6 +61,10 @@ also the source-local processor mutex; registration and DDL invalidation writers
 do not change. The count/result singleton is a global union aggregate, not a
 second per-source authority.
 
+M8.2 changes no catalog contract. The deterministic concurrency gate proves
+each relation-kind row serializes only its owning source while the singleton
+count/result remains the one aggregate commit point.
+
 ## M2 execution facts
 
 The extension installs exactly four M2 tables. Three private tables own applied

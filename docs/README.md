@@ -107,6 +107,11 @@ the existing singleton count state and public result intentionally count the
 union of all admitted source rows. A crash in one source transaction rolls back
 only that transaction and the shared aggregate update.
 
+M8.2 proves the mutex/CAS behavior under real concurrency. Two calls for one
+source transaction yield exactly one Apply and one replay no-op; while source 1
+is paused after its mutex, source 2 can commit independently and publish the
+correct union result.
+
 **Not proved.** M7 has no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
