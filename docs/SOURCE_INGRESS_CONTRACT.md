@@ -326,8 +326,7 @@ activate public `3/25` only at the exact fence, and then reach `4/32` through an
 ordinary M10 live transaction. Slot feedback covers the durable catch-up and
 live terminals; snapshot batches create no continuation.
 
-M11.3 recovery is described below. M11.4 million-row memory/performance remains
-unproved, so M11 is incomplete and M12 binding rebuild remains untouched.
+M11.3 recovery is described below; M11.4 bounded production evidence follows.
 
 ## M11.3 recovery ingress
 
@@ -356,5 +355,24 @@ same-slot resume across immediate PostgreSQL restart, killed feedback after
 catch-up Apply and after active cutover, exact-fence replay, and a no-op restart
 once feedback covers the active terminal. Final SQL differential is `4/50`.
 The gate does not directly kill at the reservation instruction or exercise an
-active foreign old-slot conflict. M11.4 remains the million-row boundedness/
-performance slice.
+active foreign old-slot conflict.
+
+## M11.4 bounded bootstrap ingress
+
+The frozen gate admits one million snapshot rows in exactly 100 batches of at
+most 10,000 and one exact concurrent 10,000-change WAL transaction. It retains
+three scan connections, synchronous batches, direct M10 catch-up backpressure,
+and no channel or queue. Pre-observation limits are scan <=120 s and >=10,000
+rows/s, catch-up+activation <=15 s, and Rust RSS growth <=256 MiB.
+
+PG17.10 records 3.098397625 s / 322,747.47 rows/s, 1.320857542 s catch-up, and
+10,160→13,824 KiB RSS (+3,664). PG18.4 records 3.136067542 s /
+318,870.68 rows/s, 1.329330584 s, and 10,160→13,824 KiB (+3,664). Both pass the SQL differential
+after concurrent UPDATE/DELETE/INSERT and the ordinary M10 live handoff.
+
+Operators should budget exactly three connections while scanning and two after
+handoff, never expose `building`, and choose recovery by phase: exact
+slot cleanup/replacement only before `scan_complete`; same-slot reattach at or
+after it. M11 is complete at this declared source shape, but indefinite
+concurrent-writer catch-up, tail latency, reconnect supervision, and M12 remain
+outside the evidence.

@@ -313,8 +313,19 @@ SQL differential `4/50`. It reconstructs the durable creating/slot-absent crash
 state rather than killing at that exact instruction; an active foreign old-slot
 conflict is not directly exercised.
 
-**Unproved:** M11.4 million-row
-boundedness/heap/performance,
+M11.4 closes the declared boundedness gate with one million snapshot rows in
+100 synchronous 10,000-row batches and one concurrent 10,000-change WAL
+transaction. PG17/PG18 scan+Apply are 3.098397625/3.136067542 s
+(322,747.47/318,870.68 rows/s), catch-up+activation are
+1.320857542/1.329330584 s, and observed Rust RSS growth is 3,664/3,664 KiB.
+Both retain the three-connection scan budget, no queue, SQL differential, and
+ordinary live handoff. The frozen limits were 120 s, 10,000 rows/s minimum,
+15 s catch-up, and 256 MiB RSS growth.
+
+M11 is complete at its declared pristine nullable-int8 CountRows/SumInt8
+initialization boundary, not a complete V2.
+
+**Unproved:** indefinite concurrent-writer catch-up and tail latency,
 network/TLS behavior, shutdown during Apply, reconnect daemon/
 backoff policy, allocator/RSS peaks, cross-host soak, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old

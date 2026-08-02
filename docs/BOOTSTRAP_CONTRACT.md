@@ -212,7 +212,29 @@ CountRows/SumInt8 equal the SQL differential `4/50`.
 
 The test does not kill the process at the exact reservation instruction; it
 reconstructs the identical committed authority state. An active foreign old-
-slot conflict is not directly exercised. M11.4 must
-prove the frozen million-row throughput, catch-up latency, bounded heap, and
-concurrent-write performance gates. M11 is not complete, and M12 remains
-untouched.
+slot conflict is not directly exercised.
+
+M11.4 is green on PG17.10 and PG18.4 with limits frozen before measurement:
+1,000,000 snapshot rows in batches of at most 10,000, scan within 120 seconds
+and at least 10,000 rows/s, one exact 10,000-change concurrent WAL transaction
+plus activation within 15 seconds, Rust RSS growth at most 256 MiB, exactly
+three scan connections, and synchronous delivery with no queue. PG17 scans and
+applies 100 batches in 3.098397625 s (322,747.47 rows/s), catches up and
+activates in 1.320857542 s, and grows RSS from 10,160 to 13,824 KiB
+(+3,664 KiB). PG18 takes 3.136067542 s (318,870.68 rows/s), 1.329330584 s, and
+10,160 to 13,824 KiB (+3,664 KiB). SQL differential and ordinary M10 live
+handoff remain exact.
+
+Operationally, start bootstrap only for a pristine source with an absent exact
+slot and valid publication binding. Treat `building` as unavailable. Monitor
+phase, committed batch ordinal and the PostgreSQL slot independently; never
+edit a checkpoint or infer ownership from a name. Before `scan_complete`, use
+the explicit exact replacement operation after slot cleanup. At or after
+`scan_complete`, retain the same slot and resume. Enter ordinary live ingress
+only after active cutover and terminal feedback. Budget three connections per
+scanning source and no more than one 10,000-row batch or one M10 transaction in
+memory.
+
+M11 is complete at this pristine nullable-int8 CountRows/SumInt8 boundary. It
+does not complete V2, start M12, prove indefinite concurrent-writer catch-up or
+tail latency, or provide a reconnect supervisor.

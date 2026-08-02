@@ -427,6 +427,11 @@ CountRows and SumInt8 match the SQL oracle `4/50`. The gate reconstructs rather
 than instruction-level kills the post-reservation durable state and does not
 directly exercise an active foreign old-slot conflict.
 
-M11.4 still owns the
-million-row bounded-memory and performance proof. M11 remains incomplete; M12
-active/non-pristine rebuild is untouched.
+M11.4 proves the bounded recovery path on PG17.10 and PG18.4 with 1,000,000
+rows, 100 batches of 10,000, one concurrent 10,000-change WAL transaction,
+exact SQL differential, and live handoff. Scan+Apply take
+3.098397625/3.136067542 s, catch-up+activation 1.320857542/1.329330584 s, and
+Rust RSS grows 3,664/3,664 KiB. These pass the pre-observation 120 s, 10,000 rows/s,
+15 s and 256 MiB limits. M11 is complete at this declared recovery boundary;
+indefinitely sustained writers/tail latency, reconnect supervision, the two
+narrow M11.3 injection gaps above, and M12 active/non-pristine rebuild remain.

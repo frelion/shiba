@@ -394,9 +394,9 @@ Conversion to ordinary M10 then applies `(5,7)`, acknowledges its terminal, and
 must yield exact `4/32`, four rows, and two WAL continuations without duplicate
 snapshot contribution.
 
-This production gate is green on PG17.10 and PG18.4. It is not the M11.3 crash
-matrix or M11.4 million-row performance gate; M11 remains incomplete and M12 is
-untouched.
+This production gate is green on PG17.10 and PG18.4. It is distinct from the
+M11.3 crash matrix and M11.4 million-row performance gate documented below;
+those later gates complete M11 without entering M12.
 
 ## M11.3 recovery gate
 
@@ -433,9 +433,22 @@ an audit stop, not a target. A production file warns above 300 and fails above
 400. SQL files remain at most 150 lines. Warnings cannot fail CI, while hard
 limits do; no threshold justifies compacting code or deleting recovery tests.
 
-M11.4 must freeze its million-row throughput, catch-up latency and heap bounds
-before measuring them. Until that gate is implemented and green, M11 remains
-incomplete.
+## M11.4 bounded performance gate
+
+Run `scripts/test-m11-bootstrap-performance.sh` independently for PG17 and
+PG18. The test freezes its limits before observation: 1,000,000 snapshot rows,
+10,000 rows per batch, scan <=120 s and >=10,000 rows/s, one exact 10,000-change
+concurrent WAL transaction plus activation <=15 s, Rust RSS growth <=256 MiB,
+three bootstrap connections, synchronous delivery, and no queue.
+
+PG17.10 passes with 100 batches in 3.098397625 s (322,747.47 rows/s), catch-up
+in 1.320857542 s, and RSS 10,160→13,824 KiB (+3,664). PG18.4 passes in
+3.136067542 s (318,870.68 rows/s), 1.329330584 s, and 10,160→13,824 KiB
+(+3,664).
+Both prove SQL differential after concurrent UPDATE/DELETE/INSERT and ordinary
+M10 live handoff. M11 is complete at this declared boundary. This local bounded
+gate is not evidence for indefinitely sustained writers, contention tail
+latency, reconnect supervision, cross-host soak, or M12.
 
 ## Evidence handling
 

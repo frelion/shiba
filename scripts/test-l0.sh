@@ -204,6 +204,7 @@ scripts = [
         "m10-catalog-ingress", "m10-governed-ingress",
         "m10-performance-ingress", "m10-shutdown-ingress",
         "m11-bootstrap-contract", "m11-bootstrap", "m11-recovery",
+        "m11-bootstrap-performance",
     )
 ]
 for path in scripts:
@@ -239,8 +240,9 @@ readme = pathlib.Path("docs/README.md").read_text()
 if "BOOTSTRAP_CONTRACT.md" not in readme or "0002-m11-consistent-bootstrap.md" not in readme:
     raise SystemExit("docs README must link the M11.1 contract and ADR")
 manifest = pathlib.Path("docs/contracts/REUSE_MANIFEST.md").read_text()
-if "M11.1" not in manifest or "M11.2" not in manifest:
-    raise SystemExit("REUSE_MANIFEST must record M11.1 and M11.2 evidence")
+for milestone in ("M11.1", "M11.2", "M11.3", "M11.4"):
+    if milestone not in manifest:
+        raise SystemExit(f"REUSE_MANIFEST must record {milestone} evidence")
 PY
 
 # No production SQL may smuggle in an old authority or dynamic workflow.

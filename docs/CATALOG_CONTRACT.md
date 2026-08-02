@@ -138,8 +138,11 @@ it binds the exact source, slot generation and name, immutable
 the ephemeral `snapshot_name` nor dynamic slot progress and is not a second WAL
 cursor, continuation, row log, or EffectStream.
 
-The bootstrap coordinator is its sole writer. Runtime remains the only writer
-of current source rows and operator state/result. A batch's row/operator writes
+The bootstrap coordinator is its sole lifecycle writer. The least-privilege
+Apply role has `SELECT` and `UPDATE` on this private table because live operator
+execution takes `FOR UPDATE` on the phase to serialize with active cutover;
+PUBLIC still has no privilege. Runtime remains the only writer of current
+source rows and operator state/result. A batch's row/operator writes
 and checkpoint advance share one transaction. Public results must represent
 building/unavailable as `result_status = building, value_bigint = NULL`;
 complete values require `result_status = active` and become visible with active
@@ -159,8 +162,9 @@ key, immutable consistent point, latest batch ordinal/key/digest, unique writer
 fence token, and catch-up fence LSN. It stores no snapshot name, WAL payload, or
 moving slot cursor. PG17/18 prove initial reservation, building visibility, two
 bounded batch checkpoints, fence activation, WAL-only continuation, and
-ordinary live handoff. M11.3 recovery is described below; M11.4 million-row
-performance remains unproved, so M11 and M12 are not complete.
+ordinary live handoff. M11.3 recovery is described below. M11.4 adds no catalog
+authority and proves that the same checkpoint/result schema remains bounded at
+one million rows; M11 is complete at its declared boundary, while M12 is not.
 
 ## M11.3 pristine attempt replacement writer
 
@@ -191,3 +195,10 @@ rollback, advisory competition, same-slot restart/catch-up, and active-before-
 feedback exact-fence replay. The creating/slot-absent crash state is
 reconstructed durably rather than reached by an instruction-level process kill;
 an active foreign old-slot conflict is not directly tested.
+
+M11.4 performs 100 atomic 10,000-row checkpoint advances, one real 10,000-
+change WAL continuation, exact fence activation, and live handoff without a
+batch table, moving LSN mirror, or additional writer. Operators must inspect
+`result_status`, not a partial numeric value, and must never repair lifecycle by
+manual catalog updates. Indefinite writer catch-up and M12 non-pristine rebuild
+remain outside this authority.

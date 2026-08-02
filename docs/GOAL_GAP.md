@@ -1,4 +1,4 @@
-# V2 goal gap after M11.3
+# V2 goal gap after M11
 
 M1–M9 are the reference correctness kernel, not a complete Shiba V2. They
 prove the transaction and recovery semantics that later architecture must
@@ -10,7 +10,7 @@ operator, effect, and sink contracts.
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
 | Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap checkpoint/lifecycle, and PG17/18-proved exact pre-scan replacement writer | M12 non-pristine rebuild lifecycle |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
-| Source Ingress | M10 production COPY BOTH plus M11.2 snapshot/live handoff and M11.3 PG17/18 pre-scan replacement/same-slot recovery | M11.4 scale/performance, TLS/disconnect policy, Apply-time shutdown, reconnect/backoff and cross-host soak |
+| Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
 | Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
 | EffectStream | Non-durable transaction-local EffectBatch | Persisted effects intentionally absent |
 | Runtime | Replay/recovery plus ordered registered-operator execution integrated with M10 ingress | Broader operators and production orchestration |
@@ -49,8 +49,13 @@ continuation on PG17.10 and PG18.4. The matrix covers partial reset/replay/
 rollback, worker competition, immediate PostgreSQL restart, killed ACK windows,
 exact-fence replay, feedback-covered restart and SQL differential `4/50`.
 Instruction-level kill at reservation and an active foreign old-slot conflict
-remain narrower unproved cases. M11.4
-million-row throughput, catch-up latency and heap bounds remain unproved. M11 is
+remain narrower unproved cases. M11.4 proves one million rows in 100 bounded
+10,000-row batches: PG17/PG18 scan+Apply are
+3.098397625/3.136067542 s (322,747.47/318,870.68 rows/s), catch-up+activation are
+1.320857542/1.329330584 s, and RSS growth is 3,664/3,664 KiB against thresholds
+frozen before observation. SQL differential and live handoff are green.
+
+M11 is complete at its pristine nullable-int8 CountRows/SumInt8 scope. V2 is
 not complete, and active/non-pristine rebuild remains untouched M12 scope.
 
 M10.3 deliberately does not add persisted partial-stream recovery: partial
