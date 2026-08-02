@@ -131,6 +131,19 @@ therefore rejected as relation drift before a `SourceTransaction` or durable
 write exists. M5.4 does not add persistent source binding, general identity
 configuration, composite replica indexes, `FULL`, `NOTHING`, or `D + O`.
 
+## M5.5 name-independent source binding
+
+The existing `PgoutputSource` binding uses source ID, slot generation, relation
+OID, frozen shape, and expected replica identity. RELATION schema, table, and
+column names are parsed only for framing; renaming them does not change
+admission while PostgreSQL preserves the relation OID.
+
+Dropping and recreating the same qualified table name produces a different
+relation OID. A decoder holding the original binding rejects that transaction
+as `RelationMismatch` before constructing a `SourceTransaction`. M5.5 adds no
+durable registry or discovery scan; binding creation/lifecycle and M7
+ObjectAddress invalidation remain separate contracts.
+
 ## M3.2 acknowledgement crash point
 
 The recovery gate deliberately separates database visibility from replication
@@ -168,3 +181,5 @@ of scope. M5.3 additionally proves exact composite `D + K`, pair isolation,
 missing-row rollback, crash/retry, and replay. M5.4 proves explicit
 single-column replica-index admission, atomic INSERT/DELETE recovery, and live
 default-identity drift rejection without adding a catalog authority.
+M5.5 proves relation and column names are not identity, while same-name
+drop/recreate OID drift fails before writes or continuation advancement.

@@ -100,6 +100,12 @@ from expected `d` to expected `i`; tuple decoding, the current-state authority,
 sole writer, and transaction owner remain unchanged. This configuration is not
 a durable catalog binding and cannot silently accept identity drift.
 
+M5.5 adds no production state. It proves that the existing admitted-source
+configuration is an OID binding rather than a name lookup: table/column rename
+preserves admission, while same-name drop/recreate changes the OID and fails
+before the processor owns a transaction. Registration, discovery, and DDL
+observation are not introduced.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction

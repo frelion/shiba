@@ -108,3 +108,9 @@ same row/count/result/continuation transaction, including crash rollback, retry
 once, and exact replay. A RELATION carrying default identity after live drift
 fails in the pure decoder, so no processor transaction opens and the prior
 continuation remains authoritative.
+
+M5.5 also changes no transaction owner. Rename transactions affect only the
+source catalog and a later admitted INSERT commits through the existing Apply
+path. After same-name drop/recreate, relation-OID mismatch fails during pure
+decode; row state, count/result, and continuation retain their last committed
+values. Recovery of a future durable binding registry is not claimed.

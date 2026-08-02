@@ -21,8 +21,11 @@ The extension does not perform remote calls, create replication resources, or
 hold a cross-system lock. Retrying an installation error means first ending the
 aborted transaction, then starting a complete new transaction.
 
-**Not proved:** relation binding, DDL invalidation, source catalog rows, or any
-multi-writer lifecycle. See [transaction and recovery](TRANSACTION_RECOVERY.md).
+M5.5 proves the runtime's explicit relation-OID binding behavior without adding
+a source catalog table: rename remains valid and same-name drop/recreate fails
+closed. Durable binding registration, DDL invalidation, source catalog rows,
+and any multi-writer lifecycle remain unproved. See
+[transaction and recovery](TRANSACTION_RECOVERY.md).
 
 ## M2 execution facts
 
