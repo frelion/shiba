@@ -91,7 +91,7 @@ PY
   mkdir -p "$SHIBA_TEST_SOCKET" "$SHIBA_TEST_CAPTURE"
   "$SHIBA_TEST_PG_BINDIR/initdb" -D "$SHIBA_TEST_DATA" \
     --no-locale --encoding=UTF8 --auth=trust >/dev/null
-  printf '%s\n' 'wal_level=logical' 'max_replication_slots=4' 'max_wal_senders=4' \
+  printf '%s\n' 'wal_level=logical' 'max_replication_slots=8' 'max_wal_senders=4' \
     "wal_sender_timeout=$SHIBA_TEST_WAL_SENDER_TIMEOUT" >> "$SHIBA_TEST_DATA/postgresql.conf"
   if [[ -n "${SHIBA_TEST_LOGICAL_DECODING_WORK_MEM:-}" ]]; then
     printf 'logical_decoding_work_mem=%s\n' "$SHIBA_TEST_LOGICAL_DECODING_WORK_MEM" \

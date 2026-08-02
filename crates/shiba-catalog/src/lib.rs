@@ -43,6 +43,24 @@
     requires = ["text_payload"]
 );
 
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/008_source_ingress.sql",
+    name = "source_ingress",
+    requires = ["source_invalidation"]
+);
+
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/009_source_ingress_registration.sql",
+    name = "source_ingress_registration",
+    requires = ["source_ingress"]
+);
+
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/010_source_ingress_invalidation.sql",
+    name = "source_ingress_invalidation",
+    requires = ["source_ingress_registration"]
+);
+
 #[cfg(test)]
 mod tests {
     const CATALOG_SQL: &str = include_str!("../../../sql/v2/001_catalog_identity.sql");
@@ -52,6 +70,11 @@ mod tests {
     const M4_COMPOSITE_SQL: &str = include_str!("../../../sql/v2/005_composite_insert.sql");
     const M5_TEXT_SQL: &str = include_str!("../../../sql/v2/006_text_payload.sql");
     const M7_SOURCE_SQL: &str = include_str!("../../../sql/v2/007_source_invalidation.sql");
+    const M10_INGRESS_SQL: &str = include_str!("../../../sql/v2/008_source_ingress.sql");
+    const M10_REGISTRATION_SQL: &str =
+        include_str!("../../../sql/v2/009_source_ingress_registration.sql");
+    const M10_INVALIDATION_SQL: &str =
+        include_str!("../../../sql/v2/010_source_ingress_invalidation.sql");
 
     fn normalized_sql() -> String {
         CATALOG_SQL.to_ascii_lowercase()
@@ -208,5 +231,81 @@ mod tests {
             assert!(sql.contains(kind));
         }
         assert!(!sql.contains("object_identity"));
+    }
+
+    #[test]
+    fn ingress_authority_has_one_config_and_one_exact_invalidation() {
+        let sql = M10_INGRESS_SQL.to_ascii_lowercase();
+        assert_eq!(sql.matches("create table ").count(), 2);
+        for required in [
+            "source_ingress_config",
+            "source_ingress_invalidation",
+            "publication_classid = 'pg_publication'::regclass",
+            "slot_name name not null unique",
+            "slot_generation bigint not null check (slot_generation > 0)",
+            "publication_name name not null",
+            "publication_attnums smallint[] not null",
+            "source_ingress_bound_source foreign key",
+            "source_ingress_invalidation_exact_config foreign key",
+            "slot_generation = expected_generation + 1",
+        ] {
+            assert!(
+                sql.contains(required),
+                "missing ingress contract: {required}"
+            );
+        }
+        for forbidden in [
+            "confirmed_flush_lsn",
+            "active_pid",
+            "create_replication_slot",
+        ] {
+            assert!(
+                !sql.contains(forbidden),
+                "forbidden ingress state: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn ingress_registration_freezes_exact_publication_semantics() {
+        let sql = M10_REGISTRATION_SQL.to_ascii_lowercase();
+        for required in [
+            "for update",
+            "member.prqual is null",
+            "member.prattrs::smallint[]",
+            "attribute.attnum > 0 and not attribute.attisdropped",
+            "pubinsert and pubupdate and pubdelete and not pubviaroot",
+            "slot.plugin = 'pgoutput'",
+            "not slot.temporary and not slot.active",
+        ] {
+            assert!(
+                sql.contains(required),
+                "missing registration contract: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn ingress_event_writer_detects_snapshot_drift_without_name_identity() {
+        let sql = M10_INVALIDATION_SQL.to_ascii_lowercase();
+        for required in [
+            "create or replace function shiba_internal.invalidate_source_object()",
+            "source_ingress_invalidation",
+            "publication.oid = config.publication_objid",
+            "publication.pubname = config.publication_name",
+            "config.publication_attnums = case",
+            "member.prqual is null",
+            "on conflict (source_id) do nothing",
+        ] {
+            assert!(
+                sql.contains(required),
+                "missing invalidation contract: {required}"
+            );
+        }
+        let name_only_lookup = "where publication.pubname = config.publication_name";
+        assert!(
+            !sql.contains(name_only_lookup),
+            "publication name became standalone identity: {name_only_lookup}"
+        );
     }
 }
