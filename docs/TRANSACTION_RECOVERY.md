@@ -44,6 +44,33 @@ Apply facts, and continuation stay unchanged. Thus retry starts at the PostgreSQ
 slot, but Shiba commit visibility remains authoritative. The CLI, publication,
 and slot are test infrastructure, not a second Shiba continuation.
 
+## M10 transport recovery boundary
+
+Source Ingress holds no PostgreSQL Apply transaction while receiving WAL. It
+assembles one bounded transaction, invokes the existing synchronous Runtime on
+a separate connection, and may advance feedback only after Runtime's database
+transaction has committed as `Applied` or has proved the exact identity already
+committed as `AlreadyApplied`.
+
+```text
+slot -> receive -> decode -> Runtime transaction -> commit -> feedback
+          X          X              X                X
+       replay     replay        rollback         replay/no-op
+```
+
+A crash before Apply produces no feedback. A crash after Apply commit but
+before feedback produces exact replay and `AlreadyApplied`. A requested
+keepalive reports the last durable end position rather than the newest received
+WAL position. Decoder, Apply, or Operator failure stops at the failed
+transaction. PostgreSQL retains transport history through the slot;
+`source_continuation` independently prevents duplicate computation. Neither
+authority mirrors or repairs the other.
+
+Protocol-v2 segments remain volatile and cannot enter Runtime before their
+terminal commit. Disconnect discards partial assembly so the slot can replay
+it. A terminal abort may advance transport feedback only after its exact safe
+coordinate is proved on PG17 and PG18; it creates no Shiba durable state.
+
 M4.1 payload presence/value is inserted into the existing Apply row before the
 operator and continuation writes. Invalid tuple tags or shapes fail during pure
 decode and cannot open a database transaction. A PostgreSQL error after payload

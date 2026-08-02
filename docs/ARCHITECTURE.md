@@ -193,6 +193,19 @@ proves the earlier operator write, source mutation, audit, result, and
 continuation are not independently visible. This adds no durable effect table,
 execution SQL, scheduler, or second transaction owner.
 
+M10 introduces Source Ingress as a transport owner, not another state writer.
+One libpq logical-replication connection receives COPY BOTH payloads while a
+separate existing PostgreSQL client invokes Runtime. A bounded incremental
+assembler retains at most one transaction and the existing decoder remains the
+only semantic pgoutput decoder. Waiting for WAL therefore owns no Apply
+transaction or lock, and slow Apply stops further reads without a queue.
+
+PostgreSQL's replication slot is the transport-cursor authority;
+`source_continuation` remains the computation/replay authority. Ingress may
+report a terminal end position only after Runtime returns `Applied` or
+`AlreadyApplied`. It cannot write current rows, operator state/results, or
+continuation, and Shiba does not mirror slot progress.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -201,7 +214,8 @@ No later code may use an old authority as a fallback. An implementation is
 accepted only after its clean-room tests prove its new contract; legacy tests are
 evidence inputs, not implementation dependencies.
 
-**Unproved:** production replication transport and slot ownership, admission
+**Unproved:** M10 production replication transport and slot ownership until its
+PG17/18 gates pass, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving,

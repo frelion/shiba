@@ -156,8 +156,11 @@ effect, compatibility path, alias, fallback,
 or dual write.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),
-[catalog contract](CATALOG_CONTRACT.md), and the [reuse manifest](contracts/REUSE_MANIFEST.md)
-before extending the workspace. Ingress work must also follow the
+[catalog contract](CATALOG_CONTRACT.md), the
+[Source Ingress contract](SOURCE_INGRESS_CONTRACT.md), the
+[transport ADR](adr/0001-m10-replication-transport.md), and the
+[reuse manifest](contracts/REUSE_MANIFEST.md) before extending the workspace.
+Ingress work must also follow the
 [pgoutput contract](PGOUTPUT_CONTRACT.md).
 Nullable tuple work is bounded by the [tuple contract](TUPLE_CONTRACT.md).
 Compiler, EffectBatch, Operator, and sink work must follow the
