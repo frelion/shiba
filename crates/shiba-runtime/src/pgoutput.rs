@@ -155,7 +155,7 @@ fn decode_relation(cursor: &mut Cursor<'_>, source: PgoutputSource) -> Result<()
         SourceShape::CompositeInt8 => &[(1, INT8_OID), (1, INT8_OID)],
         SourceShape::TextPayload => &[(1, INT8_OID), (0, TEXT_OID)],
     };
-    if cursor.byte()? != b'd' || usize::from(cursor.u16()?) != columns.len() {
+    if cursor.byte()? != source.relation_identity || usize::from(cursor.u16()?) != columns.len() {
         return Err(PgoutputError::RelationShape);
     }
     for (expected_key_flag, expected_oid) in columns {

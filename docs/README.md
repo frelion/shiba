@@ -60,9 +60,15 @@ M5.3 extends the already admitted two-int8 primary-key shape through DELETE.
 Both key components identify one current-state row; deleting one pair leaves a
 row sharing key1 untouched and atomically decrements count/result.
 
-**Not proved.** M5.1 has no production replication transport/slot lifecycle,
+M5.4 explicitly admits the existing single-int8-key shape for a live replica
+identity index. The default and index constructors require `d` and `i`
+respectively, so a live identity change fails before Apply. This is decoder
+configuration, not a second durable source-binding authority.
+
+**Not proved.** M5.4 has no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
-UPDATE old tuples, NULL text, binary payloads, TOAST keys,
+UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
+binding or replica-index drift observation without a RELATION message,
 streaming transaction, slot-generation change, multiple
 sources, DDL invalidation, external effect, compatibility path, alias, fallback,
 or dual write.

@@ -94,6 +94,12 @@ general row-identity layer. The same current-state row stores both components;
 the processor matches both (including NULL-safe single-key handling), deletes
 exactly one row, decrements count/result, and commits continuation atomically.
 
+M5.4 adds an explicit decoder configuration for the existing single-key shape
+under PostgreSQL replica identity index. It changes only RELATION admission
+from expected `d` to expected `i`; tuple decoding, the current-state authority,
+sole writer, and transaction owner remain unchanged. This configuration is not
+a durable catalog binding and cannot silently accept identity drift.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -104,7 +110,7 @@ evidence inputs, not implementation dependencies.
 
 **Unproved:** production replication transport and slot ownership, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
-tuples, NULL text, binary payloads, TOAST keys,
-streaming transactions, catalog binding inspection, concurrency,
+tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
+streaming transactions, durable catalog binding inspection, concurrency,
 generation changes, multiple sources, general operators, and recovery workers
 remain.

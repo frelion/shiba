@@ -102,3 +102,9 @@ M5.3 uses the same DELETE ordering for a two-component key. Decode failure
 writes nothing; a missing pair or backend termination rolls back pair deletion,
 count, result, and continuation. Retry removes the pair once, and exact replay
 short-circuits before row lookup.
+
+M5.4 changes no recovery ordering. An admitted index-identity DELETE uses the
+same row/count/result/continuation transaction, including crash rollback, retry
+once, and exact replay. A RELATION carrying default identity after live drift
+fails in the pure decoder, so no processor transaction opens and the prior
+continuation remains authoritative.

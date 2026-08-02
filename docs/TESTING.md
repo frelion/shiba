@@ -120,6 +120,13 @@ exact pair is removed while count/result decrement once. It also proves bad
 second-key rejection, a valid missing-pair rollback, continuation-after-insert
 crash rollback, retry, and replay on PostgreSQL 17 and 18.
 
+`test-m5-replica-index.sh` captures a real single-column relation under
+`REPLICA IDENTITY USING INDEX`, proves RELATION `i`, exact key flag and `D + K`,
+then applies INSERT and DELETE through the existing current-state/count/result/
+continuation transaction. It proves crash rollback, retry once, replay no-op,
+and that a live switch back to default identity is rejected before writes on
+PostgreSQL 17 and 18.
+
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.
 

@@ -46,6 +46,10 @@ M5.3 admits `DELETE (key1, key2)` for the existing composite-int8 shape. The
 `K` tuple contains exactly two canonical text int8 values; both are required to
 select the current row. This does not generalize identity arity or key types.
 
+M5.4 permits the existing single-int8-key INSERT/DELETE tuple shape under an
+explicit replica-identity-index relation admission. Tuple decoding and Apply
+representation are unchanged; only RELATION `i` versus `d` admission differs.
+
 ## Apply representation and ownership
 
 `SourcePayload::Absent` means the admitted relation has no payload column;
@@ -78,5 +82,5 @@ authority.
 Admission for `D + O`, replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, TOAST keys, binary transfer, streaming
 transactions, multiple sources, generation changes, and broader schema drift
-is not admitted through M5.3. Composite
+is not admitted through M5.4. Composite
 identities beyond the existing fixed two-int8 INSERT/DELETE shape are excluded.

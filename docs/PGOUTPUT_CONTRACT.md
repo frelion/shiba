@@ -118,6 +118,19 @@ selector `K`, column count `2`, and two canonical non-NULL text int8 values.
 Both components become the existing row identity pair. A bad second tag,
 partial/extra pair, `O`, or DELETE for another shape fails before writes.
 
+## M5.4 replica identity index admission
+
+`PgoutputSource::with_replica_index` explicitly admits the existing single
+`int8` key shape when RELATION advertises replica identity index (`i`) and the
+sole column has key flag `1`. The default constructor continues to require
+`d`; neither path infers identity from relation or index names.
+
+The index-bound path uses the unchanged INSERT and `D + K` tuple languages and
+the existing processor transaction. A live switch back to default identity is
+therefore rejected as relation drift before a `SourceTransaction` or durable
+write exists. M5.4 does not add persistent source binding, general identity
+configuration, composite replica indexes, `FULL`, `NOTHING`, or `D + O`.
+
 ## M3.2 acknowledgement crash point
 
 The recovery gate deliberately separates database visibility from replication
@@ -152,4 +165,6 @@ unchanged-TOAST `u` UPDATE. M5.2 proves a real default-EXTENDED, out-of-line,
 uncompressed `t` replacement. Both cover crash/retry/replay with exact durable
 text. Broader identity, NULL/binary text, TOAST keys, and streaming remain out
 of scope. M5.3 additionally proves exact composite `D + K`, pair isolation,
-missing-row rollback, crash/retry, and replay.
+missing-row rollback, crash/retry, and replay. M5.4 proves explicit
+single-column replica-index admission, atomic INSERT/DELETE recovery, and live
+default-identity drift rejection without adding a catalog authority.

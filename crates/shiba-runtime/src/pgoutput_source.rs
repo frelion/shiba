@@ -6,6 +6,7 @@ pub struct PgoutputSource {
     pub(crate) slot_generation: SlotGeneration,
     pub(crate) relation_id: u32,
     pub(crate) shape: SourceShape,
+    pub(crate) relation_identity: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +49,20 @@ impl PgoutputSource {
             relation_id,
             SourceShape::KeyOnly,
         )
+    }
+    #[must_use]
+    pub const fn with_replica_index(
+        source_id: SourceId,
+        slot_generation: SlotGeneration,
+        relation_id: u32,
+    ) -> Self {
+        Self {
+            source_id,
+            slot_generation,
+            relation_id,
+            shape: SourceShape::KeyOnly,
+            relation_identity: b'i',
+        }
     }
     #[must_use]
     pub const fn with_nullable_int8_payload(
@@ -99,6 +114,7 @@ impl PgoutputSource {
             slot_generation,
             relation_id,
             shape,
+            relation_identity: b'd',
         }
     }
 }
