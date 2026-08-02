@@ -84,6 +84,11 @@ unchanged-TOAST UPDATE carries only a `u` token, so the processor validates that
 the target is an existing text row and retains its durable value. Row state,
 unchanged count/result, and continuation still share one processor transaction.
 
+M5.2 uses the same text row and writer for a complete replacement value. The
+wire owns the new UTF-8 bytes; the processor overwrites only `payload_text`,
+keeps count/result stable, and records continuation in the same transaction.
+No TOAST store, fetcher, or alternate value authority is introduced.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -94,7 +99,7 @@ evidence inputs, not implementation dependencies.
 
 **Unproved:** production replication transport and slot ownership, admission
 for `D + O` or replica identity `FULL`, composite DELETE, key-changing UPDATE
-and old tuples, new/incompressible TOAST values, NULL text, TOAST keys,
+and old tuples, NULL text, binary payloads, TOAST keys,
 streaming transactions, catalog binding inspection, concurrency,
 generation changes, multiple sources, general operators, and recovery workers
 remain.

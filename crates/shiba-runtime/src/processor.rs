@@ -149,13 +149,13 @@ fn apply_changes(
                 )?;
             }
             SourceChange::Update(update) => {
-                let changed = match update.source_payload {
+                let changed = match &update.source_payload {
                     SourceUpdatePayload::Int8(payload) => transaction.execute(
                         "UPDATE shiba_internal.applied_insert
                          SET payload_present = true, payload_int8 = $1, payload_text = NULL
                          WHERE source_id = $2 AND source_row_id = $3
                            AND source_row_sub_id IS NULL AND payload_text IS NULL",
-                        &[&payload, &source_id, &update.source_row_id],
+                        &[payload, &source_id, &update.source_row_id],
                     )?,
                     SourceUpdatePayload::UnchangedText => transaction.execute(
                         "UPDATE shiba_internal.applied_insert
@@ -164,6 +164,14 @@ fn apply_changes(
                            AND source_row_sub_id IS NULL
                            AND payload_text IS NOT NULL AND payload_int8 IS NULL",
                         &[&source_id, &update.source_row_id],
+                    )?,
+                    SourceUpdatePayload::Text(payload) => transaction.execute(
+                        "UPDATE shiba_internal.applied_insert
+                         SET payload_text = $1
+                         WHERE source_id = $2 AND source_row_id = $3
+                           AND source_row_sub_id IS NULL
+                           AND payload_text IS NOT NULL AND payload_int8 IS NULL",
+                        &[payload, &source_id, &update.source_row_id],
                     )?,
                 };
                 if changed != 1 {

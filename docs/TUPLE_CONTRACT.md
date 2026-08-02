@@ -1,6 +1,6 @@
 # Tuple contract
 
-## Admitted shapes through M5.1
+## Admitted shapes through M5.2
 
 M4 accepts exactly four INSERT relation shapes:
 
@@ -38,6 +38,10 @@ owns the complete UTF-8 text bytes from a `t` tuple value. UPDATE admits only
 `(key=t, payload=u)`: `u` is an instruction to preserve the existing durable
 text, not a payload value and not NULL. Other payload tags fail closed.
 
+M5.2 also admits `t` in text-payload UPDATE as a complete replacement UTF-8
+value. It replaces only an existing text row. Source TOAST compression and
+out-of-line storage do not change the admitted tuple representation.
+
 ## Apply representation and ownership
 
 `SourcePayload::Absent` means the admitted relation has no payload column;
@@ -68,7 +72,7 @@ authority.
 ## Deferred boundary
 
 Admission for `D + O`, replica identity `FULL`, composite DELETE, key-changing
-UPDATE, UPDATE old tuples, new/incompressible TOAST values, NULL text, TOAST
-keys, binary transfer, streaming transactions, multiple sources, generation
-changes, and broader schema drift is not admitted through M5.1. Composite
+UPDATE, UPDATE old tuples, NULL text, TOAST keys, binary transfer, streaming
+transactions, multiple sources, generation changes, and broader schema drift
+is not admitted through M5.2. Composite
 identities beyond the existing fixed INSERT shape are also excluded.

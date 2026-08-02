@@ -38,14 +38,10 @@ pub(crate) fn decode_insert(
         SourceShape::TextPayload => {
             let key = decode_int8(cursor)?;
             let format = cursor.byte()?;
-            if format != b't' {
-                return Err(PgoutputError::TupleTag(format));
-            }
-            let length = usize::try_from(cursor.u32()?).map_err(|_| PgoutputError::Truncated)?;
-            let payload = std::str::from_utf8(cursor.take(length)?)
-                .map_err(|_| PgoutputError::TupleValue)?
-                .to_owned();
-            Ok(DecodedChange::RowInsert(key, SourcePayload::Text(payload)))
+            Ok(DecodedChange::RowInsert(
+                key,
+                SourcePayload::Text(decode_text(cursor, format)?),
+            ))
         }
     }
 }
@@ -65,14 +61,11 @@ pub(crate) fn decode_update(
         SourceShape::TextPayload => {
             tuple_header(cursor, source, b'N', 2)?;
             let key = decode_int8(cursor)?;
-            let format = cursor.byte()?;
-            if format != b'u' {
-                return Err(PgoutputError::TupleTag(format));
-            }
-            Ok(DecodedChange::Update(
-                key,
-                SourceUpdatePayload::UnchangedText,
-            ))
+            let payload = match cursor.byte()? {
+                b'u' => SourceUpdatePayload::UnchangedText,
+                format => SourceUpdatePayload::Text(decode_text(cursor, format)?),
+            };
+            Ok(DecodedChange::Update(key, payload))
         }
         _ => Err(PgoutputError::TupleShape),
     }
@@ -118,4 +111,14 @@ fn decode_int8(cursor: &mut Cursor<'_>) -> Result<i64, PgoutputError> {
         return Err(PgoutputError::TupleTag(format));
     }
     cursor.int8_text()
+}
+
+fn decode_text(cursor: &mut Cursor<'_>, format: u8) -> Result<String, PgoutputError> {
+    if format != b't' {
+        return Err(PgoutputError::TupleTag(format));
+    }
+    let length = usize::try_from(cursor.u32()?).map_err(|_| PgoutputError::Truncated)?;
+    Ok(std::str::from_utf8(cursor.take(length)?)
+        .map_err(|_| PgoutputError::TupleValue)?
+        .to_owned())
 }

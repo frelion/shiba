@@ -92,3 +92,8 @@ retains `payload_text`, writes the unchanged count/result, and inserts
 continuation last in its existing transaction. Backend termination after that
 continuation INSERT proves the text, count, result, and continuation all remain
 old; retry advances once and exact replay is a no-op.
+
+M5.2 applies a complete `t` replacement under the same ordering. A crash after
+continuation INSERT exposes the previous text and previous continuation; retry
+publishes the replacement once, and replay cannot replace it again. The source
+TOAST table never participates in the processor transaction or recovery path.

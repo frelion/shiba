@@ -125,6 +125,9 @@ pub fn decode_committed_changes(
                         SourceUpdatePayload::UnchangedText => {
                             SourceUpdate::unchanged_text(sequence, row_id)
                         }
+                        SourceUpdatePayload::Text(value) => {
+                            SourceUpdate::text(sequence, row_id, value)
+                        }
                     };
                     SourceChange::Update(update)
                 }

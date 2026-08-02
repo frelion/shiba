@@ -103,6 +103,14 @@ previously applied text value and carries no replacement bytes.
 and other relation shapes fail during pure decode. M5.1 does not admit a new
 text value in UPDATE or infer data from the source table outside pgoutput.
 
+## M5.2 incompressible TOAST replacement
+
+Text-payload UPDATE additionally admits a present `t` value. The decoder owns
+its complete UTF-8 bytes and the processor replaces the existing durable text;
+`u` continues to mean retain the old value. `n`, `b`, invalid UTF-8, and a
+replacement for a non-text row fail closed. PostgreSQL storage/compression is
+evidence about the source value, not a second wire format or Shiba authority.
+
 ## M3.2 acknowledgement crash point
 
 The recovery gate deliberately separates database visibility from replication
@@ -132,7 +140,8 @@ missing target rolls back mutation and continuation. M4.5 proves real `D + K`,
 exact key decoding, atomic current-state deletion and count publication,
 failure rollback, crash/retry, and exact replay on both supported PostgreSQL
 majors. M4.6 proves default identity/key-flag admission and live FULL drift
-rejection before writes. Admission of broader identity, DELETE/UPDATE forms,
-new/incompressible TOAST values, NULL text, TOAST keys, and streaming remain
-out of scope. M5.1 proves exact text INSERT plus a real unchanged-TOAST `u`
-UPDATE, including crash/retry/replay with the retained value.
+rejection before writes. M5.1 proves exact text INSERT plus a real
+unchanged-TOAST `u` UPDATE. M5.2 proves a real default-EXTENDED, out-of-line,
+uncompressed `t` replacement. Both cover crash/retry/replay with exact durable
+text. Broader identity, NULL/binary text, TOAST keys, and streaming remain out
+of scope.

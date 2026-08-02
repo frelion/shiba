@@ -27,6 +27,8 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m4-replica-identity.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m5-toast.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m5-toast.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m5-incompressible-toast.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m5-incompressible-toast.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -102,6 +104,13 @@ captured as `U + N` with canonical key `t` and payload `u`. The gate proves bad
 payload-tag rejection before writes, continuation-after-insert crash rollback,
 exact text retention, retry once, replay no-op, and unchanged private/public
 count on PostgreSQL 17 and 18.
+
+`test-m5-incompressible-toast.sh` uses two seeded, dependency-free 64 KiB
+high-entropy ASCII values under default `EXTENDED` storage. It proves both
+source values are out-of-line and uncompressed, then verifies the replacement
+UPDATE carries exact `t` bytes and atomically replaces `payload_text` while
+count/result stay `1`. A binary-tag corruption, post-continuation crash, retry,
+and exact replay prove the failure and recovery boundaries on PG17/18.
 
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.

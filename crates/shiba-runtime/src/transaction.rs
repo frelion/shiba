@@ -20,13 +20,14 @@ pub struct SourceInsert {
     pub source_payload: SourcePayload,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SourceUpdatePayload {
     Int8(Option<i64>),
     UnchangedText,
+    Text(String),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceUpdate {
     pub input_sequence: InputSequence,
     pub source_row_id: i64,
@@ -53,6 +54,15 @@ impl SourceUpdate {
             input_sequence,
             source_row_id,
             source_payload: SourceUpdatePayload::UnchangedText,
+        }
+    }
+
+    #[must_use]
+    pub fn text(input_sequence: InputSequence, source_row_id: i64, source_payload: String) -> Self {
+        Self {
+            input_sequence,
+            source_row_id,
+            source_payload: SourceUpdatePayload::Text(source_payload),
         }
     }
 }

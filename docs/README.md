@@ -52,10 +52,14 @@ text INSERT stores the exact value; an UPDATE whose pgoutput payload is `u`
 retains that committed value while count/result remain unchanged and
 continuation advances in the same processor transaction.
 
+M5.2 admits a present text-format replacement on that same UPDATE path. A real
+default-EXTENDED, out-of-line and uncompressed payload is replaced exactly;
+row state, unchanged count/result, and continuation still commit together.
+
 **Not proved.** M5.1 has no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, composite DELETE,
-key-changing UPDATE, UPDATE old tuples, new/incompressible TOAST values, NULL
-text, TOAST keys, streaming transaction, slot-generation change, multiple
+key-changing UPDATE, UPDATE old tuples, NULL text, binary payloads, TOAST keys,
+streaming transaction, slot-generation change, multiple
 sources, DDL invalidation, external effect, compatibility path, alias, fallback,
 or dual write.
 
