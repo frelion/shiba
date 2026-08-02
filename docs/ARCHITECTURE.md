@@ -322,6 +322,13 @@ Both retain the three-connection scan budget, no queue, SQL differential, and
 ordinary live handoff. The frozen limits were 120 s, 10,000 rows/s minimum,
 15 s catch-up, and 256 MiB RSS growth.
 
+M11.5 closes the role boundary on PG17.10/PG18.4: bootstrap
+control/Apply/scanning runs as a non-superuser `NOREPLICATION` identity,
+transport as a distinct non-superuser `REPLICATION` identity, and result
+reading as a public-result-only identity. Permission loss and role reversal
+fail before state or feedback advances. This changes no authority,
+transaction owner, connection count, or production path.
+
 M11 is complete at its declared pristine nullable-int8 CountRows/SumInt8
 initialization boundary, not a complete V2.
 

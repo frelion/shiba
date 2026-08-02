@@ -376,3 +376,11 @@ slot cleanup/replacement only before `scan_complete`; same-slot reattach at or
 after it. M11 is complete at this declared source shape, but indefinite
 concurrent-writer catch-up, tail latency, reconnect supervision, and M12 remain
 outside the evidence.
+
+M11.5 proves the same ingress under split least privilege on PG17.10 and
+PG18.4: a non-superuser `NOREPLICATION` control/Apply/scanner connection, a
+separate non-superuser `REPLICATION` transport connection, and a public-result-
+only reader. The real path reaches live ingress and matches the SQL oracle.
+Role swapping and revoked `EXECUTE`, source `SELECT`, or checkpoint `UPDATE`
+fail before unauthorized Apply or feedback; no production session uses
+superuser or inherited role membership.

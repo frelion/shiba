@@ -238,3 +238,16 @@ memory.
 M11 is complete at this pristine nullable-int8 CountRows/SumInt8 boundary. It
 does not complete V2, start M12, prove indefinite concurrent-writer catch-up or
 tail latency, or provide a reconnect supervisor.
+
+## M11.5 least-privilege acceptance
+
+PG17.10 and PG18.4 prove the complete bootstrap with no production session run
+as superuser or owner. Control/Apply/scanning uses a non-superuser
+`NOREPLICATION` identity, transport uses a distinct non-superuser
+`REPLICATION` identity, and the result reader can select only the public
+result. Real snapshot scan, concurrent WAL catch-up, activation and live
+handoff succeed. Swapped identities and missing `EXECUTE`, source `SELECT`, or
+checkpoint `UPDATE` fail without partial state, continuation, result
+publication, or feedback. Split-role successful `restart_abandoned`,
+TLS/password policy, cross-host credential rotation, and column-level grants
+remain unproved.

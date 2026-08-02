@@ -202,3 +202,11 @@ batch table, moving LSN mirror, or additional writer. Operators must inspect
 `result_status`, not a partial numeric value, and must never repair lifecycle by
 manual catalog updates. Indefinite writer catch-up and M12 non-pristine rebuild
 remain outside this authority.
+
+M11.5 proves this privilege boundary on PG17.10 and PG18.4. The non-superuser
+bootstrap control role has `NOREPLICATION` and only explicit private-table,
+source, sequence, and revoked bootstrap-function grants. The transport role has
+`REPLICATION` but cannot perform control Apply; the result reader has only
+public result `SELECT`. Missing `EXECUTE`, source `SELECT`, or checkpoint
+`UPDATE`, and swapped control/transport identities, leave the catalog fail
+closed. PUBLIC gains no privilege and no writer or authority changes.

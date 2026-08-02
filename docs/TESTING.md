@@ -462,3 +462,17 @@ independent rollback/crash tests do not claim equivalence to an old runtime.
 Differential tests use the legacy
 repository solely as an oracle and must never link it, load its SQL, or share a
 catalog authority.
+
+## M11.5 least-privilege bootstrap gate
+
+Run `scripts/test-m11-bootstrap-roles.sh` independently with the absolute PG17
+and PG18 `pg_config` paths. It uses a non-superuser `NOREPLICATION`
+control/Apply/scanner, a distinct non-superuser `REPLICATION` transport, and a
+public-result-only reader. The full snapshot, concurrent WAL catch-up,
+activation and live handoff must match the CountRows/SumInt8 SQL oracle.
+
+Negative cases swap roles and revoke bootstrap-function `EXECUTE`, source
+`SELECT`, or checkpoint `UPDATE`; each must leave source/operator state,
+continuation, public activation and feedback unchanged. PG17.10 and PG18.4
+pass. TLS/password policy, cross-host credentials, column-level grants, and a
+successful split-role abandoned-attempt replacement are not claimed.

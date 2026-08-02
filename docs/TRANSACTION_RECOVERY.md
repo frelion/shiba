@@ -435,3 +435,11 @@ Rust RSS grows 3,664/3,664 KiB. These pass the pre-observation 120 s, 10,000 row
 15 s and 256 MiB limits. M11 is complete at this declared recovery boundary;
 indefinitely sustained writers/tail latency, reconnect supervision, the two
 narrow M11.3 injection gaps above, and M12 active/non-pristine rebuild remain.
+
+M11.5 adds permission-loss recovery evidence on PG17.10 and PG18.4. Missing
+bootstrap-function `EXECUTE`, source `SELECT`, or checkpoint `UPDATE`, and
+control/transport role reversal, stop without committing row/operator state,
+continuation, activation, or feedback. Restoring the exact grant lets the
+bounded bootstrap proceed; no cleanup authority or fallback is introduced.
+Successful `restart_abandoned` under split roles remains a narrow unproved
+operational case.

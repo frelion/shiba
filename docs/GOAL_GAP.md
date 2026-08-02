@@ -74,3 +74,11 @@ during Apply, reconnect daemon/backoff, allocator/RSS peaks, and cross-host soak
 remain future ingress work. The complete V2 is not finished: non-pristine
 binding rebuild, SQL frontend, broader operators/results, and production
 orchestration remain.
+
+M11.5 additionally proves on PG17.10 and PG18.4 that full bootstrap does not
+depend on superuser execution: control/Apply/scanning, replication transport,
+and result reading use three separated least-privilege identities. Role
+swapping and missing function, source, or checkpoint privileges fail closed.
+TLS/password policy, cross-host credential rotation, column-level grants, and
+split-role successful abandoned-attempt replacement remain operational gaps,
+not M11 data-correctness gaps.
