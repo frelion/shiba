@@ -24,16 +24,19 @@ PG_CONFIG="$pg_config" cargo check -p shiba-operator --all-targets
 PG_CONFIG="$pg_config" cargo check -p shiba-compiler --all-targets
 PG_CONFIG="$pg_config" cargo check -p shiba-catalog --no-default-features --features "$feature" --all-targets
 PG_CONFIG="$pg_config" cargo check -p shiba-runtime --all-targets
+PG_CONFIG="$pg_config" cargo check -p shiba-ingress --all-targets
 PG_CONFIG="$pg_config" cargo test -p shiba-protocol
 PG_CONFIG="$pg_config" cargo test -p shiba-operator
 PG_CONFIG="$pg_config" cargo test -p shiba-compiler
 PG_CONFIG="$pg_config" cargo test -p shiba-catalog --no-default-features --features "$feature"
 PG_CONFIG="$pg_config" cargo test -p shiba-runtime --lib
+PG_CONFIG="$pg_config" cargo test -p shiba-ingress
 PG_CONFIG="$pg_config" cargo clippy -p shiba-protocol --all-targets -- -D warnings
 PG_CONFIG="$pg_config" cargo clippy -p shiba-operator --all-targets -- -D warnings
 PG_CONFIG="$pg_config" cargo clippy -p shiba-compiler --all-targets -- -D warnings
 PG_CONFIG="$pg_config" cargo clippy -p shiba-catalog --no-default-features --features "$feature" --all-targets -- -D warnings
 PG_CONFIG="$pg_config" cargo clippy -p shiba-runtime --all-targets -- -D warnings
+PG_CONFIG="$pg_config" cargo clippy -p shiba-ingress --all-targets -- -D warnings
 git diff --check
 
 # An unborn branch has no tracked diff, so check every tracked-or-untracked
@@ -77,6 +80,7 @@ limits = {
     "sql_file_hard": 150,
     "operator_soft": 600,
     "compiler_soft": 600,
+    "ingress_soft": 1400,
 }
 
 runtime_files = sorted(pathlib.Path("crates/shiba-runtime/src").glob("*.rs"))
@@ -85,6 +89,7 @@ runtime_total = sum(line_counts.values())
 component_files = {
     "operator": sorted(pathlib.Path("crates/shiba-operator/src").glob("*.rs")),
     "compiler": sorted(pathlib.Path("crates/shiba-compiler/src").glob("*.rs")),
+    "ingress": sorted(pathlib.Path("crates/shiba-ingress/src").glob("*.rs")),
 }
 all_production_counts = dict(line_counts)
 for files in component_files.values():
@@ -137,6 +142,7 @@ test_counts = {
         pathlib.Path("crates/shiba-runtime/tests"),
         pathlib.Path("crates/shiba-operator/tests"),
         pathlib.Path("crates/shiba-compiler/tests"),
+        pathlib.Path("crates/shiba-ingress/tests"),
     )
     for path in root.rglob("*.rs")
 }
@@ -191,6 +197,7 @@ scripts = [
         "m7-concurrent-ddl", "m8-multi-source", "m8-concurrent-sources",
         "m8-bounded-decode", "m8-performance", "m9-registration",
         "m9-count-sum", "m9-operator-concurrency", "m9-operator-performance",
+        "m10-committed-ingress",
     )
 ]
 for path in scripts:

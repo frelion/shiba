@@ -31,6 +31,8 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m5-incompressible-toast.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m5-composite-delete.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m5-composite-delete.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m10-committed-ingress.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m10-committed-ingress.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -183,6 +185,15 @@ source waits on the binding mutex while source 2 commits independently; after
 release, CountRows and SumInt8 finish in source order and all replays are no-op.
 The existing M6 gates remain the streaming regression proof for the admitted
 key-only CountRows shape; M9 does not add nullable-payload streaming admission.
+
+`test-m10-committed-ingress.sh` is the first production transport gate. It
+links the selected libpq for the requested PostgreSQL major, enters real COPY
+BOTH without `pg_recvlogical`, receives protocol-v1 XLogData, assembles one
+transaction, invokes the existing decoder and Runtime on a separate Apply
+connection, and proves public CountRows=2, SumInt8=10 plus one continuation.
+Pure ingress tests independently split every byte boundary, coalesce frames and
+transactions, enforce the 16 MiB buffer bound, and validate `w`/`k`. M10.1 does
+not claim ACK or restart recovery.
 
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and

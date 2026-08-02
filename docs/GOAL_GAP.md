@@ -10,7 +10,7 @@ operator, effect, and sink contracts.
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
 | Catalog | Version, source bindings/invalidation, operator definition/state/result | Binding rebuild lifecycle |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
-| Source Ingress | Real protocol-v1/v2 pgoutput decode in PG17/18 tests | Production receiver, feedback and slot lifecycle |
+| Source Ingress | Production protocol-v1 COPY BOTH plus bounded assembly; protocol-v2 decoder evidence | Durable feedback/restart, production streaming assembly and slot lifecycle |
 | Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
 | EffectStream | Non-durable transaction-local EffectBatch | Persisted effects intentionally absent |
 | Runtime | Replay/recovery plus ordered registered-operator execution | Production ingress lifecycle and broader operators |
@@ -28,7 +28,8 @@ has been removed.
 
 ## Still unproved
 
-Production replication receiver/feedback/slot restart, persisted partial-stream
+Production replication feedback/slot restart, production streamed assembly,
+persisted partial-stream
 recovery, source binding rebuild and generation lifecycle, SQL frontend,
 non-aggregate operators, non-bigint result shapes, sustained throughput,
 empirical heap peak, and contention tail latency remain outside M9.2.

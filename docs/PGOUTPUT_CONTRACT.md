@@ -164,6 +164,20 @@ an optimization for WAL retention, not a second Shiba authority.
 
 ## Evidence and deferred boundary
 
+M10.1 replaces the CLI-only transport gap for protocol v1. Production Rust uses
+libpq COPY BOTH to receive complete outer `CopyData` values, strictly parses
+`w`/`k`, and incrementally scans pgoutput frames across arbitrary XLogData
+payload boundaries. The scanner owns no tuple or relation semantics. After one
+complete `B...C` transaction is assembled, the unchanged strict decoder remains
+the only component that can construct `SourceTransaction`; Runtime then owns
+the one Apply transaction. PG17 and PG18 both prove the real path through
+CountRows=2 and SumInt8=10.
+
+M10.1 does not yet send feedback, reconnect, assemble protocol-v2 streaming, or
+own slot/config lifecycle. Its terminal scanner exposes the COMMIT `end_lsn` as
+a candidate transport coordinate, but M10.2 must prove that coordinate against
+slot `confirmed_flush_lsn` before ACK is enabled.
+
 The wire layout follows the PostgreSQL 17/18 logical replication protocol and
 message-format documentation. The test uses each major's own `pg_recvlogical`
 and a disposable publication/slot. PostgreSQL's CLI appends a newline after each

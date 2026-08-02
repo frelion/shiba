@@ -1,0 +1,21 @@
+[package]
+name = "shiba-ingress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Bounded production logical-replication ingress for Shiba"
+
+[dependencies]
+libpq = "=6.0.1"
+postgres = "0.19"
+shiba-runtime = { path = "../shiba-runtime" }
+
+[dev-dependencies]
+shiba-compiler = { path = "../shiba-compiler" }
+shiba-operator = { path = "../shiba-operator" }
+shiba-protocol = { path = "../shiba-protocol" }
+
+[lints]
+workspace = true

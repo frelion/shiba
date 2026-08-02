@@ -2,6 +2,7 @@
 members = [
     "crates/shiba-catalog",
     "crates/shiba-compiler",
+    "crates/shiba-ingress",
     "crates/shiba-operator",
     "crates/shiba-protocol",
     "crates/shiba-runtime",
