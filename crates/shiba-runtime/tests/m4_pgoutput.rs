@@ -113,7 +113,7 @@ fn m4_real_pgoutput_nullable_payload_and_bad_key_tag() {
     let rows = client
         .query(
             "SELECT source_row_id, payload_present, payload_int8
-             FROM shiba_internal.source_row_state ORDER BY state_id",
+             FROM shiba_internal.source_row_state ORDER BY row_state_id",
             &[],
         )
         .expect("query applied payload facts");

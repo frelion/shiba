@@ -103,7 +103,7 @@ fn m4_real_pgoutput_composite_keys_and_bad_second_key_tag() {
     let rows = client
         .query(
             "SELECT source_row_id, source_row_sub_id
-             FROM shiba_internal.source_row_state ORDER BY state_id",
+             FROM shiba_internal.source_row_state ORDER BY row_state_id",
             &[],
         )
         .expect("query applied composite facts");

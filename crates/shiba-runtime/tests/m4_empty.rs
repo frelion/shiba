@@ -100,7 +100,7 @@ fn m4_real_pgoutput_empty_tuples_and_bad_column_count() {
     let rows = client
         .query(
             "SELECT source_row_id IS NULL, payload_present, payload_int8
-             FROM shiba_internal.source_row_state ORDER BY state_id",
+             FROM shiba_internal.source_row_state ORDER BY row_state_id",
             &[],
         )
         .expect("query applied empty facts");
