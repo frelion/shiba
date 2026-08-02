@@ -128,3 +128,29 @@ Source Ingress is a transport owner, not another state writer. Governance
 revalidates catalog/live publication and slot state before receive, Apply, and
 every ACK; an invalidation cannot be bypassed by an empty commit. Ingress cannot
 write current rows, operator state/results, or continuation.
+
+## M11.1 bootstrap authority
+
+M11 will add exactly one private `source_bootstrap` checkpoint/lifecycle
+authority for a pristine source. Its identity is a never-reused `BootstrapId`;
+it binds the exact source, slot generation and name, immutable
+`consistent_point`, lifecycle, and committed scan progress. It stores neither
+the ephemeral `snapshot_name` nor dynamic slot progress and is not a second WAL
+cursor, continuation, row log, or EffectStream.
+
+The bootstrap coordinator is its sole writer. Runtime remains the only writer
+of current source rows and operator state/result. A batch's row/operator writes
+and checkpoint advance share one transaction. Public results must represent
+building/unavailable as `status = building, value_bigint = NULL`; complete
+values require `status = active` and become visible with active lifecycle in one
+cutover transaction. M11 replaces the WAL-cause-shaped `applied_insert` with
+the sole key-owned `source_row_state`; no alias or second current-row table may
+remain.
+
+Before `scan_complete`, a failed hidden attempt may be fully removed only by
+the explicit pristine bootstrap owner and restarted with a fresh never-reused
+attempt and slot/snapshot. After `scan_complete`, the checkpoint directs
+recovery to the existing-slot catch-up phase. Ordinary M10 startup still cannot
+create or drop slots. Active/non-pristine reset or generation rebuild is M12,
+not an M11 cleanup path. No M11 catalog SQL exists yet; these constraints and
+their PG17/18 recovery evidence remain unproved.

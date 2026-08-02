@@ -1,4 +1,4 @@
-# V2 goal gap after M10
+# V2 goal gap after the M11.1 contract
 
 M1–M9 are the reference correctness kernel, not a complete Shiba V2. They
 prove the transaction and recovery semantics that later architecture must
@@ -8,9 +8,9 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source and publication binding/invalidation, ingress config/generation, operator definition/state/result | Non-pristine binding rebuild lifecycle |
+| Catalog | Version, source and publication binding/invalidation, ingress config/generation, operator definition/state/result; M11.1 freezes one future bootstrap checkpoint authority | M11 bootstrap implementation and non-pristine binding rebuild lifecycle |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
-| Source Ingress | M10 production protocol-v1/v2 COPY BOTH, bounded assembly, feedback/crash restart, governed slot/publication lifecycle, split roles, idle shutdown, and frozen local performance | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, allocator/RSS and cross-host soak |
+| Source Ingress | M10 production protocol-v1/v2 COPY BOTH plus M11.1's accepted `EXPORT_SNAPSHOT`/`consistent_point` handoff contract | M11 scanner/catch-up/cutover evidence, TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, allocator/RSS and cross-host soak |
 | Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
 | EffectStream | Non-durable transaction-local EffectBatch | Persisted effects intentionally absent |
 | Runtime | Replay/recovery plus ordered registered-operator execution integrated with M10 ingress | Broader operators and production orchestration |
@@ -31,6 +31,16 @@ has been removed.
 Non-pristine source binding rebuild, SQL frontend, non-aggregate operators,
 non-bigint result shapes, cross-host sustained soak, empirical heap peak, and
 contention tail latency remain outside the proved boundary.
+
+M11.1 defines only the initialization contract. A new slot's
+`EXPORT_SNAPSHOT` result is the sole snapshot/WAL boundary; the snapshot name is
+ephemeral, bootstrap IDs cannot be confused with source transactions, partial
+results remain unavailable, and pre-scan-complete loss resets the entire hidden
+pristine attempt. After scan completion, recovery retains the slot for M10
+catch-up. The production checkpoint/scanner/cutover, crash matrix, PG17/18 SQL
+differential, million-row boundedness, heap peak, and performance thresholds are
+not yet proved. M11 is not complete, and active/non-pristine rebuild remains
+M12.
 
 M10.3 deliberately does not add persisted partial-stream recovery: partial
 stream bytes are volatile and PostgreSQL's replication slot replays them after

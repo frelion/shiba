@@ -357,6 +357,27 @@ PostgreSQL 17 and 18.
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.
 
+## M11.1 contract gate
+
+M11.1 first records the PostgreSQL semantic boundary; it is not a production
+implementation gate. The paired PG17/18 experiment creates a new logical
+slot through replication protocol with `EXPORT_SNAPSHOT`, records its exact
+`consistent_point` and nonempty `snapshot_name`, and keep that exporter idle.
+Multiple fresh `REPEATABLE READ READ ONLY` transactions must import the same
+snapshot before their first query and observe the same baseline while a normal
+transaction observes concurrently committed INSERT/UPDATE/DELETE.
+
+The experiment must also prove that executing another exporter command or
+closing it prevents a new import, without changing an already imported
+transaction's view. It must leave no Shiba row/operator/result/continuation or
+cursor mirror. The gate passes on PG17.10 and PG18.4; PG18 additionally proves
+the opaque snapshot token may contain hexadecimal letters. Static checks
+require the separate Bootstrap identities, one
+checkpoint authority, building/unavailable public result, exact three-to-two
+connection transition, pristine pre-scan reset, same-slot post-scan catch-up,
+and explicit M12 deferral. Production gates do not yet exist, so M11 remains
+unproved and incomplete.
+
 ## Evidence handling
 
 Fixtures in `tests/fixtures` must be data, not copied executable implementation.

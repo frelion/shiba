@@ -247,6 +247,31 @@ commit-to-durable-Apply in 860.865/867.479 ms and direct slow-Apply
 backpressure. M10 is complete at this production-ingress scope, not a claim
 that Shiba V2 is complete.
 
+M11.1 freezes the initial-data boundary without adding an implementation.
+Explicit bootstrap creates a logical `pgoutput` slot with `EXPORT_SNAPSHOT`;
+PostgreSQL's returned `consistent_point` and ephemeral `snapshot_name` are the
+only allowed bridge between existing rows and M10 WAL. Fresh short read-only
+repeatable-read scan transactions repeatedly import that snapshot while the
+exporting replication connection stays idle. Each bounded batch has a distinct
+bootstrap identity and atomically advances the one bootstrap checkpoint with
+current-row and operator state. It is never a fake WAL transaction and never
+advances `source_continuation`.
+
+M11 replaces the WAL-cause-shaped `applied_insert` table with the sole
+key-owned `source_row_state` and tags transaction-local effects as WAL or
+bootstrap. Catch-up cutover requires an exact attempt-bound logical-message
+`BootstrapFence`, never a keepalive `wal_end` or sampled LSN. The fence is a
+transport terminal, not a source transaction or general pgoutput `M` path.
+
+The initial slice is pristine and pre-active. Public results remain building/
+unavailable through scan and catch-up; one transaction publishes complete
+results and active lifecycle together. Before `scan_complete`, losing the
+ephemeral snapshot resets the hidden attempt and starts a fresh never-used
+attempt/slot/snapshot. After `scan_complete`, recovery retains that slot and
+resumes M10 catch-up. Scan owns exactly three connections; catch-up/live return
+to M10's two. No WAL spool, queue, second continuation, or durable EffectStream
+is introduced. Active/non-pristine rebuild remains M12.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -255,7 +280,9 @@ No later code may use an old authority as a fallback. An implementation is
 accepted only after its clean-room tests prove its new contract; legacy tests are
 evidence inputs, not implementation dependencies.
 
-**Unproved:** network/TLS behavior, shutdown during Apply, reconnect daemon/
+**Unproved:** M11 bootstrap implementation, PG17/18 snapshot/WAL differential,
+bootstrap crash/reset and atomic cutover, million-row boundedness/performance,
+network/TLS behavior, shutdown during Apply, reconnect daemon/
 backoff policy, allocator/RSS peaks, cross-host soak, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,

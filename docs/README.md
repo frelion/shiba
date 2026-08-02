@@ -143,8 +143,18 @@ operator 1 before failing operator 2; its audit, source row, both operator
 writes, result writes, and continuation all roll back.
 M9.2 is a bounded aggregate execution proof, not a complete V2 runtime.
 
-**Not proved.** There is no production receiver/restart or replication
-transport/slot lifecycle, nor persisted partial-stream recovery,
+M11.1 defines, but does not yet implement, consistent initialization. A new
+logical slot created with `EXPORT_SNAPSHOT` supplies the sole
+`consistent_point`/snapshot boundary. Bounded snapshot batches have separate
+bootstrap identities, never fabricate WAL transactions or continuation, and
+remain publicly unavailable until catch-up and atomic activation. Losing the
+ephemeral snapshot before scan completion resets the hidden pristine attempt;
+active/non-pristine rebuild remains M12.
+
+**Not proved.** M11 snapshot scanning, checkpoint/cutover implementation,
+crash recovery, PG17/18 differential correctness, and bounded performance are
+not proved. M10 production receiver/restart and slot lifecycle are proved, but
+persisted partial-stream recovery is intentionally absent, as are
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
 binding lifecycle/registration or replica-index drift observation without a
@@ -159,6 +169,8 @@ Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),
 [catalog contract](CATALOG_CONTRACT.md), the
 [Source Ingress contract](SOURCE_INGRESS_CONTRACT.md), the
 [transport ADR](adr/0001-m10-replication-transport.md), and the
+[bootstrap contract](BOOTSTRAP_CONTRACT.md), the
+[bootstrap ADR](adr/0002-m11-consistent-bootstrap.md), and the
 [reuse manifest](contracts/REUSE_MANIFEST.md) before extending the workspace.
 Ingress work must also follow the
 [pgoutput contract](PGOUTPUT_CONTRACT.md).

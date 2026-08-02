@@ -200,6 +200,7 @@ scripts = [
         "m10-committed-ingress", "m10-streaming-ingress",
         "m10-catalog-ingress", "m10-governed-ingress",
         "m10-performance-ingress", "m10-shutdown-ingress",
+        "m11-bootstrap-contract",
     )
 ]
 for path in scripts:
@@ -208,6 +209,35 @@ for path in scripts:
         raise SystemExit(f"{path} does not use shared PostgreSQL integration support")
     if re.search(r"cargo pgrx package|\binitdb\b|^trap ", text, re.MULTILINE):
         raise SystemExit(f"{path} duplicates shared PostgreSQL cluster mechanics")
+PY
+
+# M11.1 freezes the exported-snapshot boundary before bootstrap production code.
+python3 - <<'PY'
+import pathlib
+
+contract_path = pathlib.Path("docs/BOOTSTRAP_CONTRACT.md")
+adr_path = pathlib.Path("docs/adr/0002-m11-consistent-bootstrap.md")
+if not contract_path.is_file() or not adr_path.is_file():
+    raise SystemExit("M11.1 bootstrap contract and ADR must both exist")
+
+contract = contract_path.read_text().lower()
+required = (
+    "export_snapshot", "consistent_point", "snapshot_name",
+    "set transaction snapshot", "repeatable read", "bootstrapid",
+    "bootstrapbatchid", "effectorigin", "source_bootstrap", "source_row_state",
+    "bootstrapfence", "building", "unavailable",
+    "three connections", "scan_complete", "source_continuation",
+)
+missing = [term for term in required if term not in contract]
+if missing:
+    raise SystemExit(f"M11.1 bootstrap contract is missing: {missing}")
+
+readme = pathlib.Path("docs/README.md").read_text()
+if "BOOTSTRAP_CONTRACT.md" not in readme or "0002-m11-consistent-bootstrap.md" not in readme:
+    raise SystemExit("docs README must link the M11.1 contract and ADR")
+manifest = pathlib.Path("docs/contracts/REUSE_MANIFEST.md").read_text()
+if "M11.1" not in manifest:
+    raise SystemExit("REUSE_MANIFEST must record M11.1 evidence")
 PY
 
 # No production SQL may smuggle in an old authority or dynamic workflow.

@@ -346,3 +346,38 @@ states/results, and old continuation; retry applies both operators once. An
 overflow in operator 2 has the same rollback boundary. Same-source processors
 serialize on the existing binding row and acquire operator states in ascending
 ID order; a paused source does not prevent an unrelated source from committing.
+
+## M11.1 bootstrap recovery contract
+
+The only initial-copy boundary is a new logical slot created with
+`EXPORT_SNAPSHOT`. PostgreSQL returns an immutable `consistent_point` and an
+ephemeral `snapshot_name`; short read-only repeatable-read scanners import the
+name before their first query while the exporter remains idle. Snapshot batches
+carry `BootstrapId`/`BootstrapBatchId`, never a fabricated source transaction or
+commit LSN, and never advance `source_continuation`.
+
+One `source_bootstrap` checkpoint advances in the same short Apply transaction
+as the batch's current-row and operator writes. A failure before commit exposes
+neither; an exact retry contributes once. Public results remain building/
+unavailable, so a committed private batch is not partial publication.
+
+Catch-up cannot declare completion from a keepalive or sampled WAL position.
+It must observe the exact committed logical-message `BootstrapFence` for the
+current attempt after all earlier terminal outcomes were durably handled. The
+fence never enters Runtime or `source_continuation`; malformed, mixed, stale,
+foreign, or otherwise unknown `M` input fails closed.
+
+Before `scan_complete`, connection, Shiba, or PostgreSQL loss destroys the
+ephemeral snapshot. Recovery fully resets the hidden pristine attempt and its
+exactly owned slot, then creates a fresh never-reused attempt/slot/snapshot.
+Persisting the snapshot name or resuming its checkpoint under another snapshot
+is forbidden. After `scan_complete`, recovery instead retains the existing slot
+and resumes M10 catch-up from its `consistent_point`. A crash before cutover
+leaves results unavailable; cutover atomically publishes complete operator
+results and active lifecycle.
+
+Every phase retains M10's exact binding/publication/generation/invalidation
+checks. Scan has three connections and batch-local Apply transactions;
+catch-up/live have two. No Apply transaction or lock survives scan/network/WAL
+wait, and no WAL spool, queue, second continuation, or persisted EffectStream
+exists. These are M11.1 decisions, not yet production or crash-test evidence.

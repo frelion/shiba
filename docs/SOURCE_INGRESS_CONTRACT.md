@@ -287,3 +287,34 @@ lifecycle, split-role permissions, bounded idle shutdown, and the frozen local
 performance gate have PG17/18 evidence. M10 is complete at this declared scope.
 TLS/disconnect behavior, shutdown during Apply, reconnect/backoff orchestration,
 allocator/RSS measurement, and cross-host soak remain future work.
+
+## M11.1 bootstrap handoff
+
+M11 does not infer an initial boundary from M10 feedback. Its explicit
+pre-active lifecycle creates a new `pgoutput` slot with `EXPORT_SNAPSHOT` and
+uses only PostgreSQL's returned `consistent_point` and ephemeral
+`snapshot_name`. While the exporter remains idle, each bounded short scanner
+imports that snapshot in a read-only repeatable-read transaction before its
+first query. The snapshot name is neither persisted nor recoverable.
+
+Snapshot batches have separate bootstrap identities and do not enter the M10
+receiver, decoder, `SourceTransaction`, terminal-ACK, or continuation domains.
+After the final scan checkpoint commits, M10 starts at the exact
+`consistent_point` and consumes accumulated WAL with its existing bounded
+transport and authorization rules. Catch-up adds no queue or spool. Exact
+source/publication ObjectAddress, frozen semantics, durable invalidation, slot,
+and generation must be valid before every scan, Apply, catch-up, ACK, and
+cutover step.
+
+Cutover requires an exact transactional logical-message fence bound to the
+active BootstrapId. M11 temporarily enables pgoutput messages and admits only
+that strict `BootstrapFence(end_lsn)` terminal; sampled/keepalive LSNs, unknown
+`M`, mixed source changes, and foreign/stale attempts cannot authorize cutover.
+
+Scan uses exactly three connections: exporter/replication, scanner, and Apply.
+It releases the scanner after `scan_complete`; catch-up/live use the existing
+two. Before scan completion, loss of the exported snapshot resets the entire
+hidden pristine attempt and creates a fresh slot/boundary. After scan completion
+the same slot is retained for recovery. The M11.1 PG17/18 gate proves the
+exported-snapshot lifetime and exact consistent-point relation. Production
+scanning, logical-message fence, catch-up, cutover, and recovery remain pending.
