@@ -150,6 +150,11 @@ mod tests {
         assert!(sql.contains("pg_event_trigger_dropped_objects()"));
         assert!(sql.contains("pg_catalog.pg_attribute"));
         assert!(sql.contains("attribute.attnum > 0"));
+        assert!(sql.contains("pg_catalog.pg_index"));
+        assert!(sql.contains("identity.indisreplident"));
+        for kind in ["relation", "column", "identity_index"] {
+            assert!(sql.contains(kind));
+        }
         assert!(!sql.contains("object_identity"));
     }
 }

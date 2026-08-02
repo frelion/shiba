@@ -118,7 +118,8 @@ complete commit into the same sole processor writer.
 M7.1 adds two non-overlapping facts. `source_binding` is the immutable mapping
 from source ID to exact admitted object addresses and is written only by the private
 registration function. M7.3 makes that set one relation plus its live user
-columns; it does not add another authority. `source_invalidation` is written only by one event
+columns; M7.4 adds the current replica-identity index when one exists. Neither
+adds another authority. `source_invalidation` is written only by one event
 trigger function in the owning DDL transaction. For a non-replay transaction,
 the processor resolves the bound OID, acquires relation `ACCESS SHARE`, checks
 the exact invalidation, then performs Apply. The object lock is held through
@@ -134,6 +135,11 @@ and column type change by a bound relation address. The existing event writer
 handles both; the processor still locks only the unique relation row and rejects
 an invalidation of any address in the source's frozen binding set.
 
+M7.4 gives the otherwise shape-identical relation and index rows explicit
+`binding_kind` values. Registration discovers only the current
+`indisreplident` index. Runtime locks the relation-kind row; the unchanged event
+writer matches index DDL by exact index ObjectAddress.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -145,6 +151,6 @@ evidence inputs, not implementation dependencies.
 **Unproved:** production replication transport and slot ownership, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
-streaming interleaving, replica-identity index invalidation, concurrency,
+streaming interleaving, concurrent DDL/Apply scheduling, binding rebuild lifecycle,
 generation changes, multiple sources, general operators, and recovery workers
 remain.

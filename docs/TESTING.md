@@ -149,6 +149,11 @@ relation and exact positive column attribute numbers. It covers type-change
 rollback/apply, committed type-change fail-closed behavior, and an isolated
 column rename whose durable cause is the exact column address on PG17 and PG18.
 
+`test-m7-index-invalidation.sh` proves the identity-index binding, unrelated
+index isolation, rename rollback/apply, committed exact-index invalidation,
+pending pre-Apply rejection, state isolation, and historical replay on
+PostgreSQL 17 and 18.
+
 `test-m5-source-binding.sh` binds the decoder to a real relation OID, applies an
 INSERT, renames both table and column, and applies another INSERT under the same
 OID. It then drops/recreates the original qualified name, proves the new OID is

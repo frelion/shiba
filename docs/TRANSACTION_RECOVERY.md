@@ -145,3 +145,8 @@ M7.3 registers relation and live-column addresses in one transaction. A rolled
 back column-type change rolls back invalidation and leaves pending work valid.
 A committed type change or column rename writes one exact bound cause; the
 processor's any-bound-address check rejects pending work before all Shiba writes.
+
+M7.4 freezes the current replica-identity index in that same registration
+transaction. Index rename rollback removes invalidation and retains the OID;
+committed rename records the exact index address. Runtime still locks the source
+relation and rejects any bound-object invalidation before Apply.

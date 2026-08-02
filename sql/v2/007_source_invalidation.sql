@@ -1,11 +1,17 @@
--- M7.1 binds each admitted source to one PostgreSQL ObjectAddress. Binding
--- creation and DDL invalidation own separate immutable facts with one writer each.
+-- M7 binds each admitted source to one exact PostgreSQL ObjectAddress set.
+-- Binding creation and DDL invalidation remain separate facts with one writer each.
 
 CREATE TABLE shiba_internal.source_binding (
     source_id bigint NOT NULL CHECK (source_id > 0),
+    binding_kind text NOT NULL,
     address_classid oid NOT NULL CHECK (address_classid = 'pg_class'::regclass),
     address_objid oid NOT NULL,
     address_objsubid integer NOT NULL CHECK (address_objsubid >= 0),
+    CONSTRAINT source_binding_kind_address CHECK (
+        (binding_kind = 'relation' AND address_objsubid = 0)
+        OR (binding_kind = 'column' AND address_objsubid > 0)
+        OR (binding_kind = 'identity_index' AND address_objsubid = 0)
+    ),
     PRIMARY KEY (source_id, address_classid, address_objid, address_objsubid),
     CONSTRAINT source_binding_address_unique UNIQUE (
         address_classid, address_objid, address_objsubid
@@ -46,16 +52,25 @@ BEGIN
     END IF;
 
     INSERT INTO shiba_internal.source_binding (
-        source_id, address_classid, address_objid, address_objsubid
+        source_id, binding_kind,
+        address_classid, address_objid, address_objsubid
     )
-    SELECT requested_source_id, 'pg_class'::regclass, requested_relation, 0
+    SELECT requested_source_id, 'relation',
+           'pg_class'::regclass, requested_relation, 0
     UNION ALL
-    SELECT requested_source_id, 'pg_class'::regclass, requested_relation,
+    SELECT requested_source_id, 'column',
+           'pg_class'::regclass, requested_relation,
            attribute.attnum::integer
     FROM pg_catalog.pg_attribute AS attribute
     WHERE attribute.attrelid = requested_relation
       AND attribute.attnum > 0
-      AND NOT attribute.attisdropped;
+      AND NOT attribute.attisdropped
+    UNION ALL
+    SELECT requested_source_id, 'identity_index',
+           'pg_class'::regclass, identity.indexrelid, 0
+    FROM pg_catalog.pg_index AS identity
+    WHERE identity.indrelid = requested_relation
+      AND identity.indisreplident;
 END
 $function$;
 
@@ -105,6 +120,6 @@ CREATE EVENT TRIGGER shiba_source_sql_drop
     EXECUTE FUNCTION shiba_internal.invalidate_source_object();
 
 COMMENT ON TABLE shiba_internal.source_binding IS
-    'Immutable source relation and column ObjectAddress binding authority';
+    'Immutable source relation, column, and identity-index ObjectAddress authority';
 COMMENT ON TABLE shiba_internal.source_invalidation IS
     'Exact ObjectAddress invalidation facts written in the owning DDL transaction';

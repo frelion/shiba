@@ -16,6 +16,7 @@ pub(crate) fn run(transaction: &mut Transaction<'_>, source_id: i64) -> Result<(
              LEFT JOIN pg_catalog.pg_namespace AS namespace
                ON namespace.oid = class.relnamespace
              WHERE binding.source_id = $1
+               AND binding.binding_kind = 'relation'
                AND binding.address_objsubid = 0",
             &[&source_id],
         )?

@@ -29,9 +29,10 @@ and any multi-writer lifecycle remain unproved. See
 
 ## M7.1 source ObjectAddress authority
 
-`source_binding` stores one immutable relation ObjectAddress and each live
-user-column ObjectAddress per registered source. The private registration
-function inserts that complete set atomically and is its only logical writer.
+`source_binding` stores one immutable relation ObjectAddress, each live
+user-column ObjectAddress, and the current replica-identity index ObjectAddress
+when configured. The private registration function inserts that complete set
+atomically and is its only logical writer.
 `source_invalidation` stores the exact matching address reported by PostgreSQL
 event-trigger helpers; one event-trigger function is its only writer for both
 `ddl_command_end` and `sql_drop`. Names and rendered object identities are not
@@ -46,6 +47,10 @@ M7.3 keeps the same table and writer. Relation rows use `objsubid = 0`; column
 rows use their positive PostgreSQL attribute number. The invalidation foreign
 key therefore proves every durable cause was in the registered exact-address
 set. Runtime relation locking explicitly selects the single zero-subid row.
+
+M7.4 adds `binding_kind` because relation and index are both `pg_class` objects
+with zero subid. Its closed values are `relation`, `column`, and
+`identity_index`; this is not a dynamic kind registry.
 
 ## M2 execution facts
 
