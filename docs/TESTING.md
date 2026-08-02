@@ -127,6 +127,11 @@ continuation transaction. It proves crash rollback, retry once, replay no-op,
 and that a live switch back to default identity is rejected before writes on
 PostgreSQL 17 and 18.
 
+`test-m7-concurrent-ddl.sh` uses bounded wait-event polling, not timing guesses,
+to prove Apply's granted relation lock, DDL's waiting exclusive lock, zero
+blocked-state writes, Apply-before-DDL commit order, and subsequent fail-closed
+processing on PostgreSQL 17 and 18.
+
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and
 requires real matching `A`. After abort feedback it restarts the same slot and

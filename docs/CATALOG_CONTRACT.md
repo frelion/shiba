@@ -52,6 +52,10 @@ M7.4 adds `binding_kind` because relation and index are both `pg_class` objects
 with zero subid. Its closed values are `relation`, `column`, and
 `identity_index`; this is not a dynamic kind registry.
 
+M7.5 adds no catalog row. Its concurrent gate proves the relation lock orders
+the existing Apply transaction before a conflicting DDL transaction; the DDL
+transaction remains the sole writer of the resulting invalidation fact.
+
 ## M2 execution facts
 
 The extension installs exactly four M2 tables. Three private tables own applied

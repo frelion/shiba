@@ -150,3 +150,8 @@ M7.4 freezes the current replica-identity index in that same registration
 transaction. Index rename rollback removes invalidation and retains the OID;
 committed rename records the exact index address. Runtime still locks the source
 relation and rejects any bound-object invalidation before Apply.
+
+M7.5 observes the live lock order: Apply holds granted `AccessShareLock` while
+a conflicting DDL waits for `AccessExclusiveLock`. No result or invalidation is
+visible while blocked. Releasing the test-only pause lets Apply commit first,
+then DDL commits invalidation; the next pending transaction fails before writes.

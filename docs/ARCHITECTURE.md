@@ -140,6 +140,10 @@ M7.4 gives the otherwise shape-identical relation and index rows explicit
 `indisreplident` index. Runtime locks the relation-kind row; the unchanged event
 writer matches index DDL by exact index ObjectAddress.
 
+M7.5 adds no production component. A test-only trigger pauses Apply after
+preflight; PostgreSQL lock inspection proves the processor already holds the
+relation lock and conflicting DDL waits until the processor transaction commits.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -151,6 +155,6 @@ evidence inputs, not implementation dependencies.
 **Unproved:** production replication transport and slot ownership, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
-streaming interleaving, concurrent DDL/Apply scheduling, binding rebuild lifecycle,
+streaming interleaving, binding rebuild lifecycle,
 generation changes, multiple sources, general operators, and recovery workers
 remain.

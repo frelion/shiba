@@ -96,13 +96,18 @@ set. Index rename rollback leaves pending work valid; committed rename records
 the exact stable index OID and rejects later work before Apply. Unrelated index
 DDL remains isolated.
 
+M7.5 proves the transaction race with observed PostgreSQL locks. Apply holds
+relation `AccessShareLock` through its commit, so conflicting DDL waits; after
+Apply commits, DDL commits invalidation and the next pending transaction fails
+before any Shiba write.
+
 **Not proved.** M7 has no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
 binding lifecycle/registration or replica-index drift observation without a
 RELATION message, streamed interleaving/subtransactions or bounded buffering,
 slot-generation change, multiple
-sources, concurrent DDL/Apply scheduling, binding rebuild lifecycle, external effect, compatibility path, alias, fallback,
+sources, binding rebuild lifecycle, external effect, compatibility path, alias, fallback,
 or dual write.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),
