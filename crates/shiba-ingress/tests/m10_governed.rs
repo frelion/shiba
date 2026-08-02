@@ -81,7 +81,9 @@ fn governed_session_uses_split_roles_and_revalidates_before_empty_ack() {
              GRANT SELECT ON shiba_internal.source_invalidation,
                  shiba_internal.source_ingress_config,
                  shiba_internal.source_ingress_invalidation,
+                 shiba_internal.source_bootstrap,
                  shiba_internal.operator_definition TO {APPLY_ROLE};
+             GRANT UPDATE ON shiba_internal.source_bootstrap TO {APPLY_ROLE};
              GRANT SELECT, INSERT, UPDATE
                  ON shiba_internal.source_continuation TO {APPLY_ROLE};
              GRANT SELECT, INSERT, UPDATE, DELETE
