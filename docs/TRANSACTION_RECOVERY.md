@@ -78,3 +78,10 @@ then removes and decrements once; replaying that exact committed transaction
 returns `AlreadyApplied` without touching row state or counts. Continuation is
 therefore the transaction replay authority, while `applied_insert` is the sole
 current source-row state; neither a DELETE log nor a recovery writer exists.
+
+M4.6 adds no transaction or recovery writer. Replica identity and key flags are
+validated by the pure decoder before it can return a `SourceTransaction`; a
+live FULL-identity `D + O` transaction therefore cannot open the processor
+transaction. Apply row, private count, public result, and continuation all stay
+at their last committed values, and the pipeline must stop rather than skip the
+unadmitted source transaction.

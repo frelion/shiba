@@ -159,6 +159,10 @@ fn cstring_end_checked(bytes: &[u8], start: usize) -> Option<usize> {
     bounded_add(start, offset.checked_add(1)?, bytes.len())
 }
 
+pub(super) fn cstring_end(bytes: &[u8], start: usize) -> usize {
+    cstring_end_checked(bytes, start).expect("terminated pgoutput string")
+}
+
 fn read_u16_checked(bytes: &[u8], at: usize) -> Option<u16> {
     let end = at.checked_add(2)?;
     Some(u16::from_be_bytes(bytes.get(at..end)?.try_into().ok()?))

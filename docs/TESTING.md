@@ -23,6 +23,8 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m4-update.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m4-delete.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m4-delete.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m4-replica-identity.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m4-replica-identity.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -83,6 +85,13 @@ exactly once; and continuation commits with them. It separately proves invalid
 tuple tag rejection before writes, missing-row and count-underflow rollback,
 backend-crash rollback of row/count/result/continuation, successful retry, exact
 replay no-op, and the same behavior on PostgreSQL 17 and 18.
+
+`test-m4-replica-identity.sh` first captures and applies a default-identity
+single-key INSERT, proving RELATION `d`, key flag `1`, result visibility, and
+exact replay. It then changes the live source to replica identity FULL and
+captures a real `RELATION f` plus `D + O` DELETE. The decoder rejects before
+Apply, leaving the existing row, private count, public result, and continuation
+unchanged on PostgreSQL 17 and 18.
 
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.

@@ -42,8 +42,14 @@ result, and continuation commit in the same processor-owned PostgreSQL
 transaction. Missing-row, decode, and backend-crash failures expose none of
 those writes; retry applies once and exact transaction replay is a no-op.
 
-**Not proved.** M4.5 has no production replication transport/slot lifecycle,
-`D + O`, replica identity `FULL`, composite DELETE, key-changing UPDATE, UPDATE
+M4.6 makes replica identity part of relation admission instead of silently
+accepting any PostgreSQL setting. The four frozen shapes require default
+replica identity and their exact key-column flags. A live change to `FULL`
+therefore fails during decode before Apply can write or advance continuation.
+
+**Not proved.** M4.6 has no production replication transport/slot lifecycle,
+admission for `D + O` or replica identity `FULL`, composite DELETE,
+key-changing UPDATE, UPDATE
 old tuples, TOAST, streaming transaction, slot-generation change, multiple
 sources, DDL invalidation, external effect, compatibility path, alias, fallback,
 or dual write.

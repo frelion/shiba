@@ -1,6 +1,6 @@
 # Tuple contract
 
-## Admitted shapes through M4.5
+## Admitted shapes through M4.6
 
 M4 accepts exactly four INSERT relation shapes:
 
@@ -27,6 +27,11 @@ M4.5 additionally admits `DELETE (key)` only for the single-key shape. The
 pgoutput DELETE must select a `K` tuple with exactly one column containing a
 canonical text `int8`. The relation OID and tuple selector are validated; NULL,
 unchanged-TOAST, binary, `O`, extra columns, and non-canonical text fail closed.
+
+M4.6 requires the enclosing RELATION to advertise default replica identity and
+the exact key flags of the admitted shape. It observes but rejects a live FULL
+identity relation and its `D + O` tuple before tuple decoding or Apply. No old
+row representation is added.
 
 ## Apply representation and ownership
 
@@ -56,7 +61,8 @@ authority.
 
 ## Deferred boundary
 
-`D + O`, replica identity `FULL`, composite DELETE, key-changing UPDATE, UPDATE
-old tuples, TOAST, binary transfer, streaming transactions, multiple sources,
-generation changes, and schema drift are not admitted through M4.5. Composite
+Admission for `D + O`, replica identity `FULL`, composite DELETE, key-changing
+UPDATE, UPDATE old tuples, TOAST, binary transfer, streaming transactions,
+multiple sources, generation changes, and broader schema drift is not admitted
+through M4.6. Composite
 identities beyond the existing fixed INSERT shape are also excluded.

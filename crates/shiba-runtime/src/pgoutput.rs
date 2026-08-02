@@ -4,7 +4,7 @@ use shiba_protocol::{IngressTransactionId, InputSequence, PostgresLsn, SourceTra
 
 use crate::{
     SourceChange, SourceInsert, SourceTransaction, SourceUpdate,
-    pgoutput_source::PgoutputSource,
+    pgoutput_source::{PgoutputSource, SourceShape},
     pgoutput_tuple::{DecodedChange, decode_delete, decode_insert, decode_update},
     pgoutput_wire::Cursor,
 };
@@ -47,7 +47,7 @@ impl fmt::Display for PgoutputError {
 impl std::error::Error for PgoutputError {}
 
 /// # Errors
-/// Rejects input that is not one complete admitted M4.5 transaction.
+/// Rejects input that is not one complete admitted M4.6 transaction.
 pub fn decode_committed_changes(
     input: &[u8],
     source: PgoutputSource,
@@ -135,12 +135,17 @@ fn decode_relation(cursor: &mut Cursor<'_>, source: PgoutputSource) -> Result<()
     }
     cursor.string()?;
     cursor.string()?;
-    let columns = source.shape.columns();
-    if !matches!(cursor.byte()?, b'd' | b'n' | b'f' | b'i') || cursor.u16()? != columns {
+    let key_flags: &[u8] = match source.shape {
+        SourceShape::Empty => &[],
+        SourceShape::KeyOnly => &[1],
+        SourceShape::NullableInt8Payload => &[1, 0],
+        SourceShape::CompositeInt8 => &[1, 1],
+    };
+    if cursor.byte()? != b'd' || usize::from(cursor.u16()?) != key_flags.len() {
         return Err(PgoutputError::RelationShape);
     }
-    for _ in 0..columns {
-        if cursor.byte()? > 1 {
+    for expected_key_flag in key_flags {
+        if cursor.byte()? != *expected_key_flag {
             return Err(PgoutputError::RelationShape);
         }
         cursor.string()?;

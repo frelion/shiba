@@ -77,6 +77,20 @@ The wire semantics are grounded independently in the PostgreSQL
 [17 logical replication message formats](https://www.postgresql.org/docs/17/protocol-logicalrep-message-formats.html)
 and [18 logical replication message formats](https://www.postgresql.org/docs/18/protocol-logicalrep-message-formats.html).
 
+## M4.6 replica identity admission
+
+The RELATION message is admitted only when its replica identity byte is
+PostgreSQL default (`d`) and its column key flags exactly match the selected
+frozen shape: `[]`, `[1]`, `[1, 0]`, or `[1, 1]`. The decoder does not infer a
+key from a name, column order, or tuple contents. `n`, `f`, `i`, an unknown
+identity byte, or a key-flag mismatch fails as relation shape before a
+`SourceTransaction` exists.
+
+A live `ALTER TABLE ... REPLICA IDENTITY FULL` followed by DELETE emits
+`RELATION f` and `D + O`; M4.6 observes that real boundary but deliberately
+rejects it. It does not decode `O`, add a FULL-row identity, or advance the
+existing continuation past the rejected transaction.
+
 ## M3.2 acknowledgement crash point
 
 The recovery gate deliberately separates database visibility from replication
@@ -105,5 +119,6 @@ payload UPDATE, including non-NULL canonical text and a valid UPDATE whose
 missing target rolls back mutation and continuation. M4.5 proves real `D + K`,
 exact key decoding, atomic current-state deletion and count publication,
 failure rollback, crash/retry, and exact replay on both supported PostgreSQL
-majors. The broader DELETE/UPDATE forms, TOAST, and streaming remain out of
-scope.
+majors. M4.6 proves default identity/key-flag admission and live FULL drift
+rejection before writes. Admission of broader identity, DELETE/UPDATE forms,
+TOAST, and streaming remain out of scope.

@@ -72,6 +72,12 @@ The processor remains the sole writer and PostgreSQL transaction owner. It
 deletes exactly one row, decrements private count without underflow, publishes
 the matching result, and records continuation in the same transaction.
 
+M4.6 tightens the pure decoder's existing relation-shape check. It admits only
+PostgreSQL default replica identity (`d`) and exact key flags for each frozen
+shape: none for empty, key for single-key, key/non-key for nullable payload,
+and two keys for composite identity. This adds no durable state or writer. A
+live `FULL` relation is rejected before the processor owns a transaction.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -80,8 +86,9 @@ No later code may use an old authority as a fallback. An implementation is
 accepted only after its clean-room tests prove its new contract; legacy tests are
 evidence inputs, not implementation dependencies.
 
-**Unproved:** production replication transport and slot ownership, `D + O`,
-replica identity `FULL`, composite DELETE, key-changing UPDATE and old tuples,
+**Unproved:** production replication transport and slot ownership, admission
+for `D + O` or replica identity `FULL`, composite DELETE, key-changing UPDATE
+and old tuples,
 TOAST, streaming transactions, catalog binding inspection, concurrency,
 generation changes, multiple sources, general operators, and recovery workers
 remain.
