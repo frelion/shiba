@@ -28,6 +28,14 @@ transaction. The existing M2 processor remains the sole writer and PostgreSQL
 transaction owner. A decode error cannot call Apply and cannot advance
 continuation.
 
+## M4.1 nullable payload extension
+
+`PgoutputSource::with_nullable_int8_payload` admits exactly two columns: a
+non-null canonical text `int8` key followed by a nullable text `int8` payload.
+The pgoutput `n` tag becomes `SourcePayload::Null`; canonical text becomes
+`Int8`. Key NULL and `u`/`b` tuple tags fail closed. The original constructor
+retains the exact M3 single-key shape and produces `SourcePayload::Absent`.
+
 ## M3.2 acknowledgement crash point
 
 The recovery gate deliberately separates database visibility from replication

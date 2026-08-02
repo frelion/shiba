@@ -41,6 +41,12 @@ continuation and replay an already visible transaction; the processor's durable
 identity check makes that replay a no-op. Slot feedback never writes Shiba state
 and cannot make a result visible.
 
+M4.1 extends each existing Apply fact with `payload_present` and nullable
+`payload_int8`. This distinguishes a relation with no payload column from a
+present SQL NULL without creating another Apply table or authority. The decoder
+admits only key-only or key-plus-nullable-int8 shapes; the same processor writes
+the payload, count state, result, and continuation in one transaction.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -49,6 +55,6 @@ No later code may use an old authority as a fallback. An implementation is
 accepted only after its clean-room tests prove its new contract; legacy tests are
 evidence inputs, not implementation dependencies.
 
-**Unproved:** production replication transport and slot ownership, catalog
-binding inspection, concurrency, generation changes, non-INSERT tuple shapes,
-general operators, and recovery workers remain future work.
+**Unproved:** production replication transport and slot ownership, empty and
+composite identities, UPDATE/DELETE, TOAST, catalog binding inspection,
+concurrency, generation changes, general operators, and recovery workers remain.

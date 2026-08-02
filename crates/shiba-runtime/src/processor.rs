@@ -5,7 +5,7 @@ use shiba_protocol::PostgresLsn;
 
 use crate::count;
 use crate::transaction::as_bigint;
-use crate::{M2Error, SourceTransaction};
+use crate::{M2Error, SourcePayload, SourceTransaction};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessOutcome {
@@ -14,11 +14,8 @@ pub enum ProcessOutcome {
 }
 
 /// Atomically applies one committed source transaction and advances its result.
-///
 /// # Errors
-///
-/// Returns an error for identity/order violations, count overflow, or any
-/// `PostgreSQL` failure. `PostgreSQL` rolls back every staged fact on error.
+/// Fails on identity/order, overflow, or `PostgreSQL` errors; all facts roll back.
 pub fn process(client: &mut Client, input: &SourceTransaction) -> Result<ProcessOutcome, M2Error> {
     let mut transaction = client.transaction()?;
     let outcome = process_in_transaction(&mut transaction, input)?;
@@ -79,11 +76,17 @@ fn process_in_transaction(
 
     for insert in &input.inserts {
         let sequence = as_bigint("input_sequence", insert.input_sequence.get())?;
+        let (payload_present, payload_int8) = match insert.source_payload {
+            SourcePayload::Absent => (false, None),
+            SourcePayload::Null => (true, None),
+            SourcePayload::Int8(value) => (true, Some(value)),
+        };
         transaction.execute(
             "INSERT INTO shiba_internal.applied_insert (
                  source_id, slot_generation, commit_lsn,
-                 ingress_transaction_id, input_sequence, source_row_id
-             ) VALUES ($1, $2, $3::text::pg_lsn, $4, $5, $6)",
+                 ingress_transaction_id, input_sequence, source_row_id,
+                 payload_present, payload_int8
+             ) VALUES ($1, $2, $3::text::pg_lsn, $4, $5, $6, $7, $8)",
             &[
                 &source_id,
                 &generation,
@@ -91,6 +94,8 @@ fn process_in_transaction(
                 &ingress_id,
                 &sequence,
                 &insert.source_row_id,
+                &payload_present,
+                &payload_int8,
             ],
         )?;
     }

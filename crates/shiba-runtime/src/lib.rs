@@ -1,19 +1,16 @@
-//! M2's single-source, INSERT-only transactional walking skeleton.
-//!
-//! The caller supplies an ingress-independent committed source transaction.
-//! [`process`] is the sole production entry point and owns the complete
-//! `PostgreSQL` transaction. There is no decoder, fallback, worker, or dynamic
-//! SQL surface in this crate.
+//! Clean-room single-source transactional walking skeleton through M4.1.
+//! Strict decoding feeds the sole writer and `PostgreSQL` transaction owner.
 
 #![forbid(unsafe_code)]
 
 mod count;
 mod error;
 mod pgoutput;
+mod pgoutput_wire;
 mod processor;
 mod transaction;
 
 pub use error::M2Error;
 pub use pgoutput::{PgoutputError, PgoutputSource, decode_committed_insert};
 pub use processor::{ProcessOutcome, process};
-pub use transaction::{SourceInsert, SourceTransaction};
+pub use transaction::{SourceInsert, SourcePayload, SourceTransaction};

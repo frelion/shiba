@@ -17,10 +17,17 @@
     requires = ["catalog_identity"]
 );
 
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/003_nullable_insert.sql",
+    name = "nullable_insert",
+    requires = ["insert_count"]
+);
+
 #[cfg(test)]
 mod tests {
     const CATALOG_SQL: &str = include_str!("../../../sql/v2/001_catalog_identity.sql");
     const M2_SQL: &str = include_str!("../../../sql/v2/002_insert_count.sql");
+    const M4_SQL: &str = include_str!("../../../sql/v2/003_nullable_insert.sql");
 
     fn normalized_sql() -> String {
         CATALOG_SQL.to_ascii_lowercase()
@@ -69,7 +76,12 @@ mod tests {
 
     #[test]
     fn installation_has_no_dynamic_or_compatibility_mechanism() {
-        let sql = format!("{}\n{}", normalized_sql(), M2_SQL.to_ascii_lowercase());
+        let sql = format!(
+            "{}\n{}\n{}",
+            normalized_sql(),
+            M2_SQL.to_ascii_lowercase(),
+            M4_SQL.to_ascii_lowercase()
+        );
         for forbidden in [
             "create trigger",
             "execute format(",

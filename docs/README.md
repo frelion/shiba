@@ -4,7 +4,8 @@ This worktree starts a new V2 on branch `codex/v2-cleanroom`. It is not a refact
 of the previous V1 or V2 code. Phase 1 established Protocol and Catalog; M2 adds
 one transactional INSERT/count vertical path; M3.1 replaces its synthetic input
 with a strict decoder fed by live PostgreSQL `pgoutput` version 1. M3.2 proves
-safe slot replay across the post-result/pre-ack crash window.
+safe slot replay across the post-result/pre-ack crash window. M4.1 adds a fixed
+nullable `int8` payload while retaining the stable non-null `int8` row key.
 
 ## Scope decision
 
@@ -26,12 +27,13 @@ M3.1 decodes a complete live `BEGIN → RELATION → INSERT+ → COMMIT` transac
 for one admitted `int8` relation before invoking the unchanged M2 processor.
 Decode failures therefore cannot expose Apply, result, or continuation state.
 
-**Not proved.** M3 has no production replication transport/slot lifecycle,
-UPDATE/DELETE, NULL, TOAST, streaming transaction,
+**Not proved.** M4.1 has no production replication transport/slot lifecycle,
+empty tuples, composite identity, UPDATE/DELETE, TOAST, streaming transaction,
 DDL invalidation, concurrent source, external effect, compatibility path,
 alias, fallback, or dual write.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),
 [catalog contract](CATALOG_CONTRACT.md), and the [reuse manifest](contracts/REUSE_MANIFEST.md)
-before extending the workspace. M3 work must also follow the
+before extending the workspace. Ingress work must also follow the
 [pgoutput contract](PGOUTPUT_CONTRACT.md).
+Nullable tuple work is bounded by the [tuple contract](TUPLE_CONTRACT.md).

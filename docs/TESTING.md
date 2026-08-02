@@ -13,6 +13,8 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m2.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m3.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m3.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m4.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m4.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -43,6 +45,11 @@ transaction it disables periodic feedback, stops the receiver after complete
 COMMIT, applies result `3` while `confirmed_flush_lsn` is unchanged, kills the
 receiver, then proves slot replay is the identical transaction and is a no-op.
 PG17 and PG18 run the same gate.
+
+`test-m4.sh` captures a real two-column relation containing SQL NULL and an
+`int8` value. It proves operator-error rollback after payload Apply, exact Apply
+facts, count result, replay no-op, and a precisely corrupted key tuple tag
+failing before any durable state appears.
 
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.

@@ -43,3 +43,9 @@ same identity and the processor returns `AlreadyApplied`; result, operator state
 Apply facts, and continuation stay unchanged. Thus retry starts at the PostgreSQL
 slot, but Shiba commit visibility remains authoritative. The CLI, publication,
 and slot are test infrastructure, not a second Shiba continuation.
+
+M4.1 payload presence/value is inserted into the existing Apply row before the
+operator and continuation writes. Invalid tuple tags or shapes fail during pure
+decode and cannot open a database transaction. A PostgreSQL error after payload
+Apply still rolls back payload, count, result, and continuation together under
+the unchanged M2 transaction owner.

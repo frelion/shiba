@@ -5,9 +5,17 @@ use shiba_protocol::{InputSequence, SourceTransactionId};
 use crate::M2Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourcePayload {
+    Absent,
+    Null,
+    Int8(i64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceInsert {
     pub input_sequence: InputSequence,
     pub source_row_id: i64,
+    pub source_payload: SourcePayload,
 }
 
 impl SourceInsert {
@@ -16,6 +24,20 @@ impl SourceInsert {
         Self {
             input_sequence,
             source_row_id,
+            source_payload: SourcePayload::Absent,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_payload(
+        input_sequence: InputSequence,
+        source_row_id: i64,
+        source_payload: SourcePayload,
+    ) -> Self {
+        Self {
+            input_sequence,
+            source_row_id,
+            source_payload,
         }
     }
 }
@@ -27,7 +49,7 @@ pub struct SourceTransaction {
 }
 
 impl SourceTransaction {
-    /// Constructs the only M2 production input.
+    /// Constructs the admitted committed source transaction.
     ///
     /// # Errors
     ///
