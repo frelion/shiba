@@ -101,13 +101,19 @@ relation `AccessShareLock` through its commit, so conflicting DDL waits; after
 Apply commits, DDL commits invalidation and the next pending transaction fails
 before any Shiba write.
 
+M8.1 admits multiple registered sources. Each source has its own immutable
+binding lock, fixed slot generation, continuation order, and replay identity;
+the existing singleton count state and public result intentionally count the
+union of all admitted source rows. A crash in one source transaction rolls back
+only that transaction and the shared aggregate update.
+
 **Not proved.** M7 has no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
 binding lifecycle/registration or replica-index drift observation without a
 RELATION message, streamed interleaving/subtransactions or bounded buffering,
-slot-generation change, multiple
-sources, binding rebuild lifecycle, external effect, compatibility path, alias, fallback,
+slot-generation change, concurrent transaction scheduling/backpressure,
+binding rebuild lifecycle, external effect, compatibility path, alias, fallback,
 or dual write.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),

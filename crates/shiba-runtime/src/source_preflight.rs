@@ -2,7 +2,25 @@ use postgres::Transaction;
 
 use crate::M2Error;
 
-pub(crate) fn run(transaction: &mut Transaction<'_>, source_id: i64) -> Result<(), M2Error> {
+pub(crate) fn lock_binding(
+    transaction: &mut Transaction<'_>,
+    source_id: i64,
+) -> Result<(), M2Error> {
+    transaction
+        .query_opt(
+            "SELECT 1
+             FROM shiba_internal.source_binding AS binding
+             WHERE binding.source_id = $1
+               AND binding.binding_kind = 'relation'
+               AND binding.address_objsubid = 0
+             FOR UPDATE OF binding",
+            &[&source_id],
+        )?
+        .ok_or(M2Error::SourceBindingMissing)?;
+    Ok(())
+}
+
+pub(crate) fn validate(transaction: &mut Transaction<'_>, source_id: i64) -> Result<(), M2Error> {
     let binding = transaction
         .query_opt(
             "SELECT pg_catalog.quote_ident(namespace.nspname),

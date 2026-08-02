@@ -56,6 +56,11 @@ M7.5 adds no catalog row. Its concurrent gate proves the relation lock orders
 the existing Apply transaction before a conflicting DDL transaction; the DDL
 transaction remains the sole writer of the resulting invalidation fact.
 
+M8.1 reuses one independent binding set per source. The relation-kind row is
+also the source-local processor mutex; registration and DDL invalidation writers
+do not change. The count/result singleton is a global union aggregate, not a
+second per-source authority.
+
 ## M2 execution facts
 
 The extension installs exactly four M2 tables. Three private tables own applied

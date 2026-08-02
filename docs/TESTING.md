@@ -132,6 +132,11 @@ to prove Apply's granted relation lock, DDL's waiting exclusive lock, zero
 blocked-state writes, Apply-before-DDL commit order, and subsequent fail-closed
 processing on PostgreSQL 17 and 18.
 
+`test-m8-multi-source.sh` captures two real sources through independent slots
+and publications. It proves source-local continuation/replay, the shared union
+count/result, source-2 crash isolation and retry, and generation mismatch
+rollback on PostgreSQL 17 and 18.
+
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and
 requires real matching `A`. After abort feedback it restarts the same slot and

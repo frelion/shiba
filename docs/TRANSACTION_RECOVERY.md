@@ -155,3 +155,9 @@ M7.5 observes the live lock order: Apply holds granted `AccessShareLock` while
 a conflicting DDL waits for `AccessExclusiveLock`. No result or invalidation is
 visible while blocked. Releasing the test-only pause lets Apply commit first,
 then DDL commits invalidation; the next pending transaction fails before writes.
+
+M8.1 serializes each source on its relation-binding row. A fast replay probe
+preserves the historical no-lock path; a second probe after the mutex closes the
+concurrent duplicate race. Continuation ordering and fixed generation are
+source-local, while row changes and the global aggregate still commit together.
+A backend crash on source 2 leaves source 1 and the aggregate at their old values.

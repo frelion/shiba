@@ -144,6 +144,12 @@ M7.5 adds no production component. A test-only trigger pauses Apply after
 preflight; PostgreSQL lock inspection proves the processor already holds the
 relation lock and conflicting DDL waits until the processor transaction commits.
 
+M8.1 removes only the singleton-source restriction. A source's relation-binding
+row is its serialization mutex; the processor probes replay, takes that row
+lock, probes replay again, then validates DDL and source-local continuation
+order. `count_state` and `count_result` remain one global aggregate over the
+union of admitted sources and are still written in the same processor transaction.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -156,5 +162,5 @@ evidence inputs, not implementation dependencies.
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving, binding rebuild lifecycle,
-generation changes, multiple sources, general operators, and recovery workers
+generation changes, concurrent ingress/backpressure, general operators, and recovery workers
 remain.

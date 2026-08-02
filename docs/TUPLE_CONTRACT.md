@@ -81,6 +81,6 @@ authority.
 
 Admission for `D + O`, replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, TOAST keys, binary transfer, streaming
-transactions, multiple sources, generation changes, and broader schema drift
+transactions, generation changes, and broader schema drift
 is not admitted through M5.4. Composite
 identities beyond the existing fixed two-int8 INSERT/DELETE shape are excluded.

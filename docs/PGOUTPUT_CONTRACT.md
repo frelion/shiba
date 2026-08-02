@@ -72,7 +72,10 @@ can write.
 This is deliberately only PostgreSQL's default-replica-identity `D + K` path
 for a stable, single-column `int8` key. `D + O`, replica identity `FULL`,
 composite DELETE, key-changing UPDATE, UPDATE old tuples, TOAST, streaming,
-generation changes, and multiple sources remain outside the admitted language.
+generation changes and one decoder value spanning multiple sources remain
+outside the admitted language. M8.1 runs multiple explicit single-source
+decoder bindings through one processor; it does not add discovery or multiplexed
+wire admission.
 The wire semantics are grounded independently in the PostgreSQL
 [17 logical replication message formats](https://www.postgresql.org/docs/17/protocol-logicalrep-message-formats.html)
 and [18 logical replication message formats](https://www.postgresql.org/docs/18/protocol-logicalrep-message-formats.html).

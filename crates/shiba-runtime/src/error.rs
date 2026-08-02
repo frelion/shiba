@@ -13,7 +13,7 @@ pub enum M2Error {
     Postgres(postgres::Error),
     SourceBindingMissing,
     SourceInvalidated,
-    SourceScopeMismatch,
+    SlotGenerationMismatch,
 }
 
 impl fmt::Display for M2Error {
@@ -38,8 +38,8 @@ impl fmt::Display for M2Error {
             Self::Postgres(error) => write!(formatter, "PostgreSQL transaction failed: {error}"),
             Self::SourceBindingMissing => formatter.write_str("source binding is missing"),
             Self::SourceInvalidated => formatter.write_str("source binding is invalidated"),
-            Self::SourceScopeMismatch => {
-                formatter.write_str("M2 accepts exactly one source and slot generation")
+            Self::SlotGenerationMismatch => {
+                formatter.write_str("slot generation does not match source continuation")
             }
         }
     }
