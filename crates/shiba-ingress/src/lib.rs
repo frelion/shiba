@@ -7,6 +7,7 @@ use core::fmt;
 mod assembler;
 mod bootstrap;
 mod bootstrap_catchup;
+mod bootstrap_recovery;
 mod bootstrap_transition;
 mod connection_config;
 mod envelope;

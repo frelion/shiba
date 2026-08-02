@@ -278,6 +278,26 @@ state to `3/40`, apply one concurrent INSERT/UPDATE/DELETE WAL transaction to
 for `4/32`. Public values stay building/NULL before cutover, current rows equal
 the SQL oracle, and only real WAL writes continuation.
 
+M11.3 adds recovery without another data path. Before `scan_complete`, an
+explicit coordinator drops only the exact inactive attempt-owned slot; one
+catalog transaction then retires the exact old checkpoint/config, removes its
+hidden partial rows, resets private operator state, and reserves a distinct
+attempt with a larger generation through the existing live publication
+validator. After `scan_complete`, recovery never resets the snapshot build: it
+retains the same slot and resumes the existing M10 catch-up. An active cutover
+whose feedback was interrupted is replayed only against the exact stored fence
+marker and `activation_end_lsn`; Runtime is not reinvoked for the fence.
+Per-source advisory ownership serializes competing coordinators, while
+PostgreSQL remains the physical slot cursor authority.
+
+The synchronous Runtime is currently about 2,260 production lines because
+bootstrap identity/model, bounded batch Apply, operator execution, source
+preflight, and WAL decoding remain separate named responsibilities. The
+complexity gate warns at the historical 1,200-line soft budget and stops for a
+fresh responsibility audit at 3,000; 3,000 is not a target or permission to
+fill. Production files warn above 300 and fail above 400. No file split may add
+an authority, compatibility path, or abstraction without two real callers.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -286,7 +306,14 @@ No later code may use an old authority as a fallback. An implementation is
 accepted only after its clean-room tests prove its new contract; legacy tests are
 evidence inputs, not implementation dependencies.
 
-**Unproved:** M11.3 crash reset/resume and worker competition, M11.4 million-row
+M11.3's PG17.10/PG18.4 recovery gate proves pre-scan exact replacement,
+partial-state reset, rollback/replay, advisory competition, same-slot resume
+across PostgreSQL restart, catch-up and active-before-feedback replay, and final
+SQL differential `4/50`. It reconstructs the durable creating/slot-absent crash
+state rather than killing at that exact instruction; an active foreign old-slot
+conflict is not directly exercised.
+
+**Unproved:** M11.4 million-row
 boundedness/heap/performance,
 network/TLS behavior, shutdown during Apply, reconnect daemon/
 backoff policy, allocator/RSS peaks, cross-host soak, admission

@@ -134,7 +134,32 @@ impl BootstrapSession {
             ],
         )?;
 
-        let replication = ReplicationTransport::connect(replication_conninfo)?;
+        Self::finish_reserved(ReservedBootstrap {
+            apply,
+            scanner,
+            spec,
+            options,
+            apply_conninfo: apply_conninfo.to_owned(),
+            replication_conninfo: replication_conninfo.to_owned(),
+            advisory_key,
+            permit,
+        })
+    }
+
+    pub(crate) fn finish_reserved(reserved: ReservedBootstrap) -> Result<Self, IngressError> {
+        let ReservedBootstrap {
+            mut apply,
+            scanner,
+            spec,
+            options,
+            apply_conninfo,
+            replication_conninfo,
+            advisory_key,
+            permit,
+        } = reserved;
+        let source_id = as_bigint(spec.source_id.get())?;
+        let bootstrap_id = as_bigint(spec.bootstrap_id.get())?;
+        let replication = ReplicationTransport::connect(&replication_conninfo)?;
         let boundary = match replication.create_exported_slot(&spec.slot_name) {
             Ok(boundary) => boundary,
             Err(error) => {
@@ -180,8 +205,8 @@ impl BootstrapSession {
             locator,
             next_ordinal: 1,
             last_key: None,
-            apply_conninfo: apply_conninfo.to_owned(),
-            replication_conninfo: replication_conninfo.to_owned(),
+            apply_conninfo,
+            replication_conninfo,
             advisory_key,
             permit,
         })
@@ -261,6 +286,17 @@ impl BootstrapSession {
     }
 }
 
+pub(crate) struct ReservedBootstrap {
+    pub(crate) apply: Client,
+    pub(crate) scanner: Client,
+    pub(crate) spec: BootstrapSpec,
+    pub(crate) options: BootstrapOptions,
+    pub(crate) apply_conninfo: String,
+    pub(crate) replication_conninfo: String,
+    pub(crate) advisory_key: i64,
+    pub(crate) permit: ActivePermit,
+}
+
 pub(crate) struct BootstrapParts {
     pub(crate) apply: Client,
     pub(crate) config: GovernedConfig,
@@ -321,7 +357,7 @@ impl ScanLocator {
     }
 }
 
-fn validate_spec(spec: &BootstrapSpec) -> Result<(), IngressError> {
+pub(crate) fn validate_spec(spec: &BootstrapSpec) -> Result<(), IngressError> {
     if spec.publication_oid == 0 {
         return Err(IngressError::InvalidIdentifier("publication OID"));
     }
@@ -332,6 +368,6 @@ fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn as_bigint(value: u64) -> Result<i64, IngressError> {
+pub(crate) fn as_bigint(value: u64) -> Result<i64, IngressError> {
     i64::try_from(value).map_err(|_| IngressError::Governance("identity exceeds bigint"))
 }

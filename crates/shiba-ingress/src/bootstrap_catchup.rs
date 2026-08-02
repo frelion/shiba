@@ -103,9 +103,14 @@ impl BootstrapCatchupSession {
         let bootstrap_key = as_bigint(bootstrap_id.get())?;
         let row = apply
             .query_opt(
-                "SELECT slot_name::text, slot_generation, phase
-                 FROM shiba_internal.source_bootstrap
-                 WHERE source_id = $1 AND bootstrap_id = $2",
+                "SELECT bootstrap.slot_name::text, bootstrap.slot_generation,
+                        bootstrap.phase, config.publication_objid::bigint
+                 FROM shiba_internal.source_bootstrap AS bootstrap
+                 JOIN shiba_internal.source_ingress_config AS config
+                   ON config.source_id = bootstrap.source_id
+                  AND config.slot_name = bootstrap.slot_name
+                  AND config.slot_generation = bootstrap.slot_generation
+                 WHERE bootstrap.source_id = $1 AND bootstrap.bootstrap_id = $2",
                 &[&source_key, &bootstrap_key],
             )?
             .ok_or(IngressError::Governance("bootstrap attempt is missing"))?;
@@ -121,7 +126,8 @@ impl BootstrapCatchupSession {
         let spec = BootstrapSpec {
             source_id,
             bootstrap_id,
-            publication_oid: 1,
+            publication_oid: u32::try_from(row.get::<_, i64>(3))
+                .map_err(|_| IngressError::Governance("publication OID is invalid"))?,
             slot_name: row.get(0),
             slot_generation,
         };

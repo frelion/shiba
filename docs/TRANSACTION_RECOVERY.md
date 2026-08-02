@@ -348,7 +348,7 @@ overflow in operator 2 has the same rollback boundary. Same-source processors
 serialize on the existing binding row and acquire operator states in ascending
 ID order; a paused source does not prevent an unrelated source from committing.
 
-## M11.2 bootstrap recovery boundary
+## M11.2–M11.3 bootstrap recovery boundary
 
 The only initial-copy boundary is a new logical slot created with
 `EXPORT_SNAPSHOT`. PostgreSQL returns an immutable `consistent_point` and an
@@ -377,12 +377,38 @@ and resumes M10 catch-up from its `consistent_point`. A crash before cutover
 leaves results unavailable; cutover atomically publishes complete operator
 results and active lifecycle.
 
+Pre-scan reset has two deliberately separate owners. The coordinator holds the
+source advisory fence and uses the replication transport to drop only the exact
+inactive physical slot from the exact configured database. It then invokes one
+catalog transaction with the old BootstrapId/slot/generation and the distinct
+new BootstrapId/slot/larger generation. That writer rejects an existing old or
+new slot, continuation, active/non-building result, post-scan phase, stale
+identity, or publication drift. On success it deletes hidden partial current
+rows, resets private operator state, retires the exact old bootstrap/config,
+and calls the existing reservation validator. Any error rolls all catalog,
+row, state, and result changes back; it cannot recreate or drop a slot.
+
+The crash windows are closed as follows:
+
+- before slot creation, or after a failed create: the exact creating/
+  cleanup-pending attempt has no usable snapshot and is replaced;
+- before a scan batch commit: no rows, operator state, or checkpoint from that
+  batch exist; after commit, exact batch replay is a no-op;
+- after any pre-scan process or PostgreSQL restart: the exported snapshot is
+  not recoverable, so partial hidden state is reset under a new attempt;
+- after `scan_complete` or during catch-up: retain the same persistent slot and
+  resume M10 terminals; never rescan or replace the attempt;
+- after active cutover but before fence feedback: exact fence replay matches
+  both `catchup_fence_lsn` and `activation_end_lsn`, then feedback advances;
+  if feedback already covers the terminal, restart enters live directly;
+- competing/repeated starts: only the advisory-lock owner can mutate lifecycle
+  or manage the exact slot; losers fail without catalog or slot mutation.
+
 Every phase retains M10's exact binding/publication/generation/invalidation
 checks. Scan has three connections and batch-local Apply transactions;
 catch-up/live have two. No Apply transaction or lock survives scan/network/WAL
 wait, and no WAL spool, queue, second continuation, or persisted EffectStream
-exists. M11.2 implements this non-crash path; the reset/resume claims still
-require M11.3 crash evidence.
+exists.
 
 M11.2 now proves the non-crash path on PG17 and PG18. Batches of two commit
 snapshot state to private `3/40` with public building/NULL; one real concurrent
@@ -391,8 +417,16 @@ the exact committed fence transaction publishes active `3/25`; and ordinary
 M10 live ingress commits and acknowledges `4/32`. No snapshot batch writes a
 continuation or duplicates a current row.
 
-This does not prove the recovery prose above. M11.3 still owns failures before
-and after scan completion, during catch-up/cutover/cleanup, PostgreSQL and Shiba
-restart, duplicate workers, and repeated bootstrap start. M11.4 still owns the
+M11.3's PG17.10/PG18.4 gate proves the recovery boundary above: reconstructed
+durable creating/slot-absent restart, cleanup-pending exact replacement,
+partial-scan reset, stale/foreign rejection, exact replay, overflow rollback,
+worker conflict, immediate PostgreSQL restart after `scan_complete`, catch-up
+Apply commit before killed ACK, active cutover before killed ACK with exact
+fence replay, and feedback-covered active restart. Final source/current rows,
+CountRows and SumInt8 match the SQL oracle `4/50`. The gate reconstructs rather
+than instruction-level kills the post-reservation durable state and does not
+directly exercise an active foreign old-slot conflict.
+
+M11.4 still owns the
 million-row bounded-memory and performance proof. M11 remains incomplete; M12
 active/non-pristine rebuild is untouched.

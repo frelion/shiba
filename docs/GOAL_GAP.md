@@ -1,4 +1,4 @@
-# V2 goal gap after M11.2
+# V2 goal gap after M11.3
 
 M1–M9 are the reference correctness kernel, not a complete Shiba V2. They
 prove the transaction and recovery semantics that later architecture must
@@ -8,9 +8,9 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, and one implemented bootstrap checkpoint/lifecycle | M11.3 recovery proof and M12 non-pristine rebuild lifecycle |
+| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap checkpoint/lifecycle, and PG17/18-proved exact pre-scan replacement writer | M12 non-pristine rebuild lifecycle |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
-| Source Ingress | M10 production COPY BOTH plus M11.2 production exported-snapshot scan, fence catch-up, atomic activation, and live handoff | M11.3 crash recovery, M11.4 scale/performance, TLS/disconnect policy, Apply-time shutdown, reconnect/backoff and cross-host soak |
+| Source Ingress | M10 production COPY BOTH plus M11.2 snapshot/live handoff and M11.3 PG17/18 pre-scan replacement/same-slot recovery | M11.4 scale/performance, TLS/disconnect policy, Apply-time shutdown, reconnect/backoff and cross-host soak |
 | Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
 | EffectStream | Non-durable transaction-local EffectBatch | Persisted effects intentionally absent |
 | Runtime | Replay/recovery plus ordered registered-operator execution integrated with M10 ingress | Broader operators and production orchestration |
@@ -43,7 +43,13 @@ M10 live conversion. PG17/18 prove private `3/40`, concurrent-WAL `3/25`, active
 `3/25`, then live `4/32`, with building/NULL visibility and SQL differential
 equality.
 
-M11.3 crash reset/resume, restart and worker competition remain unproved. M11.4
+M11.3 proves exact pre-scan reset/re-reservation, post-scan same-slot
+resume, and active-before-feedback recovery without a second cursor or
+continuation on PG17.10 and PG18.4. The matrix covers partial reset/replay/
+rollback, worker competition, immediate PostgreSQL restart, killed ACK windows,
+exact-fence replay, feedback-covered restart and SQL differential `4/50`.
+Instruction-level kill at reservation and an active foreign old-slot conflict
+remain narrower unproved cases. M11.4
 million-row throughput, catch-up latency and heap bounds remain unproved. M11 is
 not complete, and active/non-pristine rebuild remains untouched M12 scope.
 

@@ -141,6 +141,22 @@ impl ReplicationTransport {
         })
     }
 
+    /// Drops one exact, caller-validated inactive logical slot.
+    ///
+    /// This primitive is intentionally not used by ordinary receiver startup.
+    /// The bootstrap recovery owner must first reconcile durable attempt
+    /// identity and physical slot metadata under the source advisory lock.
+    pub(crate) fn drop_slot(&self, slot: &str) -> Result<(), IngressError> {
+        validate_slot(slot)?;
+        let result = self
+            .connection
+            .exec(&format!("DROP_REPLICATION_SLOT {}", quote_identifier(slot)));
+        if result.status() != Status::CommandOk {
+            return Err(IngressError::UnexpectedStatus(result.status()));
+        }
+        Ok(())
+    }
+
     /// Blocks until libpq returns one complete `CopyData` payload.
     ///
     /// # Errors

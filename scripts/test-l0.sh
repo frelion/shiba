@@ -203,7 +203,7 @@ scripts = [
         "m10-committed-ingress", "m10-streaming-ingress",
         "m10-catalog-ingress", "m10-governed-ingress",
         "m10-performance-ingress", "m10-shutdown-ingress",
-        "m11-bootstrap-contract", "m11-bootstrap",
+        "m11-bootstrap-contract", "m11-bootstrap", "m11-recovery",
     )
 ]
 for path in scripts:

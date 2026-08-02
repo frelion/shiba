@@ -326,5 +326,35 @@ activate public `3/25` only at the exact fence, and then reach `4/32` through an
 ordinary M10 live transaction. Slot feedback covers the durable catch-up and
 live terminals; snapshot batches create no continuation.
 
-M11.3 crash reset/resume and M11.4 million-row memory/performance remain
-unproved. M11 is incomplete, and M12 binding rebuild remains untouched.
+M11.3 recovery is described below. M11.4 million-row memory/performance remains
+unproved, so M11 is incomplete and M12 binding rebuild remains untouched.
+
+## M11.3 recovery ingress
+
+Pre-scan recovery is an explicit bootstrap operation, never ordinary M10
+startup. Holding the same per-source advisory lock, it verifies the exact old
+BootstrapId, slot and generation, drops only that inactive physical slot via
+the replication transport, and calls the single catalog replacement writer
+only after old and new slot names are absent. The replacement advances both
+attempt identity and generation and reuses the existing reservation validator;
+it does not auto-discover, adopt, create, drop, or rotate any other slot.
+
+After `scan_complete`, recovery takes the opposite path: the persistent slot is
+the transport cursor authority, so the coordinator reattaches it and resumes
+the existing bounded M10 receiver. Catch-up continues to revalidate exact
+source/publication/generation before receive, Apply, activation, and ACK. An
+active cutover with feedback still pending can authorize only an exact replay
+of its stored fence marker and terminal `activation_end_lsn`; a slot already
+confirmed through that end enters live without replaying Runtime. PostgreSQL
+restart changes neither rule, and advisory-lock competition permits only one
+active coordinator per source.
+
+The M11.3 gate is green on PG17.10 and PG18.4. It proves reconstructed durable
+creating/slot-absent restart and exact replacement, partial-scan reset,
+stale/foreign rejection, batch replay and rollback, worker competition,
+same-slot resume across immediate PostgreSQL restart, killed feedback after
+catch-up Apply and after active cutover, exact-fence replay, and a no-op restart
+once feedback covers the active terminal. Final SQL differential is `4/50`.
+The gate does not directly kill at the reservation instruction or exercise an
+active foreign old-slot conflict. M11.4 remains the million-row boundedness/
+performance slice.

@@ -132,12 +132,38 @@ different snapshot.
 This reset is safe only because M11 admits a pristine, never-active source and
 no partial result was public.
 
+M11.3 makes that reset explicit. The coordinator first acquires the same
+per-source advisory ownership fence, revalidates the exact old bootstrap ID,
+slot and generation, and permits replacement only from `creating`, `scanning`,
+`cleanup_pending`, or `failed`. It then drops the exact inactive physical slot
+through the replication connection. Only after PostgreSQL proves both the old
+and requested new slot names absent may the single catalog writer atomically
+clear partial `source_row_state`, reset private operator state, retire the exact
+old bootstrap/config pair, and reserve a distinct BootstrapId with a strictly
+larger generation. The existing reservation writer performs the final live
+binding/publication validation and restores public results to building/NULL.
+The result's internal active/zero normalization exists only inside this
+uncommitted replacement transaction and can never become visible. A slot that
+still exists, a continuation, an active result, publication drift, a stale
+attempt, or any post-`scan_complete` phase rejects replacement without mutation.
+
 After `scan_complete`, restart retains the existing slot and resumes bounded
 M10 catch-up. A crash before active cutover leaves the result unavailable; a
-crash after the cutover transaction observes the complete active result. Slot
+crash after the cutover transaction observes the complete active result. If
+cutover commits before fence feedback, `activation_end_lsn` remains the exact
+durable authorization: restart replays the same fence, proves the same marker
+and terminal end LSN, sends feedback, and never runs Runtime or republishes a
+different value. If slot feedback already covers that terminal, restart can
+enter live ingress without replay. Slot
 creation and pre-active cleanup are explicit bootstrap lifecycle operations,
 not ordinary M10 startup behavior. Cleanup must never infer a slot by name or
 drop a slot owned by another attempt.
+
+PostgreSQL restart never changes these choices. A pre-scan exported snapshot is
+gone and therefore uses exact replacement; a `scan_complete`, `catching_up`, or
+active attempt keeps its persistent slot and resumes from PostgreSQL's cursor.
+Two bootstrap workers contend on the per-source advisory lock, so at most one
+can create, replace, scan, catch up, activate, or acknowledge the source.
 
 ## Identity and resource governance
 
@@ -174,8 +200,19 @@ INSERT reaches `4/32`. The final current-row keys and nullable values equal the
 source SQL oracle, only the two real WAL transactions create continuations, and
 slot feedback covers each durable terminal.
 
-M11.3 must still prove the complete pre-scan reset and post-scan resume crash
-matrix, including PostgreSQL/Shiba restart and competing workers. M11.4 must
+M11.3 is green on PG17.10 and PG18.4. Its recovery gate reconstructs the
+durable crash-after-reservation state (`creating`, exact slot absent), persists
+`cleanup_pending`, replaces it with a new ID/generation, resets a partial scan,
+and rejects stale generation and a foreign replacement slot. It also proves
+exact batch replay, overflow rollback, advisory-lock competition,
+`scan_complete` plus immediate PostgreSQL restart, catch-up Apply committed
+before killed ACK, active cutover committed before killed ACK with exact-fence
+replay, and feedback-covered active restart. The final source/current rows and
+CountRows/SumInt8 equal the SQL differential `4/50`.
+
+The test does not kill the process at the exact reservation instruction; it
+reconstructs the identical committed authority state. An active foreign old-
+slot conflict is not directly exercised. M11.4 must
 prove the frozen million-row throughput, catch-up latency, bounded heap, and
 concurrent-write performance gates. M11 is not complete, and M12 remains
 untouched.

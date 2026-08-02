@@ -159,5 +159,35 @@ key, immutable consistent point, latest batch ordinal/key/digest, unique writer
 fence token, and catch-up fence LSN. It stores no snapshot name, WAL payload, or
 moving slot cursor. PG17/18 prove initial reservation, building visibility, two
 bounded batch checkpoints, fence activation, WAL-only continuation, and
-ordinary live handoff. M11.3 crash/reset/resume and M11.4 million-row
-performance remain unproved; M11 and M12 are not complete.
+ordinary live handoff. M11.3 recovery is described below; M11.4 million-row
+performance remains unproved, so M11 and M12 are not complete.
+
+## M11.3 pristine attempt replacement writer
+
+`shiba_internal.replace_pristine_source_bootstrap` is the sole catalog writer
+for replacing a hidden pre-scan attempt. Its compare-and-swap input contains
+the exact old BootstrapId/source/slot/generation plus a distinct new
+BootstrapId, requested publication OID, new slot and strictly larger
+generation. It locks the exact binding, bootstrap and ingress rows and admits
+only `creating`, `scanning`, `cleanup_pending`, or `failed`. Both physical slot
+names must already be absent; slot drop/create remain replication-transport
+operations outside this SQL transaction.
+
+The writer also requires no source continuation and only building/NULL public
+results. It deletes partial `source_row_state`, resets the source's private
+operator states, retires the exact old bootstrap/config, and calls the existing
+reservation writer. The latter rechecks live binding, invalidation,
+publication OID/membership/flags, empty physical slot, and pristine state before
+inserting the new exact config/checkpoint and leaving results building/NULL.
+To reuse that strict initial-reservation predicate, results are normalized to
+active/zero only inside the uncommitted replacement transaction; no reader can
+observe it, and any later validation failure rolls the whole replacement back.
+
+The writer never handles `scan_complete`, `catching_up`, or `active`, never
+touches `source_continuation`, and cannot create/drop slots. Public has no table
+or function privileges. PG17.10 and PG18.4 prove exact replacement and partial-
+state reset, stale-generation/foreign-slot rejection, exact replay, overflow
+rollback, advisory competition, same-slot restart/catch-up, and active-before-
+feedback exact-fence replay. The creating/slot-absent crash state is
+reconstructed durably rather than reached by an instruction-level process kill;
+an active foreign old-slot conflict is not directly tested.

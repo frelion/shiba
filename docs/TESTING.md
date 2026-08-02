@@ -398,6 +398,45 @@ This production gate is green on PG17.10 and PG18.4. It is not the M11.3 crash
 matrix or M11.4 million-row performance gate; M11 remains incomplete and M12 is
 untouched.
 
+## M11.3 recovery gate
+
+Run `scripts/test-m11-recovery.sh` independently for PG17 and PG18. The gate
+reconstructs the committed crash-after-reservation state (`creating`, exact
+slot absent); restart persists `cleanup_pending` without a fabricated
+consistent point and performs exact pre-scan replacement. Reservation rejects
+a preexisting slot before an attempt exists. Replacement rejects stale
+generation and a foreign requested slot; partial rows and operator state are
+cleared only with the old config/checkpoint; the distinct attempt and larger
+generation remain building/NULL; and a failure rolls back the replacement.
+
+The production recovery matrix additionally covers batch-before-commit,
+batch-after-commit exact replay, post-`scan_complete` same-slot resume,
+catch-up restart, active cutover before feedback, restart after feedback,
+PostgreSQL restart, Shiba/session restart, duplicate worker advisory-lock
+competition, and repeated start. Assertions compare source rows, CountRows,
+SumInt8, public visibility, continuation, phase, slot generation and exact
+`confirmed_flush_lsn`; no test infers success from names alone.
+
+This gate is green on PG17.10 and PG18.4. It proves exact batch replay and
+overflow rollback, duplicate-worker advisory conflict, `scan_complete` followed
+by immediate PostgreSQL restart and resume, catch-up Apply committed before its
+ACK connection is killed, active cutover committed before its ACK connection is
+killed and then exact-fence replayed, feedback-covered active restart as a
+no-op, and final source/current rows plus CountRows/SumInt8 SQL differential
+`4/50`. It does not directly kill the process at the reservation instruction or
+exercise an active foreign old-slot conflict.
+
+Complexity checks remain structural. Runtime's roughly 2,260 production lines
+are split among bootstrap model/Apply, source Apply, operator execution,
+preflight and decoder responsibilities. The 1,200 total is a warning; 3,000 is
+an audit stop, not a target. A production file warns above 300 and fails above
+400. SQL files remain at most 150 lines. Warnings cannot fail CI, while hard
+limits do; no threshold justifies compacting code or deleting recovery tests.
+
+M11.4 must freeze its million-row throughput, catch-up latency and heap bounds
+before measuring them. Until that gate is implemented and green, M11 remains
+incomplete.
+
 ## Evidence handling
 
 Fixtures in `tests/fixtures` must be data, not copied executable implementation.

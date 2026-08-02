@@ -73,6 +73,12 @@
     requires = ["source_bootstrap"]
 );
 
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/013_source_bootstrap_replacement.sql",
+    name = "source_bootstrap_replacement",
+    requires = ["source_bootstrap_reservation"]
+);
+
 #[cfg(test)]
 mod tests {
     const CATALOG_SQL: &str = include_str!("../../../sql/v2/001_catalog_identity.sql");
@@ -90,6 +96,8 @@ mod tests {
     const M11_BOOTSTRAP_SQL: &str = include_str!("../../../sql/v2/011_source_bootstrap.sql");
     const M11_RESERVATION_SQL: &str =
         include_str!("../../../sql/v2/012_source_bootstrap_reservation.sql");
+    const M11_REPLACEMENT_SQL: &str =
+        include_str!("../../../sql/v2/013_source_bootstrap_replacement.sql");
 
     fn normalized_sql() -> String {
         CATALOG_SQL.to_ascii_lowercase()
@@ -432,5 +440,59 @@ mod tests {
         }
         assert!(!sql.contains("pg_create_logical_replication_slot"));
         assert!(!sql.contains("pg_drop_replication_slot"));
+    }
+
+    #[test]
+    fn m11_cleanup_constraints_admit_pre_boundary_failure_only_without_fence() {
+        let sql = M11_BOOTSTRAP_SQL.to_ascii_lowercase();
+        for required in [
+            "phase in ('cleanup_pending', 'failed') and (\n            consistent_point is null",
+            "phase in ('cleanup_pending', 'failed') and (\n            catchup_fence_lsn is null",
+            "consistent_point is not null\n                and catchup_fence_lsn >= consistent_point",
+        ] {
+            assert!(
+                sql.contains(required),
+                "missing recovery constraint: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn m11_replacement_is_exact_pre_active_and_reuses_reservation() {
+        let sql = M11_REPLACEMENT_SQL.to_ascii_lowercase();
+        assert_eq!(sql.matches("create table ").count(), 0);
+        assert_eq!(sql.matches("create function ").count(), 1);
+        for required in [
+            "create function shiba_internal.replace_pristine_source_bootstrap",
+            "new_generation <= old_generation",
+            "for update of binding, bootstrap, config",
+            "'creating', 'scanning', 'cleanup_pending', 'failed'",
+            "replacement requires absent old and new slots",
+            "from shiba_internal.source_continuation",
+            "result.result_status <> 'building'",
+            "delete from shiba_internal.source_row_state",
+            "set value_bigint = 0",
+            "normalization is transaction-local",
+            "delete from shiba_internal.source_bootstrap",
+            "delete from shiba_internal.source_ingress_config",
+            "perform shiba_internal.reserve_source_bootstrap",
+            "revoke all on function shiba_internal.replace_pristine_source_bootstrap",
+        ] {
+            assert!(
+                sql.contains(required),
+                "missing replacement boundary: {required}"
+            );
+        }
+        for forbidden in [
+            "pg_create_logical_replication_slot",
+            "pg_drop_replication_slot",
+            "confirmed_flush_lsn",
+            "create table shiba_internal.bootstrap_batch",
+        ] {
+            assert!(
+                !sql.contains(forbidden),
+                "forbidden recovery authority: {forbidden}"
+            );
+        }
     }
 }

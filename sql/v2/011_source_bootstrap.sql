@@ -30,8 +30,13 @@ CREATE TABLE shiba_internal.source_bootstrap (
     ),
     CONSTRAINT source_bootstrap_consistent_point CHECK (
         (phase = 'creating' AND consistent_point IS NULL)
-        OR (phase <> 'creating' AND consistent_point IS NOT NULL
+        OR (phase IN ('scanning', 'scan_complete', 'catching_up', 'active')
+            AND consistent_point IS NOT NULL
             AND consistent_point > '0/0'::pg_lsn)
+        OR (phase IN ('cleanup_pending', 'failed') AND (
+            consistent_point IS NULL
+            OR consistent_point > '0/0'::pg_lsn
+        ))
     ),
     CONSTRAINT source_bootstrap_batch_checkpoint CHECK (
         (last_batch_ordinal = 0
@@ -42,14 +47,15 @@ CREATE TABLE shiba_internal.source_bootstrap (
             AND pg_catalog.octet_length(last_batch_digest) = 32)
     ),
     CONSTRAINT source_bootstrap_catchup_fence CHECK (
-        (phase IN ('catching_up', 'active', 'cleanup_pending')
+        (phase IN ('catching_up', 'active')
          AND catchup_fence_lsn IS NOT NULL
          AND catchup_fence_lsn >= consistent_point)
         OR (phase IN ('creating', 'scanning', 'scan_complete')
             AND catchup_fence_lsn IS NULL)
-        OR (phase = 'failed' AND (
+        OR (phase IN ('cleanup_pending', 'failed') AND (
             catchup_fence_lsn IS NULL
-            OR catchup_fence_lsn >= consistent_point
+            OR (consistent_point IS NOT NULL
+                AND catchup_fence_lsn >= consistent_point)
         ))
     ),
     CONSTRAINT source_bootstrap_activation_authorization CHECK (
