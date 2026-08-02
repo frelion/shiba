@@ -59,6 +59,24 @@ canonical text `int8` payload. The decoder preserves message order in one
 unchanged-TOAST, binary, and any other shape fail closed. M4.4 does not admit an
 INSERT and UPDATE of the same row in one transaction.
 
+## M4.5 stable-key DELETE extension
+
+Only key-only mode admits DELETE. The exact protocol-version-1 wire shape is
+relation OID followed by tuple selector `K`, column count `1`, and one `t`
+column containing canonical decimal text for an `i64`. The decoder returns a
+DELETE change only after checking the admitted relation OID, selector, count,
+tuple tag, length, canonical key, transaction envelope, and trailing boundary.
+An invalid selector or tuple tag fails during pure decode, before the processor
+can write.
+
+This is deliberately only PostgreSQL's default-replica-identity `D + K` path
+for a stable, single-column `int8` key. `D + O`, replica identity `FULL`,
+composite DELETE, key-changing UPDATE, UPDATE old tuples, TOAST, streaming,
+generation changes, and multiple sources remain outside the admitted language.
+The wire semantics are grounded independently in the PostgreSQL
+[17 logical replication message formats](https://www.postgresql.org/docs/17/protocol-logicalrep-message-formats.html)
+and [18 logical replication message formats](https://www.postgresql.org/docs/18/protocol-logicalrep-message-formats.html).
+
 ## M3.2 acknowledgement crash point
 
 The recovery gate deliberately separates database visibility from replication
@@ -83,5 +101,9 @@ post-result/pre-ack crash window on PG17 and PG18 using the slot's own
 `confirmed_flush_lsn`. Production transport and slot lifecycle remain unproved;
 they cannot introduce another continuation or writer. M4.1–M4.3 prove nullable,
 empty, and fixed composite INSERT shapes. M4.4 proves unchanged-key nullable
-payload UPDATE; DELETE, key-changing/old-tuple UPDATE, TOAST, and streaming
-remain out of scope.
+payload UPDATE, including non-NULL canonical text and a valid UPDATE whose
+missing target rolls back mutation and continuation. M4.5 proves real `D + K`,
+exact key decoding, atomic current-state deletion and count publication,
+failure rollback, crash/retry, and exact replay on both supported PostgreSQL
+majors. The broader DELETE/UPDATE forms, TOAST, and streaming remain out of
+scope.

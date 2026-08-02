@@ -63,6 +63,15 @@ the row, while `source_continuation` durably records each committed source
 transaction. UPDATE does not advance count. Apply mutation, unchanged count
 state/result, and continuation are owned by the same processor transaction.
 
+M4.5 removes that same Apply row for a pgoutput `D + K` change with one stable
+`int8` key. `applied_insert` has therefore evolved into the sole current
+source-row-state authority: INSERT creates, UPDATE mutates, and DELETE removes.
+Its name is recorded debt; renaming it is deferred because doing so would expand
+this slice, and no alias, compatibility view, or second state table is allowed.
+The processor remains the sole writer and PostgreSQL transaction owner. It
+deletes exactly one row, decrements private count without underflow, publishes
+the matching result, and records continuation in the same transaction.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -71,7 +80,8 @@ No later code may use an old authority as a fallback. An implementation is
 accepted only after its clean-room tests prove its new contract; legacy tests are
 evidence inputs, not implementation dependencies.
 
-**Unproved:** production replication transport and slot ownership,
-DELETE, key-changing UPDATE, replica-identity changes, TOAST, catalog binding
-inspection, concurrency, generation changes, general operators, and recovery
-workers remain.
+**Unproved:** production replication transport and slot ownership, `D + O`,
+replica identity `FULL`, composite DELETE, key-changing UPDATE and old tuples,
+TOAST, streaming transactions, catalog binding inspection, concurrency,
+generation changes, multiple sources, general operators, and recovery workers
+remain.

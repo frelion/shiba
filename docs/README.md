@@ -8,7 +8,8 @@ safe slot replay across the post-result/pre-ack crash window. M4.1 adds a fixed
 nullable `int8` payload while retaining the stable non-null `int8` row key.
 M4.2 admits zero-column INSERT tuples without inventing a row identity.
 M4.3 adds a fixed two-`int8` composite row identity. M4.4 admits a
-single-key UPDATE that changes only the nullable payload.
+single-key UPDATE that changes only the nullable payload. M4.5 admits DELETE
+only for a stable, single-column `int8` key emitted as pgoutput `D + K`.
 
 ## Scope decision
 
@@ -34,10 +35,18 @@ M4.4 treats the existing Apply row as current source state. An unchanged-key
 UPDATE mutates its payload in the same processor transaction, leaves count at
 the number of inserted rows, and advances continuation only with that mutation.
 
-**Not proved.** M4.4 has no production replication transport/slot lifecycle,
-DELETE, key-changing UPDATE, replica-identity changes, TOAST, streaming
-transaction, DDL invalidation, concurrent source, external effect,
-compatibility path, alias, fallback, or dual write.
+M4.5 makes that current-state meaning explicit: `applied_insert` is the sole
+source-row-state table, despite its now-incomplete name. INSERT creates a row,
+UPDATE mutates it in place, and DELETE removes it. DELETE, private count, public
+result, and continuation commit in the same processor-owned PostgreSQL
+transaction. Missing-row, decode, and backend-crash failures expose none of
+those writes; retry applies once and exact transaction replay is a no-op.
+
+**Not proved.** M4.5 has no production replication transport/slot lifecycle,
+`D + O`, replica identity `FULL`, composite DELETE, key-changing UPDATE, UPDATE
+old tuples, TOAST, streaming transaction, slot-generation change, multiple
+sources, DDL invalidation, external effect, compatibility path, alias, fallback,
+or dual write.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),
 [catalog contract](CATALOG_CONTRACT.md), and the [reuse manifest](contracts/REUSE_MANIFEST.md)

@@ -3,19 +3,13 @@ use core::fmt;
 use shiba_protocol::{IngressTransactionId, InputSequence, PostgresLsn, SourceTransactionId};
 
 use crate::{
-    SourceChange, SourceInsert, SourcePayload, SourceTransaction, SourceUpdate,
-    pgoutput_source::{PgoutputSource, SourceShape},
+    SourceChange, SourceInsert, SourceTransaction, SourceUpdate,
+    pgoutput_source::PgoutputSource,
+    pgoutput_tuple::{DecodedChange, decode_delete, decode_insert, decode_update},
     pgoutput_wire::Cursor,
 };
 
 const INT8_OID: u32 = 20;
-
-enum DecodedChange {
-    EmptyInsert,
-    RowInsert(i64, SourcePayload),
-    CompositeInsert(i64, i64),
-    Update(i64, Option<i64>),
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PgoutputError {
@@ -53,7 +47,7 @@ impl fmt::Display for PgoutputError {
 impl std::error::Error for PgoutputError {}
 
 /// # Errors
-/// Rejects input that is not one complete admitted M4.4 transaction.
+/// Rejects input that is not one complete admitted M4.5 transaction.
 pub fn decode_committed_changes(
     input: &[u8],
     source: PgoutputSource,
@@ -80,6 +74,7 @@ pub fn decode_committed_changes(
         match tag {
             b'I' => values.push(decode_insert(&mut cursor, source)?),
             b'U' => values.push(decode_update(&mut cursor, source)?),
+            b'D' => values.push(decode_delete(&mut cursor, source)?),
             b'C' if !values.is_empty() => break,
             b'C' => return Err(PgoutputError::MessageOrder),
             other => return Err(PgoutputError::UnknownMessage(other)),
@@ -124,6 +119,10 @@ pub fn decode_committed_changes(
                 DecodedChange::Update(row_id, payload) => {
                     SourceChange::Update(SourceUpdate::new(sequence, row_id, payload))
                 }
+                DecodedChange::Delete(source_row_id) => SourceChange::Delete {
+                    input_sequence: sequence,
+                    source_row_id,
+                },
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -151,70 +150,4 @@ fn decode_relation(cursor: &mut Cursor<'_>, source: PgoutputSource) -> Result<()
         cursor.u32()?;
     }
     Ok(())
-}
-
-fn decode_insert(
-    cursor: &mut Cursor<'_>,
-    source: PgoutputSource,
-) -> Result<DecodedChange, PgoutputError> {
-    if cursor.u32()? != source.relation_id {
-        return Err(PgoutputError::RelationMismatch);
-    }
-    let columns = source.shape.columns();
-    if cursor.byte()? != b'N' || cursor.u16()? != columns {
-        return Err(PgoutputError::TupleShape);
-    }
-    match source.shape {
-        SourceShape::Empty => Ok(DecodedChange::EmptyInsert),
-        SourceShape::KeyOnly => Ok(DecodedChange::RowInsert(
-            decode_int8(cursor)?,
-            SourcePayload::Absent,
-        )),
-        SourceShape::NullableInt8Payload => {
-            let key = decode_int8(cursor)?;
-            let payload = match decode_optional_int8(cursor)? {
-                None => SourcePayload::Null,
-                Some(value) => SourcePayload::Int8(value),
-            };
-            Ok(DecodedChange::RowInsert(key, payload))
-        }
-        SourceShape::CompositeInt8 => Ok(DecodedChange::CompositeInsert(
-            decode_int8(cursor)?,
-            decode_int8(cursor)?,
-        )),
-    }
-}
-
-fn decode_update(
-    cursor: &mut Cursor<'_>,
-    source: PgoutputSource,
-) -> Result<DecodedChange, PgoutputError> {
-    if source.shape != SourceShape::NullableInt8Payload {
-        return Err(PgoutputError::TupleShape);
-    }
-    if cursor.u32()? != source.relation_id {
-        return Err(PgoutputError::RelationMismatch);
-    }
-    if cursor.byte()? != b'N' || cursor.u16()? != 2 {
-        return Err(PgoutputError::TupleShape);
-    }
-    let row_id = decode_int8(cursor)?;
-    let payload = decode_optional_int8(cursor)?;
-    Ok(DecodedChange::Update(row_id, payload))
-}
-
-fn decode_optional_int8(cursor: &mut Cursor<'_>) -> Result<Option<i64>, PgoutputError> {
-    match cursor.byte()? {
-        b'n' => Ok(None),
-        b't' => Ok(Some(cursor.int8_text()?)),
-        tag => Err(PgoutputError::TupleTag(tag)),
-    }
-}
-
-fn decode_int8(cursor: &mut Cursor<'_>) -> Result<i64, PgoutputError> {
-    let format = cursor.byte()?;
-    if format != b't' {
-        return Err(PgoutputError::TupleTag(format));
-    }
-    cursor.int8_text()
 }

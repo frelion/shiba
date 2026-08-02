@@ -64,3 +64,17 @@ missing row fails closed. Backend termination after continuation INSERT proves
 that payload, count state, result, and continuation all remain at their prior
 committed values. Retry applies the UPDATE once; exact replay then returns
 `AlreadyApplied` before mutation. Slot feedback remains outside this authority.
+
+M4.5 uses that unchanged owner and ordering for DELETE. The processor deletes
+exactly one current-state row, checks and decrements count without underflow,
+publishes the identical public count, then records continuation last before the
+single COMMIT. A missing row or underflow aborts the whole transaction, so row,
+private count, public result, and continuation all retain their old values.
+Invalid `D + K` bytes fail even earlier during pure decode.
+
+A backend termination after continuation INSERT and before COMMIT proves the
+same four durable observations remain old. Retrying the same decoded DELETE
+then removes and decrements once; replaying that exact committed transaction
+returns `AlreadyApplied` without touching row state or counts. Continuation is
+therefore the transaction replay authority, while `applied_insert` is the sole
+current source-row state; neither a DELETE log nor a recovery writer exists.

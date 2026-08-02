@@ -21,6 +21,8 @@ PG_CONFIG=/opt/homebrew/opt/postgresql@18/bin/pg_config ./scripts/test-l0.sh
 ./scripts/test-m4-composite.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ./scripts/test-m4-update.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
 ./scripts/test-m4-update.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
+./scripts/test-m4-delete.sh /opt/homebrew/opt/postgresql@17/bin/pg_config
+./scripts/test-m4-delete.sh /opt/homebrew/opt/postgresql@18/bin/pg_config
 ```
 
 `test-l0.sh` selects the matching `pg17` or `pg18` feature, then runs formatting,
@@ -66,10 +68,21 @@ It proves exact two-part Apply facts, count `2`, replay no-op, and a precisely
 corrupted second-key tag failing with zero durable state.
 
 `test-m4-update.sh` applies a real INSERT and then captures an unchanged-key
-UPDATE whose nullable payload becomes SQL NULL. It proves count stays `1`, the
-Apply payload changes exactly once, a corrupt key tag fails before writes, and
-backend termination after continuation INSERT rolls payload and continuation
-back together before a successful retry and replay no-op.
+UPDATE through both non-NULL canonical text and SQL NULL paths. It proves count
+stays `1`, the Apply payload changes exactly once, a corrupt key tag fails before
+writes, and a valid UPDATE for a missing row rolls mutation and continuation
+back. Backend termination after continuation INSERT rolls payload, count,
+result, and continuation back together before successful retry and replay no-op.
+
+`test-m4-delete.sh` first applies one real INSERT transaction containing two
+single-key rows, then captures one row's real DELETE as pgoutput protocol-v1
+`D + K`. It proves relation OID, selector,
+column count, and canonical text key decoding; only the target current-state row
+is removed; another row is unchanged; private count and public result decrement
+exactly once; and continuation commits with them. It separately proves invalid
+tuple tag rejection before writes, missing-row and count-underflow rollback,
+backend-crash rollback of row/count/result/continuation, successful retry, exact
+replay no-op, and the same behavior on PostgreSQL 17 and 18.
 
 During development run fmt, check, the Runtime unit tests, one current scenario,
 and clippy. Run both complete PG matrices only at the milestone boundary.

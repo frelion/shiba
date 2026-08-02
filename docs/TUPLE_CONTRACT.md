@@ -1,6 +1,6 @@
 # Tuple contract
 
-## Admitted shapes through M4.4
+## Admitted shapes through M4.5
 
 M4 accepts exactly four INSERT relation shapes:
 
@@ -23,6 +23,11 @@ M4.4 additionally admits `UPDATE (key, payload)` only for the nullable-payload
 shape when PostgreSQL emits a new tuple and the key is unchanged. Its encoding
 rules are identical to INSERT. Old/key tuples and key mutation are excluded.
 
+M4.5 additionally admits `DELETE (key)` only for the single-key shape. The
+pgoutput DELETE must select a `K` tuple with exactly one column containing a
+canonical text `int8`. The relation OID and tuple selector are validated; NULL,
+unchanged-TOAST, binary, `O`, extra columns, and non-canonical text fail closed.
+
 ## Apply representation and ownership
 
 `SourcePayload::Absent` means the admitted relation has no payload column;
@@ -40,13 +45,18 @@ count operator state, public result, and continuation commit or roll back
 together. Replay uses the unchanged transaction identity and never re-applies a
 payload.
 
-For UPDATE the existing Apply row is current source state: only its payload is
-mutated. The original INSERT cause remains stable, continuation records the
-UPDATE transaction, and count state/result do not change. All remain under the
-same writer and PostgreSQL transaction.
+The existing `applied_insert` row is current source state: INSERT creates it,
+UPDATE mutates only its payload, and DELETE removes it. The original INSERT
+cause remains stable while the row exists. Continuation is the transaction
+replay authority, not a change log or a second row-state table. DELETE removes
+exactly the matching single-key row, decrements private count and public result
+once, and records continuation under the same writer and PostgreSQL transaction.
+The table name is known debt; M4.5 adds no alias, compatibility view, or second
+authority.
 
 ## Deferred boundary
 
-DELETE, key-changing UPDATE, old/key tuples, replica identity changes, TOAST,
-binary transfer, and schema drift are not admitted through M4.4. Composite
-identities beyond two built-in `int8` columns are also excluded.
+`D + O`, replica identity `FULL`, composite DELETE, key-changing UPDATE, UPDATE
+old tuples, TOAST, binary transfer, streaming transactions, multiple sources,
+generation changes, and schema drift are not admitted through M4.5. Composite
+identities beyond the existing fixed INSERT shape are also excluded.

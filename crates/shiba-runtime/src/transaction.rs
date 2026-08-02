@@ -40,10 +40,15 @@ impl SourceUpdate {
         }
     }
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceChange {
     Insert(SourceInsert),
     Update(SourceUpdate),
+    Delete {
+        input_sequence: InputSequence,
+        source_row_id: i64,
+    },
 }
 
 impl SourceInsert {
@@ -56,6 +61,7 @@ impl SourceInsert {
             source_payload: SourcePayload::Absent,
         }
     }
+
     #[must_use]
     pub const fn with_payload(
         input_sequence: InputSequence,
@@ -69,6 +75,7 @@ impl SourceInsert {
             source_payload,
         }
     }
+
     #[must_use]
     pub const fn empty(input_sequence: InputSequence) -> Self {
         Self {
@@ -78,6 +85,7 @@ impl SourceInsert {
             source_payload: SourcePayload::Absent,
         }
     }
+
     #[must_use]
     pub const fn composite(input_sequence: InputSequence, first: i64, second: i64) -> Self {
         Self {
@@ -88,6 +96,7 @@ impl SourceInsert {
         }
     }
 }
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceTransaction {
     pub identity: SourceTransactionId,
@@ -103,6 +112,7 @@ impl SourceTransaction {
             inserts.into_iter().map(SourceChange::Insert).collect(),
         )
     }
+
     /// # Errors
     /// Rejects empty, duplicate, or out-of-range changes.
     pub fn from_changes(
@@ -133,6 +143,10 @@ impl SourceTransaction {
                     update.input_sequence.get(),
                     Some((update.source_row_id, None)),
                 ),
+                SourceChange::Delete {
+                    input_sequence,
+                    source_row_id,
+                } => (input_sequence.get(), Some((*source_row_id, None))),
             };
             validate_coordinate("input_sequence", sequence)?;
             if !sequences.insert(sequence) {

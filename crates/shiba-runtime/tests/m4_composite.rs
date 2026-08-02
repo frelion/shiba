@@ -1,68 +1,17 @@
-use std::{fs, path::PathBuf, process::Command};
-
 use postgres::{Client, NoTls};
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{PgoutputSource, ProcessOutcome, decode_committed_changes, process};
 
-fn required(name: &str) -> String {
-    std::env::var(name)
-        .unwrap_or_else(|_| panic!("scripts/test-m4-composite.sh must provide {name}"))
-}
+mod support;
 
-fn command(name: &str) -> Command {
-    let mut command =
-        Command::new(PathBuf::from(required("SHIBA_M4_COMPOSITE_PG_BINDIR")).join(name));
-    command.args([
-        "-h",
-        &required("SHIBA_M4_COMPOSITE_HOST"),
-        "-p",
-        &required("SHIBA_M4_COMPOSITE_PORT"),
-        "-U",
-        &required("SHIBA_M4_COMPOSITE_USER"),
-        "-d",
-        "postgres",
-    ]);
-    command
-}
+use support::{PgoutputCapture, message_end, read_u16, read_u32};
 
-fn create_slot() {
-    let status = command("pg_recvlogical")
-        .args([
-            "-S",
-            "shiba_m4_composite_slot",
-            "-P",
-            "pgoutput",
-            "--create-slot",
-        ])
-        .status()
-        .expect("run pg_recvlogical --create-slot");
-    assert!(status.success(), "create logical slot");
-}
-
-fn capture(client: &mut Client) -> Vec<u8> {
-    let end_lsn: String = client
-        .query_one("SELECT pg_current_wal_lsn()::text", &[])
-        .expect("read capture end LSN")
-        .get(0);
-    let output =
-        PathBuf::from(required("SHIBA_M4_COMPOSITE_CAPTURE_DIR")).join("composite.pgoutput");
-    let status = command("pg_recvlogical")
-        .args(["-S", "shiba_m4_composite_slot", "--start", "-f"])
-        .arg(&output)
-        .args([
-            "-n",
-            "-E",
-            &end_lsn,
-            "-o",
-            "proto_version=1",
-            "-o",
-            "publication_names=shiba_m4_composite_pub",
-        ])
-        .status()
-        .expect("capture pgoutput");
-    assert!(status.success(), "capture through end LSN {end_lsn}");
-    strip_recvlogical_delimiters(&fs::read(output).expect("read captured pgoutput"))
-}
+const CAPTURE: PgoutputCapture = PgoutputCapture {
+    script: "scripts/test-m4-composite.sh",
+    env_prefix: "SHIBA_M4_COMPOSITE",
+    slot: "shiba_m4_composite_slot",
+    publication: "shiba_m4_composite_pub",
+};
 
 fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
@@ -76,75 +25,6 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
         )
         .expect("query durable state");
     (row.get(0), row.get(1), row.get(2), row.get(3))
-}
-
-// pg_recvlogical adds one newline per XLogData. Structural message lengths
-// identify only those delimiters, so tuple content is never globally changed.
-fn strip_recvlogical_delimiters(capture: &[u8]) -> Vec<u8> {
-    let mut wire = Vec::new();
-    let mut start = 0;
-    while start < capture.len() {
-        let end = message_end(capture, start);
-        assert_eq!(capture.get(end), Some(&b'\n'), "missing client delimiter");
-        wire.extend_from_slice(&capture[start..end]);
-        start = end + 1;
-    }
-    wire
-}
-
-fn message_end(bytes: &[u8], start: usize) -> usize {
-    let mut at = start + 1;
-    match bytes[start] {
-        b'B' => at + 20,
-        b'C' => at + 25,
-        b'R' => {
-            at += 4;
-            at = cstring_end(bytes, at);
-            at = cstring_end(bytes, at);
-            at += 1;
-            let columns = read_u16(bytes, at);
-            at += 2;
-            for _ in 0..columns {
-                at += 1;
-                at = cstring_end(bytes, at);
-                at += 8;
-            }
-            at
-        }
-        b'I' => {
-            at += 5;
-            let columns = read_u16(bytes, at);
-            at += 2;
-            for _ in 0..columns {
-                let kind = bytes[at];
-                at += 1;
-                if matches!(kind, b't' | b'b') {
-                    at += 4 + usize::try_from(read_u32(bytes, at)).expect("tuple length");
-                } else {
-                    assert!(matches!(kind, b'n' | b'u'), "unknown tuple kind");
-                }
-            }
-            at
-        }
-        tag => panic!("unexpected pgoutput tag {tag:#x}"),
-    }
-}
-
-fn cstring_end(bytes: &[u8], start: usize) -> usize {
-    start
-        + bytes[start..]
-            .iter()
-            .position(|byte| *byte == 0)
-            .expect("terminated pgoutput string")
-        + 1
-}
-
-fn read_u16(bytes: &[u8], at: usize) -> u16 {
-    u16::from_be_bytes(bytes[at..at + 2].try_into().expect("u16 field"))
-}
-
-fn read_u32(bytes: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes(bytes[at..at + 4].try_into().expect("u32 field"))
 }
 
 fn first_insert_second_key_tag(wire: &[u8]) -> usize {
@@ -163,7 +43,7 @@ fn first_insert_second_key_tag(wire: &[u8]) -> usize {
 #[test]
 #[ignore = "requires the isolated logical PostgreSQL cluster from scripts/test-m4-composite.sh"]
 fn m4_real_pgoutput_composite_keys_and_bad_second_key_tag() {
-    let connection = required("SHIBA_M4_COMPOSITE_DATABASE_URL");
+    let connection = CAPTURE.required("DATABASE_URL");
     let mut client = Client::connect(&connection, NoTls).expect("connect to temporary PostgreSQL");
     client
         .batch_execute(
@@ -193,11 +73,11 @@ fn m4_real_pgoutput_composite_keys_and_bad_second_key_tag() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
-    create_slot();
+    CAPTURE.create_slot();
     client
         .batch_execute("INSERT INTO source_m4_composite.events VALUES (10, 201), (10, 202)")
         .expect("commit same-first-key composite rows");
-    let wire = capture(&mut client);
+    let wire = CAPTURE.capture(&mut client, "composite.pgoutput");
 
     let mut bad_second_key = wire.clone();
     let second_tag = first_insert_second_key_tag(&bad_second_key);

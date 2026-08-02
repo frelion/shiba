@@ -3,7 +3,7 @@ use core::fmt;
 #[derive(Debug)]
 pub enum M2Error {
     CoordinateOutOfRange(&'static str),
-    CountOverflow,
+    CountOutOfRange,
     DuplicateInputSequence(u64),
     DuplicateSourceRow(i64),
     EmptyTransaction,
@@ -20,7 +20,9 @@ impl fmt::Display for M2Error {
             Self::CoordinateOutOfRange(field) => {
                 write!(formatter, "{field} exceeds PostgreSQL bigint range")
             }
-            Self::CountOverflow => formatter.write_str("count exceeds PostgreSQL bigint range"),
+            Self::CountOutOfRange => {
+                formatter.write_str("count is outside the non-negative PostgreSQL bigint range")
+            }
             Self::DuplicateInputSequence(value) => {
                 write!(formatter, "duplicate input sequence {value}")
             }

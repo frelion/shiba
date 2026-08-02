@@ -73,7 +73,7 @@ fn process_in_transaction(
         }
     }
 
-    let insert_count = apply_changes(
+    let row_delta = apply_changes(
         transaction,
         input,
         source_id,
@@ -89,7 +89,7 @@ fn process_in_transaction(
          FOR UPDATE",
         &[],
     )?;
-    let next_count = count::advance(row.get(0), insert_count)?;
+    let next_count = count::advance(row.get(0), row_delta)?;
     transaction.execute(
         "UPDATE shiba_internal.count_state SET row_count = $1 WHERE singleton = 1",
         &[&next_count],
@@ -115,12 +115,12 @@ fn apply_changes(
     generation: i64,
     ingress_id: i64,
     commit_lsn: &str,
-) -> Result<usize, M2Error> {
-    let mut inserts = 0;
+) -> Result<i64, M2Error> {
+    let mut row_delta = 0;
     for change in &input.changes {
         match change {
             SourceChange::Insert(insert) => {
-                inserts += 1;
+                row_delta += 1;
                 let sequence = as_bigint("input_sequence", insert.input_sequence.get())?;
                 let (payload_present, payload_int8) = match insert.source_payload {
                     SourcePayload::Absent => (false, None),
@@ -158,7 +158,19 @@ fn apply_changes(
                     return Err(M2Error::MissingSourceRow);
                 }
             }
+            SourceChange::Delete { source_row_id, .. } => {
+                let changed = transaction.execute(
+                    "DELETE FROM shiba_internal.applied_insert
+                     WHERE source_id = $1 AND source_row_id = $2
+                       AND source_row_sub_id IS NULL",
+                    &[&source_id, source_row_id],
+                )?;
+                if changed != 1 {
+                    return Err(M2Error::MissingSourceRow);
+                }
+                row_delta -= 1;
+            }
         }
     }
-    Ok(inserts)
+    Ok(row_delta)
 }

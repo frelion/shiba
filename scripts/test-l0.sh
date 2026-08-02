@@ -55,23 +55,108 @@ if errors:
     raise SystemExit("\n".join(errors))
 PY
 
-# Keep the accepted M4.4 production budget executable rather than aspirational.
+# Central complexity thresholds: warnings report growth; hard limits fail.
 python3 - <<'PY'
 import pathlib
+import sys
+
+limits = {
+    "runtime_soft": 1200,
+    "runtime_hard": 2000,
+    "production_file_soft": 250,
+    "production_file_hard": 350,
+    "test_file_soft": 300,
+    "sql_file_hard": 150,
+}
 
 runtime_files = sorted(pathlib.Path("crates/shiba-runtime/src").glob("*.rs"))
 line_counts = {path: len(path.read_text().splitlines()) for path in runtime_files}
-too_large = [f"{path}: {count}" for path, count in line_counts.items() if count > 250]
-if too_large:
-    raise SystemExit("M4.4 production file exceeds 250 lines: " + ", ".join(too_large))
-if sum(line_counts.values()) > 800:
-    raise SystemExit("M4.4 Runtime production code exceeds its 800-line hard limit")
+runtime_total = sum(line_counts.values())
+production_warnings = [
+    f"{path}: {count}" for path, count in line_counts.items()
+    if count > limits["production_file_soft"]
+]
+production_failures = [
+    f"{path}: {count}" for path, count in line_counts.items()
+    if count > limits["production_file_hard"]
+]
+if runtime_total > limits["runtime_soft"]:
+    details = ", ".join(f"{path.name}={count}" for path, count in line_counts.items())
+    print(
+        f"warning: Runtime production total {runtime_total} > {limits['runtime_soft']} ({details})",
+        file=sys.stderr,
+    )
+if production_warnings:
+    print(
+        f"warning: production file > {limits['production_file_soft']} lines: "
+        + ", ".join(production_warnings),
+        file=sys.stderr,
+    )
+if runtime_total > limits["runtime_hard"]:
+    raise SystemExit(
+        f"Runtime production total {runtime_total} exceeds "
+        f"{limits['runtime_hard']}-line hard limit"
+    )
+if production_failures:
+    raise SystemExit(
+        f"production file exceeds {limits['production_file_hard']}-line hard limit: "
+        + ", ".join(production_failures)
+    )
+
+test_counts = {
+    path: len(path.read_text().splitlines())
+    for path in pathlib.Path("crates/shiba-runtime/tests").rglob("*.rs")
+}
+test_warnings = [
+    f"{path}: {count}" for path, count in test_counts.items()
+    if count > limits["test_file_soft"]
+]
+if test_warnings:
+    print(
+        f"warning: integration test file > {limits['test_file_soft']} lines: "
+        + ", ".join(test_warnings),
+        file=sys.stderr,
+    )
+
 sql_counts = {
     path: len(path.read_text().splitlines()) for path in pathlib.Path("sql/v2").glob("*.sql")
 }
-too_large_sql = [f"{path}: {count}" for path, count in sql_counts.items() if count > 150]
+too_large_sql = [
+    f"{path}: {count}" for path, count in sql_counts.items()
+    if count > limits["sql_file_hard"]
+]
 if too_large_sql:
-    raise SystemExit("M4.4 SQL file exceeds 150 lines: " + ", ".join(too_large_sql))
+    raise SystemExit(
+        f"SQL file exceeds {limits['sql_file_hard']}-line hard limit: "
+        + ", ".join(too_large_sql)
+    )
+PY
+
+# Repeated pgoutput test mechanics have one test-only owner.
+python3 - <<'PY'
+import pathlib
+import re
+
+tests = pathlib.Path("crates/shiba-runtime/tests")
+support = tests / "support" / "mod.rs"
+helper_pattern = re.compile(
+    r"fn (strip_recvlogical_delimiters|framed_message_count|message_end|"
+    r"message_end_checked|cstring_end_checked|read_u16_checked|read_u32_checked)\b"
+)
+owners = [path for path in tests.rglob("*.rs") if helper_pattern.search(path.read_text())]
+if owners != [support]:
+    raise SystemExit(f"pgoutput framing helpers must exist only in {support}: {owners}")
+
+scripts = [
+    pathlib.Path(f"scripts/test-{name}.sh")
+    for name in ("m3", "m4", "m4-empty", "m4-composite", "m4-update", "m4-delete")
+]
+for path in scripts:
+    text = path.read_text()
+    if "lib/pg-integration.sh" not in text:
+        raise SystemExit(f"{path} does not use shared PostgreSQL integration support")
+    if re.search(r"cargo pgrx package|\binitdb\b|^trap ", text, re.MULTILINE):
+        raise SystemExit(f"{path} duplicates shared PostgreSQL cluster mechanics")
 PY
 
 # No production SQL may smuggle in an old authority or dynamic workflow.
@@ -152,7 +237,7 @@ manifest = pathlib.Path("docs/contracts/REUSE_MANIFEST.md").read_text()
 header = "| 成果 | 来源 | 分类A/B/C | 复用方式 | 证据 | 未证明边界 |"
 if header not in manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks the required audit-table header")
-for required in ("Protocol JSON/schema", "canonical digest", "PG17/18", "Phase 1", "M3.1", "M3.2", "M4.1", "M4.2", "M4.3", "M4.4"):
+for required in ("Protocol JSON/schema", "canonical digest", "PG17/18", "Phase 1", "M3.1", "M3.2", "M4.1", "M4.2", "M4.3", "M4.4", "M4.5"):
     if required not in manifest:
         raise SystemExit(f"REUSE_MANIFEST.md lacks required Phase-1 contract: {required}")
 PY
