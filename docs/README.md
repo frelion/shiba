@@ -112,12 +112,18 @@ source transaction yield exactly one Apply and one replay no-op; while source 1
 is paused after its mutex, source 2 can commit independently and publish the
 correct union result.
 
-**Not proved.** M7 has no production replication transport/slot lifecycle,
+M8.3 bounds both admitted decoder paths before Apply. A borrowed pgoutput input
+may be at most 16 MiB and one decoded transaction may contain at most 10,000
+changes. Exact-limit committed and streamed transactions remain admitted; an
+oversized input or 10,001st change returns `LimitExceeded` without constructing
+a transaction or changing durable state. Runtime owns no ingress queue.
+
+**Not proved.** There is no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
 binding lifecycle/registration or replica-index drift observation without a
-RELATION message, streamed interleaving/subtransactions or bounded buffering,
-slot-generation change, concurrent transaction scheduling/backpressure,
+RELATION message, streamed interleaving/subtransactions, slot-generation
+change, production ingress scheduling/backpressure or transport memory,
 binding rebuild lifecycle, external effect, compatibility path, alias, fallback,
 or dual write.
 

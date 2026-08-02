@@ -2,7 +2,7 @@ use shiba_protocol::{IngressTransactionId, InputSequence, PostgresLsn, SourceTra
 
 use crate::{
     PgoutputError, SourceInsert, SourcePayload, SourceTransaction,
-    pgoutput::decode_relation,
+    pgoutput::{MAX_PGOUTPUT_CHANGES, check_input_limit, decode_relation},
     pgoutput_source::{PgoutputSource, SourceShape},
     pgoutput_tuple::{DecodedChange, decode_insert},
     pgoutput_wire::Cursor,
@@ -14,6 +14,7 @@ pub fn decode_streamed_changes(
     input: &[u8],
     source: PgoutputSource,
 ) -> Result<SourceTransaction, PgoutputError> {
+    check_input_limit(input)?;
     if source.shape != SourceShape::KeyOnly {
         return Err(PgoutputError::RelationShape);
     }
@@ -38,6 +39,9 @@ pub fn decode_streamed_changes(
                     relation_seen = true;
                 }
                 b'I' if relation_seen => {
+                    if row_ids.len() >= MAX_PGOUTPUT_CHANGES {
+                        return Err(PgoutputError::LimitExceeded);
+                    }
                     require_xid(&mut cursor, xid)?;
                     match decode_insert(&mut cursor, source)? {
                         DecodedChange::RowInsert(row_id, SourcePayload::Absent) => {

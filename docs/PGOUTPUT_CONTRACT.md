@@ -216,3 +216,15 @@ Relation OID admission remains pure, but decoding alone no longer authorizes a
 new Apply. The processor requires the source's immutable ObjectAddress binding,
 holds the relation lock, and rejects an exact durable DDL invalidation before
 writing. Exact replay is still decided by continuation first.
+
+## M8.3 bounded decoder admission
+
+Both decoder entry points borrow one complete input buffer and reject a buffer
+larger than 16 MiB before parsing. Each admits at most 10,000 changes: exactly
+10,000 is valid, while observing a 10,001st supported change returns
+`PgoutputError::LimitExceeded` before that tuple is decoded or appended.
+
+Limit rejection produces no `SourceTransaction`, so the processor, its
+PostgreSQL transaction, and continuation are never reached. These limits bound
+decoder-owned output and accepted borrowed input; they do not claim a bounded
+production receiver, transport queue, feedback loop, or throughput threshold.

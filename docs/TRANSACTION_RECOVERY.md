@@ -166,3 +166,9 @@ M8.2 starts two exact duplicate calls before either commits. The second waits on
 the source mutex, then the post-lock replay probe returns `AlreadyApplied`; no
 duplicate row, count, result, or continuation is written. A transaction for a
 different source commits while source 1 is paused, proving recovery isolation.
+
+M8.3 rejects a borrowed pgoutput buffer above 16 MiB before parsing and rejects
+a 10,001st change before decoding or appending it. Either path returns no
+`SourceTransaction`, never opens the processor transaction, and therefore
+cannot modify row state, count, result, or continuation. Exactly 10,000 changes
+remain inside the existing atomic Apply/replay boundary.

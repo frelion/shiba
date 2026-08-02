@@ -11,6 +11,8 @@ use crate::{
 
 const INT8_OID: u32 = 20;
 const TEXT_OID: u32 = 25;
+pub(crate) const MAX_PGOUTPUT_INPUT_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_PGOUTPUT_CHANGES: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PgoutputError {
@@ -25,6 +27,7 @@ pub enum PgoutputError {
     TupleValue,
     InvalidIdentity,
     InvalidLsn,
+    LimitExceeded,
 }
 
 impl fmt::Display for PgoutputError {
@@ -41,6 +44,7 @@ impl fmt::Display for PgoutputError {
             Self::TupleValue => formatter.write_str("invalid pgoutput int8 text value"),
             Self::InvalidIdentity => formatter.write_str("invalid pgoutput transaction identity"),
             Self::InvalidLsn => formatter.write_str("inconsistent pgoutput commit LSN"),
+            Self::LimitExceeded => formatter.write_str("pgoutput decoder limit exceeded"),
         }
     }
 }
@@ -53,6 +57,7 @@ pub fn decode_committed_changes(
     input: &[u8],
     source: PgoutputSource,
 ) -> Result<SourceTransaction, PgoutputError> {
+    check_input_limit(input)?;
     let mut cursor = Cursor::new(input);
     if cursor.byte()? != b'B' {
         return Err(PgoutputError::MessageOrder);
@@ -72,6 +77,9 @@ pub fn decode_committed_changes(
     let mut values = Vec::new();
     loop {
         let tag = cursor.byte()?;
+        if matches!(tag, b'I' | b'U' | b'D') && values.len() >= MAX_PGOUTPUT_CHANGES {
+            return Err(PgoutputError::LimitExceeded);
+        }
         match tag {
             b'I' => values.push(decode_insert(&mut cursor, source)?),
             b'U' => values.push(decode_update(&mut cursor, source)?),
@@ -140,6 +148,13 @@ pub fn decode_committed_changes(
         })
         .collect::<Result<Vec<_>, _>>()?;
     SourceTransaction::from_changes(identity, changes).map_err(|_| PgoutputError::TupleValue)
+}
+
+pub(crate) fn check_input_limit(input: &[u8]) -> Result<(), PgoutputError> {
+    if input.len() > MAX_PGOUTPUT_INPUT_BYTES {
+        return Err(PgoutputError::LimitExceeded);
+    }
+    Ok(())
 }
 
 pub(crate) fn decode_relation(

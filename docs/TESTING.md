@@ -141,6 +141,13 @@ rollback on PostgreSQL 17 and 18.
 bounded channel receives to prove one-Apply duplicate CAS and independent
 source progress with exact global/per-source state on PostgreSQL 17 and 18.
 
+`test-m8-bounded-decode.sh` captures a real 10,000-change committed transaction,
+decodes/applies/replays it, then captures 10,001 changes and requires explicit
+limit rejection with unchanged durable state on PostgreSQL 17 and 18. A pure
+test also proves both committed and streamed decoders reject input above 16 MiB.
+This is decoder admission evidence, not a production receiver or throughput
+claim.
+
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and
 requires real matching `A`. After abort feedback it restarts the same slot and

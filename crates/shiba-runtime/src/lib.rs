@@ -1,5 +1,5 @@
-//! Clean-room single-source transaction pipeline through M4.4; strict pgoutput
-//! decoding feeds the sole writer and `PostgreSQL` transaction owner.
+//! Clean-room multi-source transaction pipeline; bounded strict pgoutput decoding
+//! feeds the sole writer and `PostgreSQL` transaction owner.
 
 #![forbid(unsafe_code)]
 

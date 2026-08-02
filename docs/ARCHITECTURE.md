@@ -155,6 +155,12 @@ queues on the binding-row mutex and is resolved by the post-lock replay probe;
 a different source has a different mutex and can progress to the global count
 transaction independently.
 
+M8.3 adds one decoder admission boundary, not a queue. Both committed and
+streamed decoders borrow at most 16 MiB and own at most 10,000 decoded changes.
+The shared check rejects excess input before parsing; each decoder rejects the
+10,001st change before decoding or appending it. Rejection cannot reach the
+processor, so it adds no authority, writer, transaction, or recovery path.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -167,5 +173,6 @@ evidence inputs, not implementation dependencies.
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving, binding rebuild lifecycle,
-generation changes, concurrent ingress/backpressure, general operators, and recovery workers
+generation changes, production ingress/backpressure and transport memory,
+general operators, and recovery workers
 remain.
