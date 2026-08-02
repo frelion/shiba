@@ -1,8 +1,4 @@
-//! Minimal database-local catalog identity for the clean-room V2.
-//!
-//! This crate owns installation metadata only. Source, effect, runtime,
-//! operator, result, registration, and compatibility state are intentionally
-//! outside its Phase-1 authority.
+//! Database-local catalog and durable authority schema for clean-room V2.
 
 ::pgrx::pg_module_magic!(name, version);
 
@@ -12,15 +8,15 @@
 );
 
 ::pgrx::extension_sql_file!(
-    "../../../sql/v2/002_insert_count.sql",
-    name = "insert_count",
+    "../../../sql/v2/002_source_apply.sql",
+    name = "source_apply",
     requires = ["catalog_identity"]
 );
 
 ::pgrx::extension_sql_file!(
     "../../../sql/v2/003_nullable_insert.sql",
     name = "nullable_insert",
-    requires = ["insert_count"]
+    requires = ["source_apply"]
 );
 
 ::pgrx::extension_sql_file!(
@@ -50,7 +46,7 @@
 #[cfg(test)]
 mod tests {
     const CATALOG_SQL: &str = include_str!("../../../sql/v2/001_catalog_identity.sql");
-    const M2_SQL: &str = include_str!("../../../sql/v2/002_insert_count.sql");
+    const M9_AUTHORITY_SQL: &str = include_str!("../../../sql/v2/002_source_apply.sql");
     const M4_SQL: &str = include_str!("../../../sql/v2/003_nullable_insert.sql");
     const M4_EMPTY_SQL: &str = include_str!("../../../sql/v2/004_empty_insert.sql");
     const M4_COMPOSITE_SQL: &str = include_str!("../../../sql/v2/005_composite_insert.sql");
@@ -69,17 +65,71 @@ mod tests {
     }
 
     #[test]
-    fn m2_owns_only_its_four_required_tables() {
-        let sql = M2_SQL.to_ascii_lowercase();
-        assert_eq!(sql.matches("create table ").count(), 4);
+    fn m9_owns_only_its_five_required_tables() {
+        let sql = M9_AUTHORITY_SQL.to_ascii_lowercase();
+        assert_eq!(sql.matches("create table ").count(), 5);
         for table in [
             "shiba_internal.applied_insert",
-            "shiba_internal.count_state",
             "shiba_internal.source_continuation",
-            "shiba.count_result",
+            "shiba_internal.operator_definition",
+            "shiba_internal.operator_state",
+            "shiba.operator_result",
         ] {
             assert!(sql.contains(&format!("create table {table}")));
         }
+        assert!(!sql.contains("count_state"));
+        assert!(!sql.contains("count_result"));
+    }
+
+    #[test]
+    fn m9_operator_authority_has_frozen_shapes() {
+        let sql = M9_AUTHORITY_SQL.to_ascii_lowercase();
+        for required in [
+            "check (compiler_version = 1)",
+            "operator_kind in ('count_rows', 'sum_int8')",
+            "operator_kind = 'count_rows'",
+            "input_classid is null",
+            "input_objid is null",
+            "input_objsubid is null",
+            "operator_kind = 'sum_int8'",
+            "input_classid is not null",
+            "input_classid = 'pg_class'::regclass",
+            "input_objid is not null",
+            "input_objsubid is not null",
+            "input_objsubid > 0",
+            "unique (\n        operator_id, operator_kind",
+            "value_bigint bigint not null",
+            "foreign key (\n        operator_id, operator_kind",
+        ] {
+            assert!(
+                sql.contains(required),
+                "missing authority shape: {required}"
+            );
+        }
+        assert!(!sql.contains("value_bigint >= 0"));
+        assert!(!sql.contains("on delete"));
+        assert_eq!(sql.matches("insert into ").count(), 0);
+        assert_eq!(sql.matches("comment on table ").count(), 5);
+        assert!(!sql.contains("create trigger"));
+    }
+
+    #[test]
+    fn m9_operator_permissions_are_private_state_and_public_read_only_result() {
+        let sql = M9_AUTHORITY_SQL.to_ascii_lowercase();
+        for table in [
+            "applied_insert",
+            "source_continuation",
+            "operator_definition",
+            "operator_state",
+        ] {
+            assert!(sql.contains(&format!(
+                "revoke all on table shiba_internal.{table} from public"
+            )));
+        }
+        assert!(sql.contains("revoke all on table shiba.operator_result from public"));
+        assert!(sql.contains("grant select on table shiba.operator_result to public"));
+        assert!(!sql.contains("grant insert"));
+        assert!(!sql.contains("grant update"));
     }
 
     #[test]
@@ -107,7 +157,7 @@ mod tests {
         let sql = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             normalized_sql(),
-            M2_SQL.to_ascii_lowercase(),
+            M9_AUTHORITY_SQL.to_ascii_lowercase(),
             M4_SQL.to_ascii_lowercase(),
             M4_EMPTY_SQL.to_ascii_lowercase(),
             M4_COMPOSITE_SQL.to_ascii_lowercase(),
@@ -119,6 +169,8 @@ mod tests {
             "execute format(",
             "create table shiba_internal.source (",
             "create table shiba_internal.effect (",
+            "count_state",
+            "count_result",
             "compatibility",
             "fallback",
             "alias",

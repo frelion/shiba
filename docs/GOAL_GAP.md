@@ -9,13 +9,13 @@ operator, effect, and sink contracts.
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Operator IR and compiled-plan contracts |
 | Catalog | Database-local version, source bindings and exact DDL invalidation | Operator definitions/state and binding rebuild lifecycle |
-| Compiler | Not present | Strict declarative IR to ObjectAddress-bound plan |
+| Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
 | Source Ingress | Real protocol-v1/v2 pgoutput decode in PG17/18 tests | Production receiver, feedback and slot lifecycle |
-| Source Apply | One current-row authority with INSERT/UPDATE/DELETE/TOAST | Transaction-local row effects for multiple operators |
-| EffectStream | Not present | Non-durable before/after batch; no effect log |
-| Runtime | Replay, crash, CAS, DDL and synchronous concurrency semantics | General operator execution and production ingress lifecycle |
-| Operator | Fixed count calculation embedded in Runtime | Database-free shared contract and a second distinct operator |
-| Result Sink | Fixed `count_result` table | Operator-keyed state and public result sink |
+| Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
+| EffectStream | Non-durable transaction-local EffectBatch | Persisted effects intentionally absent |
+| Runtime | Replay/recovery plus ordered registered-operator execution | Production ingress lifecycle and broader operators |
+| Operator | Database-free CountRows/SumInt8 contract; CountRows integrated | Prove second distinct operator and add non-aggregate kinds |
+| Result Sink | Operator-keyed private state and public result | Non-bigint result shapes |
 
 ## Proven reference boundary
 

@@ -20,12 +20,18 @@ feature="pg$pg_major"
 
 cargo fmt --all -- --check
 PG_CONFIG="$pg_config" cargo check -p shiba-protocol --all-targets
+PG_CONFIG="$pg_config" cargo check -p shiba-operator --all-targets
+PG_CONFIG="$pg_config" cargo check -p shiba-compiler --all-targets
 PG_CONFIG="$pg_config" cargo check -p shiba-catalog --no-default-features --features "$feature" --all-targets
 PG_CONFIG="$pg_config" cargo check -p shiba-runtime --all-targets
 PG_CONFIG="$pg_config" cargo test -p shiba-protocol
+PG_CONFIG="$pg_config" cargo test -p shiba-operator
+PG_CONFIG="$pg_config" cargo test -p shiba-compiler
 PG_CONFIG="$pg_config" cargo test -p shiba-catalog --no-default-features --features "$feature"
 PG_CONFIG="$pg_config" cargo test -p shiba-runtime --lib
 PG_CONFIG="$pg_config" cargo clippy -p shiba-protocol --all-targets -- -D warnings
+PG_CONFIG="$pg_config" cargo clippy -p shiba-operator --all-targets -- -D warnings
+PG_CONFIG="$pg_config" cargo clippy -p shiba-compiler --all-targets -- -D warnings
 PG_CONFIG="$pg_config" cargo clippy -p shiba-catalog --no-default-features --features "$feature" --all-targets -- -D warnings
 PG_CONFIG="$pg_config" cargo clippy -p shiba-runtime --all-targets -- -D warnings
 git diff --check
@@ -42,6 +48,8 @@ names = subprocess.check_output(
 errors = []
 for name in names:
     path = pathlib.Path(name)
+    if not path.is_file():
+        continue
     data = path.read_bytes()
     if b"\0" in data:
         continue
@@ -67,17 +75,28 @@ limits = {
     "production_file_hard": 350,
     "test_file_soft": 300,
     "sql_file_hard": 150,
+    "operator_soft": 600,
+    "compiler_soft": 600,
 }
 
 runtime_files = sorted(pathlib.Path("crates/shiba-runtime/src").glob("*.rs"))
 line_counts = {path: len(path.read_text().splitlines()) for path in runtime_files}
 runtime_total = sum(line_counts.values())
+component_files = {
+    "operator": sorted(pathlib.Path("crates/shiba-operator/src").glob("*.rs")),
+    "compiler": sorted(pathlib.Path("crates/shiba-compiler/src").glob("*.rs")),
+}
+all_production_counts = dict(line_counts)
+for files in component_files.values():
+    all_production_counts.update(
+        {path: len(path.read_text().splitlines()) for path in files}
+    )
 production_warnings = [
-    f"{path}: {count}" for path, count in line_counts.items()
+    f"{path}: {count}" for path, count in all_production_counts.items()
     if count > limits["production_file_soft"]
 ]
 production_failures = [
-    f"{path}: {count}" for path, count in line_counts.items()
+    f"{path}: {count}" for path, count in all_production_counts.items()
     if count > limits["production_file_hard"]
 ]
 if runtime_total > limits["runtime_soft"]:
@@ -103,9 +122,23 @@ if production_failures:
         + ", ".join(production_failures)
     )
 
+for component, files in component_files.items():
+    total = sum(all_production_counts[path] for path in files)
+    if total > limits[f"{component}_soft"]:
+        print(
+            f"warning: shiba-{component} production total {total} > "
+            f"{limits[f'{component}_soft']}",
+            file=sys.stderr,
+        )
+
 test_counts = {
     path: len(path.read_text().splitlines())
-    for path in pathlib.Path("crates/shiba-runtime/tests").rglob("*.rs")
+    for root in (
+        pathlib.Path("crates/shiba-runtime/tests"),
+        pathlib.Path("crates/shiba-operator/tests"),
+        pathlib.Path("crates/shiba-compiler/tests"),
+    )
+    for path in root.rglob("*.rs")
 }
 test_warnings = [
     f"{path}: {count}" for path, count in test_counts.items()
@@ -156,7 +189,7 @@ scripts = [
         "m6-stream-commit", "m6-stream-abort", "m7-ddl-invalidation",
         "m7-drop-invalidation", "m7-column-invalidation", "m7-index-invalidation",
         "m7-concurrent-ddl", "m8-multi-source", "m8-concurrent-sources",
-        "m8-bounded-decode", "m8-performance",
+        "m8-bounded-decode", "m8-performance", "m9-registration",
     )
 ]
 for path in scripts:
@@ -169,12 +202,12 @@ PY
 
 # No production SQL may smuggle in an old authority or dynamic workflow.
 if rg -n -i \
-  'source_publications|change[_ ]log|dual[-_ ]write|compatibility|fallback|alias|create trigger|execute format\(' \
+  'source_publications|change[_ ]log|dual[-_ ]write|compatibility|fallback|alias|count_state|count_result|create table .*effect|create trigger|execute format\(' \
   sql/v2; then
   echo "forbidden implementation surface found" >&2
   exit 1
 fi
-if rg -n -i 'effectstream|source ingress|registration|publication|replication slot' \
+if rg -n -i 'effectstream|source ingress|publication|replication slot' \
   sql/v2; then
   echo "out-of-scope component leaked into production SQL" >&2
   exit 1
@@ -245,7 +278,7 @@ manifest = pathlib.Path("docs/contracts/REUSE_MANIFEST.md").read_text()
 header = "| 成果 | 来源 | 分类A/B/C | 复用方式 | 证据 | 未证明边界 |"
 if header not in manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks the required audit-table header")
-for required in ("Protocol JSON/schema", "canonical digest", "PG17/18", "Phase 1", "M3.1", "M3.2", "M4.1", "M4.2", "M4.3", "M4.4", "M4.5", "M4.6", "M5.1", "M5.2", "M5.3", "M5.4", "M5.5", "M6.1", "M6.2", "M7.1", "M7.2", "M7.3", "M7.4", "M7.5", "M8.1", "M8.2", "M8.3", "M8.4"):
+for required in ("Protocol JSON/schema", "canonical digest", "PG17/18", "Phase 1", "M3.1", "M3.2", "M4.1", "M4.2", "M4.3", "M4.4", "M4.5", "M4.6", "M5.1", "M5.2", "M5.3", "M5.4", "M5.5", "M6.1", "M6.2", "M7.1", "M7.2", "M7.3", "M7.4", "M7.5", "M8.1", "M8.2", "M8.3", "M8.4", "M9.1"):
     if required not in manifest:
         raise SystemExit(f"REUSE_MANIFEST.md lacks required Phase-1 contract: {required}")
 PY

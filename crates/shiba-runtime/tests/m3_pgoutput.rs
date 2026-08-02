@@ -26,14 +26,24 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT row_count FROM shiba.count_result WHERE singleton = 1),
-                (SELECT row_count FROM shiba_internal.count_state WHERE singleton = 1),
+                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
                 (SELECT count(*) FROM shiba_internal.applied_insert),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
         )
         .expect("query durable state");
     (row.get(0), row.get(1), row.get(2), row.get(3))
+}
+
+fn public_result(client: &mut Client) -> i64 {
+    client
+        .query_one(
+            "SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1",
+            &[],
+        )
+        .expect("query SQL result")
+        .get(0)
 }
 
 struct StoppedCapture(Option<Child>);
@@ -227,9 +237,5 @@ fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
         .expect("read acknowledged replay position")
         .get(0);
     assert!(acknowledged, "clean replay capture must acknowledge WAL");
-    let result: i64 = client
-        .query_one("SELECT row_count FROM shiba.count_result", &[])
-        .expect("query SQL result")
-        .get(0);
-    assert_eq!(result, 3);
+    assert_eq!(public_result(&mut client), 3);
 }

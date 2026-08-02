@@ -3,12 +3,15 @@ use core::fmt;
 #[derive(Debug)]
 pub enum M2Error {
     CoordinateOutOfRange(&'static str),
-    CountOutOfRange,
     DuplicateInputSequence(u64),
     DuplicateSourceRow(i64),
     EmptyTransaction,
     IdentityConflict,
+    InvalidOperatorDefinition,
+    InvalidSourceRowState,
     MissingSourceRow,
+    MissingSourceOperator,
+    Operator(shiba_operator::OperatorError),
     OutOfOrder,
     Postgres(postgres::Error),
     SourceBindingMissing,
@@ -23,9 +26,6 @@ impl fmt::Display for M2Error {
             Self::CoordinateOutOfRange(field) => {
                 write!(formatter, "{field} exceeds PostgreSQL bigint range")
             }
-            Self::CountOutOfRange => {
-                formatter.write_str("count is outside the non-negative PostgreSQL bigint range")
-            }
             Self::DuplicateInputSequence(value) => {
                 write!(formatter, "duplicate input sequence {value}")
             }
@@ -34,7 +34,15 @@ impl fmt::Display for M2Error {
             Self::IdentityConflict => {
                 formatter.write_str("source coordinate has a different transaction identity")
             }
+            Self::InvalidOperatorDefinition => {
+                formatter.write_str("durable operator definition is invalid")
+            }
+            Self::InvalidSourceRowState => {
+                formatter.write_str("durable source row state violates its value shape")
+            }
             Self::MissingSourceRow => formatter.write_str("source change targets no applied row"),
+            Self::MissingSourceOperator => formatter.write_str("source has no registered operator"),
+            Self::Operator(error) => write!(formatter, "operator evaluation failed: {error}"),
             Self::OutOfOrder => formatter.write_str("commit LSN is not strictly increasing"),
             Self::Postgres(error) => write!(formatter, "PostgreSQL transaction failed: {error}"),
             Self::SourceBindingMissing => formatter.write_str("source binding is missing"),
@@ -52,9 +60,16 @@ impl fmt::Display for M2Error {
 impl std::error::Error for M2Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Operator(error) => Some(error),
             Self::Postgres(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<shiba_operator::OperatorError> for M2Error {
+    fn from(error: shiba_operator::OperatorError) -> Self {
+        Self::Operator(error)
     }
 }
 

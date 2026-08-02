@@ -12,7 +12,8 @@ legacy catalog table, publication, or change log participates.
 
 `CREATE EXTENSION` runs the extension SQL as one PostgreSQL transaction. It first
 creates the schemas, constrained identity, and restricted version function, then
-installs the four M2 tables with zero-valued count state/result. If installation
+installs source-row/continuation and operator authority tables without seeded
+operators. If installation
 fails, PostgreSQL rolls back the whole installation; the empty-install test must
 prove there is no partial `shiba` or `shiba_internal` state. Extension upgrade,
 external side effects, and migrations are out of scope.
@@ -65,14 +66,20 @@ M8.2 changes no catalog contract. The deterministic concurrency gate proves
 each relation-kind row serializes only its owning source while the singleton
 count/result remains the one aggregate commit point.
 
-## M2 execution facts
+## M9.1 operator authority
 
-The extension installs exactly four M2 tables. Three private tables own applied
-INSERT causes, deterministic count state, and committed continuation history.
-`shiba.count_result` is the SQL-queryable Result Sink projection. These are
-separate facts with one logical writer and one commit point, not alternative
-authorities for the same decision. PUBLIC receives only result `SELECT`; all
-internal access and result mutation remain revoked.
+The clean-room install contains `operator_definition`, `operator_state`, and
+`shiba.operator_result`; it does not create or later drop old count tables.
+Definitions freeze compiler version, source ID, operator kind, and nullable or
+complete input ObjectAddress according to the kind. The registration adapter is
+the sole definition writer and verifies source binding existence/invalidation.
+Runtime alone updates state/result. State may be negative because SumInt8 is a
+signed aggregate; CountRows enforces non-negativity in its pure evaluator.
+
+Each public result has the same operator ID/kind as its definition through a
+foreign key. Internal definition/state have no PUBLIC privileges; the public
+sink grants SELECT only. Installation seeds no operator: definition, zero state,
+and zero result are created atomically by explicit registration.
 
 Later tuple slices alter only the existing current-state table. M5.1 adds
 `payload_text` with int8/text mutual exclusion; it creates no fifth table,

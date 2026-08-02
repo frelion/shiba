@@ -3,9 +3,13 @@
     reason = "each integration test compiles only its support subset"
 )]
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, num::NonZeroU64, path::PathBuf, process::Command};
 
 use postgres::Client;
+use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
+use shiba_operator::OperatorId;
+use shiba_protocol::SourceId;
+use shiba_runtime::compile_and_register;
 
 pub(super) fn register_source(client: &mut Client, relation_name: &str) {
     client
@@ -14,6 +18,17 @@ pub(super) fn register_source(client: &mut Client, relation_name: &str) {
             &[&relation_name],
         )
         .expect("register source relation");
+    register_count_operator(client, 1, 1);
+}
+
+pub(super) fn register_count_operator(client: &mut Client, source_id: u64, operator_id: u64) {
+    let spec = OperatorSpecV1 {
+        version: OPERATOR_SPEC_VERSION,
+        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("non-zero operator id")),
+        source_id: SourceId::new(source_id).expect("non-zero source id"),
+        operation: OperatorOperationV1::CountRows,
+    };
+    compile_and_register(client, &spec).expect("compile and register CountRows operator");
 }
 
 pub(super) struct PgoutputCapture {

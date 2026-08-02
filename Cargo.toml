@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/shiba-catalog",
+    "crates/shiba-compiler",
+    "crates/shiba-operator",
     "crates/shiba-protocol",
     "crates/shiba-runtime",
 ]

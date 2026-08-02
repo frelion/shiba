@@ -1,17 +1,18 @@
 [package]
-name = "shiba-runtime"
+name = "shiba-operator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Clean-room transactional source-apply and operator runtime"
+description = "Database-independent operator contracts for Shiba V2"
 
 [dependencies]
-postgres = "0.19"
-shiba-compiler = { path = "../shiba-compiler" }
-shiba-operator = { path = "../shiba-operator" }
+serde = { version = "1.0", features = ["derive"] }
 shiba-protocol = { path = "../shiba-protocol" }
+
+[dev-dependencies]
+serde_json = "1.0"
 
 [lints]
 workspace = true

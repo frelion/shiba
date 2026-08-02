@@ -78,8 +78,8 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT row_count FROM shiba.count_result WHERE singleton = 1),
-                (SELECT row_count FROM shiba_internal.count_state WHERE singleton = 1),
+                (SELECT sum(value_bigint)::bigint FROM shiba.operator_result),
+                (SELECT sum(value_bigint)::bigint FROM shiba_internal.operator_state),
                 (SELECT count(*) FROM shiba_internal.applied_insert),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
@@ -97,6 +97,19 @@ fn continuations(client: &mut Client) -> Vec<(i64, i64)> {
             &[],
         )
         .expect("query per-source continuations")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+}
+
+fn operator_results(client: &mut Client) -> Vec<(i64, i64)> {
+    client
+        .query(
+            "SELECT operator_id, value_bigint
+             FROM shiba.operator_result ORDER BY operator_id",
+            &[],
+        )
+        .expect("query per-source operator results")
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
         .collect()
@@ -170,6 +183,7 @@ fn install_sources(client: &mut Client) -> (PgoutputSource, PgoutputSource) {
             &[],
         )
         .expect("register source2");
+    support::register_count_operator(client, 2, 2);
     SOURCE1_CAPTURE.create_slot();
     SOURCE2_CAPTURE.create_slot();
     (source1, source2)
@@ -229,6 +243,7 @@ fn prove_duplicate_serialization(client: &mut Client, connection: &str, input: &
     assert_eq!(first_outcome, ProcessOutcome::Applied);
     assert_eq!(duplicate_outcome, ProcessOutcome::AlreadyApplied);
     assert_eq!(durable_state(client), (1, 1, 1, 1));
+    assert_eq!(operator_results(client), vec![(1, 1), (2, 0)]);
     assert_eq!(continuations(client), vec![(1, 1)]);
 }
 
@@ -254,6 +269,7 @@ fn prove_independent_progress(
     source2_task.join().expect("join source2 thread");
     wait_until_lock_waiting(client, "m8_source1_blocked", Some("advisory"));
     assert_eq!(durable_state(client), (2, 2, 2, 2));
+    assert_eq!(operator_results(client), vec![(1, 1), (2, 1)]);
     assert_eq!(continuations(client), vec![(1, 1), (2, 1)]);
     release_blocker(client);
     assert_eq!(
@@ -265,6 +281,7 @@ fn prove_independent_progress(
     );
     source1_task.join().expect("join blocked source1 thread");
     assert_eq!(durable_state(client), (3, 3, 3, 3));
+    assert_eq!(operator_results(client), vec![(1, 2), (2, 1)]);
     assert_eq!(continuations(client), vec![(1, 2), (2, 1)]);
     assert_eq!(
         process(client, source1).expect("replay source1"),

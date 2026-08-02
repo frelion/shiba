@@ -169,6 +169,22 @@ literal cannot bypass the bound. `process` is a synchronous call borrowing one
 and commit waits directly stop that caller. The global count row remains the
 known cross-source serialization point.
 
+M9.1 supersedes that fixed aggregate authority. `shiba-operator` defines pure
+row effects and checked evaluation; `shiba-compiler` turns strict declarative
+IR plus a supplied live descriptor into a name-independent compiled operator.
+Runtime Source Apply reads UPDATE/DELETE before images under row lock, performs
+each mutation once, and returns one in-memory EffectBatch. It then locks the
+source's operator states in ascending operator-ID order, updates state and the
+operator-keyed public sink, and writes continuation last.
+
+`operator_definition` is written only by `compile_and_register`, which shares
+the source binding lock/invalidation boundary and initializes definition,
+state, and result atomically. Runtime is the sole state/result writer. The old
+count tables are deleted rather than mirrored or exposed through aliases.
+Multi-source CountRows results are source-scoped operator facts; a test may sum
+them to compare with the historical union observation, but that sum is not a
+new durable authority.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -182,5 +198,6 @@ for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving, binding rebuild lifecycle,
 generation changes, production transport backpressure and transport memory,
-sustained throughput/tail latency, general operators, and recovery workers
+sustained throughput/tail latency, a proven second/non-aggregate operator, and
+recovery workers
 remain.

@@ -180,3 +180,16 @@ lookup or `Client::transaction`; durable row state, count, result, and
 continuation therefore remain unchanged. Admitted work remains synchronous, so
 database blocking propagates to the caller rather than accumulating in a
 Runtime-owned queue.
+
+M9.1 keeps PostgreSQL as the sole transaction owner while replacing the fixed
+calculation. Exact replay still returns before Source Apply. For new work,
+Source Apply locks and reads existing rows as needed, writes each mutation once,
+and builds a non-durable EffectBatch. Runtime then locks operator state in
+ascending operator-ID order, evaluates pure CountRows, publishes state/result,
+and inserts continuation last. Any row-image, operator, state/result, database,
+or crash failure rolls the row mutation and every operator write back together.
+
+Registration has its own single PostgreSQL transaction: binding lock,
+invalidation check, descriptor construction, pure compilation, definition,
+zero state, and zero result either all commit or all disappear. A failed or
+duplicate registration cannot become a partially executable operator.

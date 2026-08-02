@@ -1193,6 +1193,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "shiba-compiler"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shiba-operator",
+ "shiba-protocol",
+]
+
+[[package]]
+name = "shiba-operator"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shiba-protocol",
+]
+
+[[package]]
 name = "shiba-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1206,6 +1225,8 @@ name = "shiba-runtime"
 version = "0.1.0"
 dependencies = [
  "postgres",
+ "shiba-compiler",
+ "shiba-operator",
  "shiba-protocol",
 ]
 

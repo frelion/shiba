@@ -125,6 +125,14 @@ and commit latency propagate to its caller. A real 10,000-change PG17/18 gate
 freezes regression ceilings of 2 seconds decode, 10 seconds first Apply, and 2
 seconds exact replay; current evidence is about 8 ms, 0.8 seconds, and 0.2 ms.
 
+M9.1 replaces the fixed count implementation with a database-free Operator and
+Compiler contract. Source Apply now emits a transaction-local, non-durable
+before/after `EffectBatch`; registered `CountRows` operators update
+operator-keyed private state and public results before continuation in the same
+processor transaction. Operator specifications are strict version-1 JSON;
+column names are resolved once and only ObjectAddress identity is durable. The
+old `count_state` and `count_result` authorities no longer exist.
+
 **Not proved.** There is no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
@@ -132,7 +140,8 @@ binding lifecycle/registration or replica-index drift observation without a
 RELATION message, streamed interleaving/subtransactions, slot-generation
 change, production transport scheduling/backpressure or transport memory,
 multi-source contention/tail latency and sustained throughput,
-binding rebuild lifecycle, external effect, compatibility path, alias, fallback,
+binding rebuild lifecycle, a proven second operator, non-aggregate operators,
+external effect, compatibility path, alias, fallback,
 or dual write.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),
@@ -140,3 +149,5 @@ Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),
 before extending the workspace. Ingress work must also follow the
 [pgoutput contract](PGOUTPUT_CONTRACT.md).
 Nullable tuple work is bounded by the [tuple contract](TUPLE_CONTRACT.md).
+Compiler, EffectBatch, Operator, and sink work must follow the
+[operator contract](OPERATOR_CONTRACT.md).

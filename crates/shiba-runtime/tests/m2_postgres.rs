@@ -4,6 +4,8 @@ use shiba_protocol::{
 };
 use shiba_runtime::{M2Error, ProcessOutcome, SourceInsert, SourceTransaction, process};
 
+mod support;
+
 fn input(lsn: u64, ingress: u64, rows: &[(u64, i64)]) -> SourceTransaction {
     let identity = SourceTransactionId::new(
         SourceId::new(1).expect("non-zero source"),
@@ -28,8 +30,8 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT row_count FROM shiba.count_result WHERE singleton = 1),
-                (SELECT row_count FROM shiba_internal.count_state WHERE singleton = 1),
+                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
                 (SELECT count(*) FROM shiba_internal.applied_insert),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
@@ -49,7 +51,7 @@ fn prove_operator_rollback(client: &mut Client) {
              END
              $$;
              CREATE TRIGGER m2_fail_operator
-             BEFORE UPDATE ON shiba_internal.count_state
+             BEFORE UPDATE ON shiba_internal.operator_state
              FOR EACH ROW EXECUTE FUNCTION m2_test.fail_operator();",
         )
         .expect("install test-only operator failure trigger");
@@ -60,7 +62,7 @@ fn prove_operator_rollback(client: &mut Client) {
     ));
     assert_eq!(durable_state(client), (2, 2, 2, 1));
     client
-        .batch_execute("DROP TRIGGER m2_fail_operator ON shiba_internal.count_state")
+        .batch_execute("DROP TRIGGER m2_fail_operator ON shiba_internal.operator_state")
         .expect("remove operator failure trigger");
     assert_eq!(
         process(client, &second).expect("retry rolled-back transaction"),
@@ -108,13 +110,19 @@ fn prove_permissions(client: &mut Client) {
         .batch_execute("CREATE ROLE shiba_m2_reader NOLOGIN; SET ROLE shiba_m2_reader")
         .expect("assume ordinary role");
     let visible_count: i64 = client
-        .query_one("SELECT row_count FROM shiba.count_result", &[])
+        .query_one(
+            "SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1",
+            &[],
+        )
         .expect("ordinary role can query result")
         .get(0);
     assert_eq!(visible_count, 4);
     assert!(
         client
-            .execute("UPDATE shiba.count_result SET row_count = 0", &[])
+            .execute(
+                "UPDATE shiba.operator_result SET value_bigint = 0 WHERE operator_id = 1",
+                &[],
+            )
             .is_err()
     );
     assert!(
@@ -158,6 +166,7 @@ fn m2_transaction_replay_failure_crash_and_permissions() {
             &[],
         )
         .expect("register M2 source relation");
+    support::register_count_operator(&mut client, 1, 1);
 
     let first = input(0x64, 7, &[(1, 101), (2, 102)]);
     assert_eq!(

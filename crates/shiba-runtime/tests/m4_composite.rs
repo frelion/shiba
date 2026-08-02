@@ -17,8 +17,8 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT row_count FROM shiba.count_result WHERE singleton = 1),
-                (SELECT row_count FROM shiba_internal.count_state WHERE singleton = 1),
+                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
                 (SELECT count(*) FROM shiba_internal.applied_insert),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
@@ -117,7 +117,10 @@ fn m4_real_pgoutput_composite_keys_and_bad_second_key_tag() {
         (10, 202)
     );
     let result: i64 = client
-        .query_one("SELECT row_count FROM shiba.count_result", &[])
+        .query_one(
+            "SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1",
+            &[],
+        )
         .expect("query SQL result")
         .get(0);
     assert_eq!(result, 2);

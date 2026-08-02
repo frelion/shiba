@@ -1,4 +1,5 @@
 use postgres::{Client, NoTls};
+use shiba_operator::OperatorError;
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{
     M2Error, PgoutputSource, ProcessOutcome, SourceTransaction, decode_committed_changes, process,
@@ -19,8 +20,8 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT row_count FROM shiba.count_result WHERE singleton = 1),
-                (SELECT row_count FROM shiba_internal.count_state WHERE singleton = 1),
+                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
                 (SELECT count(*) FROM shiba_internal.applied_insert),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
@@ -76,20 +77,24 @@ fn assert_apply_row(client: &mut Client, row_id: i64) {
 fn prove_count_underflow(client: &mut Client, delete: &SourceTransaction) {
     client
         .batch_execute(
-            "UPDATE shiba_internal.count_state SET row_count = 0 WHERE singleton = 1;
-             UPDATE shiba.count_result SET row_count = 0 WHERE singleton = 1;",
+            "UPDATE shiba_internal.operator_state
+                 SET value_bigint = 0 WHERE operator_id = 1;
+             UPDATE shiba.operator_result
+                 SET value_bigint = 0 WHERE operator_id = 1;",
         )
         .expect("install count underflow precondition");
     assert!(matches!(
         process(client, delete),
-        Err(M2Error::CountOutOfRange)
+        Err(M2Error::Operator(OperatorError::CountUnderflow))
     ));
     assert_eq!(durable_state(client), (0, 0, 2, 1));
     assert_apply_row(client, 401);
     client
         .batch_execute(
-            "UPDATE shiba_internal.count_state SET row_count = 2 WHERE singleton = 1;
-             UPDATE shiba.count_result SET row_count = 2 WHERE singleton = 1;",
+            "UPDATE shiba_internal.operator_state
+                 SET value_bigint = 2 WHERE operator_id = 1;
+             UPDATE shiba.operator_result
+                 SET value_bigint = 2 WHERE operator_id = 1;",
         )
         .expect("restore count after underflow proof");
 }

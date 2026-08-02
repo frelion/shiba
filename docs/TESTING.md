@@ -156,6 +156,14 @@ changes and a forged public value fails before database state or replay can be
 reached. The threshold is a correctness regression gate, not a sustained-load,
 tail-latency, or cross-hardware benchmark.
 
+`test-m9-registration.sh` installs the operator authority, proves CountRows has
+no input address, resolves a live int8 column name to its exact ObjectAddress,
+and proves missing source/column, wrong type, and duplicate ID leave no partial
+definition/state/result. The migrated M2–M8 gates explicitly register one
+CountRows per source and query operator-keyed state/result; multi-source tests
+sum those independent public facts only to retain the historical union
+observation.
+
 `test-m6-stream-abort.sh` starts a live protocol-v2 receiver before a 10,000-row
 transaction, observes real segments while it is open, rolls it back, and
 requires real matching `A`. After abort feedback it restarts the same slot and

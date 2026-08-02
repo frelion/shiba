@@ -17,8 +17,8 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT row_count FROM shiba.count_result WHERE singleton = 1),
-                (SELECT row_count FROM shiba_internal.count_state WHERE singleton = 1),
+                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
                 (SELECT count(*) FROM shiba_internal.applied_insert),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
@@ -87,7 +87,7 @@ fn m4_real_pgoutput_nullable_payload_and_bad_key_tag() {
              CREATE FUNCTION m4_test.fail_operator() RETURNS trigger
              LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'M4 failure'; END $$;
              CREATE TRIGGER m4_fail_operator BEFORE UPDATE
-             ON shiba_internal.count_state FOR EACH ROW
+             ON shiba_internal.operator_state FOR EACH ROW
              EXECUTE FUNCTION m4_test.fail_operator();",
         )
         .expect("install payload rollback failure point");
@@ -135,7 +135,10 @@ fn m4_real_pgoutput_nullable_payload_and_bad_key_tag() {
         (202, true, Some(42))
     );
     let result: i64 = client
-        .query_one("SELECT row_count FROM shiba.count_result", &[])
+        .query_one(
+            "SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1",
+            &[],
+        )
         .expect("query SQL result")
         .get(0);
     assert_eq!(result, 2);
