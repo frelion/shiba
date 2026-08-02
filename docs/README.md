@@ -65,9 +65,9 @@ identity index. The default and index constructors require `d` and `i`
 respectively, so a live identity change fails before Apply. This is decoder
 configuration, not a second durable source-binding authority.
 
-M5.5 proves that this source binding is independent of schema/table/column
-names and catalog scan order. Rename preserves the bound relation OID; a
-same-name drop/recreate produces a new OID and is rejected before Apply.
+M5.5 proves the pgoutput decoder binding is independent of names and catalog
+scan order. M7.1 supersedes rename admission at the processor boundary: the OID
+is stable, but committed source DDL records invalidation before later Apply.
 
 M6.1 admits one complete, non-interleaved streamed key-only INSERT transaction.
 No segment is visible before stream commit; the assembled transaction uses the
@@ -81,13 +81,18 @@ For each new transaction the processor locks the bound relation, checks the
 DDL-owned invalidation fact, and only then applies. Rename rollback leaves the
 binding valid; committed rename invalidates before any later result is visible.
 
-**Not proved.** M7.1 has no production replication transport/slot lifecycle,
+M7.2 proves the same authority for object removal without adding production
+code. Direct DROP rollback removes its invalidation atomically; committed DROP,
+schema CASCADE, and same-name recreation preserve the old exact ObjectAddress
+invalidation and cannot revive the source binding.
+
+**Not proved.** M7 has no production replication transport/slot lifecycle,
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
 binding lifecycle/registration or replica-index drift observation without a
 RELATION message, streamed interleaving/subtransactions or bounded buffering,
 slot-generation change, multiple
-sources, column/type/index/drop DDL coverage, external effect, compatibility path, alias, fallback,
+sources, column/type/index DDL coverage, external effect, compatibility path, alias, fallback,
 or dual write.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),

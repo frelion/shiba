@@ -139,6 +139,11 @@ proves exact relation ObjectAddress storage, unrelated-DDL isolation, rename
 rollback, committed-rename invalidation, pre-Apply failure, historical replay,
 and ordinary-role denial on PostgreSQL 17 and 18.
 
+`test-m7-drop-invalidation.sh` proves direct DROP rollback, committed DROP,
+exact old relation ObjectAddress retention, same-name/new-OID non-revival, and
+schema CASCADE invalidation on PostgreSQL 17 and 18. Pending work fails before
+row/count/result/continuation writes; historical exact replay remains a no-op.
+
 `test-m5-source-binding.sh` binds the decoder to a real relation OID, applies an
 INSERT, renames both table and column, and applies another INSERT under the same
 OID. It then drops/recreates the original qualified name, proves the new OID is

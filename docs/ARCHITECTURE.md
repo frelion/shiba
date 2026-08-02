@@ -123,6 +123,11 @@ the processor resolves the bound OID, acquires relation `ACCESS SHARE`, checks
 the exact invalidation, then performs Apply. The object lock is held through
 commit, closing the DDL/check-to-Apply race without a second runtime writer.
 
+M7.2 adds no authority or production path. PostgreSQL rolls back `sql_drop`
+facts with direct DROP, while committed direct DROP and schema CASCADE retain
+the old relation ObjectAddress. Recreating the same qualified name produces a
+different OID and cannot satisfy or replace the immutable binding.
+
 ## Phase gates
 
 Every later module must name: its durable authority, sole writer, transaction
@@ -134,6 +139,6 @@ evidence inputs, not implementation dependencies.
 **Unproved:** production replication transport and slot ownership, admission
 for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
 tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
-streaming interleaving, column/type/index/drop invalidation, concurrency,
+streaming interleaving, column/type/index invalidation, concurrency,
 generation changes, multiple sources, general operators, and recovery workers
 remain.
