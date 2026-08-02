@@ -71,7 +71,7 @@ fn rows(client: &mut Client) -> Vec<(i64, Option<i64>)> {
     client
         .query(
             "SELECT source_row_id, payload_int8
-             FROM shiba_internal.applied_insert ORDER BY source_row_id",
+             FROM shiba_internal.source_row_state ORDER BY source_row_id",
             &[],
         )
         .expect("query current source-row state")

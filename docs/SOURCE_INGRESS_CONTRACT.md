@@ -228,7 +228,7 @@ The proved Apply grants are:
 - `SELECT` on source/ingress invalidations, ingress config, and
   `operator_definition`;
 - `SELECT, INSERT, UPDATE` on `source_continuation`;
-- `SELECT, INSERT, UPDATE, DELETE` on the current-row table `applied_insert`;
+- `SELECT, INSERT, UPDATE, DELETE` on the current-row table `source_row_state`;
 - `SELECT, UPDATE` on `operator_state` and public `operator_result`;
 - `SELECT` on the bound source table solely for the relation lock above.
 
@@ -288,7 +288,7 @@ performance gate have PG17/18 evidence. M10 is complete at this declared scope.
 TLS/disconnect behavior, shutdown during Apply, reconnect/backoff orchestration,
 allocator/RSS measurement, and cross-host soak remain future work.
 
-## M11.1 bootstrap handoff
+## M11.2 bootstrap handoff
 
 M11 does not infer an initial boundary from M10 feedback. Its explicit
 pre-active lifecycle creates a new `pgoutput` slot with `EXPORT_SNAPSHOT` and
@@ -316,5 +316,15 @@ It releases the scanner after `scan_complete`; catch-up/live use the existing
 two. Before scan completion, loss of the exported snapshot resets the entire
 hidden pristine attempt and creates a fresh slot/boundary. After scan completion
 the same slot is retained for recovery. The M11.1 PG17/18 gate proves the
-exported-snapshot lifetime and exact consistent-point relation. Production
-scanning, logical-message fence, catch-up, cutover, and recovery remain pending.
+exported-snapshot lifetime and exact consistent-point relation.
+
+M11.2 implements the scanner, strict logical-message fence, catch-up, cutover,
+and live conversion without adding another receiver or queue. Both PG17 and
+PG18 scan batches of two to private `3/40` while public results remain
+building/NULL, consume one concurrent source transaction to private `3/25`,
+activate public `3/25` only at the exact fence, and then reach `4/32` through an
+ordinary M10 live transaction. Slot feedback covers the durable catch-up and
+live terminals; snapshot batches create no continuation.
+
+M11.3 crash reset/resume and M11.4 million-row memory/performance remain
+unproved. M11 is incomplete, and M12 binding rebuild remains untouched.

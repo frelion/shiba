@@ -85,7 +85,7 @@ fn governed_session_uses_split_roles_and_revalidates_before_empty_ack() {
              GRANT SELECT, INSERT, UPDATE
                  ON shiba_internal.source_continuation TO {APPLY_ROLE};
              GRANT SELECT, INSERT, UPDATE, DELETE
-                 ON shiba_internal.applied_insert TO {APPLY_ROLE};
+                 ON shiba_internal.source_row_state TO {APPLY_ROLE};
              GRANT SELECT, UPDATE ON shiba_internal.operator_state TO {APPLY_ROLE};
              GRANT USAGE ON SCHEMA shiba TO {APPLY_ROLE};
              GRANT SELECT, UPDATE ON shiba.operator_result TO {APPLY_ROLE};

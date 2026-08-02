@@ -19,7 +19,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
             "SELECT
                 (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
                 (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
-                (SELECT count(*) FROM shiba_internal.applied_insert),
+                (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
         )
@@ -30,7 +30,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
 fn assert_pair(client: &mut Client, first: i64, second: i64, expected: i64) {
     let count = client
         .query_one(
-            "SELECT count(*) FROM shiba_internal.applied_insert
+            "SELECT count(*) FROM shiba_internal.source_row_state
              WHERE source_row_id = $1 AND source_row_sub_id = $2",
             &[&first, &second],
         )

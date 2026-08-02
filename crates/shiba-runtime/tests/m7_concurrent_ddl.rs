@@ -27,7 +27,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
             "SELECT
                 (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
                 (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
-                (SELECT count(*) FROM shiba_internal.applied_insert),
+                (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
         )
@@ -100,7 +100,7 @@ fn install_apply_blocker(client: &mut Client) {
              END
              $$;
              CREATE TRIGGER m7_concurrent_apply_block
-             BEFORE INSERT ON shiba_internal.applied_insert
+             BEFORE INSERT ON shiba_internal.source_row_state
              FOR EACH ROW EXECUTE FUNCTION m7_concurrent_test.block_apply();"
         ))
         .expect("install Apply advisory-lock blocker");

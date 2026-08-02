@@ -31,7 +31,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
             "SELECT
                 (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
                 (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
-                (SELECT count(*) FROM shiba_internal.applied_insert),
+                (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
         )
@@ -42,7 +42,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
 fn applied_payload(client: &mut Client) -> String {
     client
         .query_one(
-            "SELECT payload_text FROM shiba_internal.applied_insert
+            "SELECT payload_text FROM shiba_internal.source_row_state
              WHERE source_row_id = 701",
             &[],
         )

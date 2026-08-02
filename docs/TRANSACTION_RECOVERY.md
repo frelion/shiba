@@ -213,8 +213,9 @@ A backend termination after continuation INSERT and before COMMIT proves the
 same four durable observations remain old. Retrying the same decoded DELETE
 then removes and decrements once; replaying that exact committed transaction
 returns `AlreadyApplied` without touching row state or counts. Continuation is
-therefore the transaction replay authority, while `applied_insert` is the sole
-current source-row state; neither a DELETE log nor a recovery writer exists.
+therefore the transaction replay authority, while the table later renamed
+directly to `source_row_state` is the sole current-row authority; neither a
+DELETE log nor a recovery writer exists.
 
 M4.6 adds no transaction or recovery writer. Replica identity and key flags are
 validated by the pure decoder before it can return a `SourceTransaction`; a
@@ -347,7 +348,7 @@ overflow in operator 2 has the same rollback boundary. Same-source processors
 serialize on the existing binding row and acquire operator states in ascending
 ID order; a paused source does not prevent an unrelated source from committing.
 
-## M11.1 bootstrap recovery contract
+## M11.2 bootstrap recovery boundary
 
 The only initial-copy boundary is a new logical slot created with
 `EXPORT_SNAPSHOT`. PostgreSQL returns an immutable `consistent_point` and an
@@ -380,4 +381,18 @@ Every phase retains M10's exact binding/publication/generation/invalidation
 checks. Scan has three connections and batch-local Apply transactions;
 catch-up/live have two. No Apply transaction or lock survives scan/network/WAL
 wait, and no WAL spool, queue, second continuation, or persisted EffectStream
-exists. These are M11.1 decisions, not yet production or crash-test evidence.
+exists. M11.2 implements this non-crash path; the reset/resume claims still
+require M11.3 crash evidence.
+
+M11.2 now proves the non-crash path on PG17 and PG18. Batches of two commit
+snapshot state to private `3/40` with public building/NULL; one real concurrent
+WAL transaction advances private state and its sole continuation to `3/25`;
+the exact committed fence transaction publishes active `3/25`; and ordinary
+M10 live ingress commits and acknowledges `4/32`. No snapshot batch writes a
+continuation or duplicates a current row.
+
+This does not prove the recovery prose above. M11.3 still owns failures before
+and after scan completion, during catch-up/cutover/cleanup, PostgreSQL and Shiba
+restart, duplicate workers, and repeated bootstrap start. M11.4 still owns the
+million-row bounded-memory and performance proof. M11 remains incomplete; M12
+active/non-pristine rebuild is untouched.

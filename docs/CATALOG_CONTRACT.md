@@ -129,9 +129,9 @@ revalidates catalog/live publication and slot state before receive, Apply, and
 every ACK; an invalidation cannot be bypassed by an empty commit. Ingress cannot
 write current rows, operator state/results, or continuation.
 
-## M11.1 bootstrap authority
+## M11.2 bootstrap authority
 
-M11 will add exactly one private `source_bootstrap` checkpoint/lifecycle
+M11.2 adds exactly one private `source_bootstrap` checkpoint/lifecycle
 authority for a pristine source. Its identity is a never-reused `BootstrapId`;
 it binds the exact source, slot generation and name, immutable
 `consistent_point`, lifecycle, and committed scan progress. It stores neither
@@ -141,16 +141,23 @@ cursor, continuation, row log, or EffectStream.
 The bootstrap coordinator is its sole writer. Runtime remains the only writer
 of current source rows and operator state/result. A batch's row/operator writes
 and checkpoint advance share one transaction. Public results must represent
-building/unavailable as `status = building, value_bigint = NULL`; complete
-values require `status = active` and become visible with active lifecycle in one
-cutover transaction. M11 replaces the WAL-cause-shaped `applied_insert` with
-the sole key-owned `source_row_state`; no alias or second current-row table may
-remain.
+building/unavailable as `result_status = building, value_bigint = NULL`;
+complete values require `result_status = active` and become visible with active
+lifecycle in one cutover transaction. M11.2 replaces the WAL-cause-shaped
+`applied_insert` with the sole key-owned `source_row_state`; no alias or second
+current-row table remains.
 
 Before `scan_complete`, a failed hidden attempt may be fully removed only by
 the explicit pristine bootstrap owner and restarted with a fresh never-reused
 attempt and slot/snapshot. After `scan_complete`, the checkpoint directs
 recovery to the existing-slot catch-up phase. Ordinary M10 startup still cannot
 create or drop slots. Active/non-pristine reset or generation rebuild is M12,
-not an M11 cleanup path. No M11 catalog SQL exists yet; these constraints and
-their PG17/18 recovery evidence remain unproved.
+not an M11 cleanup path.
+
+The implemented schema contains the closed lifecycle, exact ingress foreign
+key, immutable consistent point, latest batch ordinal/key/digest, unique writer
+fence token, and catch-up fence LSN. It stores no snapshot name, WAL payload, or
+moving slot cursor. PG17/18 prove initial reservation, building visibility, two
+bounded batch checkpoints, fence activation, WAL-only continuation, and
+ordinary live handoff. M11.3 crash/reset/resume and M11.4 million-row
+performance remain unproved; M11 and M12 are not complete.

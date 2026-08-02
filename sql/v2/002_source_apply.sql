@@ -1,18 +1,12 @@
 -- M9.1 durable Source Apply, operator, result, and replay authorities. The
 -- registration/runtime writer owns each transaction; installation seeds none.
 
-CREATE TABLE shiba_internal.applied_insert (
+CREATE TABLE shiba_internal.source_row_state (
+    row_state_id bigint GENERATED ALWAYS AS IDENTITY,
     source_id bigint NOT NULL CHECK (source_id > 0),
-    slot_generation bigint NOT NULL CHECK (slot_generation > 0),
-    commit_lsn pg_lsn NOT NULL CHECK (commit_lsn > '0/0'::pg_lsn),
-    ingress_transaction_id bigint NOT NULL CHECK (ingress_transaction_id > 0),
-    input_sequence bigint NOT NULL CHECK (input_sequence > 0),
     source_row_id bigint NOT NULL,
-    CONSTRAINT applied_insert_cause_primary PRIMARY KEY (
-        source_id, slot_generation, commit_lsn,
-        ingress_transaction_id, input_sequence
-    ),
-    CONSTRAINT applied_insert_source_row_unique UNIQUE (source_id, source_row_id)
+    CONSTRAINT source_row_state_primary PRIMARY KEY (row_state_id),
+    CONSTRAINT source_row_state_source_row_unique UNIQUE (source_id, source_row_id)
 );
 
 CREATE TABLE shiba_internal.source_continuation (
@@ -63,7 +57,13 @@ CREATE TABLE shiba_internal.operator_state (
 CREATE TABLE shiba.operator_result (
     operator_id bigint PRIMARY KEY,
     operator_kind text NOT NULL,
-    value_bigint bigint NOT NULL,
+    result_status text NOT NULL DEFAULT 'active'
+        CHECK (result_status IN ('building', 'active')),
+    value_bigint bigint,
+    CONSTRAINT operator_result_visibility CHECK (
+        (result_status = 'building' AND value_bigint IS NULL)
+        OR (result_status = 'active' AND value_bigint IS NOT NULL)
+    ),
     CONSTRAINT operator_result_definition FOREIGN KEY (
         operator_id, operator_kind
     ) REFERENCES shiba_internal.operator_definition (
@@ -71,15 +71,15 @@ CREATE TABLE shiba.operator_result (
     )
 );
 
-REVOKE ALL ON TABLE shiba_internal.applied_insert FROM PUBLIC;
+REVOKE ALL ON TABLE shiba_internal.source_row_state FROM PUBLIC;
 REVOKE ALL ON TABLE shiba_internal.source_continuation FROM PUBLIC;
 REVOKE ALL ON TABLE shiba_internal.operator_definition FROM PUBLIC;
 REVOKE ALL ON TABLE shiba_internal.operator_state FROM PUBLIC;
 REVOKE ALL ON TABLE shiba.operator_result FROM PUBLIC;
 GRANT SELECT ON TABLE shiba.operator_result TO PUBLIC;
 
-COMMENT ON TABLE shiba_internal.applied_insert IS
-    'Current source-row state and stable applied-cause authority';
+COMMENT ON TABLE shiba_internal.source_row_state IS
+    'Sole key-owned current source-row state; WAL and bootstrap causes are not stored here';
 COMMENT ON TABLE shiba_internal.source_continuation IS
     'Committed source transaction history and exact replay authority';
 COMMENT ON TABLE shiba_internal.operator_definition IS
@@ -87,4 +87,4 @@ COMMENT ON TABLE shiba_internal.operator_definition IS
 COMMENT ON TABLE shiba_internal.operator_state IS
     'Private bigint state for one registered deterministic operator';
 COMMENT ON TABLE shiba.operator_result IS
-    'Read-only SQL result projection for one registered operator';
+    'Read-only SQL result projection; building rows expose no partial value';

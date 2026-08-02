@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+mod bootstrap;
+mod bootstrap_model;
 mod error;
 mod operator_execution;
 mod pgoutput;
@@ -16,6 +18,11 @@ mod source_preflight;
 mod streamed_pgoutput;
 mod transaction;
 
+pub use bootstrap::{
+    BootstrapProcessOutcome, BootstrapTransitionOutcome, activate_bootstrap,
+    complete_bootstrap_scan, process_bootstrap_batch,
+};
+pub use bootstrap_model::{BootstrapBatch, MAX_BOOTSTRAP_BATCH_ROWS, SnapshotRow};
 pub use error::M2Error;
 pub use pgoutput::{
     PgoutputError, PgoutputRelationState, decode_committed_changes,

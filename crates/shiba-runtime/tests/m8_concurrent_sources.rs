@@ -80,7 +80,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
             "SELECT
                 (SELECT sum(value_bigint)::bigint FROM shiba.operator_result),
                 (SELECT sum(value_bigint)::bigint FROM shiba_internal.operator_state),
-                (SELECT count(*) FROM shiba_internal.applied_insert),
+                (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
         )
@@ -152,7 +152,7 @@ fn install_sources(client: &mut Client) -> (PgoutputSource, PgoutputSource) {
              END
              $$;
              CREATE TRIGGER m8_block_source1
-             BEFORE INSERT ON shiba_internal.applied_insert
+             BEFORE INSERT ON shiba_internal.source_row_state
              FOR EACH ROW EXECUTE FUNCTION m8_concurrent_test.block_source1();"
         ))
         .expect("install sources and source1 blocker");

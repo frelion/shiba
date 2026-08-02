@@ -2,12 +2,20 @@ use core::fmt;
 
 #[derive(Debug)]
 pub enum M2Error {
+    BootstrapBatchLimitExceeded,
+    BootstrapBatchOutOfOrder,
+    BootstrapIdentityConflict,
+    BootstrapMissing,
+    BootstrapRowsOutOfOrder,
     CoordinateOutOfRange(&'static str),
     DuplicateInputSequence(u64),
     DuplicateSourceRow(i64),
     EmptyTransaction,
+    EmptyBootstrapBatch,
     IdentityConflict,
     InvalidOperatorDefinition,
+    InvalidBootstrapPhase,
+    InvalidBootstrapFence,
     InvalidSourceRowState,
     MissingSourceRow,
     MissingSourceOperator,
@@ -23,6 +31,19 @@ pub enum M2Error {
 impl fmt::Display for M2Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BootstrapBatchLimitExceeded => {
+                formatter.write_str("bootstrap batch exceeds the 10,000-row limit")
+            }
+            Self::BootstrapBatchOutOfOrder => {
+                formatter.write_str("bootstrap batch ordinal is not the next expected ordinal")
+            }
+            Self::BootstrapIdentityConflict => {
+                formatter.write_str("bootstrap identity or replay digest conflicts")
+            }
+            Self::BootstrapMissing => formatter.write_str("source bootstrap authority is missing"),
+            Self::BootstrapRowsOutOfOrder => {
+                formatter.write_str("bootstrap row keys are not strictly increasing")
+            }
             Self::CoordinateOutOfRange(field) => {
                 write!(formatter, "{field} exceeds PostgreSQL bigint range")
             }
@@ -31,11 +52,18 @@ impl fmt::Display for M2Error {
             }
             Self::DuplicateSourceRow(value) => write!(formatter, "duplicate source row {value}"),
             Self::EmptyTransaction => formatter.write_str("M2 requires at least one INSERT"),
+            Self::EmptyBootstrapBatch => formatter.write_str("bootstrap batch cannot be empty"),
             Self::IdentityConflict => {
                 formatter.write_str("source coordinate has a different transaction identity")
             }
             Self::InvalidOperatorDefinition => {
                 formatter.write_str("durable operator definition is invalid")
+            }
+            Self::InvalidBootstrapPhase => {
+                formatter.write_str("bootstrap lifecycle phase rejects this operation")
+            }
+            Self::InvalidBootstrapFence => {
+                formatter.write_str("terminal end LSN does not cover the bootstrap catch-up fence")
             }
             Self::InvalidSourceRowState => {
                 formatter.write_str("durable source row state violates its value shape")

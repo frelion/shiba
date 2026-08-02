@@ -84,7 +84,7 @@ BEGIN
         SELECT 1 FROM shiba_internal.source_continuation
         WHERE source_id = requested_source_id
         UNION ALL
-        SELECT 1 FROM shiba_internal.applied_insert
+        SELECT 1 FROM shiba_internal.source_row_state
         WHERE source_id = requested_source_id
     ) THEN
         RAISE EXCEPTION 'source rebuild required before slot rotation';

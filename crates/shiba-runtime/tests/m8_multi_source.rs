@@ -25,7 +25,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
             "SELECT
                 (SELECT sum(value_bigint)::bigint FROM shiba.operator_result),
                 (SELECT sum(value_bigint)::bigint FROM shiba_internal.operator_state),
-                (SELECT count(*) FROM shiba_internal.applied_insert),
+                (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
         )
@@ -37,7 +37,7 @@ fn applied_rows(client: &mut Client) -> Vec<(i64, i64)> {
     client
         .query(
             "SELECT source_id, source_row_id
-             FROM shiba_internal.applied_insert
+             FROM shiba_internal.source_row_state
              ORDER BY source_id, source_row_id",
             &[],
         )

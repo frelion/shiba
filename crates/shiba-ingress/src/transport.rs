@@ -16,6 +16,12 @@ pub struct ReplicationTransport {
     connection: Connection,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExportedSnapshot {
+    pub(crate) consistent_point: String,
+    pub(crate) snapshot_name: String,
+}
+
 impl ReplicationTransport {
     /// Opens a connection whose libpq-parsed conninfo explicitly selects
     /// database-scoped replication mode.
@@ -43,18 +49,23 @@ impl ReplicationTransport {
     /// # Errors
     /// Rejects unsafe names, command failures, and responses other than
     /// `CopyBoth`.
-    pub fn start(
+    pub(crate) fn start_with_messages(
         &self,
         slot: &str,
         publication: &str,
         start_lsn: u64,
         mode: ReplicationMode,
+        messages: bool,
     ) -> Result<(), IngressError> {
         validate_slot(slot)?;
         validate_identifier(publication, "publication")?;
-        let options = match mode {
-            ReplicationMode::Committed => "proto_version '1'",
-            ReplicationMode::Streamed => "proto_version '2', streaming 'on'",
+        let options = match (mode, messages) {
+            (ReplicationMode::Committed, false) => "proto_version '1'",
+            (ReplicationMode::Committed, true) => "proto_version '1', messages 'true'",
+            (ReplicationMode::Streamed, false) => "proto_version '2', streaming 'on'",
+            (ReplicationMode::Streamed, true) => {
+                "proto_version '2', streaming 'on', messages 'true'"
+            }
         };
         let query = format!(
             "START_REPLICATION SLOT {} LOGICAL {} \
@@ -69,6 +80,65 @@ impl ReplicationTransport {
             return Err(IngressError::UnexpectedStatus(status));
         }
         Ok(())
+    }
+
+    pub(crate) fn create_exported_slot(
+        &self,
+        slot: &str,
+    ) -> Result<ExportedSnapshot, IngressError> {
+        validate_slot(slot)?;
+        let result = self.connection.exec(&format!(
+            "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput (SNAPSHOT 'export')",
+            quote_identifier(slot)
+        ));
+        if result.status() != Status::TuplesOk || result.ntuples() != 1 || result.nfields() != 4 {
+            return Err(IngressError::UnexpectedStatus(result.status()));
+        }
+        for (index, expected) in [
+            "slot_name",
+            "consistent_point",
+            "snapshot_name",
+            "output_plugin",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if result.field_name(index).ok().flatten().as_deref() != Some(expected) {
+                return Err(IngressError::InvalidEnvelope(
+                    "unexpected CREATE_REPLICATION_SLOT response",
+                ));
+            }
+        }
+        let value = |index| {
+            result
+                .value(0, index)
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .map(str::to_owned)
+                .ok_or(IngressError::InvalidEnvelope(
+                    "invalid CREATE_REPLICATION_SLOT field",
+                ))
+        };
+        if value(0)? != slot || value(3)? != "pgoutput" {
+            return Err(IngressError::InvalidEnvelope(
+                "CREATE_REPLICATION_SLOT identity mismatch",
+            ));
+        }
+        let consistent_point = value(1)?;
+        let snapshot_name = value(2)?;
+        if consistent_point == "0/0"
+            || snapshot_name.is_empty()
+            || !snapshot_name
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        {
+            return Err(IngressError::InvalidEnvelope(
+                "invalid exported snapshot boundary",
+            ));
+        }
+        Ok(ExportedSnapshot {
+            consistent_point,
+            snapshot_name,
+        })
     }
 
     /// Blocks until libpq returns one complete `CopyData` payload.
@@ -112,7 +182,7 @@ impl ReplicationTransport {
     }
 }
 
-fn validate_slot(slot: &str) -> Result<(), IngressError> {
+pub(crate) fn validate_slot(slot: &str) -> Result<(), IngressError> {
     if slot.is_empty()
         || slot.len() > 63
         || !slot

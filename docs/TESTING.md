@@ -375,8 +375,28 @@ the opaque snapshot token may contain hexadecimal letters. Static checks
 require the separate Bootstrap identities, one
 checkpoint authority, building/unavailable public result, exact three-to-two
 connection transition, pristine pre-scan reset, same-slot post-scan catch-up,
-and explicit M12 deferral. Production gates do not yet exist, so M11 remains
-unproved and incomplete.
+and explicit M12 deferral.
+
+## M11.2 production vertical gate
+
+Run `scripts/test-m11-bootstrap.sh` independently with the absolute PG17 and
+PG18 `pg_config` paths. The gate uses the production Bootstrap session with an
+absent slot, exact exported snapshot, batch limit two, CountRows, and SumInt8.
+Baseline rows `(1,10),(2,NULL),(3,30)` must reach private `3/40` while public
+results remain building/NULL after every batch.
+
+During that snapshot, one source transaction inserts `(4,5)`, changes row 1 to
+20, and deletes row 3. Catch-up must preserve building visibility, produce
+private `3/25`, create exactly one real-WAL continuation, and activate public
+`3/25` only after the exact attempt-bound fence is durably handled. Current
+state must be exactly `(1,20),(2,NULL),(4,5)`, equal to the SQL differential.
+Conversion to ordinary M10 then applies `(5,7)`, acknowledges its terminal, and
+must yield exact `4/32`, four rows, and two WAL continuations without duplicate
+snapshot contribution.
+
+This production gate is green on PG17.10 and PG18.4. It is not the M11.3 crash
+matrix or M11.4 million-row performance gate; M11 remains incomplete and M12 is
+untouched.
 
 ## Evidence handling
 

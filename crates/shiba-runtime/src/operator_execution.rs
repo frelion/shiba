@@ -2,7 +2,8 @@ use core::num::NonZeroU64;
 
 use postgres::Transaction;
 use shiba_operator::{
-    CompiledOperator, CompiledOperatorKind, EffectBatch, ObjectAddress, OperatorId, apply_operator,
+    CompiledOperator, CompiledOperatorKind, EffectBatch, EffectOrigin, ObjectAddress, OperatorId,
+    apply_operator,
 };
 use shiba_protocol::SourceId;
 
@@ -13,6 +14,7 @@ pub(crate) fn apply_all(
     source_id: i64,
     batch: &EffectBatch,
 ) -> Result<(), M2Error> {
+    let publish_result = result_visibility(transaction, source_id, batch.origin)?;
     let rows = transaction.query(
         "SELECT definition.operator_id, state.value_bigint,
                 definition.operator_kind,
@@ -66,16 +68,57 @@ pub(crate) fn apply_all(
         {
             return Err(M2Error::InvalidOperatorDefinition);
         }
-        if transaction.execute(
-            "UPDATE shiba.operator_result
-             SET value_bigint = $1 WHERE operator_id = $2",
-            &[&next, &raw_operator_id],
-        )? != 1
+        if publish_result
+            && transaction.execute(
+                "UPDATE shiba.operator_result
+                 SET value_bigint = $1
+                 WHERE operator_id = $2 AND result_status = 'active'",
+                &[&next, &raw_operator_id],
+            )? != 1
         {
             return Err(M2Error::InvalidOperatorDefinition);
         }
     }
     Ok(())
+}
+
+fn result_visibility(
+    transaction: &mut Transaction<'_>,
+    source_id: i64,
+    origin: EffectOrigin,
+) -> Result<bool, M2Error> {
+    let expected_source = u64::try_from(source_id).map_err(|_| M2Error::InvalidBootstrapPhase)?;
+    let phase = transaction
+        .query_opt(
+            "SELECT bootstrap_id, phase
+             FROM shiba_internal.source_bootstrap
+             WHERE source_id = $1
+             FOR UPDATE",
+            &[&source_id],
+        )?
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)));
+    match (origin, phase) {
+        (EffectOrigin::Wal(identity), None) if identity.source_id.get() == expected_source => {
+            Ok(true)
+        }
+        (EffectOrigin::Wal(identity), Some((_, phase)))
+            if identity.source_id.get() == expected_source && phase == "active" =>
+        {
+            Ok(true)
+        }
+        (EffectOrigin::Wal(identity), Some((_, phase)))
+            if identity.source_id.get() == expected_source && phase == "catching_up" =>
+        {
+            Ok(false)
+        }
+        (EffectOrigin::Bootstrap(batch), Some((bootstrap_id, phase)))
+            if u64::try_from(bootstrap_id).ok() == Some(batch.bootstrap_id.get())
+                && phase == "scanning" =>
+        {
+            Ok(false)
+        }
+        _ => Err(M2Error::InvalidBootstrapPhase),
+    }
 }
 
 fn decode_kind(

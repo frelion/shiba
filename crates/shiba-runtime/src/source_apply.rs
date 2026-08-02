@@ -1,5 +1,5 @@
 use postgres::{Row, Transaction};
-use shiba_operator::{EffectBatch, RowEffect, RowImage, Value};
+use shiba_operator::{EffectBatch, EffectOrigin, RowEffect, RowImage, Value};
 
 use crate::transaction::as_bigint;
 use crate::{
@@ -12,32 +12,20 @@ pub(crate) fn apply(
 ) -> Result<EffectBatch, M2Error> {
     let identity = input.identity;
     let source_id = as_bigint("source_id", identity.source_id.get())?;
-    let generation = as_bigint("slot_generation", identity.slot_generation.get())?;
-    let ingress_id = as_bigint(
-        "ingress_transaction_id",
-        identity.ingress_transaction_id.get(),
-    )?;
-    let commit_lsn = identity.commit_lsn.to_string();
     let mut effects = Vec::with_capacity(input.changes.len());
 
     for change in &input.changes {
         effects.push(match change {
             SourceChange::Insert(insert) => {
-                let sequence = as_bigint("input_sequence", insert.input_sequence.get())?;
                 let payload = operator_value(&insert.source_payload);
                 let (payload_present, payload_int8, payload_text) = value_columns(&payload);
                 transaction.execute(
-                    "INSERT INTO shiba_internal.applied_insert (
-                         source_id, slot_generation, commit_lsn,
-                         ingress_transaction_id, input_sequence, source_row_id,
-                         source_row_sub_id, payload_present, payload_int8, payload_text
-                     ) VALUES ($1, $2, $3::text::pg_lsn, $4, $5, $6, $7, $8, $9, $10)",
+                    "INSERT INTO shiba_internal.source_row_state (
+                         source_id, source_row_id, source_row_sub_id,
+                         payload_present, payload_int8, payload_text
+                     ) VALUES ($1, $2, $3, $4, $5, $6)",
                     &[
                         &source_id,
-                        &generation,
-                        &commit_lsn,
-                        &ingress_id,
-                        &sequence,
                         &insert.source_row_id,
                         &insert.source_row_sub_id,
                         &payload_present,
@@ -62,7 +50,7 @@ pub(crate) fn apply(
             } => {
                 let before = load_row(transaction, source_id, *source_row_id, *source_row_sub_id)?;
                 let changed = transaction.execute(
-                    "DELETE FROM shiba_internal.applied_insert
+                    "DELETE FROM shiba_internal.source_row_state
                      WHERE source_id = $1 AND source_row_id = $2
                        AND source_row_sub_id IS NOT DISTINCT FROM $3",
                     &[&source_id, source_row_id, source_row_sub_id],
@@ -78,7 +66,7 @@ pub(crate) fn apply(
         });
     }
     Ok(EffectBatch {
-        source_transaction: identity,
+        origin: EffectOrigin::Wal(identity),
         effects,
     })
 }
@@ -105,7 +93,7 @@ fn apply_update(
     };
     let (payload_present, payload_int8, payload_text) = value_columns(&after_payload);
     let changed = transaction.execute(
-        "UPDATE shiba_internal.applied_insert
+        "UPDATE shiba_internal.source_row_state
          SET payload_present = $1, payload_int8 = $2, payload_text = $3
          WHERE source_id = $4 AND source_row_id = $5
            AND source_row_sub_id IS NULL",
@@ -140,7 +128,7 @@ fn load_row(
         .query_opt(
             "SELECT source_row_id, source_row_sub_id,
                     payload_present, payload_int8, payload_text
-             FROM shiba_internal.applied_insert
+             FROM shiba_internal.source_row_state
              WHERE source_id = $1 AND source_row_id = $2
                AND source_row_sub_id IS NOT DISTINCT FROM $3
              FOR UPDATE",

@@ -5,6 +5,7 @@ enum PendingFeedback {
     Applied(u64),
     Empty { lsn: u64, authorization: u64 },
     Aborted(u64),
+    Fence { lsn: u64, authorization: u64 },
 }
 
 /// In-memory capability state; `PostgreSQL` remains the durable slot authority.
@@ -31,7 +32,8 @@ impl FeedbackState {
             Some(
                 PendingFeedback::Applied(lsn)
                 | PendingFeedback::Empty { lsn, .. }
-                | PendingFeedback::Aborted(lsn),
+                | PendingFeedback::Aborted(lsn)
+                | PendingFeedback::Fence { lsn, .. },
             ) => Some(lsn),
             None => None,
         }
@@ -51,6 +53,10 @@ impl FeedbackState {
 
     pub(crate) fn mark_aborted(&mut self, lsn: u64) {
         self.pending = Some(PendingFeedback::Aborted(lsn));
+    }
+
+    pub(crate) fn mark_fence(&mut self, lsn: u64, authorization: u64) {
+        self.pending = Some(PendingFeedback::Fence { lsn, authorization });
     }
 
     pub(crate) fn require_applied(&self, lsn: u64) -> Result<(), IngressError> {
@@ -73,6 +79,16 @@ impl FeedbackState {
         matches!(self.pending, Some(PendingFeedback::Aborted(value)) if value == lsn)
             .then_some(())
             .ok_or(IngressError::FeedbackMismatch)
+    }
+
+    pub(crate) fn require_fence(&self, lsn: u64, authorization: u64) -> Result<(), IngressError> {
+        matches!(
+            self.pending,
+            Some(PendingFeedback::Fence { lsn: value, authorization: expected })
+                if value == lsn && expected == authorization
+        )
+        .then_some(())
+        .ok_or(IngressError::FeedbackMismatch)
     }
 
     pub(crate) fn complete(&mut self, lsn: u64) {

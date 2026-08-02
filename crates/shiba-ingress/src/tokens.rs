@@ -1,3 +1,4 @@
+use shiba_protocol::{BootstrapId, SourceId};
 use shiba_runtime::{ProcessOutcome, SourceTransaction};
 
 /// A decoded committed input held before Runtime Apply.
@@ -67,6 +68,64 @@ pub struct EmptyCommitted {
     end_lsn: u64,
     segment_count: usize,
     authorization: u64,
+}
+
+/// Exact attempt-bound terminal fence awaiting durable activation.
+#[derive(Debug)]
+pub struct BootstrapFence {
+    source_id: SourceId,
+    bootstrap_id: BootstrapId,
+    message_lsn: u64,
+    end_lsn: u64,
+    authorization: u64,
+}
+
+impl BootstrapFence {
+    pub(crate) const fn new(
+        source_id: SourceId,
+        bootstrap_id: BootstrapId,
+        message_lsn: u64,
+        end_lsn: u64,
+        authorization: u64,
+    ) -> Self {
+        Self {
+            source_id,
+            bootstrap_id,
+            message_lsn,
+            end_lsn,
+            authorization,
+        }
+    }
+
+    pub(crate) const fn authorization(&self) -> u64 {
+        self.authorization
+    }
+
+    #[must_use]
+    pub const fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    #[must_use]
+    pub const fn bootstrap_id(&self) -> BootstrapId {
+        self.bootstrap_id
+    }
+
+    #[must_use]
+    pub const fn end_lsn(&self) -> u64 {
+        self.end_lsn
+    }
+
+    #[must_use]
+    pub const fn message_lsn(&self) -> u64 {
+        self.message_lsn
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum BootstrapInput {
+    Transaction(ReceivedInput),
+    Fence(BootstrapFence),
 }
 
 impl EmptyCommitted {

@@ -88,6 +88,17 @@ impl GovernedSourceSession {
             ));
         }
 
+        if apply
+            .query_opt(
+                "SELECT phase FROM shiba_internal.source_bootstrap WHERE source_id = $1",
+                &[&i64::try_from(source_id.get())
+                    .map_err(|_| IngressError::Governance("source ID exceeds bigint"))?],
+            )?
+            .is_some_and(|row| row.get::<_, &str>(0) != "active")
+        {
+            return Err(IngressError::Governance("source bootstrap is not active"));
+        }
+
         let (config, confirmed_lsn) =
             GovernedConfig::load(&mut apply, source_id, expected_slot_generation, false)?;
         if config.database_name != apply_database {
@@ -242,7 +253,7 @@ impl GovernedSourceSession {
     }
 }
 
-fn advisory_key(source_id: SourceId) -> Result<i64, IngressError> {
+pub(crate) fn advisory_key(source_id: SourceId) -> Result<i64, IngressError> {
     // Positive SQL bigint source IDs map bijectively into the reserved negative
     // session-lock range (MIN+1..=-1), disjoint from positive application keys.
     let source = i64::try_from(source_id.get())

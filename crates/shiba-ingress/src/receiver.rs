@@ -1,4 +1,5 @@
 use postgres::Client;
+use shiba_protocol::{BootstrapId, SourceId};
 use shiba_runtime::{
     PgoutputRelationState, PgoutputSource, SourceTransaction, decode_committed_changes_in_session,
     decode_streamed_changes_in_session, process,
@@ -10,9 +11,11 @@ static NEXT_EMPTY_AUTHORIZATION: AtomicU64 = AtomicU64::new(1);
 use crate::{
     CommittedAssembler, IngressError, ReplicationMode, ReplicationTransport, ShutdownHandle,
     feedback::FeedbackState,
+    fence,
     streamed::{StreamTerminal, StreamedAssembler},
     tokens::{
-        AbortedTransaction, DurableTransaction, EmptyCommitted, ReceivedInput, StreamedInput,
+        AbortedTransaction, BootstrapFence, BootstrapInput, DurableTransaction, EmptyCommitted,
+        ReceivedInput, StreamedInput,
     },
 };
 
@@ -45,13 +48,33 @@ impl SourceReceiver {
         start_lsn: u64,
         last_acknowledged_lsn: u64,
     ) -> Result<Self, IngressError> {
+        Self::connect_with_messages(
+            conninfo,
+            slot,
+            publication,
+            mode,
+            start_lsn,
+            last_acknowledged_lsn,
+            false,
+        )
+    }
+
+    pub(crate) fn connect_with_messages(
+        conninfo: &str,
+        slot: &str,
+        publication: &str,
+        mode: ReplicationMode,
+        start_lsn: u64,
+        last_acknowledged_lsn: u64,
+        messages: bool,
+    ) -> Result<Self, IngressError> {
         let empty_authorization = NEXT_EMPTY_AUTHORIZATION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| IngressError::LimitExceeded)?;
         let transport = ReplicationTransport::connect(conninfo)?;
-        transport.start(slot, publication, start_lsn, mode)?;
+        transport.start_with_messages(slot, publication, start_lsn, mode, messages)?;
         let assembly = match mode {
             ReplicationMode::Committed => Assembly::Committed(CommittedAssembler::new()),
             ReplicationMode::Streamed => Assembly::Streamed(StreamedAssembler::new()),
@@ -65,6 +88,50 @@ impl SourceReceiver {
             outstanding_lsn: None,
             failed: false,
         })
+    }
+
+    pub(crate) fn receive_bootstrap_one(
+        &mut self,
+        source: PgoutputSource,
+        source_id: SourceId,
+        bootstrap_id: BootstrapId,
+        expected_content: &str,
+        shutdown: &ShutdownHandle,
+    ) -> Result<BootstrapInput, IngressError> {
+        self.ready()?;
+        if !matches!(self.assembly, Assembly::Committed(_)) {
+            return Err(IngressError::InvalidEnvelope(
+                "bootstrap catch-up requires committed mode",
+            ));
+        }
+        let result = self.receive_committed_wire(shutdown).and_then(|assembled| {
+            if let Some(fence) = fence::classify(&assembled.bytes, expected_content)? {
+                if fence.end_lsn != assembled.end_lsn {
+                    return Err(IngressError::FeedbackMismatch);
+                }
+                self.feedback
+                    .mark_fence(fence.end_lsn, self.empty_authorization);
+                return Ok(BootstrapInput::Fence(BootstrapFence::new(
+                    source_id,
+                    bootstrap_id,
+                    fence.message_lsn,
+                    fence.end_lsn,
+                    self.empty_authorization,
+                )));
+            }
+            let transaction = decode_committed_changes_in_session(
+                &assembled.bytes,
+                source,
+                &mut self.relation_state,
+            )?;
+            Ok(BootstrapInput::Transaction(
+                self.set_outstanding(transaction, assembled.end_lsn),
+            ))
+        });
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 
     /// Receives one protocol-v1 committed transaction without applying it.
@@ -191,6 +258,19 @@ impl SourceReceiver {
         }
         self.feedback
             .require_empty(token.end_lsn(), token.authorization())?;
+        self.send_ack(token.end_lsn())
+    }
+
+    pub(crate) fn acknowledge_fence(&mut self, token: &BootstrapFence) -> Result<(), IngressError> {
+        if self.failed || self.outstanding_lsn.is_some() {
+            return Err(if self.failed {
+                IngressError::ReceiverFailed
+            } else {
+                IngressError::FeedbackMismatch
+            });
+        }
+        self.feedback
+            .require_fence(token.end_lsn(), token.authorization())?;
         self.send_ack(token.end_lsn())
     }
 

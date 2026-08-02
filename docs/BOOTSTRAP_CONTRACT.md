@@ -27,7 +27,7 @@ the snapshot. Shiba never stores the name as a recoverable catalog fact.
 ordinal. Neither is a `SourceTransactionId`; a snapshot batch has no source
 commit LSN, must not fabricate one, and must not write `source_continuation`.
 Only real decoded WAL transactions enter the existing M10 continuation domain.
-M11 replaces the WAL-only `EffectBatch.source_transaction` field with the
+M11.2 replaces the WAL-only `EffectBatch.source_transaction` field with the
 closed `EffectOrigin::Wal(SourceTransactionId)` or
 `EffectOrigin::Bootstrap(BootstrapBatchId)` union. Operators still consume only
 row effects; Runtime validates the tagged origin before either write path.
@@ -47,12 +47,12 @@ last stable source key, last-batch digest, and one immutable catch-up fence.
 It never stores `snapshot_name`, received WAL, decoded changes,
 `confirmed_flush_lsn`, or `restart_lsn`.
 
-The existing `applied_insert` has become current-row state but still carries a
-WAL-cause-shaped key. M11 must replace it, without an alias or second table,
-with the sole `source_row_state` keyed only by exact source and stable row key.
-WAL provenance remains in `source_continuation`; bootstrap provenance remains
-in `source_bootstrap`. Snapshot rows therefore need no nullable or fabricated
-commit LSN/XID fields.
+M11.2 replaces the former WAL-cause-shaped `applied_insert` directly, without
+an alias or second table, with the sole `source_row_state`. Stable keyed rows are
+unique by exact source and row key; admitted keyless rows use only a generated
+internal state identity. WAL provenance remains in `source_continuation`, and
+bootstrap provenance remains in `source_bootstrap`. Current rows store no
+nullable or fabricated commit LSN, XID, or input sequence.
 
 The bootstrap coordinator is the sole lifecycle/checkpoint writer. Runtime
 remains the sole writer of current source rows and operator state/result. For
@@ -80,6 +80,13 @@ single-column keys in deterministic order and carry explicit
 `BootstrapBatchId`s through the same current-row, EffectBatch, Operator, and
 Result Sink contracts used by Runtime. A retry of an exact batch is a no-op or
 commits once; it cannot create a second row or contribution.
+
+The implemented batch admits at most 10,000 rows and performs one bounded
+set-based insert from parallel key/payload arrays. It constructs one
+transaction-local `EffectBatch` tagged `EffectOrigin::Bootstrap`, evaluates the
+existing CountRows and SumInt8 operators once, and advances the batch digest and
+checkpoint in the same transaction. It creates neither per-row SQL round trips
+nor retained effects.
 
 When the final batch and checkpoint commit atomically, the coordinator records
 `scan_complete`. It may then release the exported snapshot and start the
@@ -156,6 +163,19 @@ gate proves exact four-field slot creation, repeated short imports around real
 INSERT/UPDATE/DELETE, `confirmed_flush_lsn = consistent_point`, snapshot-token
 expiry after the exporter's next command, and no Shiba durable write. PG18 also
 proved that `snapshot_name` is opaque and may contain hexadecimal letters.
-Production bootstrap state, scanning, reset, fence/cutover, permissions, crash
-tests, SQL differential tests, million-row boundedness, heap measurements, and
-performance gates are not yet implemented or proved. M11 is not complete.
+M11.2 implements the sole `source_bootstrap` authority, strong Bootstrap IDs,
+tagged Effect origins, bounded set-based snapshot Apply, committed logical-
+message fence, active cutover, and M10 live handoff. On PG17.10 and PG18.4 the
+same real gate scans baseline `(1,10),(2,NULL),(3,30)` in batches of two. Private
+state reaches CountRows/SumInt8 `3/40` while public values remain
+`building/NULL`; one concurrent INSERT/UPDATE/DELETE transaction catches up to
+`3/25`; the exact fence atomically publishes `active 3/25`; and a later M10 live
+INSERT reaches `4/32`. The final current-row keys and nullable values equal the
+source SQL oracle, only the two real WAL transactions create continuations, and
+slot feedback covers each durable terminal.
+
+M11.3 must still prove the complete pre-scan reset and post-scan resume crash
+matrix, including PostgreSQL/Shiba restart and competing workers. M11.4 must
+prove the frozen million-row throughput, catch-up latency, bounded heap, and
+concurrent-write performance gates. M11 is not complete, and M12 remains
+untouched.

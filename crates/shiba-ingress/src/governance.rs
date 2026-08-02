@@ -220,9 +220,6 @@ fn validate_generation_continuity(
             "SELECT EXISTS (
                  SELECT 1 FROM shiba_internal.source_continuation
                  WHERE source_id = $1 AND slot_generation <> $2
-                 UNION ALL
-                 SELECT 1 FROM shiba_internal.applied_insert
-                 WHERE source_id = $1 AND slot_generation <> $2
              )",
             &[&source_id, &generation],
         )?

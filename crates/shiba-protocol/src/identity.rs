@@ -37,6 +37,37 @@ id_type!(SourceId, "source ID");
 id_type!(SlotGeneration, "slot generation");
 id_type!(IngressTransactionId, "ingress transaction ID");
 id_type!(InputSequence, "input sequence");
+id_type!(BootstrapId, "bootstrap ID");
+
+/// Identity of one ordered batch within exactly one bootstrap attempt.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapBatchId {
+    pub bootstrap_id: BootstrapId,
+    batch_ordinal: NonZeroU64,
+}
+
+impl BootstrapBatchId {
+    /// Creates a bootstrap batch identity whose ordinal starts at one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::ZeroValue`] when `batch_ordinal` is zero.
+    pub const fn new(bootstrap_id: BootstrapId, batch_ordinal: u64) -> Result<Self, ProtocolError> {
+        match NonZeroU64::new(batch_ordinal) {
+            Some(batch_ordinal) => Ok(Self {
+                bootstrap_id,
+                batch_ordinal,
+            }),
+            None => Err(ProtocolError::ZeroValue("bootstrap batch ordinal")),
+        }
+    }
+
+    #[must_use]
+    pub const fn batch_ordinal(self) -> u64 {
+        self.batch_ordinal.get()
+    }
+}
 
 /// Durable identity of one committed transaction from one source generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]

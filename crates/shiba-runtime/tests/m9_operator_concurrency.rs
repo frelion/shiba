@@ -116,7 +116,7 @@ fn install(client: &mut Client) -> (PgoutputSource, PgoutputSource) {
              END
              $$;
              CREATE TRIGGER m9_pause_source_one
-             BEFORE INSERT ON shiba_internal.applied_insert
+             BEFORE INSERT ON shiba_internal.source_row_state
              FOR EACH ROW EXECUTE FUNCTION m9_concurrency_test.pause_source_one();"
         ))
         .expect("install source relations and pause trigger");

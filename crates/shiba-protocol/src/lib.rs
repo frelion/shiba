@@ -13,11 +13,13 @@ mod lsn;
 mod version;
 mod wire;
 
-pub use digest::{WIRE_DIGEST_DOMAIN, WireDigest};
+pub use digest::{
+    BOOTSTRAP_BATCH_DIGEST_DOMAIN, BootstrapBatchDigest, WIRE_DIGEST_DOMAIN, WireDigest,
+};
 pub use error::{ProtocolError, ScopeMismatch};
 pub use identity::{
-    CauseId, CommitFrontier, IngressTransactionId, InputSequence, SlotGeneration, SourceId,
-    SourceTransactionId,
+    BootstrapBatchId, BootstrapId, CauseId, CommitFrontier, IngressTransactionId, InputSequence,
+    SlotGeneration, SourceId, SourceTransactionId,
 };
 pub use lsn::{ParsePostgresLsnError, PostgresLsn};
 pub use version::{CatalogVersion, ProtocolVersion};

@@ -5,11 +5,15 @@
 use core::fmt;
 
 mod assembler;
+mod bootstrap;
+mod bootstrap_catchup;
+mod bootstrap_transition;
 mod connection_config;
 mod envelope;
 mod feedback;
 #[cfg(test)]
 mod feedback_tests;
+mod fence;
 mod frame;
 mod governance;
 mod governed;
@@ -26,13 +30,19 @@ mod tokens;
 mod transport;
 
 pub use assembler::{AssembledTransaction, CommittedAssembler};
+pub use bootstrap::{BootstrapOptions, BootstrapSession, BootstrapSpec, SnapshotProgress};
+pub use bootstrap_catchup::{BootstrapCatchupProgress, BootstrapCatchupSession};
 pub use envelope::{ReplicationMessage, encode_feedback, parse_replication_message};
 pub use governed::{AttachOptions, GovernedSourceSession};
-pub use limits::{CONNECTIONS_PER_SOURCE, MAX_ACTIVE_CONNECTIONS, MAX_ACTIVE_SOURCES};
+pub use limits::{
+    BOOTSTRAP_CONNECTIONS_PER_SOURCE, CONNECTIONS_PER_SOURCE, MAX_ACTIVE_CONNECTIONS,
+    MAX_ACTIVE_SOURCES,
+};
 pub(crate) use receiver::SourceReceiver;
 pub use shutdown::ShutdownHandle;
 pub use tokens::{
-    AbortedTransaction, DurableTransaction, EmptyCommitted, ReceivedInput, StreamedInput,
+    AbortedTransaction, BootstrapFence, DurableTransaction, EmptyCommitted, ReceivedInput,
+    StreamedInput,
 };
 pub use transport::ReplicationMode;
 pub(crate) use transport::ReplicationTransport;

@@ -7,6 +7,6 @@ mod model;
 
 pub use apply::{OperatorError, apply_operator};
 pub use model::{
-    CompiledOperator, CompiledOperatorKind, EffectBatch, ObjectAddress, OperatorId, RowEffect,
-    RowImage, Value,
+    CompiledOperator, CompiledOperatorKind, EffectBatch, EffectOrigin, ObjectAddress, OperatorId,
+    RowEffect, RowImage, Value,
 };

@@ -1,7 +1,7 @@
 use core::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
-use shiba_protocol::{SourceId, SourceTransactionId};
+use shiba_protocol::{BootstrapBatchId, SourceId, SourceTransactionId};
 
 /// Stable identity of one registered operator.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -60,8 +60,16 @@ pub struct RowEffect {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectBatch {
-    pub source_transaction: SourceTransactionId,
+    pub origin: EffectOrigin,
     pub effects: Vec<RowEffect>,
+}
+
+/// Closed identity namespace for WAL and bootstrap effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectOrigin {
+    Wal(SourceTransactionId),
+    Bootstrap(BootstrapBatchId),
 }
 
 /// Closed set of operator implementations proven by the compiler.

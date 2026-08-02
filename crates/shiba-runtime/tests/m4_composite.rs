@@ -19,7 +19,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
             "SELECT
                 (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
                 (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
-                (SELECT count(*) FROM shiba_internal.applied_insert),
+                (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
         )
@@ -103,7 +103,7 @@ fn m4_real_pgoutput_composite_keys_and_bad_second_key_tag() {
     let rows = client
         .query(
             "SELECT source_row_id, source_row_sub_id
-             FROM shiba_internal.applied_insert ORDER BY input_sequence",
+             FROM shiba_internal.source_row_state ORDER BY state_id",
             &[],
         )
         .expect("query applied composite facts");

@@ -61,6 +61,18 @@
     requires = ["source_ingress_registration"]
 );
 
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/011_source_bootstrap.sql",
+    name = "source_bootstrap",
+    requires = ["source_ingress_invalidation"]
+);
+
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/012_source_bootstrap_reservation.sql",
+    name = "source_bootstrap_reservation",
+    requires = ["source_bootstrap"]
+);
+
 #[cfg(test)]
 mod tests {
     const CATALOG_SQL: &str = include_str!("../../../sql/v2/001_catalog_identity.sql");
@@ -75,6 +87,9 @@ mod tests {
         include_str!("../../../sql/v2/009_source_ingress_registration.sql");
     const M10_INVALIDATION_SQL: &str =
         include_str!("../../../sql/v2/010_source_ingress_invalidation.sql");
+    const M11_BOOTSTRAP_SQL: &str = include_str!("../../../sql/v2/011_source_bootstrap.sql");
+    const M11_RESERVATION_SQL: &str =
+        include_str!("../../../sql/v2/012_source_bootstrap_reservation.sql");
 
     fn normalized_sql() -> String {
         CATALOG_SQL.to_ascii_lowercase()
@@ -92,7 +107,7 @@ mod tests {
         let sql = M9_AUTHORITY_SQL.to_ascii_lowercase();
         assert_eq!(sql.matches("create table ").count(), 5);
         for table in [
-            "shiba_internal.applied_insert",
+            "shiba_internal.source_row_state",
             "shiba_internal.source_continuation",
             "shiba_internal.operator_definition",
             "shiba_internal.operator_state",
@@ -140,7 +155,7 @@ mod tests {
     fn m9_operator_permissions_are_private_state_and_public_read_only_result() {
         let sql = M9_AUTHORITY_SQL.to_ascii_lowercase();
         for table in [
-            "applied_insert",
+            "source_row_state",
             "source_continuation",
             "operator_definition",
             "operator_state",
@@ -209,7 +224,7 @@ mod tests {
     fn text_payload_extends_only_current_row_state() {
         let sql = M5_TEXT_SQL.to_ascii_lowercase();
         assert_eq!(sql.matches("create table ").count(), 0);
-        assert!(sql.contains("alter table shiba_internal.applied_insert"));
+        assert!(sql.contains("alter table shiba_internal.source_row_state"));
         assert!(sql.contains("add column payload_text text"));
         assert!(sql.contains("payload_int8 is null or payload_text is null"));
     }
@@ -307,5 +322,115 @@ mod tests {
             !sql.contains(name_only_lookup),
             "publication name became standalone identity: {name_only_lookup}"
         );
+    }
+
+    #[test]
+    fn m11_replaces_wal_causes_with_one_key_owned_row_state() {
+        let sql = M9_AUTHORITY_SQL.to_ascii_lowercase();
+        let row_state = sql
+            .split("create table shiba_internal.source_continuation")
+            .next()
+            .expect("source row state precedes continuation");
+        for required in [
+            "create table shiba_internal.source_row_state",
+            "row_state_id bigint generated always as identity",
+            "primary key (row_state_id)",
+            "unique (source_id, source_row_id)",
+        ] {
+            assert!(
+                row_state.contains(required),
+                "missing row-state contract: {required}"
+            );
+        }
+        for forbidden in [
+            "applied_insert",
+            "commit_lsn pg_lsn not null",
+            "ingress_transaction_id bigint not null",
+            "input_sequence bigint not null",
+        ] {
+            assert!(
+                !row_state.contains(forbidden),
+                "obsolete row cause: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn m11_result_visibility_is_closed_and_never_partial() {
+        let sql = M9_AUTHORITY_SQL.to_ascii_lowercase();
+        for required in [
+            "result_status text not null default 'active'",
+            "result_status in ('building', 'active')",
+            "result_status = 'building' and value_bigint is null",
+            "result_status = 'active' and value_bigint is not null",
+        ] {
+            assert!(
+                sql.contains(required),
+                "missing result visibility: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn m11_bootstrap_is_one_private_checkpoint_authority() {
+        let sql = M11_BOOTSTRAP_SQL.to_ascii_lowercase();
+        assert_eq!(sql.matches("create table ").count(), 1);
+        for required in [
+            "create table shiba_internal.source_bootstrap",
+            "bootstrap_id bigint not null unique check (bootstrap_id > 0)",
+            "'creating', 'scanning', 'scan_complete', 'catching_up'",
+            "'active', 'cleanup_pending', 'failed'",
+            "last_batch_ordinal bigint not null default 0",
+            "pg_catalog.octet_length(last_batch_digest) = 32",
+            "fence_token uuid not null unique default pg_catalog.gen_random_uuid()",
+            "activation_end_lsn pg_lsn",
+            "phase = 'active'\n         and activation_end_lsn is not null",
+            "activation_end_lsn >= catchup_fence_lsn",
+            "phase <> 'active' and activation_end_lsn is null",
+            "source_bootstrap_exact_ingress foreign key",
+            "revoke all on table shiba_internal.source_bootstrap from public",
+        ] {
+            assert!(
+                sql.contains(required),
+                "missing bootstrap authority: {required}"
+            );
+        }
+        for forbidden in [
+            "confirmed_flush_lsn",
+            "effect_batch",
+            "wal_payload",
+            "create table shiba_internal.bootstrap_batch",
+        ] {
+            assert!(
+                !sql.contains(forbidden),
+                "forbidden bootstrap state: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn m11_reservation_is_pristine_atomic_and_slot_absent() {
+        let sql = M11_RESERVATION_SQL.to_ascii_lowercase();
+        assert_eq!(sql.matches("create table ").count(), 0);
+        assert_eq!(sql.matches("create function ").count(), 1);
+        for required in [
+            "create function shiba_internal.reserve_source_bootstrap",
+            "from shiba_internal.source_row_state",
+            "from shiba_internal.source_continuation",
+            "member.prqual is null",
+            "pubinsert and pubupdate and pubdelete and not pubviaroot",
+            "from pg_catalog.pg_replication_slots",
+            "bootstrap slot must not exist before reservation",
+            "insert into shiba_internal.source_ingress_config",
+            "insert into shiba_internal.source_bootstrap",
+            "set result_status = 'building', value_bigint = null",
+        ] {
+            assert!(
+                sql.contains(required),
+                "missing reservation contract: {required}"
+            );
+        }
+        assert!(!sql.contains("pg_create_logical_replication_slot"));
+        assert!(!sql.contains("pg_drop_replication_slot"));
     }
 }

@@ -38,6 +38,7 @@ pub(crate) fn frame_status(input: &[u8]) -> Result<FrameStatus, IngressError> {
         b'I' => insert_end(input)?,
         b'U' => update_end(input)?,
         b'D' => delete_end(input)?,
+        b'M' => message_end(input)?,
         _ => return Err(IngressError::InvalidFrame),
     };
     let Some(len) = end else {
@@ -53,6 +54,22 @@ pub(crate) fn frame_status(input: &[u8]) -> Result<FrameStatus, IngressError> {
         tag,
         terminal_end_lsn,
     })
+}
+
+fn message_end(input: &[u8]) -> Result<Option<usize>, IngressError> {
+    let Some(mut at) = advance(input, 1, 9)? else {
+        return Ok(None);
+    };
+    let Some(next) = cstring_end(input, at)? else {
+        return Ok(None);
+    };
+    at = next;
+    let Some(length) = read_u32(input, at) else {
+        return Ok(None);
+    };
+    at = checked_add(at, 4)?;
+    let length = usize::try_from(length).map_err(|_| IngressError::LimitExceeded)?;
+    advance(input, at, length)
 }
 
 pub(crate) fn stream_frame_status(input: &[u8]) -> Result<StreamFrameStatus, IngressError> {

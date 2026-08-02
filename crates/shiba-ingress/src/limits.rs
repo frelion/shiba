@@ -4,6 +4,7 @@ use crate::IngressError;
 
 pub const MAX_ACTIVE_SOURCES: usize = 32;
 pub const CONNECTIONS_PER_SOURCE: usize = 2;
+pub const BOOTSTRAP_CONNECTIONS_PER_SOURCE: usize = 3;
 pub const MAX_ACTIVE_CONNECTIONS: usize = MAX_ACTIVE_SOURCES * CONNECTIONS_PER_SOURCE;
 
 static ACTIVE_SOURCES: AtomicUsize = AtomicUsize::new(0);
