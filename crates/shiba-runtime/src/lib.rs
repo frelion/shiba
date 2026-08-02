@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod bootstrap;
+mod bootstrap_activation;
 mod bootstrap_model;
 mod error;
 mod operator_execution;
@@ -18,9 +19,9 @@ mod source_preflight;
 mod streamed_pgoutput;
 mod transaction;
 
-pub use bootstrap::{
-    BootstrapProcessOutcome, BootstrapTransitionOutcome, activate_bootstrap,
-    complete_bootstrap_scan, process_bootstrap_batch,
+pub use bootstrap::{BootstrapProcessOutcome, process_bootstrap_batch};
+pub use bootstrap_activation::{
+    BootstrapTransitionOutcome, activate_bootstrap, complete_bootstrap_scan,
 };
 pub use bootstrap_model::{BootstrapBatch, MAX_BOOTSTRAP_BATCH_ROWS, SnapshotRow};
 pub use error::M2Error;

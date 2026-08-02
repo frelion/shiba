@@ -1,18 +1,16 @@
-use postgres::Client;
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
-use shiba_runtime::activate_bootstrap;
-
 use crate::{
-    BootstrapFence, DurableTransaction, GovernedSourceSession, IngressError, ReplicationMode,
-    ShutdownHandle, SourceReceiver,
+    BootstrapFence, DurableTransaction, IngressError, ReplicationMode, ShutdownHandle,
+    SourceReceiver,
     bootstrap::{BootstrapOptions, BootstrapParts, BootstrapSession, BootstrapSpec},
     bootstrap_transition::prepare_catchup,
     connection_config::{open_apply, replication_database},
     governance::GovernedConfig,
-    governed::{AttachOptions, advisory_key},
+    governed::advisory_key,
     limits::ActivePermit,
     tokens::BootstrapInput,
 };
+use postgres::Client;
+use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapCatchupProgress {
@@ -21,20 +19,20 @@ pub enum BootstrapCatchupProgress {
 }
 
 pub struct BootstrapCatchupSession {
-    receiver: Option<SourceReceiver>,
-    apply: Client,
-    config: GovernedConfig,
-    spec: BootstrapSpec,
-    options: BootstrapOptions,
-    expected_content: String,
-    shutdown: ShutdownHandle,
-    pending_durable: Option<DurableTransaction>,
-    pending_fence: Option<BootstrapFence>,
-    active: bool,
-    apply_conninfo: String,
-    replication_conninfo: String,
-    advisory_key: i64,
-    permit: ActivePermit,
+    pub(crate) receiver: Option<SourceReceiver>,
+    pub(crate) apply: Client,
+    pub(crate) config: GovernedConfig,
+    pub(crate) spec: BootstrapSpec,
+    pub(crate) options: BootstrapOptions,
+    pub(crate) expected_content: String,
+    pub(crate) shutdown: ShutdownHandle,
+    pub(crate) pending_durable: Option<DurableTransaction>,
+    pub(crate) pending_fence: Option<BootstrapFence>,
+    pub(crate) active: bool,
+    pub(crate) apply_conninfo: String,
+    pub(crate) replication_conninfo: String,
+    pub(crate) advisory_key: i64,
+    pub(crate) permit: ActivePermit,
 }
 
 impl BootstrapCatchupSession {
@@ -243,92 +241,12 @@ impl BootstrapCatchupSession {
         }
     }
 
-    fn retry_durable_ack(&mut self) -> Result<BootstrapCatchupProgress, IngressError> {
-        self.config.revalidate(&mut self.apply, true)?;
-        let token = self
-            .pending_durable
-            .take()
-            .ok_or(IngressError::FeedbackMismatch)?;
-        if let Err(error) = self.receiver_mut()?.acknowledge(&token) {
-            self.pending_durable = Some(token);
-            return Err(error);
-        }
-        Ok(BootstrapCatchupProgress::TransactionApplied)
-    }
-
-    fn retry_fence_activation(&mut self) -> Result<BootstrapCatchupProgress, IngressError> {
-        self.config.revalidate(&mut self.apply, true)?;
-        let token = self
-            .pending_fence
-            .take()
-            .ok_or(IngressError::FeedbackMismatch)?;
-        if token.source_id() != self.spec.source_id
-            || token.bootstrap_id() != self.spec.bootstrap_id
-        {
-            return Err(IngressError::FeedbackMismatch);
-        }
-        activate_bootstrap(
-            &mut self.apply,
-            self.spec.source_id,
-            self.spec.bootstrap_id,
-            token.message_lsn(),
-            token.end_lsn(),
-        )?;
-        self.config.revalidate(&mut self.apply, true)?;
-        if let Err(error) = self.receiver_mut()?.acknowledge_fence(&token) {
-            self.pending_fence = Some(token);
-            return Err(error);
-        }
-        self.active = true;
-        Ok(BootstrapCatchupProgress::Active)
-    }
-
-    /// Converts an activated bootstrap into the ordinary governed M10 session.
-    ///
-    /// # Errors
-    /// Fails if activation has not durably committed or advisory ownership was
-    /// lost before the normal receiver reattaches.
-    pub fn into_live(self) -> Result<GovernedSourceSession, IngressError> {
-        if !self.active {
-            return Err(IngressError::Governance("bootstrap is not active"));
-        }
-        let Self {
-            receiver,
-            mut apply,
-            spec,
-            options,
-            apply_conninfo,
-            replication_conninfo,
-            advisory_key,
-            permit,
-            ..
-        } = self;
-        drop(receiver);
-        let released: bool = apply
-            .query_one("SELECT pg_catalog.pg_advisory_unlock($1)", &[&advisory_key])?
-            .get(0);
-        if !released {
-            return Err(IngressError::Governance(
-                "source advisory lock was not held",
-            ));
-        }
-        drop(apply);
-        drop(permit);
-        GovernedSourceSession::attach(
-            &apply_conninfo,
-            &replication_conninfo,
-            spec.source_id,
-            spec.slot_generation,
-            AttachOptions::new(ReplicationMode::Committed, options.statement_timeout())?,
-        )
-    }
-
     #[must_use]
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         self.shutdown.clone()
     }
 
-    fn receiver_mut(&mut self) -> Result<&mut SourceReceiver, IngressError> {
+    pub(crate) fn receiver_mut(&mut self) -> Result<&mut SourceReceiver, IngressError> {
         self.receiver
             .as_mut()
             .ok_or(IngressError::Governance("bootstrap receiver is detached"))
