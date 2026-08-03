@@ -94,6 +94,7 @@ m14_gates=(
 m15_gates=(
   test-m15-sql-vertical.sh
   test-m15-sql-aggregates.sh
+  test-m15-sql-join.sh
 )
 
 cd "$root"
@@ -188,6 +189,7 @@ scripts/check-m15-contract.sh
 scripts/check-m15-parser.sh
 scripts/check-m15-registration.sh
 scripts/check-m15-aggregates.sh
+scripts/check-m15-join.sh
 cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo test -p shiba-operator -p shiba-compiler

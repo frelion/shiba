@@ -119,6 +119,45 @@ These are directed PG17.10/PG18.4 M15.5 results. They do not claim the complete
 release matrix, M15.6 Join SQL, M15.7 least-privilege registration or frozen
 frontend/registration performance.
 
+## M15.6 two-source SQL Join lifecycle evidence
+
+Pure `binder_join` tests prove the exact cross-schema SQL shape lowers to the
+generic M14 InnerJoin contract. They use left SourceId 20 and right SourceId 10
+to distinguish canonical sorted QuerySpec membership from semantic node input
+order, and cover reversed equality/aliases, quoted identifiers, exact fields,
+right effective identity, wrong type/identity/missing columns and rejected
+unproved shapes. Compiler's existing exact-right-identity test remains green.
+
+The declaration intentionally references the InnerJoin node directly as its
+keyed result. The M14 node already emits `[left.id, right.payload]`; Compiler
+adds the same generic Materialize terminal used elsewhere. Static
+`scripts/check-m15-join.sh` rejects Join recipe names and proves Runtime/Ingress
+remain SQL/Binder independent.
+
+Run `scripts/test-m15-sql-join.sh` separately with absolute PG17.10 and PG18.4
+`pg_config`. Both directed runs are green. They prove:
+
+- a NOSUPERUSER/NOREPLICATION control role atomically registers the SQL graph,
+  an independent NOSUPERUSER/REPLICATION role owns transport, and a third role
+  can only read public results;
+- missing graph INSERT and bootstrap-writer EXECUTE fail before any graph,
+  bootstrap, slot or source-row authority is left behind;
+- one exported snapshot scans both cross-schema members, hides building rows,
+  catches up concurrent two-side WAL and activates one complete result;
+- one PostgreSQL transaction modifying both tables is one graph Apply, followed
+  by explicit ACK and a complete keyed nullable SQL oracle;
+- Apply-before-ACK restart returns exact `AlreadyApplied` before feedback;
+- dropping/recreating the right effective PK gives a new OID, invalidates the
+  old exact binding, and leaves source rows, Join state/results, continuation
+  and confirmed flush LSN unchanged on rejected Apply;
+- whole-graph rebuild recompiles the durable QuerySpec against changed relation,
+  column and identity ObjectAddresses, uses generation 2, then continues live
+  Apply/ACK with the complete SQL oracle.
+
+This reuses M10--M14 production authority and changes no transaction or ACK
+rule. It is not evidence for M15.7 frozen performance or the complete release
+matrix.
+
 ## M15.2 QuerySpec cutover evidence status
 
 The green cutover deletes complete-query GraphOutputSpec recipes, changes the

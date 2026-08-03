@@ -8,6 +8,7 @@ mod bind;
 mod bind_aggregate;
 mod bind_aggregate_support;
 mod bind_expression;
+mod bind_join;
 mod bounds;
 mod error;
 mod expression;

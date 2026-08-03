@@ -1,6 +1,6 @@
 # ADR 0007: bounded SQL frontend over QuerySpec
 
-Status: accepted for M15.1; implemented through the M15.5 aggregate SQL vertical.
+Status: accepted for M15.1; implemented through the M15.6 two-source SQL vertical.
 
 ## Context
 
@@ -67,8 +67,25 @@ sum state could not distinguish zero from no non-NULL input, and the generic
 scalar sink/catalog required every active scalar to contain a non-NULL bigint.
 Directed PG17.10/PG18.4 production lifecycle tests now prove bootstrap,
 catch-up, live Apply/ACK, rollback/retry/replay and aggregate rebuild against
-SQL oracles. They do not prove M15.6 Join SQL or M15.7 least privilege,
-performance and final release gates.
+SQL oracles. At the M15.5 boundary they did not prove Join SQL or the final
+least-privilege/performance/release gates; M15.6 closes the directed Join and
+split-role portion below, while M15.7 retains performance and final release.
+
+M15.6 validates the two-source edge using the existing M14 InnerJoin rather
+than a complete-query recipe. QuerySpec membership remains sorted by SourceId,
+while explicit node inputs preserve semantic SQL left/right order. The Binder
+resolves four exact columns and requires the right equality column to match the
+effective non-null bigint PK/UK identity. Since the M14 node already emits
+`(left.id, right.payload)`, its result flows directly to the Compiler's generic
+Materialize terminal; a redundant identity Project would add no semantics.
+
+Directed PG17.10/PG18.4 evidence proves split-role atomic registration, one
+publication/slot/generation/snapshot/continuation, both-source Apply and ACK,
+Apply-before-ACK replay, exact right-PK replacement invalidation and graph-wide
+changed-ObjectAddress rebuild. No Runtime, Ingress, Bootstrap, Rebuild,
+continuation or ACK authority changes, and no legacy implementation is reused.
+M15.7 still owns frozen frontend/registration performance and the complete
+release matrix.
 
 ## Bounds
 

@@ -30,10 +30,13 @@ pub fn bind_query(
     sources: &[ResolvedSource],
 ) -> Result<QuerySpecV1, FrontendError> {
     crate::ast_validate::validate(query)?;
+    if query.join.is_some() || query.sources.len() == 2 {
+        return crate::bind_join::bind(graph_id, query, sources);
+    }
     let [resolved] = sources else {
         return Err(binding(ErrorCode::UnknownRelation, query.span));
     };
-    if query.sources.len() != 1 || query.join.is_some() {
+    if query.sources.len() != 1 {
         return Err(binding(ErrorCode::UnsupportedSyntax, query.span));
     }
     if query.group_by.is_some()
@@ -44,6 +47,14 @@ pub fn bind_query(
     {
         return crate::bind_aggregate::bind(graph_id, query, resolved);
     }
+    bind_projection(graph_id, query, resolved)
+}
+
+fn bind_projection(
+    graph_id: GraphId,
+    query: &UnboundQuery,
+    resolved: &ResolvedSource,
+) -> Result<QuerySpecV1, FrontendError> {
     let [key_item, value_item] = query.projection.as_slice() else {
         return Err(binding(ErrorCode::UnsupportedSyntax, query.span));
     };

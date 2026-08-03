@@ -286,9 +286,30 @@ It also proves predicate/group transitions, deleting the last non-NULL scalar
 input, overflow rollback with no continuation/feedback advance, retry/replay,
 and changed-ObjectAddress grouped-SUM rebuild. Failure-first tests fixed the
 sum-state zero/empty ambiguity and the generic scalar sink/catalog's previous
-non-NULL-only assumption. Cross-schema Join SQL, least-privilege registration
-and remaining negative binding families are M15.6/M15.7 work. The complete
-release runner remains reserved for M15.7 and is not claimed here.
+non-NULL-only assumption. M15.6 subsequently closes the admitted cross-schema
+Join SQL and directed least-privilege registration boundary below. Remaining
+negative families and complete release evidence stay M15.7 work.
+
+M15.6 lowers the exact two-source SQL shape to one generic `InnerJoin` QuerySpec
+node and one keyed result. QuerySpec source membership is canonical SourceId
+order; explicit node inputs preserve semantic SQL left/right order. The Binder
+resolves the left identity/key and right identity/payload against their exact
+descriptors and requires the right equality column to be the source's effective
+non-null bigint PK/UK. Names disappear after compilation.
+
+The existing M14 InnerJoin output is already `(left.id, right.payload)`, exactly
+the admitted SQL projection. The result can therefore reference InnerJoin
+directly and receive the Compiler's standard Materialize terminal. Inserting a
+no-op Project would not make the declaration more generic. No Join recipe,
+special registration function, Runtime branch or SQL workflow exists.
+
+On PG17.10 and PG18.4, `scripts/test-m15-sql-join.sh` proves split-role atomic
+registration, one publication/slot/generation and exported snapshot for both
+members, catch-up/live Apply/ACK, one transaction changing both tables,
+Apply-before-ACK replay, full keyed SQL oracle, right effective-PK replacement
+invalidation and graph-wide changed-ObjectAddress rebuild. Missing registration
+and bootstrap writer privileges leave no partial authority. This directed gate
+does not claim M15.7 performance or the complete release runner.
 
 The final release runner retains exact script enrollment, every M1--M14 gate,
 the frozen parser/registration thresholds and a static scan proving SQL/parser
@@ -305,5 +326,6 @@ contract. M15.2 completed the generic QuerySpec cutover, M15.3 completed the
 pure SQL-to-UnboundQuery parser, and M15.4 completed the Binder/registration and
 first single-source production SQL vertical. M15.5 completed the admitted
 single-source aggregate SQL verticals with nullable scalar output semantics.
-Two-table Join SQL, least-privilege registration, frontend/performance
-measurements and the full release matrix remain M15.6--M15.7 work.
+M15.6 completed the admitted two-table Join SQL and its directed split-role
+lifecycle. Frontend/registration performance measurements, remaining negative
+permission/admission families and the full release matrix remain M15.7 work.

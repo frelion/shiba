@@ -1,6 +1,6 @@
 # M15 QuerySpecV1 contract
 
-## M15.2 cutover and M15.5 binding status
+## M15.2 cutover and M15.6 binding status
 
 M15.2 replaced the complete-query `GraphSpecV1`/
 `GraphOutputSpecV1` recipes with this generic QuerySpec. Compiler version 2
@@ -173,5 +173,38 @@ input, and the generic scalar sink/catalog rejected typed NULL active results.
 Both fixes remain inside existing plan/state/result authorities.
 
 This is directed two-version M15.5 evidence, not the M15.7 complete release
-matrix. Two-table Join SQL, least-privilege registration and frozen frontend/
-registration performance remain unproved.
+matrix. M15.6 subsequently closes the admitted two-table Join SQL and directed
+least-privilege lifecycle boundary below; frozen frontend/registration
+performance remains unproved.
+
+## M15.6 two-source Join binding and lifecycle evidence
+
+For the exact admitted SQL shape, the Binder resolves two ordered
+`ResolvedSource` values, the left projected identity, left equality key, right
+equality identity and right payload. `QuerySpecV1.sources` remains sorted by
+SourceId as required by its canonical envelope; the InnerJoin node's two
+explicit Source inputs and field input ordinals preserve SQL left/right
+semantics independently of numeric SourceId order. Pure tests use left
+SourceId 20 and right SourceId 10 to prove that distinction.
+
+The resulting declaration has one generic stateful `InnerJoin` node and one
+keyed result referencing it. M14's established InnerJoin output layout is
+already `[left.id, right.payload]`, so Compiler adds its ordinary terminal
+Materialize directly. A no-op Project would only repeat those slots. This is a
+canonical topology choice using existing generic operations, not a complete-
+query recipe or alternate compiler/runtime path. The exact effective right
+PK/UK ObjectAddress remains a generation-specific compiled binding, not a name
+or QuerySpec identity.
+
+Pure Binder tests prove reversed equality/alias canonical equivalence, reverse
+SourceId order, exact fields and right identity, wrong/missing/type/identity
+rejection and generic Compiler acceptance. On PG17.10 and PG18.4,
+`scripts/test-m15-sql-join.sh` proves atomic least-privilege SQL registration,
+one exported snapshot over both members, catch-up/activation, one both-source
+transaction through live Apply/ACK, Apply-before-ACK `AlreadyApplied`, complete
+keyed SQL oracle, exact right-PK replacement invalidation with no durable/ACK
+advance, and changed-ObjectAddress whole-graph rebuild with post-cutover live
+ACK. No production authority, transaction, continuation or ACK rule changes.
+
+This is directed M15.6 evidence, not the M15.7 complete release matrix or
+frontend/registration performance closure.

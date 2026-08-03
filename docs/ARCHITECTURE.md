@@ -68,9 +68,33 @@ active scalar could never be NULL.
 
 Directed PG17.10/PG18.4 production lifecycle evidence covers aggregate
 registration, one-snapshot bootstrap, WAL catch-up, live Apply/ACK,
-overflow rollback/retry/replay and grouped-SUM rebuild. It does not prove the
-M15.6 two-source Join SQL binding or M15.7 least-privilege, frozen performance
-and complete release matrix gates.
+overflow rollback/retry/replay and grouped-SUM rebuild. At the M15.5 boundary
+the two-source Join SQL binding and final least-privilege/performance/release
+gates were not yet closed; M15.6 closes the directed Join and split-role portion
+below, while M15.7 retains performance and complete-matrix ownership.
+
+M15.6 completes the admitted SQL Join control-plane edge without changing the
+M14 data plane. Registration resolves both SQL relations in one database,
+acquires source locks in ascending SourceId order, then restores SQL input
+ordinals for pure binding. QuerySpec keeps its canonical sorted membership;
+the InnerJoin node separately records semantic left/right SourceIds and field
+inputs. Consequently numeric SourceId order cannot reverse Join meaning.
+
+The M14 InnerJoin node's typed output is already exactly
+`(left identity, right payload)`. M15.6 therefore makes that node the QuerySpec
+result input and relies on the Compiler's generic terminal Materialize. A
+redundant identity Project is not needed, and no `JoinQuery`, recipe, SQL
+workflow or Runtime branch is introduced. Exact right effective PK/UK identity
+is still validated and embedded only in the compiled generation-specific
+OperatorGraph.
+
+PG17.10/PG18.4 directed evidence uses separate NOREPLICATION control/Apply and
+REPLICATION receiver credentials plus a public-result-only reader. It proves
+one publication/slot/generation, one snapshot and graph continuation, two-side
+atomic WAL, explicit ACK/replay, right identity replacement fail-closed and
+whole-graph changed-ObjectAddress rebuild. These are new SQL frontend/lifecycle
+proofs over unchanged M14 authorities, not the M15.7 performance or full-release
+closure.
 
 M14.6 cuts the production lifecycle over to the graph boundary frozen in
 [OPERATOR_GRAPH_CONTRACT.md](OPERATOR_GRAPH_CONTRACT.md): one canonical typed
@@ -502,9 +526,8 @@ backoff policy, allocator/RSS peaks, cross-host soak, admission
 for `D + O` or replica identity `FULL`, composite UPDATE and broader old-tuple
 shapes, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving,
-production failover and persisted partial-stream recovery, Join SQL binding and
-the final least-privilege/performance matrix beyond M15.5's aggregate
-PostgreSQL lifecycles,
+production failover and persisted partial-stream recovery, and the final
+frontend/performance release matrix beyond M15.6's SQL lifecycles,
 additional operator families beyond non-aggregate ProjectRows, broader result
 types, cross-host sustained soak, empirical heap peak, contention tail latency,
 and recovery workers
@@ -678,5 +701,5 @@ declared active nullable-`int8` CountRows/SumInt8 rebuild boundary. M15.4 later
 reuses it for the first SQL-declared changed-ObjectAddress rebuild and M15.5
 reuses the same lifecycle for grouped-SUM rebuild; TLS,
 automatic reconnect supervision, cross-host/failover operation, broader source
-shapes, Join SQL registration and broader result/operator shapes remain
+shapes and broader result/operator shapes remain
 outside it.

@@ -282,7 +282,27 @@ distinguish zero from no input and the scalar sink/catalog assumption that an
 active scalar must be non-NULL. No legacy implementation or SQL workflow was
 reused.
 
-Two-table Join SQL (M15.6), least-privilege registration, the frozen frontend/
-registration performance measurements and the final complete release matrix
-(M15.7) remain unproved; M15 is not complete. The directed M15.5 evidence is not
-a claim that the complete release runner has passed.
+M15.6 binds the admitted cross-schema two-table SQL INNER JOIN to the same
+generic QuerySpec and M14 OperatorGraph. QuerySpec membership is canonical
+SourceId order, while the InnerJoin node's explicit inputs preserve semantic SQL
+left/right order. The Binder resolves the projected left identity, nullable
+left join key, exact right effective bigint PK/UK and nullable right payload
+once. The existing M14 InnerJoin node already emits exactly
+`(left.id, right.payload)`, so the result points directly to that node and the
+Compiler appends ordinary Materialize. Adding an identity Project would not add
+semantics; this direct edge is graph topology, not a Join recipe or special
+Runtime path.
+
+Directed PG17.10/PG18.4 `test-m15-sql-join.sh` proves least-privilege atomic SQL
+registration, one exported snapshot for both source members, catch-up, a
+both-table transaction through production receiver Apply/ACK, Apply-before-ACK
+replay, full keyed SQL differential, exact right-PK replacement invalidation,
+and graph-wide changed-ObjectAddress rebuild followed by live ACK. The control,
+replication and result-reader roles are distinct; missing registration/bootstrap
+writes fail without partial authority. Runtime, Ingress, Bootstrap, Rebuild,
+continuation and ACK semantics are unchanged, and no legacy implementation was
+reused.
+
+The frozen frontend/registration performance measurements and final complete
+release matrix remain M15.7 work; M15 is not complete. Directed M15.5/M15.6
+evidence is not a claim that the complete release runner has passed.
