@@ -158,22 +158,20 @@ switch. M12.2--M12.6 implement and prove that production rebuild path on
 PG17.10/PG18.4, including recovery, governance, least privilege, bounded
 million-row performance, and the complete release matrix.
 
-M13.1 freezes the next replacement boundary: a canonical compiled plan, opaque
+M13 replaces the aggregate-shaped API with a canonical compiled plan, opaque
 state codec, typed scalar/keyed transition and generic Result Sink. Concrete
 operator dispatch is confined to the database-free Operator crate. Runtime,
-Ingress, Bootstrap and Rebuild will consume only an ordered durable plan set.
+Ingress, Bootstrap and Rebuild consume only the complete ordered durable plan
+set; CountRows, SumInt8 and non-aggregate ProjectRows use that sole path.
 
-**Not proved.** M10 production receiver/restart and slot lifecycle are proved, but
-persisted partial-stream recovery is intentionally absent, as are
-admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
-UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
-binding lifecycle/registration or replica-index drift observation without a
-RELATION message, streamed interleaving/subtransactions, slot-generation
-change, production transport scheduling/backpressure or transport memory,
-multi-source contention/tail latency, sustained throughput, or heap evidence;
-the M12 production rebuild lifecycle, SQL frontend, non-aggregate operators, external
-effect, compatibility path, alias, fallback,
-or dual write. M13 has frozen but not yet implemented the non-aggregate kernel.
+**Not proved.** Persisted partial-stream recovery is intentionally absent.
+Admission for `D + O`, replica identity `FULL`, composite UPDATE, UPDATE old
+tuples, NULL text, binary payloads, TOAST keys, composite replica indexes and
+streamed interleaving/subtransactions remains outside the declared shape. SQL
+frontend, additional operator families, broader result types, external effects,
+automatic receiver supervision/reconnect, cross-host/failover operation,
+sustained soak, heap peak and contention tail latency also remain unproved.
+There is no compatibility path, alias, fallback or dual write.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),
 [catalog contract](CATALOG_CONTRACT.md), the

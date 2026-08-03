@@ -20,12 +20,13 @@ leak a partial projection. Registration and rebuild initialization call the
 same generic Runtime writer; Catalog SQL does not infer a concrete zero, patch
 an input by kind, or reset state independently.
 
-At M12 destructive prepare, the registration/compiler writer must install the
+At M12 destructive prepare, the registration/compiler writer installs the
 complete target plan set in ascending operator-ID order in the same transaction
 that makes the target the sole building authority. Recovery validates every
 canonical payload/digest/input/output contract in that durable set; activation
-only publishes the same authority. M13.4 still has to re-prove this handoff for
-arbitrary plan cardinality, including `ProjectRows`. There is no candidate
+only publishes the same authority. M13.4 re-proved this handoff for arbitrary
+plan cardinality, including `ProjectRows`, across bootstrap, catch-up and active
+rebuild on PG17.10/PG18.4. There is no candidate
 table, compatibility view, dual write or recovery-time kind reconstruction.
 
 ## Installation authority
@@ -143,8 +144,9 @@ The private slot-rotation writer is a pristine-only generation CAS. It requires
 the expected generation, locks the row, rejects invalidated or non-pristine
 sources and active/current slots, validates a different existing inactive
 `pgoutput` slot in the same database, then changes slot and increments generation
-once. It never creates or drops a physical slot. Binding rebuild remains a
-separate unimplemented lifecycle.
+once. It never creates or drops a physical slot. M12 provides the separate,
+explicit active/non-pristine rebuild lifecycle; pristine rotation does not
+silently enter it.
 
 PostgreSQL `pg_replication_slots` remains physical slot/progress authority.
 The catalog deliberately contains no `confirmed_flush_lsn`, receiver PID,
@@ -228,8 +230,9 @@ M11.4 performs 100 atomic 10,000-row checkpoint advances, one real 10,000-
 change WAL continuation, exact fence activation, and live handoff without a
 batch table, moving LSN mirror, or additional writer. Operators must inspect
 `result_status`, not a partial numeric value, and must never repair lifecycle by
-manual catalog updates. Indefinite writer catch-up and M12 non-pristine rebuild
-remain outside this authority.
+manual catalog updates. Indefinite writer catch-up remains outside this
+authority; M12 subsequently proved non-pristine rebuild through the same sole
+lifecycle and Catalog authority.
 
 M11.5 proves this privilege boundary on PG17.10 and PG18.4. The non-superuser
 bootstrap control role has `NOREPLICATION` and only explicit private-table,
@@ -371,9 +374,10 @@ and the existing operator state/result rows. The 10,000-change catch-up and
 activation therefore exercise the same transaction and authority boundaries as
 M12.3--M12.5; measurement state is test output, never durable Catalog state.
 
-The release matrix must re-prove cardinality, generation, visibility and old-
+The release matrix re-proved cardinality, generation, visibility and old-
 generation rejection on PG17 and PG18. Frozen limits are scan <= 12 s,
 catch-up <= 8 s, activation <= 2 s, total <= 25 s, RSS growth <= 128 MiB and
 retained WAL <= 256 MiB. PG17.10/PG18.4 complete in 6.343139667/6.375927458 s,
-retain at most 252,864,952/252,898,072 bytes, and pass all 96 PG invocations.
-No measurement row or additional Catalog state is created.
+retain at most 252,864,952/252,898,072 bytes, and passed all 96 M12 PG
+invocations. M13's final matrix subsequently passed 49 unique scripts and 98
+PG invocations without adding measurement rows or Catalog state.

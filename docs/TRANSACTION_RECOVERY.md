@@ -8,8 +8,8 @@ sink failure aborts source rows, every operator state/result and continuation.
 Rebuild recovery must read only the complete ordered target plan set installed
 at destructive prepare and validate every canonical digest; it cannot
 reconstruct plans by concrete kind, fixed ID, fixed cardinality or column
-position. M13.4 still has to re-prove bootstrap/catch-up/rebuild recovery and
-ACK behavior with that generic set and `ProjectRows`.
+position. M13.4 re-proved bootstrap/catch-up/rebuild recovery and ACK behavior
+with that generic set and `ProjectRows` on PG17.10/PG18.4.
 
 ## Proven transaction owners
 
@@ -160,9 +160,9 @@ Slot rotation is allowed only while the source has no continuation or current
 rows. A row lock and expected-generation comparison serialize contenders; a
 stale caller fails, while one successful caller selects a different existing
 inactive `pgoutput` slot in the same database and increments generation once.
-No slot is created or dropped. Any non-pristine source requires the future
-binding-rebuild lifecycle, so old generation computation cannot be relabeled as
-new history.
+No slot is created or dropped. Any non-pristine source requires the explicit
+M12 rebuild lifecycle, so old generation computation cannot be relabeled as new
+history.
 
 The PG17/18 governed restart gate proves detach releases both active slot and
 session ownership, after which the same catalog generation reattaches. It also
@@ -485,8 +485,8 @@ PostgreSQL 17/18 cannot distinguish an identical slot replacement by a trusted
 privileged actor. The `REPLICATION` credential is a control-plane capability,
 and its compromise or external slot DDL is outside this correctness model. M12
 does not claim database ACL enforcement or add a slot-birth marker. M12.2 now
-proves the admission transaction and rollback boundary; instruction-level slot,
-snapshot, catch-up and activation recovery remains M12.3--M12.4.
+proves the admission transaction and rollback boundary; M12.3--M12.4
+subsequently proved slot, snapshot, catch-up and activation recovery.
 
 ## M12.2 prepare rollback and forward state
 
@@ -516,10 +516,10 @@ is dynamically discovered or substituted.
 Old/foreign receiver tokens are additionally rejected by a receiver-local
 authorization capability even when their terminal LSN equals a current value.
 The capability is memory-only and cannot replace durable lifecycle/generation
-validation. The admission gate does not yet prove kill points after old-slot
+validation. The admission gate alone did not prove kill points after old-slot
 drop, new-slot creation, snapshot loss, scan/catch-up, activation or feedback;
-those remain M12.4. The corrected cardinality path initially failed on PG17
-because unparenthesized PL/pgSQL `IF CASE` is invalid.
+M12.4 subsequently proved those windows. The corrected cardinality path
+initially failed on PG17 because unparenthesized PL/pgSQL `IF CASE` is invalid.
 
 ## M12.3 proved forward path, not crash matrix
 
@@ -531,9 +531,10 @@ live Apply/ACK. Results stay `building/NULL` until activation; the old
 continuation is absent and never relabeled; the retired triple survives active
 cutover; old attach and token authorization reject.
 
-This is not evidence for recovery after a crash between those actions. Slot
-drop, slot creation, consistent-point persistence, scan, catch-up, activation
-and pre-feedback kill windows remain explicitly assigned to M12.4.
+This M12.3 gate was not by itself evidence for recovery after a crash between
+those actions. M12.4 subsequently proved slot drop, slot creation,
+consistent-point persistence, scan, catch-up, activation and pre-feedback kill
+windows.
 
 Runtime's binding lock precedes exact config/bootstrap generation validation,
 which itself precedes replay and Apply. Ordinary WAL is eligible only when the
@@ -597,7 +598,7 @@ catch-up and RSS growth. PG17.10/PG18.4 observed scan
 and retained WAL 252,864,952/252,898,072 bytes. All remain below the frozen
 bounds; no recovery rule was weakened.
 
-The final release matrix must re-run PG17 and PG18 crash, retry, concurrency,
-role and differential gates. Passing it will not prove host-loss slot failover,
-compromised replication credentials, cross-host network partitions, automatic
-reconnect supervision or indefinite-writer convergence.
+The final release matrix re-ran and passed PG17 and PG18 crash, retry,
+concurrency, role and differential gates. It does not prove host-loss slot
+failover, compromised replication credentials, cross-host network partitions,
+automatic reconnect supervision or indefinite-writer convergence.

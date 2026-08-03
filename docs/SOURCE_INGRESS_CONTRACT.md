@@ -8,10 +8,10 @@ unchanged. The transaction now drives a Catalog-loaded ordered plan set and one
 generic scalar/keyed sink. Ingress must never carry a concrete operator kind,
 fixed operator ID/count or payload column position.
 
-M13.4 still has to re-prove committed and streamed ingress, bootstrap catch-up,
-rebuild handoff, crash/replay and ACK timing with arbitrary plan cardinality and
-`ProjectRows`. A failed plan/state decode or keyed sink remains an Apply failure:
-no continuation commits and no terminal feedback may advance.
+M13.4 re-proved committed and streamed ingress, bootstrap catch-up, rebuild
+handoff, crash/replay and ACK timing with arbitrary plan cardinality and
+`ProjectRows` on PG17.10/PG18.4. A failed plan/state decode or keyed sink remains
+an Apply failure: no continuation commits and no terminal feedback may advance.
 
 ## Ownership
 
@@ -188,8 +188,8 @@ Slot replacement is a private compare-and-swap operation. It locks the config,
 requires the expected generation and a different pre-existing inactive
 `pgoutput` slot in the same database, and increments generation exactly once.
 It rejects active slots, stale callers, publication invalidation, and any source
-with current rows or continuation. The latter requires an explicit future
-binding rebuild rather than pretending old computation belongs to new history.
+with current rows or continuation. The latter requires the explicit M12 rebuild
+lifecycle rather than pretending old computation belongs to new history.
 
 ## Connection and shutdown budget
 
@@ -466,8 +466,8 @@ synchronous and no WAL spool, queue or second receiver path is added.
 
 An old token and old-generation attach are rejected. Results remain
 `building/NULL` until activation, and feedback derives only from durable WAL
-Apply after the real snapshot boundary. M12.4 still must prove restart behavior
-at every non-transactional slot and handoff crash window.
+Apply after the real snapshot boundary. M12.4 subsequently proved restart
+behavior across the non-transactional slot and handoff crash windows.
 
 After locking the sole binding, Runtime validates exact ingress config and
 bootstrap generation before replay or Apply. With a lifecycle row present,

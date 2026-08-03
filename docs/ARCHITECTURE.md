@@ -349,12 +349,13 @@ initialization boundary, not a complete V2.
 **Unproved:** indefinite concurrent-writer catch-up and tail latency,
 network/TLS behavior, shutdown during Apply, reconnect daemon/
 backoff policy, allocator/RSS peaks, cross-host soak, admission
-for `D + O` or replica identity `FULL`, key-changing/composite UPDATE and old
-tuples, NULL text, binary payloads, TOAST keys, composite replica indexes,
+for `D + O` or replica identity `FULL`, composite UPDATE and broader old-tuple
+shapes, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving,
-production failover and persisted partial-stream recovery, binding rebuild,
-SQL frontend, non-aggregate operators, cross-host sustained soak, empirical
-heap peak, contention tail latency, and recovery workers
+production failover and persisted partial-stream recovery, SQL frontend,
+additional operator families beyond non-aggregate ProjectRows, broader result
+types, cross-host sustained soak, empirical heap peak, contention tail latency,
+and recovery workers
 remain.
 
 ## M12.1 one-authority rebuild architecture
@@ -441,8 +442,9 @@ Public results remain `building/NULL` until activation. The old continuation is
 deleted rather than copied, snapshot batches never acquire WAL identity, and
 the target binding/config/generation installed by prepare is not switched a
 second time. The retired identity triple remains durable after activation.
-Old-generation attach and terminal-token authorization fail closed. M12.3 does
-not prove the instruction-level crash matrix; that remains M12.4.
+Old-generation attach and terminal-token authorization fail closed. M12.3 did
+not alone prove the instruction-level crash matrix; M12.4 subsequently closed
+that recovery gate.
 
 Runtime locks the sole binding before checking ingress config/bootstrap
 generation and before any replay or Apply action. When a bootstrap lifecycle
@@ -492,13 +494,13 @@ The existing per-source ownership fence serializes live, DDL and rebuild work:
 two rebuilds for one source have one winner, while another source can continue
 ordinary Apply. Permission loss or a swapped role rolls back before prepare, or
 leaves an already prepared target safely `building/NULL`; it never revives the
-retired generation. M12.6 closes million-row rebuild performance and the
+retired generation. M12.6 closed million-row rebuild performance and the
 release matrix without changing the execution path.
 
 ## M12.6 bounded rebuild and release architecture
 
 M12.6 adds evidence, not another execution path. The million-row active rebuild
-must use the same destructive prepare, M11 bounded scanner, M10 catch-up,
+uses the same destructive prepare, M11 bounded scanner, M10 catch-up,
 activation, feedback and live handoff described above. Before measurements, the
 acceptance limits are frozen at snapshot scan <= 12 s, 10,000-change catch-up
 <= 8 s, activation <= 2 s, complete rebuild <= 25 s, RSS growth <= 128 MiB and
