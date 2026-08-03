@@ -19,7 +19,7 @@ pub enum M2Error {
     InvalidSourceRowState,
     MissingSourceRow,
     MissingSourceOperator,
-    Operator(shiba_operator::OperatorError),
+    Kernel(shiba_operator::KernelError),
     OutOfOrder,
     Postgres(postgres::Error),
     SourceBindingMissing,
@@ -70,7 +70,9 @@ impl fmt::Display for M2Error {
             }
             Self::MissingSourceRow => formatter.write_str("source change targets no applied row"),
             Self::MissingSourceOperator => formatter.write_str("source has no registered operator"),
-            Self::Operator(error) => write!(formatter, "operator evaluation failed: {error}"),
+            Self::Kernel(error) => {
+                write!(formatter, "operator kernel rejected transition: {error}")
+            }
             Self::OutOfOrder => formatter.write_str("commit LSN is not strictly increasing"),
             Self::Postgres(error) => write!(formatter, "PostgreSQL transaction failed: {error}"),
             Self::SourceBindingMissing => formatter.write_str("source binding is missing"),
@@ -88,16 +90,16 @@ impl fmt::Display for M2Error {
 impl std::error::Error for M2Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Operator(error) => Some(error),
+            Self::Kernel(error) => Some(error),
             Self::Postgres(error) => Some(error),
             _ => None,
         }
     }
 }
 
-impl From<shiba_operator::OperatorError> for M2Error {
-    fn from(error: shiba_operator::OperatorError) -> Self {
-        Self::Operator(error)
+impl From<shiba_operator::KernelError> for M2Error {
+    fn from(error: shiba_operator::KernelError) -> Self {
+        Self::Kernel(error)
     }
 }
 

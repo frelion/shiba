@@ -83,6 +83,8 @@ BEGIN
         LEFT JOIN shiba.operator_result AS result USING (operator_id)
         WHERE definition.source_id = requested_source_id
           AND (state.operator_id IS NULL OR result.operator_id IS NULL
+               OR state.codec_version <> definition.state_codec_version
+               OR result.output_shape <> definition.output_shape
                OR result.result_status <> 'building'
                OR result.value_bigint IS NOT NULL)
     ) THEN
@@ -91,18 +93,14 @@ BEGIN
 
     DELETE FROM shiba_internal.source_row_state
     WHERE source_id = requested_source_id;
-    UPDATE shiba_internal.operator_state AS state
-    SET value_bigint = 0
-    FROM shiba_internal.operator_definition AS definition
-    WHERE definition.source_id = requested_source_id
-      AND state.operator_id = definition.operator_id;
-    -- This normalization is transaction-local and lets the pristine reservation
-    -- writer perform its unchanged strict validation before restoring building.
-    UPDATE shiba.operator_result AS result
-    SET result_status = 'active', value_bigint = 0
-    FROM shiba_internal.operator_definition AS definition
-    WHERE definition.source_id = requested_source_id
-      AND result.operator_id = definition.operator_id;
+    IF EXISTS (
+        SELECT 1
+        FROM shiba_internal.operator_result_row AS result_row
+        JOIN shiba_internal.operator_definition AS definition USING (operator_id)
+        WHERE definition.source_id = requested_source_id
+    ) THEN
+        RAISE EXCEPTION 'replacement requires reset keyed results';
+    END IF;
 
     DELETE FROM shiba_internal.source_bootstrap
     WHERE source_id = requested_source_id

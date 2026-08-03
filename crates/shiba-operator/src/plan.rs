@@ -130,6 +130,35 @@ impl CompiledPlan {
         })
     }
 
+    /// Decodes one exact canonical payload and verifies its supplied digest.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed/trailing data, unknown fields or versions, structural
+    /// contract mismatch, non-canonical bytes, and digest mismatch.
+    pub fn from_canonical_payload(
+        payload: &[u8],
+        expected_digest: [u8; 32],
+    ) -> Result<Self, PlanError> {
+        let canonical: CanonicalPlan =
+            serde_json::from_slice(payload).map_err(|_| PlanError::Codec)?;
+        let rebuilt = Self::build(
+            canonical.operator_id,
+            canonical.source_id,
+            canonical.inputs,
+            canonical.output_contract,
+            canonical.implementation,
+        )?;
+        if rebuilt.format_version != canonical.format_version
+            || rebuilt.state_contract != canonical.state_contract
+            || rebuilt.canonical_payload != payload
+            || rebuilt.digest != expected_digest
+        {
+            return Err(PlanError::DigestMismatch);
+        }
+        Ok(rebuilt)
+    }
+
     /// Recomputes and verifies the complete canonical plan representation.
     ///
     /// # Errors

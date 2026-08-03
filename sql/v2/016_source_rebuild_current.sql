@@ -5,9 +5,7 @@ CREATE FUNCTION shiba_internal.validate_source_rebuild_current(
     requested_source_id bigint, expected_old_bootstrap_id bigint,
     expected_old_relation oid, expected_old_identity_index oid,
     expected_old_publication oid, expected_old_slot name,
-    expected_old_generation bigint, expected_count_operator_id bigint,
-    expected_sum_operator_id bigint, expected_sum_input_subid integer,
-    new_bootstrap_id bigint, target_relation regclass,
+    expected_old_generation bigint, new_bootstrap_id bigint, target_relation regclass,
     target_identity_index regclass, target_publication oid,
     target_slot name, target_generation bigint
 )
@@ -15,7 +13,8 @@ RETURNS TABLE (
     database_oid oid, publication_name name,
     publication_insert boolean, publication_update boolean,
     publication_delete boolean, publication_truncate boolean,
-    publication_via_root boolean, publication_attnums smallint[]
+    publication_via_root boolean, publication_attnums smallint[],
+    target_key_subid integer, target_payload_subid integer
 )
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -24,8 +23,8 @@ DECLARE
     target record;
     m12_identity boolean;
 BEGIN
-    IF requested_source_id <= 0 OR expected_sum_input_subid <> 2
-       OR new_bootstrap_id <= 0 OR new_bootstrap_id = expected_old_bootstrap_id
+    IF requested_source_id <= 0 OR new_bootstrap_id <= 0
+       OR new_bootstrap_id = expected_old_bootstrap_id
        OR target_slot = expected_old_slot
        OR target_generation <> expected_old_generation + 1 THEN
         RAISE EXCEPTION 'rebuild identity must advance exactly once';
@@ -75,7 +74,6 @@ BEGIN
            SELECT count(*) FROM shiba_internal.source_binding
            WHERE source_id = requested_source_id AND binding_kind = 'column'
              AND address_objid = expected_old_relation
-             AND address_objsubid IN (1, expected_sum_input_subid)
        ) OR (m12_identity AND NOT EXISTS (
            SELECT 1 FROM shiba_internal.source_binding
            WHERE source_id = requested_source_id
@@ -92,7 +90,14 @@ BEGIN
              AND old_identity.indisprimary AND old_identity.indisunique
              AND old_identity.indisvalid AND old_identity.indisready
              AND old_identity.indnkeyatts = 1 AND old_identity.indnatts = 1
-             AND (old_identity.indkey::smallint[])[0] = 1
+             AND EXISTS (
+                 SELECT 1 FROM shiba_internal.source_binding AS key_binding
+                 WHERE key_binding.source_id = requested_source_id
+                   AND key_binding.binding_kind = 'column'
+                   AND key_binding.address_objid = expected_old_relation
+                   AND key_binding.address_objsubid =
+                       (old_identity.indkey::smallint[])[0]
+             )
              AND old_identity.indexprs IS NULL AND old_identity.indpred IS NULL
        ) THEN RAISE EXCEPTION 'stale source binding identity'; END IF;
     IF EXISTS (
@@ -101,28 +106,26 @@ BEGIN
           AND address_classid = 'pg_class'::regclass
           AND address_objid IN (target_relation, target_identity_index)
     ) THEN RAISE EXCEPTION 'target objects are bound by another source'; END IF;
-    IF 2 <> (SELECT count(*) FROM shiba_internal.operator_definition
-             WHERE source_id = requested_source_id)
-       OR NOT EXISTS (
-           SELECT 1 FROM shiba_internal.operator_definition AS definition
-           JOIN shiba_internal.operator_state AS state USING (operator_id)
-           JOIN shiba.operator_result AS result USING (operator_id, operator_kind)
-           WHERE definition.source_id = requested_source_id
-             AND definition.operator_id = expected_count_operator_id
-             AND definition.operator_kind = 'count_rows'
-             AND result.result_status = 'active'
-       ) OR NOT EXISTS (
-           SELECT 1 FROM shiba_internal.operator_definition AS definition
-           JOIN shiba_internal.operator_state AS state USING (operator_id)
-           JOIN shiba.operator_result AS result USING (operator_id, operator_kind)
-           WHERE definition.source_id = requested_source_id
-             AND definition.operator_id = expected_sum_operator_id
-             AND definition.operator_kind = 'sum_int8'
-             AND definition.input_classid = 'pg_class'::regclass
-             AND definition.input_objid = expected_old_relation
-             AND definition.input_objsubid = expected_sum_input_subid
-             AND result.result_status = 'active'
-       ) THEN RAISE EXCEPTION 'stale operator plan identity'; END IF;
+    PERFORM definition.operator_id
+    FROM shiba_internal.operator_definition AS definition
+    JOIN shiba_internal.operator_state AS state USING (operator_id)
+    JOIN shiba.operator_result AS result USING (operator_id, output_shape)
+    WHERE definition.source_id = requested_source_id
+    ORDER BY definition.operator_id
+    FOR UPDATE OF definition, state, result;
+    IF NOT FOUND OR EXISTS (
+        SELECT 1
+        FROM shiba_internal.operator_definition AS definition
+        LEFT JOIN shiba_internal.operator_state AS state USING (operator_id)
+        LEFT JOIN shiba.operator_result AS result
+          ON result.operator_id = definition.operator_id
+         AND result.output_shape = definition.output_shape
+        WHERE definition.source_id = requested_source_id
+          AND (state.operator_id IS NULL
+               OR state.codec_version <> definition.state_codec_version
+               OR result.operator_id IS NULL
+               OR result.result_status <> 'active')
+    ) THEN RAISE EXCEPTION 'stale operator plan identity'; END IF;
     database_oid := target.database_oid;
     publication_name := target.publication_name;
     publication_insert := target.publication_insert;
@@ -131,11 +134,13 @@ BEGIN
     publication_truncate := target.publication_truncate;
     publication_via_root := target.publication_via_root;
     publication_attnums := target.publication_attnums;
+    target_key_subid := target.target_key_subid;
+    target_payload_subid := target.target_payload_subid;
     RETURN NEXT;
 END
 $function$;
 
 REVOKE ALL ON FUNCTION shiba_internal.validate_source_rebuild_current(
-    bigint, bigint, oid, oid, oid, name, bigint, bigint,
-    bigint, integer, bigint, regclass, regclass, oid, name, bigint
+    bigint, bigint, oid, oid, oid, name, bigint,
+    bigint, regclass, regclass, oid, name, bigint
 ) FROM PUBLIC;

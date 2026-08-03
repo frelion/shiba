@@ -197,6 +197,15 @@ fn corrupt_plan_state_input_and_output_amplification_fail_closed() {
     let mut corrupt_plan = project.clone();
     corrupt_plan.digest[0] ^= 1;
     assert_eq!(initial_state(&corrupt_plan), Err(KernelError::InvalidPlan));
+    assert_eq!(
+        CompiledPlan::from_canonical_payload(&project.canonical_payload, project.digest),
+        Ok(project.clone())
+    );
+    let mut wrong_digest = project.digest;
+    wrong_digest[0] ^= 1;
+    assert!(
+        CompiledPlan::from_canonical_payload(&project.canonical_payload, wrong_digest).is_err()
+    );
     assert!(
         CompiledPlan::build(
             OperatorId::new(NonZeroU64::new(9).unwrap()),

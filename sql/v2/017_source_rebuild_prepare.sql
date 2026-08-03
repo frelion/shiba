@@ -5,9 +5,7 @@ CREATE FUNCTION shiba_internal.prepare_source_rebuild(
     requested_source_id bigint, expected_old_bootstrap_id bigint,
     expected_old_relation oid, expected_old_identity_index oid,
     expected_old_publication oid, expected_old_slot name,
-    expected_old_generation bigint, expected_count_operator_id bigint,
-    expected_sum_operator_id bigint, expected_sum_input_subid integer,
-    new_bootstrap_id bigint, target_relation regclass,
+    expected_old_generation bigint, new_bootstrap_id bigint, target_relation regclass,
     target_identity_index regclass, target_publication oid,
     target_slot name, target_generation bigint
 )
@@ -22,9 +20,8 @@ BEGIN
         requested_source_id, expected_old_bootstrap_id,
         expected_old_relation, expected_old_identity_index,
         expected_old_publication, expected_old_slot,
-        expected_old_generation, expected_count_operator_id,
-        expected_sum_operator_id, expected_sum_input_subid,
-        new_bootstrap_id, target_relation, target_identity_index,
+        expected_old_generation, new_bootstrap_id,
+        target_relation, target_identity_index,
         target_publication, target_slot, target_generation
     );
     SET CONSTRAINTS shiba_internal.source_ingress_bound_source,
@@ -43,8 +40,10 @@ BEGIN
         (source_id, binding_kind, address_classid, address_objid, address_objsubid)
     VALUES
         (requested_source_id, 'relation', 'pg_class'::regclass, target_relation, 0),
-        (requested_source_id, 'column', 'pg_class'::regclass, target_relation, 1),
-        (requested_source_id, 'column', 'pg_class'::regclass, target_relation, 2),
+        (requested_source_id, 'column', 'pg_class'::regclass,
+         target_relation, target.target_key_subid),
+        (requested_source_id, 'column', 'pg_class'::regclass,
+         target_relation, target.target_payload_subid),
         (requested_source_id, 'identity_index', 'pg_class'::regclass,
          target_identity_index, 0);
     UPDATE shiba_internal.source_ingress_config SET
@@ -59,14 +58,12 @@ BEGIN
         publication_attnums = target.publication_attnums,
         slot_name = target_slot, slot_generation = target_generation
     WHERE source_id = requested_source_id;
-    UPDATE shiba_internal.operator_definition SET
-        input_objid = target_relation, input_objsubid = 2
-    WHERE source_id = requested_source_id
-      AND operator_id = expected_sum_operator_id;
-    UPDATE shiba_internal.operator_state SET value_bigint = 0
-    WHERE operator_id IN (expected_count_operator_id, expected_sum_operator_id);
-    UPDATE shiba.operator_result SET result_status = 'building', value_bigint = NULL
-    WHERE operator_id IN (expected_count_operator_id, expected_sum_operator_id);
+    UPDATE shiba.operator_result AS result
+    SET result_status = 'building', value_bigint = NULL
+    FROM shiba_internal.operator_definition AS definition
+    WHERE definition.source_id = requested_source_id
+      AND result.operator_id = definition.operator_id
+      AND result.output_shape = definition.output_shape;
     UPDATE shiba_internal.source_bootstrap SET
         bootstrap_id = new_bootstrap_id, slot_name = target_slot,
         slot_generation = target_generation, phase = 'rebuild_prepared',
@@ -82,6 +79,6 @@ END
 $function$;
 
 REVOKE ALL ON FUNCTION shiba_internal.prepare_source_rebuild(
-    bigint, bigint, oid, oid, oid, name, bigint, bigint,
-    bigint, integer, bigint, regclass, regclass, oid, name, bigint
+    bigint, bigint, oid, oid, oid, name, bigint,
+    bigint, regclass, regclass, oid, name, bigint
 ) FROM PUBLIC;

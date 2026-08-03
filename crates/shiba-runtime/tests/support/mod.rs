@@ -234,7 +234,9 @@ fn message_end_checked(bytes: &[u8], start: usize) -> Option<usize> {
         b'B' => bounded_add(at, 20, bytes.len()),
         b'C' => bounded_add(at, 25, bytes.len()),
         b'R' => relation_end(bytes, at),
-        b'I' | b'U' | b'D' => tuple_change_end(bytes, at),
+        b'I' => insert_end(bytes, at),
+        b'U' => update_end(bytes, at),
+        b'D' => delete_end(bytes, at),
         _ => None,
     }
 }
@@ -256,6 +258,37 @@ fn relation_end(bytes: &[u8], mut at: usize) -> Option<usize> {
 
 fn tuple_change_end(bytes: &[u8], mut at: usize) -> Option<usize> {
     at = bounded_add(at, 5, bytes.len())?;
+    tuple_end(bytes, at)
+}
+
+fn insert_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let tuple_tag = bounded_add(at, 4, bytes.len())?;
+    if bytes.get(tuple_tag) != Some(&b'N') {
+        return None;
+    }
+    tuple_end(bytes, bounded_add(tuple_tag, 1, bytes.len())?)
+}
+
+fn delete_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let tuple_tag = bounded_add(at, 4, bytes.len())?;
+    if !matches!(bytes.get(tuple_tag), Some(b'K' | b'O')) {
+        return None;
+    }
+    tuple_end(bytes, bounded_add(tuple_tag, 1, bytes.len())?)
+}
+
+fn update_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut tuple_tag = bounded_add(at, 4, bytes.len())?;
+    if matches!(bytes.get(tuple_tag), Some(b'K' | b'O')) {
+        tuple_tag = tuple_end(bytes, bounded_add(tuple_tag, 1, bytes.len())?)?;
+    }
+    if bytes.get(tuple_tag) != Some(&b'N') {
+        return None;
+    }
+    tuple_end(bytes, bounded_add(tuple_tag, 1, bytes.len())?)
+}
+
+fn tuple_end(bytes: &[u8], mut at: usize) -> Option<usize> {
     let columns = read_u16_checked(bytes, at)?;
     at = bounded_add(at, 2, bytes.len())?;
     for _ in 0..columns {

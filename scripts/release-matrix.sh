@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-click M1--M12 release matrix. Every PostgreSQL scenario owns an isolated cluster.
+# One-click M1--M13 release matrix. Every PostgreSQL scenario owns an isolated cluster.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
@@ -81,11 +81,15 @@ m12_gates=(
   test-m12-rebuild-performance.sh
 )
 
+m13_gates=(
+  test-m13-operator-kernel.sh
+)
+
 cd "$root"
 
 # Enrollment is closed over every current test script: adding a gate without adding
 # it to this matrix fails before any expensive PostgreSQL work begins.
-expected="$(printf '%s\n' test-l0.sh "${foundation_gates[@]}" "${m12_gates[@]}" | sort)"
+expected="$(printf '%s\n' test-l0.sh "${foundation_gates[@]}" "${m12_gates[@]}" "${m13_gates[@]}" | sort)"
 discovered="$(find scripts -maxdepth 1 -type f -name 'test-*.sh' -exec basename {} \; | sort)"
 if [[ "$expected" != "$discovered" ]]; then
   echo "release matrix enrollment differs from current test scripts" >&2
@@ -93,7 +97,7 @@ if [[ "$expected" != "$discovered" ]]; then
   exit 1
 fi
 
-logs="$(mktemp -d /tmp/shiba-m12-release.XXXXXX)"
+logs="$(mktemp -d /tmp/shiba-m13-release.XXXXXX)"
 cleanup() {
   local exit_code=$?
   trap - EXIT HUP INT TERM
@@ -131,37 +135,51 @@ run_m12_matrix() {
   done
 }
 
+run_m13_matrix() {
+  local label="$1"
+  local pg_config="$2"
+  local gate
+  for gate in "${m13_gates[@]}"; do
+    run "$label/${gate%.sh}" "scripts/$gate" "$pg_config"
+  done
+}
+
 foundation_count=$((${#foundation_gates[@]} + 1))
 m12_count=${#m12_gates[@]}
-unique_pg_scripts=$((foundation_count + m12_count))
+m13_count=${#m13_gates[@]}
+unique_pg_scripts=$((foundation_count + m12_count + m13_count))
 pg_invocations=$((2 * unique_pg_scripts))
 echo "Release matrix plan: $version17; $version18"
-echo "PG scripts: unique=$unique_pg_scripts foundation_per_version=$foundation_count m12_per_version=$m12_count invocations=$pg_invocations"
+echo "PG scripts: unique=$unique_pg_scripts foundation_per_version=$foundation_count m12_per_version=$m12_count m13_per_version=$m13_count invocations=$pg_invocations"
 
-echo "==> phase 1/5: formatting, check, and directed pure tests"
+echo "==> phase 1/6: formatting, check, and directed pure tests"
 cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo test -p shiba-operator -p shiba-compiler
 cargo test -p shiba-runtime --lib
 cargo test -p shiba-ingress --lib
 
-echo "==> phase 2/5: workspace tests and warning-free clippy"
+echo "==> phase 2/6: workspace tests and warning-free clippy"
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
-echo "==> phase 3/5: PostgreSQL 17 M1--M11 matrix"
+echo "==> phase 3/6: PostgreSQL 17 M1--M11 matrix"
 run_foundation_matrix pg17 "$pg17"
 
-echo "==> phase 4/5: PostgreSQL 18 M1--M11 matrix"
+echo "==> phase 4/6: PostgreSQL 18 M1--M11 matrix"
 run_foundation_matrix pg18 "$pg18"
 
-echo "==> phase 5/5: M12 differential, recovery, concurrency, roles, and performance"
+echo "==> phase 5/6: M12 differential, recovery, concurrency, roles, and performance"
 run_m12_matrix pg17-m12 "$pg17"
 run_m12_matrix pg18-m12 "$pg18"
 
+echo "==> phase 6/6: M13 generic scalar/keyed operator differential"
+run_m13_matrix pg17-m13 "$pg17"
+run_m13_matrix pg18-m13 "$pg18"
+
 echo "==> release matrix passed"
 echo "PostgreSQL versions: $version17; $version18"
-echo "PG scripts: unique=$unique_pg_scripts foundation_per_version=$foundation_count m12_per_version=$m12_count invocations=$pg_invocations"
+echo "PG scripts: unique=$unique_pg_scripts foundation_per_version=$foundation_count m12_per_version=$m12_count m13_per_version=$m13_count invocations=$pg_invocations"
 echo "M12 performance evidence:"
 for label in pg17-m12 pg18-m12; do
   performance_log="$logs/${label}_test-m12-rebuild-performance.log"

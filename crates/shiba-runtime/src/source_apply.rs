@@ -92,26 +92,51 @@ fn apply_update(
         },
     };
     let (payload_present, payload_int8, payload_text) = value_columns(&after_payload);
-    let changed = transaction.execute(
-        "UPDATE shiba_internal.source_row_state
-         SET payload_present = $1, payload_int8 = $2, payload_text = $3
-         WHERE source_id = $4 AND source_row_id = $5
-           AND source_row_sub_id IS NULL",
-        &[
-            &payload_present,
-            &payload_int8,
-            &payload_text,
-            &source_id,
-            &update.source_row_id,
-        ],
-    )?;
+    let changed = if update.source_row_id == update.new_source_row_id {
+        transaction.execute(
+            "UPDATE shiba_internal.source_row_state
+             SET payload_present = $1, payload_int8 = $2, payload_text = $3
+             WHERE source_id = $4 AND source_row_id = $5
+               AND source_row_sub_id IS NULL",
+            &[
+                &payload_present,
+                &payload_int8,
+                &payload_text,
+                &source_id,
+                &update.source_row_id,
+            ],
+        )?
+    } else {
+        let deleted = transaction.execute(
+            "DELETE FROM shiba_internal.source_row_state
+             WHERE source_id = $1 AND source_row_id = $2
+               AND source_row_sub_id IS NULL",
+            &[&source_id, &update.source_row_id],
+        )?;
+        if deleted != 1 {
+            return Err(M2Error::MissingSourceRow);
+        }
+        transaction.execute(
+            "INSERT INTO shiba_internal.source_row_state (
+                 source_id, source_row_id, source_row_sub_id,
+                 payload_present, payload_int8, payload_text
+             ) VALUES ($1, $2, NULL, $3, $4, $5)",
+            &[
+                &source_id,
+                &update.new_source_row_id,
+                &payload_present,
+                &payload_int8,
+                &payload_text,
+            ],
+        )?
+    };
     if changed != 1 {
         return Err(M2Error::MissingSourceRow);
     }
     Ok(RowEffect {
         before: Some(before),
         after: Some(RowImage {
-            source_row_id: Some(update.source_row_id),
+            source_row_id: Some(update.new_source_row_id),
             source_row_sub_id: None,
             payload: after_payload,
         }),

@@ -8,7 +8,7 @@ pub(crate) enum DecodedChange {
     EmptyInsert,
     RowInsert(i64, SourcePayload),
     CompositeInsert(i64, i64),
-    Update(i64, SourceUpdatePayload),
+    Update(i64, i64, SourceUpdatePayload),
     Delete(i64, Option<i64>),
 }
 
@@ -52,9 +52,27 @@ pub(crate) fn decode_update(
 ) -> Result<DecodedChange, PgoutputError> {
     match source.shape {
         SourceShape::NullableInt8Payload => {
-            tuple_header(cursor, source, b'N', 2)?;
+            if cursor.u32()? != source.relation_id {
+                return Err(PgoutputError::RelationMismatch);
+            }
+            let tag = cursor.byte()?;
+            let old_key = if tag == b'K' {
+                tuple_column_count(cursor, 2)?;
+                let key = decode_int8(cursor)?;
+                if cursor.byte()? != b'n' || cursor.byte()? != b'N' {
+                    return Err(PgoutputError::TupleShape);
+                }
+                Some(key)
+            } else if tag == b'N' {
+                None
+            } else {
+                return Err(PgoutputError::TupleTag(tag));
+            };
+            tuple_column_count(cursor, 2)?;
+            let new_key = decode_int8(cursor)?;
             Ok(DecodedChange::Update(
-                decode_int8(cursor)?,
+                old_key.unwrap_or(new_key),
+                new_key,
                 SourceUpdatePayload::Int8(decode_optional_int8(cursor)?),
             ))
         }
@@ -65,7 +83,7 @@ pub(crate) fn decode_update(
                 b'u' => SourceUpdatePayload::UnchangedText,
                 format => SourceUpdatePayload::Text(decode_text(cursor, format)?),
             };
-            Ok(DecodedChange::Update(key, payload))
+            Ok(DecodedChange::Update(key, key, payload))
         }
         _ => Err(PgoutputError::TupleShape),
     }
@@ -108,7 +126,14 @@ fn tuple_header(
     if cursor.u32()? != source.relation_id {
         return Err(PgoutputError::RelationMismatch);
     }
-    if cursor.byte()? != tuple_tag || cursor.u16()? != columns {
+    if cursor.byte()? != tuple_tag {
+        return Err(PgoutputError::TupleShape);
+    }
+    tuple_column_count(cursor, columns)
+}
+
+fn tuple_column_count(cursor: &mut Cursor<'_>, columns: u16) -> Result<(), PgoutputError> {
+    if cursor.u16()? != columns {
         return Err(PgoutputError::TupleShape);
     }
     Ok(())

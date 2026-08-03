@@ -56,12 +56,15 @@ fn values(client: &mut Client) -> (i64, i64, i64) {
     let public = (row.get(0), row.get(1), row.get(2));
     let private = client
         .query(
-            "SELECT value_bigint FROM shiba_internal.operator_state ORDER BY operator_id",
+            "SELECT state_payload FROM shiba_internal.operator_state ORDER BY operator_id",
             &[],
         )
         .expect("query private states")
         .into_iter()
-        .map(|row| row.get::<_, i64>(0))
+        .map(|row| {
+            let payload: Vec<u8> = row.get(0);
+            i64::from_be_bytes(payload.try_into().expect("int8 operator state"))
+        })
         .collect::<Vec<_>>();
     assert_eq!(private, vec![public.0, public.1]);
     public
@@ -228,7 +231,8 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
     );
     client
         .batch_execute(
-            "UPDATE shiba_internal.operator_state SET value_bigint = 9223372036854775807
+            "UPDATE shiba_internal.operator_state
+                SET state_payload = decode('7fffffffffffffff', 'hex')
                WHERE operator_id = 2;
              UPDATE shiba.operator_result SET value_bigint = 9223372036854775807
                WHERE operator_id = 2;",
@@ -236,13 +240,15 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
         .expect("inject sum overflow boundary");
     assert!(matches!(
         process(&mut client, &overflow),
-        Err(M2Error::Operator(_))
+        Err(M2Error::Kernel(_))
     ));
     assert_eq!(values(&mut client), (1, i64::MAX, 4));
     assert_eq!(rows(&mut client), vec![(1, None)]);
     client
         .batch_execute(
-            "UPDATE shiba_internal.operator_state SET value_bigint = 0 WHERE operator_id = 2;
+            "UPDATE shiba_internal.operator_state
+                SET state_payload = decode('0000000000000000', 'hex')
+              WHERE operator_id = 2;
              UPDATE shiba.operator_result SET value_bigint = 0 WHERE operator_id = 2;",
         )
         .expect("remove overflow injection");

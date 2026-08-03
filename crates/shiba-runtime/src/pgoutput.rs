@@ -167,16 +167,16 @@ pub fn decode_committed_changes_in_session(
                 DecodedChange::CompositeInsert(key1, key2) => {
                     SourceChange::Insert(SourceInsert::composite(sequence, key1, key2))
                 }
-                DecodedChange::Update(row_id, payload) => {
+                DecodedChange::Update(old_row_id, new_row_id, payload) => {
                     let update = match payload {
                         SourceUpdatePayload::Int8(value) => {
-                            SourceUpdate::new(sequence, row_id, value)
+                            SourceUpdate::key_change(sequence, old_row_id, new_row_id, value)
                         }
                         SourceUpdatePayload::UnchangedText => {
-                            SourceUpdate::unchanged_text(sequence, row_id)
+                            SourceUpdate::unchanged_text(sequence, new_row_id)
                         }
                         SourceUpdatePayload::Text(value) => {
-                            SourceUpdate::text(sequence, row_id, value)
+                            SourceUpdate::text(sequence, new_row_id, value)
                         }
                     };
                     SourceChange::Update(update)

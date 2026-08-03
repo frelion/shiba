@@ -33,6 +33,7 @@ pub enum SourceUpdatePayload {
 pub struct SourceUpdate {
     pub input_sequence: InputSequence,
     pub source_row_id: i64,
+    pub new_source_row_id: i64,
     pub source_payload: SourceUpdatePayload,
 }
 
@@ -46,6 +47,22 @@ impl SourceUpdate {
         Self {
             input_sequence,
             source_row_id,
+            new_source_row_id: source_row_id,
+            source_payload: SourceUpdatePayload::Int8(source_payload),
+        }
+    }
+
+    #[must_use]
+    pub const fn key_change(
+        input_sequence: InputSequence,
+        old_source_row_id: i64,
+        new_source_row_id: i64,
+        source_payload: Option<i64>,
+    ) -> Self {
+        Self {
+            input_sequence,
+            source_row_id: old_source_row_id,
+            new_source_row_id,
             source_payload: SourceUpdatePayload::Int8(source_payload),
         }
     }
@@ -55,6 +72,7 @@ impl SourceUpdate {
         Self {
             input_sequence,
             source_row_id,
+            new_source_row_id: source_row_id,
             source_payload: SourceUpdatePayload::UnchangedText,
         }
     }
@@ -64,6 +82,7 @@ impl SourceUpdate {
         Self {
             input_sequence,
             source_row_id,
+            new_source_row_id: source_row_id,
             source_payload: SourceUpdatePayload::Text(source_payload),
         }
     }

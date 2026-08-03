@@ -1,7 +1,7 @@
 use core::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
-use shiba_protocol::{BootstrapBatchId, SourceId, SourceTransactionId};
+use shiba_protocol::{BootstrapBatchId, SourceTransactionId};
 
 /// Stable identity of one registered operator.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -70,23 +70,6 @@ pub struct EffectBatch {
 pub enum EffectOrigin {
     Wal(SourceTransactionId),
     Bootstrap(BootstrapBatchId),
-}
-
-/// Closed set of operator implementations proven by the compiler.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CompiledOperatorKind {
-    CountRows,
-    SumInt8 { input: ObjectAddress },
-}
-
-/// Database-independent output of compilation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompiledOperator {
-    pub operator_id: OperatorId,
-    pub source_id: SourceId,
-    pub kind: CompiledOperatorKind,
 }
 
 /// Runtime-opaque, strictly versioned operator state.

@@ -1,7 +1,7 @@
 use postgres::Client;
 use shiba_protocol::{BootstrapId, PostgresLsn, SourceId};
 
-use crate::{M2Error, source_preflight, transaction::as_bigint};
+use crate::{M2Error, operator_execution, source_preflight, transaction::as_bigint};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapTransitionOutcome {
@@ -65,28 +65,7 @@ pub fn activate_bootstrap(
         transaction.rollback()?;
         return Ok(BootstrapTransitionOutcome::AlreadyAdvanced);
     }
-    let expected: i64 = transaction
-        .query_one(
-            "SELECT count(*) FROM shiba_internal.operator_definition
-             WHERE source_id = $1",
-            &[&source_id_raw],
-        )?
-        .get(0);
-    if expected <= 0 {
-        return Err(M2Error::MissingSourceOperator);
-    }
-    let updated = transaction.execute(
-        "UPDATE shiba.operator_result AS result
-         SET result_status = 'active', value_bigint = state.value_bigint
-         FROM shiba_internal.operator_state AS state
-         JOIN shiba_internal.operator_definition AS definition USING (operator_id)
-         WHERE result.operator_id = state.operator_id
-           AND definition.source_id = $1 AND result.result_status = 'building'",
-        &[&source_id_raw],
-    )?;
-    if i64::try_from(updated).ok() != Some(expected) {
-        return Err(M2Error::InvalidOperatorDefinition);
-    }
+    operator_execution::activate_results(&mut transaction, source_id_raw)?;
     if transaction.execute(
         "UPDATE shiba_internal.source_bootstrap
          SET phase = 'active', activation_end_lsn = $3::text::pg_lsn

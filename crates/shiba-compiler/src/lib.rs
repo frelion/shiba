@@ -7,7 +7,7 @@ mod plan;
 use core::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, de};
-use shiba_operator::{CompiledOperator, CompiledOperatorKind, ObjectAddress, OperatorId};
+use shiba_operator::{ObjectAddress, OperatorId};
 use shiba_protocol::SourceId;
 
 pub use plan::compile_plan;
@@ -138,7 +138,6 @@ pub enum CompilerError {
     WrongColumnType { column: String, type_oid: u32 },
     NullableKey(String),
     PlanEncoding,
-    LegacyApiDoesNotSupportProject,
 }
 
 impl fmt::Display for CompilerError {
@@ -161,64 +160,8 @@ impl fmt::Display for CompilerError {
                 write!(formatter, "project key column {column:?} must be non-null")
             }
             Self::PlanEncoding => formatter.write_str("compiled plan encoding failed"),
-            Self::LegacyApiDoesNotSupportProject => {
-                formatter.write_str("legacy aggregate API cannot compile project_rows")
-            }
         }
     }
 }
 
 impl std::error::Error for CompilerError {}
-
-/// Resolves a strict spec against one supplied live source descriptor.
-///
-/// # Errors
-///
-/// Fails when source identity differs or `SumInt8` does not resolve exactly one
-/// `PostgreSQL` `int8` column.
-pub fn compile_operator(
-    spec: &OperatorSpecV1,
-    source: &SourceDescriptor,
-) -> Result<CompiledOperator, CompilerError> {
-    if spec.version != OPERATOR_SPEC_VERSION {
-        return Err(CompilerError::UnsupportedVersion(spec.version));
-    }
-    if spec.source_id != source.source_id {
-        return Err(CompilerError::SourceMismatch);
-    }
-    let kind = match &spec.operation {
-        OperatorOperationV1::CountRows => CompiledOperatorKind::CountRows,
-        OperatorOperationV1::SumInt8 { input_column } => {
-            if input_column.trim().is_empty() {
-                return Err(CompilerError::BlankInputColumn);
-            }
-            let mut matches = source
-                .columns
-                .iter()
-                .filter(|column| column.name == *input_column);
-            let column = matches
-                .next()
-                .ok_or_else(|| CompilerError::MissingColumn(input_column.clone()))?;
-            if matches.next().is_some() {
-                return Err(CompilerError::DuplicateColumn(input_column.clone()));
-            }
-            if column.type_oid != POSTGRES_INT8_TYPE_OID {
-                return Err(CompilerError::WrongColumnType {
-                    column: input_column.clone(),
-                    type_oid: column.type_oid,
-                });
-            }
-            CompiledOperatorKind::SumInt8 {
-                input: column.address,
-            }
-        }
-        OperatorOperationV1::ProjectRows { .. } => {
-            return Err(CompilerError::LegacyApiDoesNotSupportProject);
-        }
-    };
-    Ok(CompiledOperator {
-        operator_id: spec.operator_id,
-        source_id: spec.source_id,
-        kind,
-    })
-}

@@ -1,5 +1,5 @@
 use postgres::{Client, NoTls};
-use shiba_operator::OperatorError;
+use shiba_operator::KernelError;
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{
     M2Error, PgoutputSource, ProcessOutcome, SourceTransaction, decode_committed_changes, process,
@@ -85,7 +85,7 @@ fn prove_count_underflow(client: &mut Client, delete: &SourceTransaction) {
         .expect("install count underflow precondition");
     assert!(matches!(
         process(client, delete),
-        Err(M2Error::Operator(OperatorError::CountUnderflow))
+        Err(M2Error::Kernel(KernelError::Underflow))
     ));
     assert_eq!(durable_state(client), (0, 0, 2, 1));
     assert_apply_row(client, 401);

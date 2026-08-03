@@ -210,6 +210,7 @@ scripts = [
         "m12-rebuild-recovery",
         "m12-rebuild-governance",
         "m12-rebuild-performance",
+        "m13-operator-kernel",
     )
 ]
 for path in scripts:

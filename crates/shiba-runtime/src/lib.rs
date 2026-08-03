@@ -14,6 +14,7 @@ mod pgoutput_tuple;
 mod pgoutput_wire;
 mod processor;
 mod registration;
+mod result_sink;
 mod source_apply;
 mod source_preflight;
 mod streamed_pgoutput;

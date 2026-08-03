@@ -2,7 +2,7 @@ use std::num::NonZeroU64;
 
 use postgres::{Client, NoTls};
 use shiba_compiler::{CompilerError, OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_operator::{CompiledOperatorKind, OperatorId};
+use shiba_operator::{CompiledPlan, OperatorId, OutputContract, PlanImplementation};
 use shiba_protocol::SourceId;
 use shiba_runtime::{M2Error, RegistrationError, compile_and_register};
 
@@ -39,43 +39,53 @@ fn authority_counts(client: &mut Client) -> (i64, i64, i64) {
     (row.get(0), row.get(1), row.get(2))
 }
 
-fn assert_count_definition(client: &mut Client) {
+fn assert_definition(client: &mut Client, operator_id: i64, expected_shape: &str) -> CompiledPlan {
     let row = client
         .query_one(
-            "SELECT source_id, compiler_version, operator_kind,
-                    input_classid, input_objid, input_objsubid
-             FROM shiba_internal.operator_definition WHERE operator_id = 1",
-            &[],
+            "SELECT source_id, compiler_version, plan_format_version,
+                    plan_payload, plan_digest, state_codec_version,
+                    output_shape, encode(state.state_payload, 'hex')
+             FROM shiba_internal.operator_definition AS definition
+             JOIN shiba_internal.operator_state AS state USING (operator_id)
+             WHERE definition.operator_id = $1",
+            &[&operator_id],
         )
-        .expect("query CountRows definition");
+        .expect("query generic operator definition");
     assert_eq!(row.get::<_, i64>(0), 1);
     assert_eq!(row.get::<_, i32>(1), 1);
-    assert_eq!(row.get::<_, &str>(2), "count_rows");
-    assert_eq!(row.get::<_, Option<u32>>(3), None);
-    assert_eq!(row.get::<_, Option<u32>>(4), None);
-    assert_eq!(row.get::<_, Option<i32>>(5), None);
+    assert_eq!(row.get::<_, i32>(2), 1);
+    assert_eq!(row.get::<_, i32>(5), 1);
+    assert_eq!(row.get::<_, &str>(6), expected_shape);
+    assert_eq!(row.get::<_, &str>(7), "0000000000000000");
+    let payload: Vec<u8> = row.get(3);
+    let digest: Vec<u8> = row.get(4);
+    CompiledPlan::from_canonical_payload(&payload, digest.try_into().expect("32-byte plan digest"))
+        .expect("decode durable canonical plan")
 }
 
-fn assert_sum_definition(client: &mut Client) {
+fn assert_sum_definition(client: &mut Client, plan: &CompiledPlan) {
     let row = client
         .query_one(
-            "SELECT definition.input_classid = 'pg_class'::regclass,
-                    definition.input_objid = 'source_m9.events'::regclass,
-                    definition.input_objsubid = attribute.attnum,
-                    definition.operator_kind, definition.compiler_version
-             FROM shiba_internal.operator_definition AS definition
-             JOIN pg_catalog.pg_attribute AS attribute
-               ON attribute.attrelid = 'source_m9.events'::regclass
-              AND attribute.attname = 'payload'
-             WHERE definition.operator_id = 2",
+            "SELECT 'pg_class'::regclass::oid::bigint,
+                    'source_m9.events'::regclass::oid::bigint,
+                    attnum
+             FROM pg_catalog.pg_attribute
+             WHERE attrelid = 'source_m9.events'::regclass
+               AND attname = 'payload'",
             &[],
         )
         .expect("query live SumInt8 ObjectAddress");
-    assert!(row.get::<_, bool>(0));
-    assert!(row.get::<_, bool>(1));
-    assert!(row.get::<_, bool>(2));
-    assert_eq!(row.get::<_, &str>(3), "sum_int8");
-    assert_eq!(row.get::<_, i32>(4), 1);
+    let expected = (
+        u32::try_from(row.get::<_, i64>(0)).expect("class oid"),
+        u32::try_from(row.get::<_, i64>(1)).expect("relation oid"),
+        row.get::<_, i16>(2).into(),
+    );
+    match plan.implementation {
+        PlanImplementation::SumInt8 { input } => {
+            assert_eq!((input.class_id, input.object_id, input.sub_id), expected);
+        }
+        _ => panic!("expected SumInt8 plan"),
+    }
 }
 
 fn install_result_failure(client: &mut Client) {
@@ -202,11 +212,16 @@ fn m9_live_compile_and_registration_are_atomic_and_private() {
         .expect("remove registration failure");
     let compiled_count = compile_and_register(&mut client, &count).expect("register CountRows");
     assert!(matches!(
-        compiled_count.kind,
-        CompiledOperatorKind::CountRows
+        compiled_count.implementation,
+        PlanImplementation::CountRows
     ));
     assert_eq!(authority_counts(&mut client), (1, 1, 1));
-    assert_count_definition(&mut client);
+    let durable_count = assert_definition(&mut client, 1, "scalar");
+    assert_eq!(durable_count, compiled_count);
+    assert!(matches!(
+        durable_count.output_contract,
+        OutputContract::Scalar { .. }
+    ));
 
     let sum = spec(
         2,
@@ -217,11 +232,13 @@ fn m9_live_compile_and_registration_are_atomic_and_private() {
     );
     let compiled_sum = compile_and_register(&mut client, &sum).expect("register live SumInt8");
     assert!(matches!(
-        compiled_sum.kind,
-        CompiledOperatorKind::SumInt8 { .. }
+        compiled_sum.implementation,
+        PlanImplementation::SumInt8 { .. }
     ));
     assert_eq!(authority_counts(&mut client), (2, 2, 2));
-    assert_sum_definition(&mut client);
+    let durable_sum = assert_definition(&mut client, 2, "scalar");
+    assert_eq!(durable_sum, compiled_sum);
+    assert_sum_definition(&mut client, &durable_sum);
     prove_failures_leave_no_partial_rows(&mut client);
     prove_permissions(&mut client);
 }

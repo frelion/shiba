@@ -83,9 +83,16 @@ BEGIN
            LEFT JOIN shiba_internal.operator_state AS state USING (operator_id)
            LEFT JOIN shiba.operator_result AS result USING (operator_id)
            WHERE definition.source_id = requested_source_id
-             AND (state.operator_id IS NULL OR state.value_bigint <> 0
-                  OR result.operator_id IS NULL OR result.result_status <> 'active'
-                  OR result.value_bigint <> 0)
+             AND (state.operator_id IS NULL
+                  OR state.codec_version <> definition.state_codec_version
+                  OR result.operator_id IS NULL
+                  OR result.output_shape <> definition.output_shape
+                  OR result.result_status NOT IN ('active', 'building'))
+       ) OR EXISTS (
+           SELECT 1
+           FROM shiba_internal.operator_result_row AS result_row
+           JOIN shiba_internal.operator_definition AS definition USING (operator_id)
+           WHERE definition.source_id = requested_source_id
        ) THEN
         RAISE EXCEPTION 'bootstrap requires pristine operator state';
     END IF;

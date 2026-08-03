@@ -2,12 +2,10 @@ use core::num::NonZeroU64;
 
 use shiba_compiler::{
     CompilerError, OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1,
-    POSTGRES_INT8_TYPE_OID, SourceColumnDescriptor, SourceDescriptor, compile_operator,
-    compile_plan,
+    POSTGRES_INT8_TYPE_OID, SourceColumnDescriptor, SourceDescriptor, compile_plan,
 };
 use shiba_operator::{
-    CompiledOperatorKind, CompiledPlan, ObjectAddress, OperatorId, OutputContract,
-    PlanImplementation, ValueType,
+    CompiledPlan, ObjectAddress, OperatorId, OutputContract, PlanImplementation, ValueType,
 };
 use shiba_protocol::SourceId;
 
@@ -78,9 +76,9 @@ fn strict_json_is_canonical_and_rejects_invalid_shapes() {
 
 #[test]
 fn count_does_not_bind_a_column() {
-    let compiled =
-        compile_operator(&spec(OperatorOperationV1::CountRows), &source(vec![])).unwrap();
-    assert_eq!(compiled.kind, CompiledOperatorKind::CountRows);
+    let compiled = compile_plan(&spec(OperatorOperationV1::CountRows), &source(vec![])).unwrap();
+    assert_eq!(compiled.implementation, PlanImplementation::CountRows);
+    assert!(compiled.inputs.is_empty());
 }
 
 #[test]
@@ -88,14 +86,14 @@ fn sum_resolves_exact_int8_address_once() {
     let operation = OperatorOperationV1::SumInt8 {
         input_column: "payload".into(),
     };
-    let compiled = compile_operator(
+    let compiled = compile_plan(
         &spec(operation.clone()),
         &source(vec![column("payload", 2, POSTGRES_INT8_TYPE_OID)]),
     )
     .unwrap();
     assert_eq!(
-        compiled.kind,
-        CompiledOperatorKind::SumInt8 {
+        compiled.implementation,
+        PlanImplementation::SumInt8 {
             input: address(16_384, 2)
         }
     );
@@ -118,7 +116,7 @@ fn sum_resolves_exact_int8_address_once() {
         ),
     ] {
         assert_eq!(
-            compile_operator(&spec(operation.clone()), &source(columns)),
+            compile_plan(&spec(operation.clone()), &source(columns)),
             Err(error)
         );
     }
@@ -129,7 +127,7 @@ fn source_identity_must_match() {
     let mut descriptor = source(vec![]);
     descriptor.source_id = SourceId::new(2).unwrap();
     assert_eq!(
-        compile_operator(&spec(OperatorOperationV1::CountRows), &descriptor),
+        compile_plan(&spec(OperatorOperationV1::CountRows), &descriptor),
         Err(CompilerError::SourceMismatch)
     );
 }
@@ -139,11 +137,11 @@ fn constructed_invalid_ir_fails_closed() {
     let mut invalid_version = spec(OperatorOperationV1::CountRows);
     invalid_version.version = 2;
     assert_eq!(
-        compile_operator(&invalid_version, &source(vec![])),
+        compile_plan(&invalid_version, &source(vec![])),
         Err(CompilerError::UnsupportedVersion(2))
     );
     assert_eq!(
-        compile_operator(
+        compile_plan(
             &spec(OperatorOperationV1::SumInt8 {
                 input_column: " ".into(),
             }),

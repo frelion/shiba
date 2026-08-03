@@ -2,9 +2,12 @@ use core::fmt;
 
 use postgres::{Client, Transaction};
 use shiba_compiler::{
-    CompilerError, OperatorSpecV1, SourceColumnDescriptor, SourceDescriptor, compile_operator,
+    CompilerError, OperatorSpecV1, SourceColumnDescriptor, SourceDescriptor, compile_plan,
 };
-use shiba_operator::{CompiledOperator, CompiledOperatorKind, ObjectAddress};
+use shiba_operator::{
+    CompiledPlan, ObjectAddress, OutputContract, OutputDelta, ScalarValue, apply_plan,
+    initial_state,
+};
 
 use crate::M2Error;
 use crate::source_preflight;
@@ -25,14 +28,7 @@ impl fmt::Display for RegistrationError {
     }
 }
 
-impl std::error::Error for RegistrationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Compiler(error) => Some(error),
-            Self::Runtime(error) => Some(error),
-        }
-    }
-}
+impl std::error::Error for RegistrationError {}
 
 impl From<CompilerError> for RegistrationError {
     fn from(error: CompilerError) -> Self {
@@ -52,63 +48,87 @@ impl From<postgres::Error> for RegistrationError {
     }
 }
 
-/// Compiles and atomically installs one operator definition and its zero state.
+/// Compiles and atomically installs one generic plan, state, and result sink.
 ///
 /// # Errors
-/// Fails closed if the source is missing/invalidated, compilation fails, or any
-/// definition, state, or result write fails.
+///
+/// Fails closed if source validation, compilation, or any authority write fails.
 pub fn compile_and_register(
     client: &mut Client,
     spec: &OperatorSpecV1,
-) -> Result<CompiledOperator, RegistrationError> {
+) -> Result<CompiledPlan, RegistrationError> {
     let mut transaction = client.transaction()?;
-    let operator = register_in_transaction(&mut transaction, spec)?;
+    let plan = register_in_transaction(&mut transaction, spec)?;
     transaction.commit()?;
-    Ok(operator)
+    Ok(plan)
 }
 
 fn register_in_transaction(
     transaction: &mut Transaction<'_>,
     spec: &OperatorSpecV1,
-) -> Result<CompiledOperator, RegistrationError> {
+) -> Result<CompiledPlan, RegistrationError> {
     let source_id = as_bigint("source_id", spec.source_id.get())?;
     source_preflight::lock_binding(transaction, source_id)?;
     source_preflight::validate(transaction, source_id)?;
     let descriptor = source_descriptor(transaction, spec)?;
-    let operator = compile_operator(spec, &descriptor)?;
-    let operator_id = as_bigint("operator_id", operator.operator_id.get())?;
-    let (kind, input) = match &operator.kind {
-        CompiledOperatorKind::CountRows => ("count_rows", None),
-        CompiledOperatorKind::SumInt8 { input } => ("sum_int8", Some(*input)),
-    };
-    let input_classid = input.map(|address| i64::from(address.class_id));
-    let input_objid = input.map(|address| i64::from(address.object_id));
-    let input_objsubid = input.map(|address| address.sub_id);
+    let plan = compile_plan(spec, &descriptor)?;
+    let state = initial_state(&plan).map_err(M2Error::from)?;
+    let state_codec =
+        i32::try_from(state.codec_version).map_err(|_| M2Error::InvalidOperatorDefinition)?;
+    let initial = apply_plan(&plan, &state, &[]).map_err(M2Error::from)?;
+    let operator_id = as_bigint("operator_id", plan.operator_id.get())?;
+    let spec_payload = spec
+        .to_canonical_json()
+        .map_err(|_| CompilerError::PlanEncoding)?;
+    let (shape, value_type, key_type, nullable) = output_metadata(&plan.output_contract);
     transaction.execute(
         "INSERT INTO shiba_internal.operator_definition (
-             operator_id, source_id, compiler_version, operator_kind,
-             input_classid, input_objid, input_objsubid
-         ) VALUES ($1, $2, 1, $3, $4::bigint::oid, $5::bigint::oid, $6)",
+             operator_id, source_id, compiler_version, spec_payload,
+             plan_format_version, plan_payload, plan_digest, state_codec_version,
+             output_shape, output_value_type, output_key_type, output_value_nullable
+         ) VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         &[
             &operator_id,
             &source_id,
-            &kind,
-            &input_classid,
-            &input_objid,
-            &input_objsubid,
+            &spec_payload,
+            &i32::try_from(plan.format_version).map_err(|_| M2Error::InvalidOperatorDefinition)?,
+            &plan.canonical_payload,
+            &plan.digest.as_slice(),
+            &state_codec,
+            &shape,
+            &value_type,
+            &key_type,
+            &nullable,
         ],
     )?;
     transaction.execute(
-        "INSERT INTO shiba_internal.operator_state (operator_id, value_bigint)
-         VALUES ($1, 0)",
-        &[&operator_id],
+        "INSERT INTO shiba_internal.operator_state
+             (operator_id, codec_version, state_payload) VALUES ($1, $2, $3)",
+        &[&operator_id, &state_codec, &state.payload],
     )?;
+    let scalar = match initial.output_delta {
+        OutputDelta::ScalarReplacement {
+            value: ScalarValue::Int8(value),
+        } => Some(value),
+        OutputDelta::KeyedMutations { ref mutations } if mutations.is_empty() => None,
+        _ => return Err(M2Error::InvalidOperatorDefinition.into()),
+    };
     transaction.execute(
-        "INSERT INTO shiba.operator_result (operator_id, operator_kind, value_bigint)
-         VALUES ($1, $2, 0)",
-        &[&operator_id, &kind],
+        "INSERT INTO shiba.operator_result
+             (operator_id, result_status, output_shape, value_bigint)
+         VALUES ($1, 'active', $2, $3)",
+        &[&operator_id, &shape, &scalar],
     )?;
-    Ok(operator)
+    Ok(plan)
+}
+
+fn output_metadata(
+    contract: &OutputContract,
+) -> (&'static str, &'static str, Option<&'static str>, bool) {
+    match contract {
+        OutputContract::Scalar { .. } => ("scalar", "int8", None, false),
+        OutputContract::KeyedRows { nullable, .. } => ("keyed", "int8", Some("int8"), *nullable),
+    }
 }
 
 fn source_descriptor(
@@ -124,14 +144,10 @@ fn source_descriptor(
             &[&source_id],
         )?
         .ok_or(M2Error::SourceBindingMissing)?;
-    let relation = object_address(&relation, 0, 1, 2)?;
     let rows = transaction.query(
-        "SELECT attribute.attname,
-                binding.address_classid::bigint,
-                binding.address_objid::bigint,
-                binding.address_objsubid,
-                attribute.atttypid::bigint,
-                NOT attribute.attnotnull
+        "SELECT attribute.attname, binding.address_classid::bigint,
+                binding.address_objid::bigint, binding.address_objsubid,
+                attribute.atttypid::bigint, NOT attribute.attnotnull
          FROM shiba_internal.source_binding AS binding
          JOIN pg_catalog.pg_attribute AS attribute
            ON attribute.attrelid = binding.address_objid
@@ -140,19 +156,21 @@ fn source_descriptor(
          ORDER BY binding.address_objsubid",
         &[&source_id],
     )?;
-    let mut columns = Vec::with_capacity(rows.len());
-    for row in rows {
-        columns.push(SourceColumnDescriptor {
-            name: row.get(0),
-            address: object_address(&row, 1, 2, 3)?,
-            type_oid: u32::try_from(row.get::<_, i64>(4))
-                .map_err(|_| M2Error::InvalidOperatorDefinition)?,
-            nullable: row.get(5),
-        });
-    }
+    let columns = rows
+        .into_iter()
+        .map(|row| {
+            Ok(SourceColumnDescriptor {
+                name: row.get(0),
+                address: object_address(&row, 1, 2, 3)?,
+                type_oid: u32::try_from(row.get::<_, i64>(4))
+                    .map_err(|_| M2Error::InvalidOperatorDefinition)?,
+                nullable: row.get(5),
+            })
+        })
+        .collect::<Result<Vec<_>, RegistrationError>>()?;
     Ok(SourceDescriptor {
         source_id: spec.source_id,
-        relation,
+        relation: object_address(&relation, 0, 1, 2)?,
         columns,
     })
 }

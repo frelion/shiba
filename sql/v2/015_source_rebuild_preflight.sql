@@ -11,7 +11,8 @@ RETURNS TABLE (
     database_oid oid, publication_name name,
     publication_insert boolean, publication_update boolean,
     publication_delete boolean, publication_truncate boolean,
-    publication_via_root boolean, publication_attnums smallint[]
+    publication_via_root boolean, publication_attnums smallint[],
+    target_key_subid integer, target_payload_subid integer
 )
 LANGUAGE plpgsql
 VOLATILE
@@ -35,25 +36,42 @@ BEGIN
         SELECT count(*) FROM pg_catalog.pg_attribute AS attribute
         WHERE attribute.attrelid = target_relation
           AND attribute.attnum > 0 AND NOT attribute.attisdropped
-    ) OR NOT EXISTS (
-        SELECT 1 FROM pg_catalog.pg_attribute AS key
-        JOIN pg_catalog.pg_attribute AS payload
-          ON payload.attrelid = key.attrelid AND payload.attnum = 2
-        WHERE key.attrelid = target_relation AND key.attnum = 1
-          AND key.atttypid = 20 AND key.attnotnull
-          AND payload.atttypid = 20 AND NOT payload.attnotnull
-          AND key.attgenerated = '' AND payload.attgenerated = ''
     ) THEN
         RAISE EXCEPTION 'target must be ordinary (int8 NOT NULL, int8 NULL)';
     END IF;
+    SELECT (identity.indkey::smallint[])[0]::integer
+    INTO STRICT target_key_subid
+    FROM pg_catalog.pg_index AS identity
+    WHERE identity.indexrelid = target_identity_index
+      AND identity.indrelid = target_relation
+      AND identity.indisprimary AND identity.indisunique
+      AND identity.indisvalid AND identity.indisready
+      AND identity.indnkeyatts = 1 AND identity.indnatts = 1
+      AND identity.indexprs IS NULL AND identity.indpred IS NULL;
+    SELECT attribute.attnum::integer
+    INTO STRICT target_payload_subid
+    FROM pg_catalog.pg_attribute AS attribute
+    WHERE attribute.attrelid = target_relation
+      AND attribute.attnum > 0 AND NOT attribute.attisdropped
+      AND attribute.attnum <> target_key_subid;
     IF NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_attribute AS key
+        JOIN pg_catalog.pg_attribute AS payload
+          ON payload.attrelid = key.attrelid
+         AND payload.attnum = target_payload_subid
+        WHERE key.attrelid = target_relation AND key.attnum = target_key_subid
+          AND key.atttypid = 20 AND key.attnotnull
+          AND payload.atttypid = 20 AND NOT payload.attnotnull
+          AND key.attgenerated = '' AND payload.attgenerated = ''
+    ) OR NOT EXISTS (
         SELECT 1 FROM pg_catalog.pg_index AS identity
         WHERE identity.indexrelid = target_identity_index
           AND identity.indrelid = target_relation
           AND identity.indisprimary AND identity.indisunique
           AND identity.indisvalid AND identity.indisready
           AND identity.indnkeyatts = 1 AND identity.indnatts = 1
-          AND (identity.indkey::smallint[])[0] = 1
+          AND (identity.indkey::smallint[])[0] = target_key_subid
           AND identity.indexprs IS NULL AND identity.indpred IS NULL
     ) THEN
         RAISE EXCEPTION 'target requires exact default primary-key identity';
@@ -69,8 +87,17 @@ BEGIN
            publication.pubinsert, publication.pubupdate,
            publication.pubdelete, publication.pubtruncate,
            publication.pubviaroot,
-           CASE WHEN member.prattrs IS NULL THEN ARRAY[1::smallint, 2::smallint]
-                ELSE member.prattrs::smallint[] END
+           CASE WHEN member.prattrs IS NULL THEN ARRAY(
+                    SELECT attribute.attnum::smallint
+                    FROM pg_catalog.pg_attribute AS attribute
+                    WHERE attribute.attrelid = target_relation
+                      AND attribute.attnum > 0 AND NOT attribute.attisdropped
+                    ORDER BY attribute.attnum
+                ) ELSE ARRAY(
+                    SELECT listed.attnum
+                    FROM pg_catalog.unnest(member.prattrs::smallint[]) AS listed(attnum)
+                    ORDER BY listed.attnum
+                ) END
     INTO STRICT database_oid, publication_name,
                 publication_insert, publication_update,
                 publication_delete, publication_truncate,
@@ -87,7 +114,17 @@ BEGIN
       AND NOT publication.pubviaroot
       AND member.prrelid = target_relation AND member.prqual IS NULL
       AND (member.prattrs IS NULL
-           OR member.prattrs::smallint[] = ARRAY[1::smallint, 2::smallint])
+           OR ARRAY(
+               SELECT listed.attnum
+               FROM pg_catalog.unnest(member.prattrs::smallint[]) AS listed(attnum)
+               ORDER BY listed.attnum
+           ) = ARRAY(
+               SELECT attribute.attnum::smallint
+               FROM pg_catalog.pg_attribute AS attribute
+               WHERE attribute.attrelid = target_relation
+                 AND attribute.attnum > 0 AND NOT attribute.attisdropped
+               ORDER BY attribute.attnum
+           ))
       AND 1 = (SELECT count(*) FROM pg_catalog.pg_publication_rel
                WHERE prpubid = target_publication);
     RETURN NEXT;
