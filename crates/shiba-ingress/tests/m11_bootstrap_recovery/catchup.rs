@@ -40,7 +40,7 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
         catchup.catch_up_next().is_err(),
         "feedback transport must fail after durable Apply"
     );
-    assert_eq!(states(&mut admin), vec![(1, 4), (3, 50)]);
+    assert_eq!(states(&mut admin), vec![(1, 4), (2, 50)]);
     assert_eq!(
         admin
             .query_one(
@@ -68,7 +68,7 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
         catchup.catch_up_next().expect("ack exact Apply replay"),
         BootstrapCatchupProgress::TransactionApplied
     );
-    assert_eq!(states(&mut admin), vec![(1, 4), (3, 50)]);
+    assert_eq!(states(&mut admin), vec![(1, 4), (2, 50)]);
     assert_eq!(
         admin
             .query_one(
@@ -112,7 +112,7 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
                 row.get::<_, i64>(2)
             ))
             .collect::<Vec<_>>(),
-        vec![(2, "active".to_owned(), 4), (4, "active".to_owned(), 50)]
+        vec![(3, "active".to_owned(), 4), (4, "active".to_owned(), 50)]
     );
     drop(catchup);
     remove_receiver_kill_trigger(&mut admin, "shiba_internal.graph_bootstrap");

@@ -57,7 +57,7 @@ fn million_row_active_source_rebuild_is_bounded_and_catches_up_exactly() {
     let old_state = admin
         .query(
             "SELECT state_payload FROM shiba_internal.graph_node_state
-             WHERE graph_id = 1 AND node_id IN (1, 3) ORDER BY node_id",
+             WHERE graph_id = 1 AND node_id IN (1, 2) ORDER BY node_id",
             &[],
         )
         .expect("read non-pristine operator state");

@@ -67,7 +67,7 @@ pub(crate) fn prove_same_source_exclusion_and_other_source_progress(
     let result = admin
         .query(
             "SELECT value_bigint FROM shiba.graph_result
-             WHERE graph_id = 2 AND result_id IN (2, 4) ORDER BY result_id",
+             WHERE graph_id = 2 AND result_id IN (3, 4) ORDER BY result_id",
             &[],
         )
         .expect("read independent public result")

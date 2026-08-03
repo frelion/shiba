@@ -13,8 +13,8 @@ pub(super) fn durable(client: &mut Client) -> Durable {
     let scalar = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 101),
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 102)",
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 4),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 5)",
             &[],
         )
         .expect("query scalar results");
@@ -23,7 +23,7 @@ pub(super) fn durable(client: &mut Client) -> Durable {
         keyed: pairs(
             client,
             "SELECT result_key_bigint, result_value_bigint
-             FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 103 ORDER BY 1",
+             FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 6 ORDER BY 1",
         ),
         source: pairs(
             client,

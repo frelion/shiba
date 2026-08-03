@@ -1,9 +1,9 @@
-use std::num::NonZeroU32;
-
 use postgres::Client;
-use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
+use shiba_compiler::{
+    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
+    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+};
 use shiba_ingress::BootstrapSpec;
-use shiba_operator::NodeId;
 use shiba_protocol::{BootstrapId, GraphId, SlotGeneration, SourceId};
 use shiba_runtime::compile_and_register;
 
@@ -86,24 +86,46 @@ pub fn install_fixture(admin: &mut Client) {
     }
 }
 
-fn graph_spec(source_id: u64) -> GraphSpecV1 {
+fn graph_spec(source_id: u64) -> QuerySpecV1 {
     let source_id_value = SourceId::new(source_id).expect("source ID");
-    let node = |value| NodeId::new(NonZeroU32::new(value).expect("node ID"));
-    GraphSpecV1 {
-        version: GRAPH_SPEC_VERSION,
+    QuerySpecV1 {
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(source_id).expect("graph ID"),
         sources: vec![source_id_value],
-        outputs: vec![
-            GraphOutputSpecV1::CountRows {
-                source_id: source_id_value,
-                aggregate_node_id: node(1),
-                result_node_id: node(2),
+        nodes: vec![
+            QueryNodeV1 {
+                inputs: vec![QueryInputV1::Source {
+                    source_id: source_id_value,
+                }],
+                state_codec_version: Some(1),
+                operation: QueryOperationV1::CountRows,
             },
-            GraphOutputSpecV1::SumInt8 {
-                source_id: source_id_value,
-                input_column: "payload".to_owned(),
-                aggregate_node_id: node(3),
-                result_node_id: node(4),
+            QueryNodeV1 {
+                inputs: vec![QueryInputV1::Source {
+                    source_id: source_id_value,
+                }],
+                state_codec_version: Some(1),
+                operation: QueryOperationV1::SumInt8 {
+                    value: QueryExpressionV1::Column {
+                        field: QueryFieldV1 {
+                            input: 0,
+                            selector: QuerySelectorV1::Name {
+                                name: "payload".into(),
+                                quoted: false,
+                            },
+                        },
+                    },
+                },
+            },
+        ],
+        results: vec![
+            QueryResultV1 {
+                input_node: 1,
+                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+            },
+            QueryResultV1 {
+                input_node: 2,
+                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
             },
         ],
     }

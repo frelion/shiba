@@ -77,7 +77,7 @@ fn assert_differential(client: &mut Client) -> (i64, i64) {
     assert_eq!(
         public_results(client),
         vec![
-            (2, "active".to_owned(), Some(oracle.0)),
+            (3, "active".to_owned(), Some(oracle.0)),
             (4, "active".to_owned(), Some(oracle.1)),
         ]
     );
@@ -142,7 +142,7 @@ fn million_row_snapshot_is_bounded_and_catches_up_exactly() {
     assert_eq!(
         public_results(&mut admin),
         vec![
-            (2, "building".to_owned(), None),
+            (3, "building".to_owned(), None),
             (4, "building".to_owned(), None),
         ]
     );
@@ -181,7 +181,7 @@ fn million_row_snapshot_is_bounded_and_catches_up_exactly() {
             assert_eq!(
                 public_results(&mut admin),
                 vec![
-                    (2, "building".to_owned(), None),
+                    (3, "building".to_owned(), None),
                     (4, "building".to_owned(), None),
                 ]
             );

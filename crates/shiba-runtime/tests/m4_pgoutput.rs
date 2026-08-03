@@ -17,7 +17,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2),
                 (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.graph_continuation)",
@@ -143,7 +143,7 @@ fn m4_real_pgoutput_nullable_payload_and_bad_key_tag() {
     );
     let result: i64 = client
         .query_one(
-            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001",
+            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2",
             &[],
         )
         .expect("query SQL result")

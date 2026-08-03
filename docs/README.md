@@ -230,3 +230,9 @@ M15 SQL frontend work is governed by
 DDL-safe registration/rebuild rebind and stable diagnostics. It selects
 `sqlparser` 0.62.0 `PostgreSqlDialect` only as a parser candidate; no SQL
 frontend production path or new V2 completion claim exists yet.
+
+M15.2 is the completed generic declaration cutover, not the SQL parser slice. It
+replaces GraphSpec recipes with canonical QuerySpec nodes/results in Compiler,
+registration and rebuild while leaving OperatorGraph/Runtime/ACK authority
+unchanged. Ten pure Compiler tests and the full PG17.10/PG18.4 52-script,
+104-invocation release matrix are green. Parser/binder work remains later M15.

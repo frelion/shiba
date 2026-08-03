@@ -1,6 +1,8 @@
 use postgres::{Client, NoTls};
-use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
-use shiba_operator::ObjectAddress;
+use shiba_compiler::{
+    QUERY_SPEC_VERSION, QueryFieldV1, QueryInputV1, QueryNodeV1, QueryOperationV1,
+    QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+};
 use shiba_protocol::{GraphId, SlotGeneration, SourceId};
 use shiba_runtime::{
     M2Error, PgoutputGraph, PgoutputSource, ProcessOutcome, compile_and_register,
@@ -13,8 +15,18 @@ mod support;
 mod graph_support;
 
 use graph_support::{
-    JOIN, SINGLE, assert_identity_binding, configure, durable_join, join_rows, node, oid,
+    JOIN, SINGLE, assert_identity_binding, configure, durable_join, join_rows, oid,
 };
+
+fn named_field(input: u8, name: &str) -> QueryFieldV1 {
+    QueryFieldV1 {
+        input,
+        selector: QuerySelectorV1::Name {
+            name: name.into(),
+            quoted: false,
+        },
+    }
+}
 
 #[test]
 #[ignore = "requires scripts/test-m14-graph-runtime.sh"]
@@ -106,24 +118,31 @@ fn singleton_and_two_source_join_share_one_graph_runtime() {
 
     let source2 = SourceId::new(2).unwrap();
     let source3 = SourceId::new(3).unwrap();
-    let graph_spec = GraphSpecV1 {
-        version: GRAPH_SPEC_VERSION,
+    let graph_spec = QuerySpecV1 {
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(2).unwrap(),
         sources: vec![source2, source3],
-        outputs: vec![GraphOutputSpecV1::InnerJoin {
-            left_source_id: source2,
-            right_source_id: source3,
-            left_id_column: "id".into(),
-            left_right_key_column: "right_key".into(),
-            right_id_column: "id".into(),
-            right_payload_column: "payload".into(),
-            right_identity_index: ObjectAddress {
-                class_id: oid(&mut client, "pg_class"),
-                object_id: right_pk,
-                sub_id: 0,
+        nodes: vec![QueryNodeV1 {
+            inputs: vec![
+                QueryInputV1::Source { source_id: source2 },
+                QueryInputV1::Source { source_id: source3 },
+            ],
+            state_codec_version: Some(1),
+            operation: QueryOperationV1::InnerJoin {
+                left_id: named_field(0, "id"),
+                left_key: named_field(0, "right_key"),
+                right_id: named_field(1, "id"),
+                right_payload: named_field(1, "payload"),
             },
-            join_node_id: node(1),
-            result_node_id: node(2),
+        }],
+        results: vec![QueryResultV1 {
+            input_node: 1,
+            shape: QueryResultShapeV1::Keyed {
+                key_slot: 0,
+                key_nullable: false,
+                value_slot: 1,
+                value_nullable: true,
+            },
         }],
     };
     compile_and_register(&mut client, &graph_spec).expect("register two-source join graph");

@@ -40,7 +40,7 @@ fn private_state(client: &mut Client) -> Vec<(i64, i64)> {
         .query(
             "SELECT node_id, state_payload
              FROM shiba_internal.graph_node_state
-             WHERE graph_id = 1 AND node_id IN (1, 3) ORDER BY node_id",
+             WHERE graph_id = 1 AND node_id IN (1, 2) ORDER BY node_id",
             &[],
         )
         .expect("query private operator state")
@@ -85,8 +85,8 @@ fn assert_building(client: &mut Client) {
     assert_eq!(
         public_results(client),
         vec![
-            (2, "building".to_owned(), None),
             (4, "building".to_owned(), None),
+            (5, "building".to_owned(), None),
             (6, "building".to_owned(), None),
         ]
     );
@@ -129,8 +129,8 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     assert_eq!(
         public_results(&mut admin),
         vec![
-            (2, "active".to_owned(), Some(0)),
             (4, "active".to_owned(), Some(0)),
+            (5, "active".to_owned(), Some(0)),
             (6, "active".to_owned(), None),
         ]
     );
@@ -187,7 +187,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     );
     assert_building(&mut admin);
     assert!(projected_rows(&mut admin).is_empty());
-    assert_eq!(private_state(&mut admin), vec![(1, 2), (3, 10)]);
+    assert_eq!(private_state(&mut admin), vec![(1, 2), (2, 10)]);
     assert_eq!(source_rows(&mut admin), vec![(1, Some(10)), (2, None)]);
     assert_eq!(
         admin
@@ -209,7 +209,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     );
     assert_building(&mut admin);
     assert!(projected_rows(&mut admin).is_empty());
-    assert_eq!(private_state(&mut admin), vec![(1, 3), (3, 40)]);
+    assert_eq!(private_state(&mut admin), vec![(1, 3), (2, 40)]);
     assert_eq!(
         source_rows(&mut admin),
         vec![(1, Some(10)), (2, None), (3, Some(30))]
@@ -227,7 +227,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         BootstrapCatchupProgress::TransactionApplied
     );
     assert_building(&mut admin);
-    assert_eq!(private_state(&mut admin), vec![(1, 3), (3, 25)]);
+    assert_eq!(private_state(&mut admin), vec![(1, 3), (2, 25)]);
     assert_eq!(
         source_rows(&mut admin),
         vec![(1, Some(20)), (2, None), (4, Some(5))]
@@ -250,8 +250,8 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     assert_eq!(
         public_results(&mut admin),
         vec![
-            (2, "active".to_owned(), Some(3)),
-            (4, "active".to_owned(), Some(25)),
+            (4, "active".to_owned(), Some(3)),
+            (5, "active".to_owned(), Some(25)),
             (6, "active".to_owned(), None),
         ]
     );
@@ -292,13 +292,13 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     assert_eq!(
         public_results(&mut admin),
         vec![
-            (2, "active".to_owned(), Some(4)),
-            (4, "active".to_owned(), Some(32)),
+            (4, "active".to_owned(), Some(4)),
+            (5, "active".to_owned(), Some(32)),
             (6, "active".to_owned(), None),
         ]
     );
     assert_eq!(projected_rows(&mut admin), source_rows(&mut admin));
-    assert_eq!(private_state(&mut admin), vec![(1, 4), (3, 32)]);
+    assert_eq!(private_state(&mut admin), vec![(1, 4), (2, 32)]);
     assert_eq!(
         source_rows(&mut admin),
         vec![(1, Some(20)), (2, None), (4, Some(5)), (5, Some(7))]

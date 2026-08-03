@@ -15,6 +15,14 @@ and layered parser/Shiba bounds. Its approximate dialect and locations are input
 evidence, not authority; Shiba owns the allowlist, canonical semantics, stable
 UTF-8 byte spans and error codes. M15.1 changes no production execution path.
 
+M15.2 completes the declaration cutover only: generic
+`QuerySpecV1` nodes/results replace GraphSpec recipes, compiler version 2 stores
+canonical QuerySpec, and registration plus rebuild share `compile_query`.
+OperatorGraph, Runtime state/results, continuation, ACK and lifecycle ownership
+do not change. Pure compiler tests and the 52-script/104-invocation
+PG17.10/PG18.4 release matrix are green. SQL parsing, unbound lowering and
+frontend diagnostics remain later M15 work.
+
 M14.6 cuts the production lifecycle over to the graph boundary frozen in
 [OPERATOR_GRAPH_CONTRACT.md](OPERATOR_GRAPH_CONTRACT.md): one canonical typed
 graph owns its exact source membership, nodes, edges, terminal outputs and hard

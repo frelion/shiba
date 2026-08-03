@@ -1,8 +1,10 @@
-use std::{num::NonZeroU32, process::Command};
+use std::process::Command;
 
 use postgres::Client;
-use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
-use shiba_operator::NodeId;
+use shiba_compiler::{
+    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
+    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+};
 use shiba_protocol::{GraphId, SourceId};
 use shiba_runtime::compile_and_register;
 
@@ -38,24 +40,42 @@ pub(crate) fn restart_postgres(mode: &str) {
     assert!(started.success(), "pg_ctl restart failed");
 }
 
-fn graph_spec() -> GraphSpecV1 {
+fn graph_spec() -> QuerySpecV1 {
     let source_id = SourceId::new(1).expect("source ID");
-    let node = |value| NodeId::new(NonZeroU32::new(value).expect("node ID"));
-    GraphSpecV1 {
-        version: GRAPH_SPEC_VERSION,
+    QuerySpecV1 {
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(1).expect("graph ID"),
         sources: vec![source_id],
-        outputs: vec![
-            GraphOutputSpecV1::CountRows {
-                source_id,
-                aggregate_node_id: node(1),
-                result_node_id: node(2),
+        nodes: vec![
+            QueryNodeV1 {
+                inputs: vec![QueryInputV1::Source { source_id }],
+                state_codec_version: Some(1),
+                operation: QueryOperationV1::CountRows,
             },
-            GraphOutputSpecV1::SumInt8 {
-                source_id,
-                input_column: "payload".to_owned(),
-                aggregate_node_id: node(3),
-                result_node_id: node(4),
+            QueryNodeV1 {
+                inputs: vec![QueryInputV1::Source { source_id }],
+                state_codec_version: Some(1),
+                operation: QueryOperationV1::SumInt8 {
+                    value: QueryExpressionV1::Column {
+                        field: QueryFieldV1 {
+                            input: 0,
+                            selector: QuerySelectorV1::Name {
+                                name: "payload".into(),
+                                quoted: false,
+                            },
+                        },
+                    },
+                },
+            },
+        ],
+        results: vec![
+            QueryResultV1 {
+                input_node: 1,
+                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+            },
+            QueryResultV1 {
+                input_node: 2,
+                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
             },
         ],
     }
@@ -88,7 +108,7 @@ pub(crate) fn states(client: &mut Client) -> Vec<(i64, i64)> {
         .query(
             "SELECT node_id, state_payload
              FROM shiba_internal.graph_node_state
-             WHERE graph_id = 1 AND node_id IN (1, 3) ORDER BY node_id",
+             WHERE graph_id = 1 AND node_id IN (1, 2) ORDER BY node_id",
             &[],
         )
         .expect("query operator states")

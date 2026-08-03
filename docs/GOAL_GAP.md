@@ -2,8 +2,8 @@
 
 ## M15.1 SQL frontend contract status
 
-The next gap is frozen rather than implemented. A bounded SQL `SELECT` subset
-normalizes to canonical `QuerySpecV1`; a short PostgreSQL binder resolves only
+The SQL frontend gap is frozen but not yet implemented. A bounded SQL `SELECT`
+subset will normalize to canonical `QuerySpecV1`; a short PostgreSQL binder resolves only
 registered SourceIds and exact column ObjectAddresses, then the existing
 Compiler emits the sole executable OperatorGraph. Raw SQL, `sqlparser` AST and
 PostgreSQL server parse/optimizer trees are not authority. Rebuild rebinds the
@@ -13,8 +13,18 @@ effective identity.
 The contract fixes projection/filter/compute/grouped Count/Sum and narrow
 two-source INNER JOIN syntax, explicit rejections, identifiers/aliases,
 three-valued NULL semantics, stable spans/errors, DDL locking and hard bounds.
-`sqlparser` 0.62.0 `PostgreSqlDialect` is the candidate with minimized features;
-M15.2+ implementation and PG17.10/PG18.4 evidence remain unproved.
+`sqlparser` 0.62.0 `PostgreSqlDialect` is the candidate with minimized features.
+Parser, unbound lowering, stable frontend diagnostics and SQL-oracle evidence
+remain unproved.
+
+M15.2 replaced GraphSpec recipes with generic QuerySpec
+nodes/results through compiler version 2, registration and rebuild compilation.
+It did not add the SQL parser. Ten pure Compiler tests prove strict bounds,
+canonical digest/topology, generic M14-shape equivalence, exact catalog type
+coordinates and corrupt/old declaration rejection. The complete PG17.10/PG18.4
+release matrix passed 52 scripts and 104 invocations, including registration,
+bootstrap, rebuild, recovery and two-source lifecycle gates. M15.2 is green;
+M15 as a whole is not complete.
 
 ## M14.7 completion status
 

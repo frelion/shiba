@@ -116,7 +116,7 @@ fn bootstrap_runs_without_superuser_and_permission_loss_fails_closed() {
     assert!(
         reader
             .execute(
-                "UPDATE shiba.graph_result SET value_bigint = 99 WHERE graph_id = 1 AND result_id = 2",
+                "UPDATE shiba.graph_result SET value_bigint = 99 WHERE graph_id = 1 AND result_id = 3",
                 &[],
             )
             .is_err(),

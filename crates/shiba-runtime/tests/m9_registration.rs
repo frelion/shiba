@@ -1,8 +1,9 @@
-use std::num::NonZeroU32;
-
 use postgres::{Client, NoTls};
-use shiba_compiler::{CompilerError, GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
-use shiba_operator::{NodeId, ObjectAddress, OperatorGraph, OperatorNodeKind};
+use shiba_compiler::{
+    CompilerError, QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
+    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+};
+use shiba_operator::{ObjectAddress, OperatorGraph, OperatorNodeKind};
 use shiba_protocol::{GraphId, SourceId};
 use shiba_runtime::{M2Error, RegistrationError, compile_and_register};
 
@@ -17,27 +18,42 @@ const ENVIRONMENT: PgoutputCapture = PgoutputCapture {
     publication: "unused_m9_registration_publication",
 };
 
-fn node(value: u32) -> NodeId {
-    NodeId::new(NonZeroU32::new(value).expect("node ID"))
-}
-
-fn spec(graph_id: u64, source_id: u64, input_column: &str) -> GraphSpecV1 {
+fn spec(graph_id: u64, source_id: u64, input_column: &str) -> QuerySpecV1 {
     let source_id = SourceId::new(source_id).expect("source ID");
-    GraphSpecV1 {
-        version: GRAPH_SPEC_VERSION,
+    QuerySpecV1 {
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(graph_id).expect("graph ID"),
         sources: vec![source_id],
-        outputs: vec![
-            GraphOutputSpecV1::CountRows {
-                source_id,
-                aggregate_node_id: node(1),
-                result_node_id: node(101),
+        nodes: vec![
+            QueryNodeV1 {
+                inputs: vec![QueryInputV1::Source { source_id }],
+                state_codec_version: Some(1),
+                operation: QueryOperationV1::CountRows,
             },
-            GraphOutputSpecV1::SumInt8 {
-                source_id,
-                input_column: input_column.into(),
-                aggregate_node_id: node(2),
-                result_node_id: node(102),
+            QueryNodeV1 {
+                inputs: vec![QueryInputV1::Source { source_id }],
+                state_codec_version: Some(1),
+                operation: QueryOperationV1::SumInt8 {
+                    value: QueryExpressionV1::Column {
+                        field: QueryFieldV1 {
+                            input: 0,
+                            selector: QuerySelectorV1::Name {
+                                name: input_column.into(),
+                                quoted: false,
+                            },
+                        },
+                    },
+                },
+            },
+        ],
+        results: vec![
+            QueryResultV1 {
+                input_node: 1,
+                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+            },
+            QueryResultV1 {
+                input_node: 2,
+                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
             },
         ],
     }

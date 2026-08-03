@@ -1,5 +1,20 @@
 # M15 QuerySpecV1 contract
 
+## M15.2 cutover status
+
+M15.2 replaced the complete-query `GraphSpecV1`/
+`GraphOutputSpecV1` recipes with this generic QuerySpec. Compiler version 2
+decodes strict QuerySpec nodes/results, resolves source-name selectors once,
+builds the existing OperatorGraph, and stores canonical QuerySpec as
+`graph_definition.spec_payload`. Registration and rebuild both use the same
+declaration and compiler path; no compatibility decoder or dual format remains.
+
+Acceptance evidence is complete: ten pure Compiler tests cover strict
+codec/bounds/digest/topology and generic M14-shape compilation; the full
+PG17.10/PG18.4 release runner passed 52 scripts and 104 invocations, including
+Runtime registration, bootstrap/rebuild/recovery and Join lifecycle. SQL
+parsing and unbound SQL lowering remain later M15 work.
+
 ## Authority
 
 QuerySpecV1 is the sole durable declaration authority.
@@ -92,8 +107,10 @@ No declaration node can create unbounded expansion.
 
 ## M15.2 evidence
 
-Golden tests prove strict roundtrip, digest separation, semantic equivalence,
+Ten pure Compiler tests prove strict roundtrip, digest separation, semantic equivalence,
 deterministic NodeIds, every M14 shape through generic nodes, corrupt input
 rejection and graph behavior equivalence. PG17.10/PG18.4 M14 grouped, graph
-Runtime and Join lifecycle gates plus the complete release matrix are required
-before the M15.2 commit.
+Runtime and Join lifecycle gates passed within the complete 52-script,
+104-invocation release matrix. Failure-first migration also preserved the exact
+wrong-column catalog coordinate and corrected stale test-only node/result IDs;
+no production fallback or alternate declaration path was introduced.

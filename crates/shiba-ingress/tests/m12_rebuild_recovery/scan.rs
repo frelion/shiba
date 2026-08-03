@@ -138,7 +138,7 @@ pub(crate) fn prove_snapshot_restarts(
             "INSERT INTO shiba_internal.graph_node_state (
                  graph_id,node_id,namespace,partition_key_payload,
                  item_key_payload,codec_version,state_payload
-             ) VALUES (1,3,0,$1,$2,1,$3)",
+             ) VALUES (1,2,0,$1,$2,1,$3)",
             &[
                 &TypedValue::Bool(true)
                     .to_canonical_json()
@@ -152,7 +152,7 @@ pub(crate) fn prove_snapshot_restarts(
     admin
         .execute(
             "UPDATE shiba_internal.graph_node_state SET state_payload = $1
-             WHERE graph_id = 1 AND node_id = 3",
+             WHERE graph_id = 1 AND node_id = 2",
             &[&0_i64.to_be_bytes().as_slice()],
         )
         .expect("restore failed batch state");

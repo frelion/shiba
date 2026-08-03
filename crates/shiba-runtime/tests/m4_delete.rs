@@ -20,7 +20,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2),
                 (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.graph_continuation)",
@@ -86,7 +86,7 @@ fn prove_count_underflow(client: &mut Client, delete: &GraphTransaction) {
                  SET state_payload = decode('0000000000000000', 'hex')
                  WHERE graph_id = 1 AND node_id = 1 AND namespace = 0;
              UPDATE shiba.graph_result
-                 SET value_bigint = 0 WHERE graph_id = 1 AND result_id = 1001;",
+                 SET value_bigint = 0 WHERE graph_id = 1 AND result_id = 2;",
         )
         .expect("install count underflow precondition");
     assert!(matches!(
@@ -101,7 +101,7 @@ fn prove_count_underflow(client: &mut Client, delete: &GraphTransaction) {
                  SET state_payload = decode('0000000000000002', 'hex')
                  WHERE graph_id = 1 AND node_id = 1 AND namespace = 0;
              UPDATE shiba.graph_result
-                 SET value_bigint = 2 WHERE graph_id = 1 AND result_id = 1001;",
+                 SET value_bigint = 2 WHERE graph_id = 1 AND result_id = 2;",
         )
         .expect("restore count after underflow proof");
 }

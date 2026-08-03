@@ -87,16 +87,16 @@ pub(crate) fn assert_sql_oracle(client: &mut Client) {
         "SELECT operator_id, result_key_bigint, result_value_bigint,
                 result_key_is_null, result_value_is_null
          FROM (
-             SELECT 102::bigint AS operator_id, payload AS result_key_bigint,
+             SELECT 7::bigint AS operator_id, payload AS result_key_bigint,
                     count(*)::bigint AS result_value_bigint,
                     payload IS NULL AS result_key_is_null,
                     false AS result_value_is_null
              FROM source.events GROUP BY payload
              UNION ALL
-             SELECT 105, payload, sum(id)::bigint, payload IS NULL, false
+             SELECT 8, payload, sum(id)::bigint, payload IS NULL, false
              FROM source.events GROUP BY payload
              UNION ALL
-             SELECT 108, id, sum(payload)::bigint, false,
+             SELECT 9, id, sum(payload)::bigint, false,
                     sum(payload) IS NULL
              FROM source.events GROUP BY id
          ) AS oracle
@@ -113,7 +113,7 @@ pub(crate) fn node_state_payload(client: &mut Client, operator_id: i64, key: i64
          FROM shiba_internal.graph_node_state AS state
              JOIN shiba_internal.graph_result_row AS result
                ON result.graph_id = state.graph_id
-              AND result.result_id = state.node_id + 100
+              AND result.result_id = CASE state.node_id WHEN 2 THEN 7 WHEN 4 THEN 8 WHEN 6 THEN 9 END
               AND result.key_payload = state.partition_key_payload
              WHERE state.graph_id = 1 AND state.node_id = $1
                AND result.result_key_bigint = $2
@@ -138,7 +138,7 @@ pub(crate) fn set_node_state_payload(
                  FROM shiba_internal.graph_result_row AS result
                  WHERE state.graph_id = 1 AND state.node_id = $1
                    AND result.graph_id = state.graph_id
-                   AND result.result_id = state.node_id + 100
+                   AND result.result_id = CASE state.node_id WHEN 2 THEN 7 WHEN 4 THEN 8 WHEN 6 THEN 9 END
                    AND result.key_payload = state.partition_key_payload
                    AND result.result_key_bigint = $2
                    AND NOT result.result_key_is_null",

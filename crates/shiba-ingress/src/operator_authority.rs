@@ -52,7 +52,7 @@ fn load_graph(
     let graph = OperatorGraph::from_canonical_payload(&row.get::<_, Vec<u8>>(2), digest)
         .map_err(|_| IngressError::Governance("compiled graph is invalid"))?;
     if graph.graph_id != graph_id
-        || row.get::<_, i32>(0) != 1
+        || row.get::<_, i32>(0) != 2
         || u32::try_from(row.get::<_, i32>(1)).ok() != Some(graph.format_version)
         || row.get::<_, i32>(4) != 1
         || usize::try_from(row.get::<_, i16>(5)).ok() != Some(graph.sources.len())

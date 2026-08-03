@@ -34,10 +34,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 3),
                 (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 4),
                 (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1),
-                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 3),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 2),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],

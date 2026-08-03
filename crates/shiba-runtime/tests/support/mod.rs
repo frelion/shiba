@@ -6,7 +6,10 @@
 use std::{fs, num::NonZeroU32, path::PathBuf, process::Command};
 
 use postgres::Client;
-use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
+use shiba_compiler::{
+    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
+    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+};
 use shiba_operator::NodeId;
 use shiba_protocol::{GraphId, SourceId};
 use shiba_runtime::{PgoutputGraph, PgoutputSource, compile_and_register};
@@ -21,42 +24,35 @@ pub(super) fn register_source(client: &mut Client, relation_name: &str) {
     register_count_operator(client, 1, 1);
 }
 
-pub(super) fn register_count_operator(client: &mut Client, source_id: u64, operator_id: u64) {
+pub(super) fn register_count_operator(client: &mut Client, source_id: u64, _operator_id: u64) {
     let source_id = SourceId::new(source_id).expect("non-zero source id");
-    let aggregate_node_id = node_id(operator_id);
-    let result_node_id = node_id(operator_id.checked_add(1_000).expect("result node ID"));
-    let spec = GraphSpecV1 {
-        version: GRAPH_SPEC_VERSION,
+    let spec = QuerySpecV1 {
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(source_id.get()).expect("source-backed graph ID"),
         sources: vec![source_id],
-        outputs: vec![GraphOutputSpecV1::CountRows {
-            source_id,
-            aggregate_node_id,
-            result_node_id,
-        }],
+        nodes: vec![query_node(source_id, QueryOperationV1::CountRows, true)],
+        results: vec![scalar_result(1)],
     };
     compile_and_register(client, &spec).expect("compile and register CountRows graph");
 }
 
 pub(super) fn register_count_sum_graph(client: &mut Client, source_id: u64) {
     let source_id = SourceId::new(source_id).expect("non-zero source id");
-    let spec = GraphSpecV1 {
-        version: GRAPH_SPEC_VERSION,
+    let spec = QuerySpecV1 {
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(source_id.get()).expect("source-backed graph ID"),
         sources: vec![source_id],
-        outputs: vec![
-            GraphOutputSpecV1::CountRows {
+        nodes: vec![
+            query_node(source_id, QueryOperationV1::CountRows, true),
+            query_node(
                 source_id,
-                aggregate_node_id: node_id(1),
-                result_node_id: node_id(1_001),
-            },
-            GraphOutputSpecV1::SumInt8 {
-                source_id,
-                input_column: "payload".into(),
-                aggregate_node_id: node_id(2),
-                result_node_id: node_id(1_002),
-            },
+                QueryOperationV1::SumInt8 {
+                    value: column(0, "payload"),
+                },
+                true,
+            ),
         ],
+        results: vec![scalar_result(1), scalar_result(2)],
     };
     compile_and_register(client, &spec).expect("compile and register CountRows + SumInt8 graph");
 }
@@ -87,8 +83,54 @@ pub(super) fn configure_graph_ingress(
         .expect("configure exact graph ingress");
 }
 
-fn node_id(value: u64) -> NodeId {
+pub(super) fn node_id(value: u64) -> NodeId {
     NodeId::new(NonZeroU32::new(u32::try_from(value).expect("node ID in u32")).expect("node ID"))
+}
+
+pub(super) fn source_input(source_id: SourceId) -> QueryInputV1 {
+    QueryInputV1::Source { source_id }
+}
+
+pub(super) fn query_node(
+    source_id: SourceId,
+    operation: QueryOperationV1,
+    stateful: bool,
+) -> QueryNodeV1 {
+    QueryNodeV1 {
+        inputs: vec![source_input(source_id)],
+        state_codec_version: stateful.then_some(1),
+        operation,
+    }
+}
+
+pub(super) fn field_name(input: u8, name: &str) -> QueryFieldV1 {
+    QueryFieldV1 {
+        input,
+        selector: QuerySelectorV1::Name {
+            name: name.into(),
+            quoted: false,
+        },
+    }
+}
+
+pub(super) fn field_slot(input: u8, slot: u16) -> QueryFieldV1 {
+    QueryFieldV1 {
+        input,
+        selector: QuerySelectorV1::Slot { slot },
+    }
+}
+
+pub(super) fn column(input: u8, name: &str) -> QueryExpressionV1 {
+    QueryExpressionV1::Column {
+        field: field_name(input, name),
+    }
+}
+
+pub(super) fn scalar_result(input_node: u16) -> QueryResultV1 {
+    QueryResultV1 {
+        input_node,
+        shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+    }
 }
 
 pub(super) fn decode_scalar_state(payload: &[u8]) -> i64 {

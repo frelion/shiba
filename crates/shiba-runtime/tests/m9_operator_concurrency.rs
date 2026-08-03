@@ -179,13 +179,13 @@ fn capture_inputs(
 fn results(client: &mut Client) -> Vec<(i64, i64, i64)> {
     client
         .query(
-            "SELECT ((result.graph_id - 1) * 2 + result.result_id - 1000),
+            "SELECT ((result.graph_id - 1) * 2 + result.result_id - 2),
                     result.value_bigint,
                     COALESCE(state.state_payload, decode('0000000000000000','hex'))
              FROM shiba.graph_result AS result
              LEFT JOIN shiba_internal.graph_node_state AS state
                ON state.graph_id = result.graph_id
-              AND state.node_id = result.result_id - 1000
+              AND state.node_id = result.result_id - 2
               AND state.namespace = 0
              ORDER BY result.graph_id, result.result_id",
             &[],

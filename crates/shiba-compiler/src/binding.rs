@@ -80,7 +80,7 @@ pub(crate) fn identity_for<'a>(
     Ok(exact)
 }
 
-fn resolve<'a>(
+pub(crate) fn resolve<'a>(
     source: &'a SourceDescriptor,
     name: &str,
 ) -> Result<(u16, &'a SourceColumnDescriptor), CompilerError> {
@@ -99,18 +99,4 @@ fn resolve<'a>(
         u16::try_from(slot).map_err(|_| CompilerError::GraphEncoding)?,
         column,
     ))
-}
-
-pub(crate) fn int8<'a>(
-    source: &'a SourceDescriptor,
-    name: &str,
-) -> Result<(u16, &'a SourceColumnDescriptor), CompilerError> {
-    let found = resolve(source, name)?;
-    if found.1.type_oid != POSTGRES_INT8_TYPE_OID {
-        return Err(CompilerError::WrongColumnType {
-            column: name.into(),
-            type_oid: found.1.type_oid,
-        });
-    }
-    Ok(found)
 }

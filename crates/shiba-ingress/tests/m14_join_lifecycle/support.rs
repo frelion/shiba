@@ -1,9 +1,9 @@
-use std::num::NonZeroU32;
-
 use postgres::Client;
-use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
+use shiba_compiler::{
+    QUERY_SPEC_VERSION, QueryFieldV1, QueryInputV1, QueryNodeV1, QueryOperationV1,
+    QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+};
 use shiba_ingress::SnapshotProgress;
-use shiba_operator::{NodeId, ObjectAddress};
 use shiba_protocol::{GraphId, SourceId};
 use shiba_runtime::compile_and_register;
 
@@ -57,30 +57,47 @@ pub(crate) fn install(client: &mut Client, publication: &str) -> Fixture {
     }
 }
 
-pub(crate) fn register_join_graph(client: &mut Client, fixture: &Fixture) {
+pub(crate) fn register_join_graph(client: &mut Client, _fixture: &Fixture) {
     let left = SourceId::new(1).expect("left source ID");
     let right = SourceId::new(2).expect("right source ID");
-    let spec = GraphSpecV1 {
-        version: GRAPH_SPEC_VERSION,
+    let spec = QuerySpecV1 {
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(1).expect("graph ID"),
         sources: vec![left, right],
-        outputs: vec![GraphOutputSpecV1::InnerJoin {
-            left_source_id: left,
-            right_source_id: right,
-            left_id_column: "id".to_owned(),
-            left_right_key_column: "right_key".to_owned(),
-            right_id_column: "id".to_owned(),
-            right_payload_column: "payload".to_owned(),
-            right_identity_index: ObjectAddress {
-                class_id: oid(client, "pg_class"),
-                object_id: fixture.right_identity,
-                sub_id: 0,
+        nodes: vec![QueryNodeV1 {
+            inputs: vec![
+                QueryInputV1::Source { source_id: left },
+                QueryInputV1::Source { source_id: right },
+            ],
+            state_codec_version: Some(1),
+            operation: QueryOperationV1::InnerJoin {
+                left_id: named_field(0, "id"),
+                left_key: named_field(0, "right_key"),
+                right_id: named_field(1, "id"),
+                right_payload: named_field(1, "payload"),
             },
-            join_node_id: node(1),
-            result_node_id: node(2),
+        }],
+        results: vec![QueryResultV1 {
+            input_node: 1,
+            shape: QueryResultShapeV1::Keyed {
+                key_slot: 0,
+                key_nullable: false,
+                value_slot: 1,
+                value_nullable: true,
+            },
         }],
     };
     compile_and_register(client, &spec).expect("register exact two-source graph");
+}
+
+fn named_field(input: u8, name: &str) -> QueryFieldV1 {
+    QueryFieldV1 {
+        input,
+        selector: QuerySelectorV1::Name {
+            name: name.into(),
+            quoted: false,
+        },
+    }
 }
 
 pub(crate) fn assert_registered(client: &mut Client, fixture: &Fixture) {
@@ -228,10 +245,6 @@ fn source_rows(client: &mut Client) -> Vec<(i64, i64, Option<i64>)> {
         .into_iter()
         .map(|row| (row.get(0), row.get(1), row.get(2)))
         .collect()
-}
-
-fn node(value: u32) -> NodeId {
-    NodeId::new(NonZeroU32::new(value).expect("node ID"))
 }
 
 fn oid(client: &mut Client, name: &str) -> u32 {

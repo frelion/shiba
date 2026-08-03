@@ -31,8 +31,8 @@ fn values(client: &mut Client) -> (i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1002),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 3),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 4),
                 (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
@@ -44,7 +44,7 @@ fn values(client: &mut Client) -> (i64, i64, i64) {
              FROM shiba.graph_result AS result
              LEFT JOIN shiba_internal.graph_node_state AS state
                ON state.graph_id = result.graph_id
-              AND state.node_id = result.result_id - 1000
+              AND state.node_id = result.result_id - 2
               AND state.namespace = 0
              WHERE result.graph_id = 1 ORDER BY result.result_id",
             &[],
@@ -81,7 +81,7 @@ fn install_crash_after_count(client: &mut Client) {
              CREATE FUNCTION m9_count_sum_test.crash_after_count()
              RETURNS trigger LANGUAGE plpgsql AS $$
              BEGIN
-                 IF NEW.result_id = 1001 THEN
+                 IF NEW.result_id = 3 THEN
                      PERFORM pg_terminate_backend(pg_backend_pid());
                  END IF;
                  RETURN NEW;
@@ -216,7 +216,7 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
                 SET state_payload = decode('7fffffffffffffff', 'hex')
                WHERE graph_id = 1 AND node_id = 2 AND namespace = 0;
              UPDATE shiba.graph_result SET value_bigint = 9223372036854775807
-               WHERE graph_id = 1 AND result_id = 1002;",
+               WHERE graph_id = 1 AND result_id = 4;",
         )
         .expect("inject sum overflow boundary");
     assert!(matches!(
@@ -231,7 +231,7 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
                 SET state_payload = decode('0000000000000000', 'hex')
               WHERE graph_id = 1 AND node_id = 2 AND namespace = 0;
              UPDATE shiba.graph_result SET value_bigint = 0
-              WHERE graph_id = 1 AND result_id = 1002;",
+              WHERE graph_id = 1 AND result_id = 4;",
         )
         .expect("remove overflow injection");
     assert_eq!(

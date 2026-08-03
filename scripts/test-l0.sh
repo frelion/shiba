@@ -583,7 +583,7 @@ for marker in ("pub fn graph_state_read_set", "pub fn apply_graph_plan"):
     if marker not in kernel:
         raise SystemExit(f"M14.6 graph kernel lacks marker: {marker}")
 for marker in (
-    "pub struct GraphSpecV1", "pub fn compile_graph",
+    "pub struct QuerySpecV1", "pub fn compile_query",
     "effective_replica_identity", "Result<OperatorGraph, CompilerError>",
 ):
     if marker not in compiler:

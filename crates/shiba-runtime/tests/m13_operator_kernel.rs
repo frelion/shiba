@@ -1,8 +1,8 @@
-use std::num::NonZeroU32;
-
 use postgres::{Client, NoTls};
-use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
-use shiba_operator::NodeId;
+use shiba_compiler::{
+    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
+    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+};
 use shiba_protocol::{GraphId, SlotGeneration, SourceId};
 use shiba_runtime::{
     M2Error, PgoutputSource, ProcessOutcome, compile_and_register, decode_committed_changes,
@@ -23,34 +23,60 @@ const CAPTURE: PgoutputCapture = PgoutputCapture {
     publication: "shiba_m13_operator_kernel_pub",
 };
 
-fn node(value: u32) -> NodeId {
-    NodeId::new(NonZeroU32::new(value).expect("node id"))
-}
-
-fn spec() -> GraphSpecV1 {
+fn spec() -> QuerySpecV1 {
     let source_id = SourceId::new(1).expect("source id");
-    GraphSpecV1 {
-        version: GRAPH_SPEC_VERSION,
+    let source = || QueryInputV1::Source { source_id };
+    let column = |name: &str| QueryExpressionV1::Column {
+        field: QueryFieldV1 {
+            input: 0,
+            selector: QuerySelectorV1::Name {
+                name: name.into(),
+                quoted: false,
+            },
+        },
+    };
+    QuerySpecV1 {
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(1).expect("graph id"),
         sources: vec![source_id],
-        outputs: vec![
-            GraphOutputSpecV1::CountRows {
-                source_id,
-                aggregate_node_id: node(1),
-                result_node_id: node(101),
+        nodes: vec![
+            QueryNodeV1 {
+                inputs: vec![source()],
+                state_codec_version: Some(1),
+                operation: QueryOperationV1::CountRows,
             },
-            GraphOutputSpecV1::SumInt8 {
-                source_id,
-                input_column: "payload".into(),
-                aggregate_node_id: node(2),
-                result_node_id: node(102),
+            QueryNodeV1 {
+                inputs: vec![source()],
+                state_codec_version: Some(1),
+                operation: QueryOperationV1::SumInt8 {
+                    value: column("payload"),
+                },
             },
-            GraphOutputSpecV1::MaterializedProject {
-                source_id,
-                key_column: "id".into(),
-                value_column: "payload".into(),
-                project_node_id: node(3),
-                result_node_id: node(103),
+            QueryNodeV1 {
+                inputs: vec![source()],
+                state_codec_version: None,
+                operation: QueryOperationV1::Project {
+                    expressions: vec![column("id"), column("payload")],
+                },
+            },
+        ],
+        results: vec![
+            QueryResultV1 {
+                input_node: 1,
+                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+            },
+            QueryResultV1 {
+                input_node: 2,
+                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+            },
+            QueryResultV1 {
+                input_node: 3,
+                shape: QueryResultShapeV1::Keyed {
+                    key_slot: 0,
+                    key_nullable: false,
+                    value_slot: 1,
+                    value_nullable: true,
+                },
             },
         ],
     }
@@ -243,14 +269,14 @@ fn generic_kernel_persists_scalar_and_keyed_outputs_atomically() {
         .unwrap();
     assert_eq!(durable(&mut client), before_corrupt);
 
-    client.batch_execute("UPDATE shiba_internal.graph_node_state SET state_payload=decode('7fffffffffffffff','hex') WHERE graph_id=1 AND node_id=2 AND namespace=0; UPDATE shiba.graph_result SET value_bigint=9223372036854775807 WHERE graph_id=1 AND result_id=102").unwrap();
+    client.batch_execute("UPDATE shiba_internal.graph_node_state SET state_payload=decode('7fffffffffffffff','hex') WHERE graph_id=1 AND node_id=2 AND namespace=0; UPDATE shiba.graph_result SET value_bigint=9223372036854775807 WHERE graph_id=1 AND result_id=5").unwrap();
     let overflow = durable(&mut client);
     assert!(matches!(
         process(&mut client, &corrupt_input),
         Err(M2Error::Kernel(_))
     ));
     assert_eq!(durable(&mut client), overflow);
-    client.batch_execute("UPDATE shiba_internal.graph_node_state SET state_payload=decode('0000000000000028','hex') WHERE graph_id=1 AND node_id=2 AND namespace=0; UPDATE shiba.graph_result SET value_bigint=40 WHERE graph_id=1 AND result_id=102").unwrap();
+    client.batch_execute("UPDATE shiba_internal.graph_node_state SET state_payload=decode('0000000000000028','hex') WHERE graph_id=1 AND node_id=2 AND namespace=0; UPDATE shiba.graph_result SET value_bigint=40 WHERE graph_id=1 AND result_id=5").unwrap();
     assert_eq!(
         process(&mut client, &corrupt_input).unwrap(),
         ProcessOutcome::Applied

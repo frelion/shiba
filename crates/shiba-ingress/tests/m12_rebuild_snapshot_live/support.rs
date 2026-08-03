@@ -47,8 +47,8 @@ pub(crate) fn assert_active(client: &mut Client, count: i64, sum: i64) {
             ))
             .collect::<Vec<_>>(),
         vec![
-            (2, "active".to_owned(), Some(count)),
-            (4, "active".to_owned(), Some(sum)),
+            (4, "active".to_owned(), Some(count)),
+            (5, "active".to_owned(), Some(sum)),
             (6, "active".to_owned(), None),
         ]
     );

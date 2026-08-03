@@ -10,10 +10,23 @@ rebuild rebind, stable spans/errors and hard resource/performance bounds. ADR
 candidate; later tests must layer its recursion limit with Shiba bounds and
 normalize `Spanned`/`TokenWithSpan` locations to stable UTF-8 byte spans.
 
-M15.2+ must add pure golden/canonical/error/span/limit tests and PG17.10/PG18.4
-SQL-oracle, DDL-race, least-privilege and rebuild-rebind gates. All M1--M14
-tests remain enrolled and live Apply must contain no parser call. M15.1 claims
-no implementation evidence.
+M15.2 adds pure canonical/limit tests and reuses every enrolled M1--M14
+PG17.10/PG18.4 gate for the declaration cutover. Later SQL slices must add
+golden/error/span, SQL-oracle, DDL-race, least-privilege and rebuild-rebind
+frontend gates. Live Apply must contain no parser call. M15.1 itself claimed no
+implementation evidence.
+
+## M15.2 QuerySpec cutover evidence status
+
+The green cutover deletes complete-query GraphOutputSpec recipes, changes the
+Catalog compiler version to 2, stores canonical `QuerySpecV1`, and makes
+registration/rebuild use `compile_query`. Ten pure Compiler tests cover strict
+codec/digest/topology, hard bounds, exact catalog error coordinates and all
+former Count/Sum/Project/Compute/Filter/Grouped/Join shapes. Workspace tests,
+clippy and L0 pass. The complete release runner passed 52 scripts and 104
+PG17.10/PG18.4 invocations, including Runtime registration/results,
+bootstrap/rebuild/recovery and Join lifecycle. SQL parsing and its diagnostics
+remain unproved.
 
 ## M14.7 release evidence
 

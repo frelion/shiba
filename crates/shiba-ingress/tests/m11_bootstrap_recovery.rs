@@ -132,7 +132,7 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
         BootstrapProcessOutcome::AlreadyApplied
     );
     assert_eq!(checkpoint(&mut admin), ("scanning".to_owned(), 1, Some(2)));
-    assert_eq!(states(&mut admin), vec![(1, 2), (3, 30)]);
+    assert_eq!(states(&mut admin), vec![(1, 2), (2, 30)]);
 
     drop(bootstrap);
     let bootstrap_id = BootstrapId::new(12).expect("replacement bootstrap ID");
@@ -183,7 +183,7 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
         .query_one("SELECT pg_drop_replication_slot($1)", &[&FOREIGN_SLOT])
         .expect("drop test-owned foreign slot");
     assert_eq!(checkpoint(&mut admin), ("scanning".to_owned(), 1, Some(2)));
-    assert_eq!(states(&mut admin), vec![(1, 2), (3, 30)]);
+    assert_eq!(states(&mut admin), vec![(1, 2), (2, 30)]);
     assert_eq!(rows(&mut admin), vec![(1, Some(10)), (2, Some(20))]);
 
     let spec = BootstrapSpec {
@@ -238,7 +238,7 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     admin
         .execute(
             "UPDATE shiba_internal.graph_node_state SET state_payload = $1
-             WHERE graph_id = 1 AND node_id = 3",
+             WHERE graph_id = 1 AND node_id = 2",
             &[&(i64::MAX - 5).to_be_bytes().as_slice()],
         )
         .expect("inject bounded operator overflow");
@@ -255,11 +255,11 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     assert!(process_bootstrap_batch(&mut admin, &overflowing).is_err());
     assert_eq!(rows(&mut admin), vec![(1, Some(10)), (2, Some(20))]);
     assert_eq!(checkpoint(&mut admin), ("scanning".to_owned(), 1, Some(2)));
-    assert_eq!(states(&mut admin), vec![(1, 2), (3, i64::MAX - 5)]);
+    assert_eq!(states(&mut admin), vec![(1, 2), (2, i64::MAX - 5)]);
     admin
         .execute(
             "UPDATE shiba_internal.graph_node_state SET state_payload = $1
-             WHERE graph_id = 1 AND node_id = 3",
+             WHERE graph_id = 1 AND node_id = 2",
             &[&30_i64.to_be_bytes().as_slice()],
         )
         .expect("restore operator state after failure injection");

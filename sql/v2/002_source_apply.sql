@@ -12,7 +12,7 @@ CREATE TABLE shiba_internal.source_row_state (
 CREATE TABLE shiba_internal.graph_definition (
     graph_id bigint PRIMARY KEY CHECK (graph_id > 0),
     source_count smallint NOT NULL CHECK (source_count IN (1, 2)),
-    compiler_version integer NOT NULL CHECK (compiler_version = 1),
+    compiler_version integer NOT NULL CHECK (compiler_version = 2),
     spec_payload bytea NOT NULL CHECK (pg_catalog.octet_length(spec_payload) > 0),
     graph_format_version integer NOT NULL CHECK (graph_format_version = 1),
     graph_payload bytea NOT NULL CHECK (pg_catalog.octet_length(graph_payload) > 0),

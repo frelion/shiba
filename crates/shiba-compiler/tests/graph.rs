@@ -1,50 +1,40 @@
-use core::num::NonZeroU32;
-
 use shiba_compiler::{
-    GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1, IdentityIndexDescriptor,
-    SourceColumnDescriptor, SourceDescriptor, compile_graph,
-    compile_graph_with_optional_identities,
+    CompilerError, IdentityIndexDescriptor, QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1,
+    QueryInputV1, QueryNodeV1, QueryOperationV1, QueryResultShapeV1, QueryResultV1,
+    QuerySelectorV1, QuerySpecV1, SourceColumnDescriptor, SourceDescriptor, compile_query,
+    compile_query_with_optional_identities,
 };
-use shiba_operator::{
-    DeltaBatch, EffectOrigin, GraphEffectOrigin, MultiInputBatch, NodeId, ObjectAddress,
-    OperatorNodeKind, ResultDelta, ResultMutation, RowDelta, SourceDeltaBatch, StateEntry,
-    StateSnapshot, TypedRow, TypedValue, ValueType, apply_graph, apply_graph_plan,
-    graph_state_read_set, source_typed_layout,
-};
-use shiba_protocol::{BootstrapBatchId, BootstrapId, GraphId, SourceId};
+use shiba_operator::{ObjectAddress, OperatorNodeKind};
+use shiba_protocol::{GraphId, SourceId};
 
-fn node(value: u32) -> NodeId {
-    NodeId::new(NonZeroU32::new(value).unwrap())
-}
-
-fn address(object: u32, sub_id: i32) -> ObjectAddress {
+fn address(object_id: u32, sub_id: i32) -> ObjectAddress {
     ObjectAddress {
         class_id: 1_259,
-        object_id: object,
+        object_id,
         sub_id,
     }
 }
 
-fn source(id: u64, object: u32, names: &[(&str, bool)]) -> SourceDescriptor {
+fn source(id: u64, object_id: u32) -> SourceDescriptor {
     SourceDescriptor {
         source_id: SourceId::new(id).unwrap(),
-        relation: address(object, 0),
-        columns: names
-            .iter()
+        relation: address(object_id, 0),
+        columns: [("id", false), ("payload", true)]
+            .into_iter()
             .enumerate()
             .map(|(index, (name, nullable))| SourceColumnDescriptor {
-                name: (*name).into(),
-                address: address(object, i32::try_from(index + 1).unwrap()),
+                name: name.into(),
+                address: address(object_id, i32::try_from(index + 1).unwrap()),
                 type_oid: 20,
-                nullable: *nullable,
+                nullable,
             })
             .collect(),
     }
 }
 
-fn identity(source: &SourceDescriptor, object: u32) -> IdentityIndexDescriptor {
+fn identity(source: &SourceDescriptor, object_id: u32) -> IdentityIndexDescriptor {
     IdentityIndexDescriptor {
-        address: address(object, 0),
+        address: address(object_id, 0),
         relation: source.relation,
         key_column: source.columns[0].address,
         key_arity: 1,
@@ -57,461 +47,484 @@ fn identity(source: &SourceDescriptor, object: u32) -> IdentityIndexDescriptor {
     }
 }
 
-#[test]
-fn singleton_graph_compiles_multiple_terminal_results_canonically() {
-    let source = source(1, 10_000, &[("id", false), ("payload", true)]);
-    let index = identity(&source, 11_000);
-    let spec = GraphSpecV1 {
-        version: GRAPH_SPEC_VERSION,
-        graph_id: GraphId::new(9).unwrap(),
-        sources: vec![source.source_id],
-        outputs: vec![
-            GraphOutputSpecV1::CountRows {
-                source_id: source.source_id,
-                aggregate_node_id: node(1),
-                result_node_id: node(2),
+fn name(value: &str) -> QueryExpressionV1 {
+    QueryExpressionV1::Column {
+        field: QueryFieldV1 {
+            input: 0,
+            selector: QuerySelectorV1::Name {
+                name: value.into(),
+                quoted: false,
             },
-            GraphOutputSpecV1::SumInt8 {
-                source_id: source.source_id,
-                input_column: "payload".into(),
-                aggregate_node_id: node(3),
-                result_node_id: node(4),
-            },
-            GraphOutputSpecV1::MaterializedProject {
-                source_id: source.source_id,
-                key_column: "id".into(),
-                value_column: "payload".into(),
-                project_node_id: node(5),
-                result_node_id: node(6),
-            },
-            GraphOutputSpecV1::GroupedCount {
-                source_id: source.source_id,
-                key_column: "id".into(),
-                key_node_id: node(7),
-                aggregate_node_id: node(8),
-                result_node_id: node(9),
-            },
-            GraphOutputSpecV1::GroupedSumInt8 {
-                source_id: source.source_id,
-                key_column: "id".into(),
-                input_column: "payload".into(),
-                key_node_id: node(10),
-                aggregate_node_id: node(11),
-                result_node_id: node(12),
-            },
-        ],
-    };
-    assert!(compile_graph(&spec, std::slice::from_ref(&source), &[]).is_err());
-    let first = compile_graph(
-        &spec,
-        std::slice::from_ref(&source),
-        std::slice::from_ref(&index),
-    )
-    .unwrap();
-    let second = compile_graph(
-        &spec,
-        std::slice::from_ref(&source),
-        std::slice::from_ref(&index),
-    )
-    .unwrap();
-    assert_eq!(first.canonical_payload, second.canonical_payload);
-    assert_eq!(first.digest, second.digest);
-    assert_eq!(first.nodes.len(), 12);
-    assert_eq!(first.graph_id, spec.graph_id);
-    assert_eq!(first.sources[0].identity_index, Some(index.address));
-    let json = spec.to_canonical_json().unwrap();
-    assert_eq!(GraphSpecV1::from_json(&json).unwrap(), spec);
-    let mut unknown = json;
-    unknown.pop();
-    unknown.extend_from_slice(br#","alias":true}"#);
-    assert!(GraphSpecV1::from_json(&unknown).is_err());
+        },
+    }
+}
+
+fn slot(value: u16) -> QueryExpressionV1 {
+    QueryExpressionV1::Column {
+        field: QueryFieldV1 {
+            input: 0,
+            selector: QuerySelectorV1::Slot { slot: value },
+        },
+    }
+}
+
+fn source_input(source_id: SourceId) -> Vec<QueryInputV1> {
+    vec![QueryInputV1::Source { source_id }]
+}
+
+fn node_input(node: u16) -> Vec<QueryInputV1> {
+    vec![QueryInputV1::Node { node }]
+}
+
+fn stateful(inputs: Vec<QueryInputV1>, operation: QueryOperationV1) -> QueryNodeV1 {
+    QueryNodeV1 {
+        inputs,
+        state_codec_version: Some(1),
+        operation,
+    }
+}
+
+fn stateless(inputs: Vec<QueryInputV1>, operation: QueryOperationV1) -> QueryNodeV1 {
+    QueryNodeV1 {
+        inputs,
+        state_codec_version: None,
+        operation,
+    }
+}
+
+fn scalar(input_node: u16) -> QueryResultV1 {
+    QueryResultV1 {
+        input_node,
+        shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+    }
+}
+
+fn keyed(input_node: u16) -> QueryResultV1 {
+    QueryResultV1 {
+        input_node,
+        shape: QueryResultShapeV1::Keyed {
+            key_slot: 0,
+            key_nullable: false,
+            value_slot: 1,
+            value_nullable: true,
+        },
+    }
 }
 
 #[test]
-fn join_requires_exact_effective_right_identity() {
-    let right = source(1, 20_000, &[("id", false), ("payload", true)]);
-    let left = source(2, 30_000, &[("id", false), ("right_key", true)]);
-    let index = identity(&right, 21_000);
-    let left_index = identity(&left, 31_000);
-    let spec = GraphSpecV1 {
-        version: 1,
-        graph_id: GraphId::new(10).unwrap(),
-        sources: vec![right.source_id, left.source_id],
-        outputs: vec![GraphOutputSpecV1::InnerJoin {
-            left_source_id: left.source_id,
-            right_source_id: right.source_id,
-            left_id_column: "id".into(),
-            left_right_key_column: "right_key".into(),
-            right_id_column: "id".into(),
-            right_payload_column: "payload".into(),
-            right_identity_index: index.address,
-            join_node_id: node(1),
-            result_node_id: node(2),
-        }],
+fn generic_query_preserves_all_single_source_graph_shapes() {
+    let source = source(1, 10_000);
+    let index = identity(&source, 11_000);
+    let spec = QuerySpecV1 {
+        version: QUERY_SPEC_VERSION,
+        graph_id: GraphId::new(9).unwrap(),
+        sources: vec![source.source_id],
+        nodes: vec![
+            stateful(source_input(source.source_id), QueryOperationV1::CountRows),
+            stateful(
+                source_input(source.source_id),
+                QueryOperationV1::SumInt8 {
+                    value: name("payload"),
+                },
+            ),
+            stateless(
+                source_input(source.source_id),
+                QueryOperationV1::Project {
+                    expressions: vec![name("id"), name("payload")],
+                },
+            ),
+            stateless(
+                source_input(source.source_id),
+                QueryOperationV1::KeyBy { key: name("id") },
+            ),
+            stateful(
+                node_input(4),
+                QueryOperationV1::GroupedCount {
+                    key: QueryFieldV1 {
+                        input: 0,
+                        selector: QuerySelectorV1::Slot { slot: 2 },
+                    },
+                },
+            ),
+            stateless(
+                source_input(source.source_id),
+                QueryOperationV1::KeyBy { key: name("id") },
+            ),
+            stateful(
+                node_input(6),
+                QueryOperationV1::GroupedSumInt8 {
+                    key: QueryFieldV1 {
+                        input: 0,
+                        selector: QuerySelectorV1::Slot { slot: 2 },
+                    },
+                    value: QueryFieldV1 {
+                        input: 0,
+                        selector: QuerySelectorV1::Slot { slot: 1 },
+                    },
+                },
+            ),
+        ],
+        results: vec![scalar(1), scalar(2), keyed(3), keyed(5), keyed(7)],
     };
-    let graph = compile_graph(
-        &spec,
-        &[right.clone(), left.clone()],
-        &[index.clone(), left_index.clone()],
-    )
-    .unwrap();
+    let graph = compile_query(&spec, &[source], &[index]).unwrap();
+    assert_eq!(graph.nodes.len(), 12);
+    assert_eq!(graph.nodes[0].node_id.get(), 1);
+    assert_eq!(graph.nodes[7].node_id.get(), 8);
+    assert_eq!(graph.result_contracts().count(), 5);
+    assert_eq!(
+        graph,
+        compile_query(
+            &spec,
+            &[graph_source(1, 10_000)],
+            &[identity(&graph_source(1, 10_000), 11_000)]
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn source_column_type_error_preserves_exact_catalog_coordinate() {
+    let mut source = source(1, 10_000);
+    source.columns.push(SourceColumnDescriptor {
+        name: "label".into(),
+        address: address(10_000, 3),
+        type_oid: 25,
+        nullable: true,
+    });
+    let spec = QuerySpecV1 {
+        version: QUERY_SPEC_VERSION,
+        graph_id: GraphId::new(10).unwrap(),
+        sources: vec![source.source_id],
+        nodes: vec![stateful(
+            source_input(source.source_id),
+            QueryOperationV1::SumInt8 {
+                value: name("label"),
+            },
+        )],
+        results: vec![scalar(1)],
+    };
+    assert_eq!(
+        compile_query(&spec, &[source.clone()], &[identity(&source, 11_000)]),
+        Err(CompilerError::WrongColumnType {
+            column: "label".into(),
+            type_oid: 25,
+        })
+    );
+}
+
+fn graph_source(id: u64, object_id: u32) -> SourceDescriptor {
+    source(id, object_id)
+}
+
+#[test]
+fn filter_compute_and_project_are_generic_nodes() {
+    let source = source(1, 10_000);
+    let index = identity(&source, 11_000);
+    let predicate = QueryExpressionV1::Greater {
+        left: Box::new(name("payload")),
+        right: Box::new(QueryExpressionV1::Int8Literal { value: 10 }),
+    };
+    let add = QueryExpressionV1::CheckedAdd {
+        left: Box::new(slot(1)),
+        right: Box::new(QueryExpressionV1::Int8Literal { value: 1 }),
+    };
+    let spec = QuerySpecV1 {
+        version: 1,
+        graph_id: GraphId::new(2).unwrap(),
+        sources: vec![source.source_id],
+        nodes: vec![
+            stateless(
+                source_input(source.source_id),
+                QueryOperationV1::Filter { predicate },
+            ),
+            stateless(
+                node_input(1),
+                QueryOperationV1::Compute {
+                    expressions: vec![add],
+                },
+            ),
+            stateless(
+                node_input(2),
+                QueryOperationV1::Project {
+                    expressions: vec![slot(0), slot(2)],
+                },
+            ),
+        ],
+        results: vec![keyed(3)],
+    };
+    let graph = compile_query(&spec, &[source], &[index]).unwrap();
+    assert!(matches!(
+        graph.nodes[0].kind,
+        OperatorNodeKind::Filter { .. }
+    ));
+    assert!(matches!(
+        graph.nodes[1].kind,
+        OperatorNodeKind::Compute { .. }
+    ));
+    assert!(matches!(
+        graph.nodes[2].kind,
+        OperatorNodeKind::Project { .. }
+    ));
+}
+
+#[test]
+fn join_binds_exact_effective_right_identity_without_recipe_oid() {
+    let left = source(1, 10_000);
+    let right = source(2, 20_000);
+    let left_index = identity(&left, 11_000);
+    let right_index = identity(&right, 21_000);
+    let field = |input, name: &str| QueryFieldV1 {
+        input,
+        selector: QuerySelectorV1::Name {
+            name: name.into(),
+            quoted: false,
+        },
+    };
+    let spec = QuerySpecV1 {
+        version: 1,
+        graph_id: GraphId::new(3).unwrap(),
+        sources: vec![left.source_id, right.source_id],
+        nodes: vec![stateful(
+            vec![
+                QueryInputV1::Source {
+                    source_id: left.source_id,
+                },
+                QueryInputV1::Source {
+                    source_id: right.source_id,
+                },
+            ],
+            QueryOperationV1::InnerJoin {
+                left_id: field(0, "id"),
+                left_key: field(0, "payload"),
+                right_id: field(1, "id"),
+                right_payload: field(1, "payload"),
+            },
+        )],
+        results: vec![keyed(1)],
+    };
+    let graph = compile_query(&spec, &[left, right], &[left_index, right_index.clone()]).unwrap();
+    assert_eq!(graph.sources[1].identity_index, Some(right_index.address));
     assert!(matches!(
         graph.nodes[0].kind,
         OperatorNodeKind::InnerJoin { .. }
     ));
-    assert_eq!(graph.sources[0].identity_index, Some(index.address));
-    assert_eq!(graph.sources[1].identity_index, Some(left_index.address));
-    let mut wrong_declared = spec.clone();
-    let GraphOutputSpecV1::InnerJoin {
-        right_identity_index,
-        ..
-    } = &mut wrong_declared.outputs[0]
-    else {
-        unreachable!()
-    };
-    *right_identity_index = left_index.address;
-    assert!(
-        compile_graph(
-            &wrong_declared,
-            &[right.clone(), left.clone()],
-            &[index.clone(), left_index.clone()]
-        )
-        .is_err()
-    );
-    let mut drift = index;
-    drift.effective_replica_identity = false;
-    assert!(compile_graph(&spec, &[right, left], &[drift, left_index]).is_err());
 }
 
 #[test]
-fn every_source_requires_one_exact_effective_identity() {
-    let source = source(1, 40_000, &[("id", false), ("payload", true)]);
-    let spec = GraphSpecV1 {
+fn strict_json_digest_and_input_selector_boundaries_fail_closed() {
+    let source = source(1, 10_000);
+    let index = identity(&source, 11_000);
+    let valid = QuerySpecV1 {
         version: 1,
-        graph_id: GraphId::new(11).unwrap(),
+        graph_id: GraphId::new(4).unwrap(),
         sources: vec![source.source_id],
-        outputs: vec![GraphOutputSpecV1::CountRows {
-            source_id: source.source_id,
-            aggregate_node_id: node(1),
-            result_node_id: node(2),
-        }],
+        nodes: vec![stateful(
+            source_input(source.source_id),
+            QueryOperationV1::CountRows,
+        )],
+        results: vec![scalar(1)],
     };
-    let valid = identity(&source, 41_000);
-    let graph = compile_graph(
-        &spec,
-        std::slice::from_ref(&source),
-        std::slice::from_ref(&valid),
-    )
-    .unwrap();
-    assert_eq!(graph.sources[0].identity_index, Some(valid.address));
-    let mut invalid = Vec::new();
-    let mut wrong_relation = valid.clone();
-    wrong_relation.relation = address(99_000, 0);
-    invalid.push(wrong_relation);
-    let mut wrong_key = valid.clone();
-    wrong_key.key_column = address(40_000, 2);
-    invalid.push(wrong_key);
-    for mutate in [
-        |index: &mut IdentityIndexDescriptor| index.unique = false,
-        |index: &mut IdentityIndexDescriptor| index.valid = false,
-        |index: &mut IdentityIndexDescriptor| index.ready = false,
-        |index: &mut IdentityIndexDescriptor| index.has_expression = true,
-        |index: &mut IdentityIndexDescriptor| index.has_predicate = true,
-        |index: &mut IdentityIndexDescriptor| index.effective_replica_identity = false,
-    ] {
-        let mut index = valid.clone();
-        mutate(&mut index);
-        invalid.push(index);
-    }
-    for index in invalid {
-        assert!(
-            compile_graph(
-                &spec,
-                std::slice::from_ref(&source),
-                std::slice::from_ref(&index)
-            )
-            .is_err()
-        );
-    }
-}
-
-#[test]
-fn only_zero_column_singleton_count_may_omit_identity() {
-    let empty = source(1, 45_000, &[]);
-    let count = GraphSpecV1 {
-        version: 1,
-        graph_id: GraphId::new(45).unwrap(),
-        sources: vec![empty.source_id],
-        outputs: vec![GraphOutputSpecV1::CountRows {
-            source_id: empty.source_id,
-            aggregate_node_id: node(1),
-            result_node_id: node(2),
-        }],
-    };
-    let graph =
-        compile_graph_with_optional_identities(&count, std::slice::from_ref(&empty), &[None])
-            .unwrap();
-    assert_eq!(graph.sources[0].identity_index, None);
-
-    let keyed = source(1, 46_000, &[("id", false)]);
-    assert!(
-        compile_graph_with_optional_identities(&count, &[keyed], &[None]).is_err(),
-        "an identity-free source with any durable column must fail closed"
-    );
-}
-
-#[test]
-fn bounded_pipeline_declarations_are_canonical_and_typed() {
-    let source = source(
-        1,
-        50_000,
-        &[("id", false), ("group_id", true), ("payload", true)],
-    );
-    let index = identity(&source, 51_000);
-    let spec = GraphSpecV1 {
-        version: 1,
-        graph_id: GraphId::new(12).unwrap(),
-        sources: vec![source.source_id],
-        outputs: vec![
-            GraphOutputSpecV1::ComputedProject {
-                source_id: source.source_id,
-                key_column: "id".into(),
-                input_column: "payload".into(),
-                literal: 5,
-                compute_node_id: node(1),
-                project_node_id: node(2),
-                result_node_id: node(3),
-            },
-            GraphOutputSpecV1::FilteredGroupedCount {
-                source_id: source.source_id,
-                filter_column: "payload".into(),
-                greater_than: 10,
-                group_key_column: "group_id".into(),
-                filter_node_id: node(4),
-                project_node_id: node(5),
-                key_node_id: node(6),
-                aggregate_node_id: node(7),
-                result_node_id: node(8),
-            },
-            GraphOutputSpecV1::FilteredGroupedSumInt8 {
-                source_id: source.source_id,
-                filter_column: "payload".into(),
-                greater_than: 10,
-                group_key_column: "group_id".into(),
-                input_column: "payload".into(),
-                filter_node_id: node(9),
-                project_node_id: node(10),
-                key_node_id: node(11),
-                aggregate_node_id: node(12),
-                result_node_id: node(13),
-            },
-        ],
-    };
-    let graph = compile_graph(
-        &spec,
-        std::slice::from_ref(&source),
-        std::slice::from_ref(&index),
-    )
-    .unwrap();
-    assert!(matches!(
-        graph.nodes[0].kind,
-        OperatorNodeKind::Compute { .. }
-    ));
-    assert!(matches!(
-        graph.nodes[3].kind,
-        OperatorNodeKind::Filter { .. }
-    ));
-    assert!(matches!(
-        graph.nodes[4].kind,
-        OperatorNodeKind::Project { .. }
-    ));
-    assert!(matches!(
-        graph.nodes[5].kind,
-        OperatorNodeKind::KeyBy { .. }
-    ));
+    let bytes = valid.to_canonical_json().unwrap();
+    assert_eq!(QuerySpecV1::from_json(&bytes).unwrap(), valid);
     assert_eq!(
-        GraphSpecV1::from_json(&spec.to_canonical_json().unwrap()).unwrap(),
-        spec
+        valid.canonical_digest().unwrap(),
+        valid.canonical_digest().unwrap()
     );
+    let mut unknown = bytes.clone();
+    unknown.pop();
+    unknown.extend_from_slice(b",\"alias\":1}");
+    assert!(QuerySpecV1::from_json(&unknown).is_err());
+
+    let invalid = QuerySpecV1 {
+        nodes: vec![stateful(
+            source_input(source.source_id),
+            QueryOperationV1::SumInt8 { value: slot(1) },
+        )],
+        ..valid.clone()
+    };
+    assert_eq!(
+        compile_query(
+            &invalid,
+            std::slice::from_ref(&source),
+            std::slice::from_ref(&index),
+        ),
+        Err(CompilerError::InvalidSpec)
+    );
+    let forward = br#"{"version":1,"graph_id":4,"sources":[1],"nodes":[{"inputs":[{"input":"node","node":1}],"state_codec_version":1,"operation":{"operation":"count_rows"}}],"results":[{"input_node":1,"shape":{"shape":"scalar","value_slot":0}}]}"#;
+    assert!(QuerySpecV1::from_json(forward).is_err());
+    assert!(compile_query_with_optional_identities(&valid, &[source], &[None]).is_err());
 }
 
 #[test]
-fn computed_project_checks_arithmetic_and_preserves_null() {
-    let source = source(1, 60_000, &[("id", false), ("payload", true)]);
-    let index = identity(&source, 61_000);
-    let spec = GraphSpecV1 {
+fn identity_free_zero_column_count_remains_the_only_exception() {
+    let source = SourceDescriptor {
+        source_id: SourceId::new(1).unwrap(),
+        relation: address(10_000, 0),
+        columns: vec![],
+    };
+    let spec = QuerySpecV1 {
         version: 1,
-        graph_id: GraphId::new(13).unwrap(),
+        graph_id: GraphId::new(5).unwrap(),
         sources: vec![source.source_id],
-        outputs: vec![GraphOutputSpecV1::ComputedProject {
-            source_id: source.source_id,
-            key_column: "id".into(),
-            input_column: "payload".into(),
-            literal: 1,
-            compute_node_id: node(1),
-            project_node_id: node(2),
-            result_node_id: node(3),
-        }],
+        nodes: vec![stateful(
+            source_input(source.source_id),
+            QueryOperationV1::CountRows,
+        )],
+        results: vec![scalar(1)],
     };
-    let graph = compile_graph(
-        &spec,
-        std::slice::from_ref(&source),
-        std::slice::from_ref(&index),
-    )
-    .unwrap();
-    let layout = source_typed_layout(source.source_id, &graph.sources[0].layout).unwrap();
-    let row = |id, value| TypedRow::new(&layout, vec![TypedValue::Int8(id), value]).unwrap();
-    let batch = |value| DeltaBatch {
-        origin: EffectOrigin::Bootstrap(
-            BootstrapBatchId::new(BootstrapId::new(1).unwrap(), 1).unwrap(),
-        ),
-        layout_identity: layout.identity,
-        rows: vec![RowDelta {
-            before: None,
-            after: Some(row(1, value)),
-        }],
-    };
-    assert!(matches!(
-        apply_graph(&graph, &batch(TypedValue::Int8(4))).unwrap().results[0],
-        ResultDelta::Keyed { ref mutations, .. }
-            if matches!(mutations[0], shiba_operator::ResultMutation::Upsert { value: TypedValue::Int8(5), .. })
-    ));
-    assert!(matches!(
-        apply_graph(&graph, &batch(TypedValue::Null(ValueType::Int8))).unwrap().results[0],
-        ResultDelta::Keyed { ref mutations, .. }
-            if matches!(mutations[0], shiba_operator::ResultMutation::Upsert { value: TypedValue::Null(ValueType::Int8), .. })
-    ));
-    assert!(apply_graph(&graph, &batch(TypedValue::Int8(i64::MAX))).is_err());
+    assert!(compile_query_with_optional_identities(&spec, &[source], &[None]).is_ok());
 }
 
-fn filtered_spec(source_id: SourceId) -> GraphSpecV1 {
-    GraphSpecV1 {
+fn add_chain(mut expression: QueryExpressionV1, depth: usize) -> QueryExpressionV1 {
+    for _ in 0..depth {
+        expression = QueryExpressionV1::CheckedAdd {
+            left: Box::new(expression),
+            right: Box::new(QueryExpressionV1::Int8Literal { value: 1 }),
+        };
+    }
+    expression
+}
+
+fn boolean_predicate() -> QueryExpressionV1 {
+    let comparison = || QueryExpressionV1::Equal {
+        left: Box::new(slot(0)),
+        right: Box::new(QueryExpressionV1::Int8Literal { value: 1 }),
+    };
+    QueryExpressionV1::And {
+        left: Box::new(comparison()),
+        right: Box::new(comparison()),
+    }
+}
+
+fn bounded_spec() -> QuerySpecV1 {
+    let source_id = SourceId::new(1).unwrap();
+    QuerySpecV1 {
         version: 1,
-        graph_id: GraphId::new(14).unwrap(),
+        graph_id: GraphId::new(6).unwrap(),
         sources: vec![source_id],
-        outputs: vec![
-            GraphOutputSpecV1::FilteredGroupedCount {
-                source_id,
-                filter_column: "payload".into(),
-                greater_than: 10,
-                group_key_column: "group_id".into(),
-                filter_node_id: node(1),
-                project_node_id: node(2),
-                key_node_id: node(3),
-                aggregate_node_id: node(4),
-                result_node_id: node(5),
+        nodes: vec![stateless(
+            source_input(source_id),
+            QueryOperationV1::Project {
+                expressions: vec![name("id")],
             },
-            GraphOutputSpecV1::FilteredGroupedSumInt8 {
-                source_id,
-                filter_column: "payload".into(),
-                greater_than: 10,
-                group_key_column: "group_id".into(),
-                input_column: "payload".into(),
-                filter_node_id: node(6),
-                project_node_id: node(7),
-                key_node_id: node(8),
-                aggregate_node_id: node(9),
-                result_node_id: node(10),
+        )],
+        results: vec![QueryResultV1 {
+            input_node: 1,
+            shape: QueryResultShapeV1::Keyed {
+                key_slot: 0,
+                key_nullable: false,
+                value_slot: 0,
+                value_nullable: false,
             },
-        ],
+        }],
     }
 }
 
 #[test]
-fn filtered_grouped_pipelines_match_reference_rows() {
-    let source = source(
-        1,
-        70_000,
-        &[("id", false), ("group_id", true), ("payload", true)],
-    );
-    let index = identity(&source, 71_000);
-    let spec = filtered_spec(source.source_id);
-    let graph = compile_graph(
-        &spec,
-        std::slice::from_ref(&source),
-        std::slice::from_ref(&index),
-    )
-    .unwrap();
-    let layout = source_typed_layout(source.source_id, &graph.sources[0].layout).unwrap();
-    let batch_id = BootstrapBatchId::new(BootstrapId::new(1).unwrap(), 1).unwrap();
-    let rows = [
-        (1, 1, Some(5)),
-        (2, 1, Some(20)),
-        (3, 2, None),
-        (4, 2, Some(30)),
-    ]
-    .into_iter()
-    .map(|(id, group, payload)| RowDelta {
-        before: None,
-        after: Some(
-            TypedRow::new(
-                &layout,
-                vec![
-                    TypedValue::Int8(id),
-                    TypedValue::Int8(group),
-                    payload.map_or(TypedValue::Null(ValueType::Int8), TypedValue::Int8),
-                ],
-            )
-            .unwrap(),
-        ),
-    })
-    .collect();
-    let input = MultiInputBatch {
-        origin: GraphEffectOrigin::Bootstrap(batch_id),
-        sources: vec![SourceDeltaBatch {
-            source_id: source.source_id,
-            delta: DeltaBatch {
-                origin: EffectOrigin::Bootstrap(batch_id),
-                layout_identity: layout.identity,
-                rows,
+fn expression_depth_fails_before_encoding() {
+    let base = bounded_spec();
+    let source_id = base.sources[0];
+    let too_deep = QuerySpecV1 {
+        nodes: vec![stateless(
+            source_input(source_id),
+            QueryOperationV1::Project {
+                expressions: vec![add_chain(name("id"), 32)],
+            },
+        )],
+        ..base.clone()
+    };
+    assert!(too_deep.to_canonical_json().is_err());
+}
+
+#[test]
+fn query_wide_expression_count_fails_before_encoding() {
+    let base = bounded_spec();
+    let source_id = base.sources[0];
+    let mut many_expressions = Vec::new();
+    for index in 0..31u16 {
+        let inputs = if index == 0 {
+            source_input(source_id)
+        } else {
+            node_input(index)
+        };
+        many_expressions.push(stateless(
+            inputs,
+            QueryOperationV1::Compute {
+                expressions: vec![add_chain(slot(0), 4), add_chain(slot(0), 4)],
+            },
+        ));
+    }
+    let expression_bound = QuerySpecV1 {
+        nodes: many_expressions,
+        results: vec![QueryResultV1 {
+            input_node: 31,
+            shape: QueryResultShapeV1::Keyed {
+                key_slot: 0,
+                key_nullable: false,
+                value_slot: 1,
+                value_nullable: false,
             },
         }],
+        ..base.clone()
     };
-    let reads = graph_state_read_set(&graph, &input).unwrap();
-    let snapshot = StateSnapshot::new(
-        &reads,
-        reads
-            .keys
-            .iter()
-            .map(|key| StateEntry {
-                key: key.clone(),
-                state: None,
-            })
-            .collect(),
-    )
-    .unwrap();
-    let transition = apply_graph_plan(&graph, &snapshot, &input).unwrap();
-    assert_eq!(transition.results.len(), 2);
-    assert_eq!(
-        transition.results[0],
-        ResultDelta::Keyed {
-            node_id: node(5),
-            mutations: vec![
-                ResultMutation::Upsert {
-                    key: TypedValue::Int8(1),
-                    value: TypedValue::Int8(1),
-                },
-                ResultMutation::Upsert {
-                    key: TypedValue::Int8(2),
-                    value: TypedValue::Int8(1),
-                },
-            ],
-        }
-    );
-    assert_eq!(
-        transition.results[1],
-        ResultDelta::Keyed {
-            node_id: node(10),
-            mutations: vec![
-                ResultMutation::Upsert {
-                    key: TypedValue::Int8(1),
-                    value: TypedValue::Int8(20),
-                },
-                ResultMutation::Upsert {
-                    key: TypedValue::Int8(2),
-                    value: TypedValue::Int8(30),
-                },
-            ],
-        }
-    );
+    assert!(expression_bound.to_canonical_json().is_err());
+}
+
+#[test]
+fn query_wide_boolean_count_fails_before_encoding() {
+    let base = bounded_spec();
+    let source_id = base.sources[0];
+    let mut boolean_nodes = Vec::new();
+    for index in 0..22u16 {
+        boolean_nodes.push(stateless(
+            if index == 0 {
+                source_input(source_id)
+            } else {
+                node_input(index)
+            },
+            QueryOperationV1::Filter {
+                predicate: boolean_predicate(),
+            },
+        ));
+    }
+    let boolean_bound = QuerySpecV1 {
+        nodes: boolean_nodes,
+        results: vec![keyed(22)],
+        ..base.clone()
+    };
+    assert!(boolean_bound.to_canonical_json().is_err());
+}
+
+#[test]
+fn logical_name_bounds_and_normalization_fail_before_encoding() {
+    let base = bounded_spec();
+    let source_id = base.sources[0];
+    let invalid_name = QuerySpecV1 {
+        nodes: vec![stateless(
+            source_input(source_id),
+            QueryOperationV1::Project {
+                expressions: vec![name("")],
+            },
+        )],
+        ..base
+    };
+    assert!(invalid_name.to_canonical_json().is_err());
+    let unnormalized = QuerySpecV1 {
+        nodes: vec![stateless(
+            source_input(source_id),
+            QueryOperationV1::Project {
+                expressions: vec![QueryExpressionV1::Column {
+                    field: QueryFieldV1 {
+                        input: 0,
+                        selector: QuerySelectorV1::Name {
+                            name: "Payload".into(),
+                            quoted: false,
+                        },
+                    },
+                }],
+            },
+        )],
+        ..invalid_name
+    };
+    assert!(unnormalized.to_canonical_json().is_err());
 }

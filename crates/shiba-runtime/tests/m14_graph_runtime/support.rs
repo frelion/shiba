@@ -1,7 +1,4 @@
-use std::num::NonZeroU32;
-
 use postgres::Client;
-use shiba_operator::NodeId;
 
 use crate::support::PgoutputCapture;
 
@@ -17,10 +14,6 @@ pub(crate) const JOIN: PgoutputCapture = PgoutputCapture {
     slot: "shiba_m14_join_slot",
     publication: "shiba_m14_join_pub",
 };
-
-pub(crate) fn node(value: u32) -> NodeId {
-    NodeId::new(NonZeroU32::new(value).expect("node ID"))
-}
 
 pub(crate) fn oid(client: &mut Client, object: &str) -> u32 {
     u32::try_from(

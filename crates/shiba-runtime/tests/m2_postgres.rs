@@ -35,7 +35,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2),
                 (SELECT state_payload FROM shiba_internal.graph_node_state
                  WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
@@ -122,7 +122,7 @@ fn prove_permissions(client: &mut Client) {
         .expect("assume ordinary role");
     let visible_count: i64 = client
         .query_one(
-            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001",
+            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2",
             &[],
         )
         .expect("ordinary role can query result")
@@ -131,7 +131,7 @@ fn prove_permissions(client: &mut Client) {
     assert!(
         client
             .execute(
-                "UPDATE shiba.graph_result SET value_bigint = 0 WHERE graph_id = 1 AND result_id = 1001",
+                "UPDATE shiba.graph_result SET value_bigint = 0 WHERE graph_id = 1 AND result_id = 2",
                 &[],
             )
             .is_err()

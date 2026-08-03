@@ -1,7 +1,7 @@
 use core::fmt;
 
 use postgres::{Client, Transaction};
-use shiba_compiler::{CompilerError, GraphSpecV1, compile_graph};
+use shiba_compiler::{CompilerError, QuerySpecV1, compile_query};
 use shiba_operator::{OperatorGraph, OutputContract, TypedValue, ValueType};
 use shiba_protocol::{GraphId, SourceId};
 
@@ -68,7 +68,7 @@ impl From<postgres::Error> for RegistrationError {
 /// Fails closed if a source binding, compiler contract, or authority write fails.
 pub fn compile_and_register(
     client: &mut Client,
-    spec: &GraphSpecV1,
+    spec: &QuerySpecV1,
 ) -> Result<OperatorGraph, RegistrationError> {
     let mut transaction = client.transaction()?;
     let graph = compile_current(&mut transaction, spec)?;
@@ -96,7 +96,7 @@ pub fn compile_rebuild_graph(
         )?
         .ok_or(M2Error::InvalidOperatorDefinition)?
         .get(0);
-    let spec = GraphSpecV1::from_json(&payload).map_err(|_| CompilerError::InvalidSpec)?;
+    let spec = QuerySpecV1::from_json(&payload).map_err(|_| CompilerError::InvalidSpec)?;
     if spec.graph_id != graph_id
         || spec
             .to_canonical_json()
@@ -121,7 +121,7 @@ pub fn compile_rebuild_graph(
         descriptors.push(descriptor);
         indexes.push(identity);
     }
-    let graph = compile_graph(&spec, &descriptors, &indexes)?;
+    let graph = compile_query(&spec, &descriptors, &indexes)?;
     Ok(RebuildGraphArtifact {
         spec_payload: payload,
         graph_payload: graph.canonical_payload.clone(),
@@ -132,7 +132,7 @@ pub fn compile_rebuild_graph(
 
 fn compile_current(
     transaction: &mut Transaction<'_>,
-    spec: &GraphSpecV1,
+    spec: &QuerySpecV1,
 ) -> Result<OperatorGraph, RegistrationError> {
     let mut descriptors = Vec::with_capacity(spec.sources.len());
     let mut indexes = Vec::new();
@@ -142,7 +142,7 @@ fn compile_current(
         descriptors.push(descriptor);
         indexes.push(identity);
     }
-    Ok(shiba_compiler::compile_graph_with_optional_identities(
+    Ok(shiba_compiler::compile_query_with_optional_identities(
         spec,
         &descriptors,
         &indexes,
@@ -151,7 +151,7 @@ fn compile_current(
 
 fn insert_graph(
     transaction: &mut Transaction<'_>,
-    spec: &GraphSpecV1,
+    spec: &QuerySpecV1,
     graph: &OperatorGraph,
     status: &str,
 ) -> Result<(), RegistrationError> {
@@ -163,7 +163,7 @@ fn insert_graph(
         "INSERT INTO shiba_internal.graph_definition (
              graph_id, source_count, compiler_version, spec_payload,
              graph_format_version, graph_payload, graph_digest, state_codec_version)
-         VALUES ($1, $2, 1, $3, $4, $5, $6, 1)",
+         VALUES ($1, $2, 2, $3, $4, $5, $6, 1)",
         &[
             &graph_id,
             &i16::try_from(graph.sources.len()).map_err(|_| M2Error::InvalidOperatorDefinition)?,

@@ -76,7 +76,7 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
         .expect("restore exact receiver read privilege");
     let active_value: Option<i64> = admin
         .query_one(
-            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2",
+            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 4",
             &[],
         )
         .expect("read unchanged old result")

@@ -11,7 +11,8 @@ PostgreSQL, own transactions, or learn parser AST types.
 The flow is:
 
 ```text
-SQL text -> bounded parser -> QuerySpecV1 -> catalog binder
+SQL text -> bounded parser -> ephemeral UnboundQuery
+         -> catalog binder -> canonical QuerySpecV1
          -> ObjectAddress-bound OperatorGraph -> atomic registration
          -> existing bootstrap/live/rebuild/Runtime/Result Sink
 ```
@@ -264,8 +265,10 @@ types do not enter Operator, Runtime, Ingress or durable graph payloads.
 ## Non-goals and unproved boundary
 
 M15 does not implement general PostgreSQL SQL, mutation/DDL, arbitrary
-expressions/functions, implicit casts, output naming, SQL result execution,
+expressions/functions, implicit casts, durable output naming, SQL result execution,
 outer/three-table joins, windows, DISTINCT, Min/Max/Avg, HAVING, subqueries,
 parameters, prepared statements, views, permissions inferred from SQL,
 scheduler, plugins, remote databases or cross-host failover. M15.1 freezes this
-contract only; parser implementation and PG17/18 evidence remain M15.2+ work.
+contract. M15.2 completed the generic QuerySpec cutover in
+Compiler/registration/rebuild, but SQL parsing, unbound lowering and their
+PG17/18 evidence remain later work.

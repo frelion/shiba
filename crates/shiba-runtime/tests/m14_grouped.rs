@@ -1,8 +1,8 @@
-use std::num::NonZeroU32;
-
 use postgres::{Client, NoTls};
-use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
-use shiba_operator::NodeId;
+use shiba_compiler::{
+    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
+    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+};
 use shiba_protocol::{GraphId, SlotGeneration, SourceId};
 use shiba_runtime::{
     M2Error, PgoutputSource, ProcessOutcome, compile_and_register, decode_committed_changes,
@@ -25,41 +25,77 @@ const CAPTURE: PgoutputCapture = PgoutputCapture {
     publication: "shiba_m14_grouped_pub",
 };
 
-fn node(value: u32) -> NodeId {
-    NodeId::new(NonZeroU32::new(value).expect("node ID"))
-}
-
-fn spec() -> GraphSpecV1 {
+fn spec() -> QuerySpecV1 {
     let source_id = SourceId::new(1).expect("source ID");
-    GraphSpecV1 {
-        version: GRAPH_SPEC_VERSION,
+    let source = || QueryInputV1::Source { source_id };
+    let key_by = |name: &str| QueryNodeV1 {
+        inputs: vec![source()],
+        state_codec_version: None,
+        operation: QueryOperationV1::KeyBy {
+            key: QueryExpressionV1::Column {
+                field: name_field(name),
+            },
+        },
+    };
+    QuerySpecV1 {
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(1).expect("graph ID"),
         sources: vec![source_id],
-        outputs: vec![
-            GraphOutputSpecV1::GroupedCount {
-                source_id,
-                key_column: "payload".into(),
-                key_node_id: node(1),
-                aggregate_node_id: node(2),
-                result_node_id: node(102),
+        nodes: vec![
+            key_by("payload"),
+            QueryNodeV1 {
+                inputs: vec![QueryInputV1::Node { node: 1 }],
+                state_codec_version: Some(1),
+                operation: QueryOperationV1::GroupedCount { key: slot_field(2) },
             },
-            GraphOutputSpecV1::GroupedSumInt8 {
-                source_id,
-                key_column: "payload".into(),
-                input_column: "id".into(),
-                key_node_id: node(4),
-                aggregate_node_id: node(5),
-                result_node_id: node(105),
+            key_by("payload"),
+            QueryNodeV1 {
+                inputs: vec![QueryInputV1::Node { node: 3 }],
+                state_codec_version: Some(1),
+                operation: QueryOperationV1::GroupedSumInt8 {
+                    key: slot_field(2),
+                    value: slot_field(0),
+                },
             },
-            GraphOutputSpecV1::GroupedSumInt8 {
-                source_id,
-                key_column: "id".into(),
-                input_column: "payload".into(),
-                key_node_id: node(7),
-                aggregate_node_id: node(8),
-                result_node_id: node(108),
+            key_by("id"),
+            QueryNodeV1 {
+                inputs: vec![QueryInputV1::Node { node: 5 }],
+                state_codec_version: Some(1),
+                operation: QueryOperationV1::GroupedSumInt8 {
+                    key: slot_field(2),
+                    value: slot_field(1),
+                },
             },
         ],
+        results: (2..=6)
+            .step_by(2)
+            .map(|input_node| QueryResultV1 {
+                input_node,
+                shape: QueryResultShapeV1::Keyed {
+                    key_slot: 0,
+                    key_nullable: input_node != 6,
+                    value_slot: 1,
+                    value_nullable: input_node == 6,
+                },
+            })
+            .collect(),
+    }
+}
+
+fn name_field(name: &str) -> QueryFieldV1 {
+    QueryFieldV1 {
+        input: 0,
+        selector: QuerySelectorV1::Name {
+            name: name.into(),
+            quoted: false,
+        },
+    }
+}
+
+fn slot_field(slot: u16) -> QueryFieldV1 {
+    QueryFieldV1 {
+        input: 0,
+        selector: QuerySelectorV1::Slot { slot },
     }
 }
 
@@ -104,7 +140,7 @@ fn prove_permissions(client: &mut Client) {
     assert!(
         client
             .execute(
-                "UPDATE shiba.graph_result SET value_bigint = 0 WHERE graph_id = 1 AND result_id = 102",
+                "UPDATE shiba.graph_result SET value_bigint = 0 WHERE graph_id = 1 AND result_id = 7",
                 &[],
             )
             .is_err()
@@ -177,7 +213,7 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
         .query_one(
             "SELECT result_value_bigint, result_key_is_null, result_value_is_null
              FROM shiba.graph_result_rows
-             WHERE graph_id = 1 AND result_id = 102 AND result_key_is_null",
+             WHERE graph_id = 1 AND result_id = 7 AND result_key_is_null",
             &[],
         )
         .expect("query NULL group count");
@@ -193,7 +229,7 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
         .query_one(
             "SELECT result_value_bigint, result_value_is_null
              FROM shiba.graph_result_rows
-             WHERE graph_id = 1 AND result_id = 108 AND result_key_bigint = 3",
+             WHERE graph_id = 1 AND result_id = 9 AND result_key_bigint = 3",
             &[],
         )
         .expect("query all-NULL SUM group");
@@ -235,7 +271,7 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
     let deleted_group: i64 = client
         .query_one(
             "SELECT count(*) FROM shiba.graph_result_rows
-             WHERE graph_id = 1 AND result_id IN (102, 105) AND result_key_bigint = 10",
+             WHERE graph_id = 1 AND result_id IN (7, 8) AND result_key_bigint = 10",
             &[],
         )
         .expect("query deleted empty group")
@@ -248,18 +284,18 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
         "INSERT INTO source.events VALUES (5,20)",
         "overflow.pgoutput",
     );
-    let operator2 = node_state_payload(&mut client, 5, 20);
+    let operator2 = node_state_payload(&mut client, 4, 20);
     let mut overflow = 2_i64.to_be_bytes().to_vec();
     overflow.extend_from_slice(&2_i64.to_be_bytes());
     overflow.extend_from_slice(&i64::MAX.to_be_bytes());
-    set_node_state_payload(&mut client, 5, 20, &overflow);
+    set_node_state_payload(&mut client, 4, 20, &overflow);
     let before_overflow = durable_snapshot(&mut client);
     assert!(matches!(
         process(&mut client, &overflow_input),
         Err(M2Error::Kernel(_))
     ));
     assert_eq!(durable_snapshot(&mut client), before_overflow);
-    set_node_state_payload(&mut client, 5, 20, &operator2);
+    set_node_state_payload(&mut client, 4, 20, &operator2);
     apply_once(&mut client, &overflow_input);
 
     let corrupt_input = capture(
@@ -268,15 +304,15 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
         "UPDATE source.events SET payload = 21 WHERE id = 5",
         "corrupt-state.pgoutput",
     );
-    let operator3 = node_state_payload(&mut client, 8, 5);
-    set_node_state_payload(&mut client, 8, 5, &[0]);
+    let operator3 = node_state_payload(&mut client, 6, 5);
+    set_node_state_payload(&mut client, 6, 5, &[0]);
     let before_corrupt = durable_snapshot(&mut client);
     assert!(matches!(
         process(&mut client, &corrupt_input),
         Err(M2Error::Kernel(_))
     ));
     assert_eq!(durable_snapshot(&mut client), before_corrupt);
-    set_node_state_payload(&mut client, 8, 5, &operator3);
+    set_node_state_payload(&mut client, 6, 5, &operator3);
     apply_once(&mut client, &corrupt_input);
     let after_retry = durable_snapshot(&mut client);
     assert_eq!(
