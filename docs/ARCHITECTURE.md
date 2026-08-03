@@ -1,5 +1,24 @@
 # Architecture boundary
 
+## M16.1 contract and reference extension
+
+M16.1 freezes, but does not implement, the generic aggregate ABI and wide
+result boundary in [AGGREGATE_FUNCTION_CONTRACT.md](AGGREGATE_FUNCTION_CONTRACT.md).
+CountStar, Count(nullable `int8`), SumInt8, MinInt8 and MaxInt8 are closed
+function descriptors owned
+by `shiba-operator`; Compiler consumes descriptors and Runtime schedules only
+generic state reads/transitions/result deltas. A canonical `ResultSchemaV1`
+describes scalar or keyed rows of at most 16 typed fields, and HAVING is an
+old/new row visibility transition. No function dispatch may enter Runtime,
+Catalog, Ingress, Bootstrap, Rebuild or the sink.
+
+This is an intended in-place evolution of the single QuerySpec/OperatorGraph,
+state/result and lifecycle authorities. Its database-free test-only reference
+model proves the frozen function/state/result semantics but adds no production
+implementation, second registry, persistent intermediate delta, dual write or
+compatibility path. M15 remains the latest implemented and release-proved
+architecture.
+
 M15.1 freezes a bounded SQL declaration frontend in
 [SQL_FRONTEND_CONTRACT.md](SQL_FRONTEND_CONTRACT.md) and
 [ADR 0007](adr/0007-m15-sql-frontend.md). Raw SQL and parser AST are ephemeral;

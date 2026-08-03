@@ -1,5 +1,18 @@
 # M15 SQL frontend and QuerySpec contract
 
+## M16.1 planned aggregate frontend extension
+
+M15's implemented aggregate subset remains unchanged. M16.1 freezes the next
+lowering boundary: admitted CountStar, Count(nullable `int8`), SumInt8, MinInt8
+and MaxInt8 calls map to
+closed aggregate descriptors and deterministic call identities. An output
+alias becomes the durable public ResultSchema field name and participates in
+QuerySpec/schema/graph digests, but does not change aggregate call identity;
+grouped HAVING refers to typed aggregate call results.
+SQL recipes never enter Runtime or Catalog execution authority. Parsing,
+binding, compilation and PG17.10/PG18.4 lifecycle proof for this extension are
+not part of the M16.1 contract/reference slice.
+
 ## Scope
 
 M15 adds one bounded SQL declaration frontend to the M14 Operator Graph. It is

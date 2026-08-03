@@ -1,5 +1,18 @@
 # M15 QuerySpecV1 contract
 
+## M16.1 planned declaration extension
+
+M16.1 freezes a future strict QuerySpec extension in which each normalized
+aggregate expression has one deterministic `AggregateCallId` and one closed,
+versioned function descriptor. Repeated semantically identical calls are
+interned once; result fields and HAVING refer to call identity, never to SQL
+text, aliases or runtime recipes. Compiler resolves this declaration into the
+same sole OperatorGraph authority and canonical `ResultSchemaV1`.
+
+This extension is not implemented in M16.1. The current M15 QuerySpec codec and
+production authority remain unchanged until a later clean-room cutover; no
+parallel decoder, adapter or dual format is authorized.
+
 ## M15 declaration cutover and completion status
 
 M15.2 replaced the complete-query `GraphSpecV1`/

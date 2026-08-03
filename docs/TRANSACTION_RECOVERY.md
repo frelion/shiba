@@ -1,5 +1,20 @@
 # Transaction and recovery contract
 
+## M16.1 planned aggregate recovery boundary
+
+M16.1 does not change the proven transaction or ACK rule. A future aggregate
+execution locks generic exact/range state reads in deterministic node/key
+order, computes one deterministic transition, persists all state and wide
+result deltas, writes continuation last, commits, and only then authorizes ACK.
+Descriptor, plan, state, schema or row decode failure; arithmetic/retraction
+error; bound violation; sink failure; or backend failure rolls the entire graph
+transaction back. MIN/MAX ordered reads are bounded transaction inputs, never
+a persistent EffectStream or second recovery authority.
+
+Bootstrap and rebuild must load the same canonical graph/schema and use the
+same generic Runtime entry. These M16 behaviors are frozen here but remain
+unimplemented and unproved after M16.1.
+
 ## M14.6 graph transaction and recovery boundary
 
 One PostgreSQL transaction is now the unit of graph computation. Runtime locks

@@ -1,5 +1,23 @@
 # V2 goal gap after M15
 
+## M16.1 contract and reference status
+
+M16.1 freezes one closed aggregate descriptor ABI
+for CountStar, Count(nullable `int8`), SumInt8, MinInt8 and MaxInt8, exact
+semantic call interning,
+generic ordered candidate-state reads for retractable MIN/MAX, a canonical
+wide `ResultSchemaV1`/typed row codec and old/new HAVING visibility deltas.
+Concrete dispatch remains inside `shiba-operator`; Compiler, Runtime, Catalog,
+Ingress, Bootstrap, Rebuild and Result Sink must remain function-independent.
+Twelve database-free reference tests prove the frozen CountStar/Count/Sum/Min/
+Max, grouped/HAVING, corruption, randomized I/U/D and exact-bound semantics.
+
+None of the M16 production or PostgreSQL cutover is yet proved: MIN/MAX execution and
+retraction, multiple aggregate calls, grouped HAVING, wide Catalog/result
+persistence, lifecycle recovery, PG17.10/PG18.4 differential evidence and the
+frozen M16 performance limits remain open. M15 is still the latest implemented
+and release-proved boundary.
+
 ## M15.1--M15.7 SQL frontend status
 
 The bounded SQL `SELECT` parser emits an ephemeral `UnboundQuery`. M15.4 now

@@ -316,3 +316,21 @@ M15 is complete at its declared bounded SQL frontend and generic declaration
 scope. This is not completion of V2: general PostgreSQL SQL, broader operators
 and result types, cross-host failover, automatic receiver supervision and
 long-running production soak remain outside the proved boundary.
+
+## M16.1 generic aggregates and wide results
+
+M16.1 freezes the next contract boundary and adds a database-free, test-only
+reference model; it does not implement production behavior. The
+[aggregate function contract](AGGREGATE_FUNCTION_CONTRACT.md) and
+[ADR 0008](adr/0008-m16-aggregate-abi-wide-results.md) define a versioned,
+database-free aggregate ABI for CountStar, Count(nullable `int8`), SumInt8,
+MinInt8 and MaxInt8, exact
+aggregate-call identity, generic ordered state reads, canonical result schemas
+with at most 16 typed fields, and old/new HAVING visibility transitions.
+
+Only `shiba-operator` may dispatch concrete aggregate functions. Compiler
+consumes descriptors, while Runtime, Catalog, Ingress, Bootstrap, Rebuild and
+the Result Sink remain function-independent. Twelve pure reference tests prove
+the frozen semantics, codec rejection and exact bounds. M16.1 adds no
+production path, Catalog schema, PostgreSQL evidence or compatibility
+authority; those remain the work of subsequent M16 implementation slices.

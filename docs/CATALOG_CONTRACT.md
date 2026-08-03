@@ -1,5 +1,19 @@
 # Catalog contract
 
+## M16.1 planned wide-result authority
+
+M16.1 has contract and database-free reference evidence only. A later
+clean-room cutover may replace the current
+scalar/key/value result shape in place with one canonical `ResultSchemaV1`
+digest and typed scalar/keyed rows of at most 16 fields. The existing graph
+definition, node state, result and lifecycle tables remain the only authority;
+MIN/MAX candidate multiplicities belong to generic graph node state, not a new
+aggregate registry or cache. Runtime remains the sole state/result writer.
+
+M16.1 changes no SQL schema. A later implementation must remove the superseded
+shape in the same cutover and may not add compatibility views, dual writes or
+a second result authority.
+
 ## M14.6 graph execution authority
 
 M14.6 replaces the M13 per-operator execution layout in place. The sole durable

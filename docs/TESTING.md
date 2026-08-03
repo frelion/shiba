@@ -1,5 +1,22 @@
 # Testing strategy
 
+## M16.1 contract and reference gates
+
+Markdown/diff review freezes the aggregate descriptor ABI, call identity,
+result-schema/row codecs, generic ordered-state read contract, HAVING old/new
+transition table, transaction boundary and hard resource and performance
+thresholds. `scripts/check-m16-aggregate-contract.sh` runs 12 database-free,
+test-only reference-model cases covering CountStar/Count/Sum/Min/Max, exact
+multiplicity, grouped create/delete/key change, HAVING visibility, fixed-seed
+randomized I/U/D, codecs/corruption and exact bound/bound+1 behavior. This is
+reference evidence, not production or PostgreSQL evidence.
+
+Later M16 slices must add production codec/kernel tests beyond this independent
+reference model. PG17.10 and PG18.4 gates must compare complete scalar/keyed
+wide rows with SQL, and re-prove rollback, replay, crash, bootstrap, rebuild,
+least privilege and performance. None of that production/PG evidence is
+counted as M16.1 evidence.
+
 ## M15.1 SQL frontend contract gates
 
 M15.1 is docs-only. Static review freezes raw SQL -> canonical QuerySpec ->

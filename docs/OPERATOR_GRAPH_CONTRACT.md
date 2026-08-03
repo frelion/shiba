@@ -1,5 +1,20 @@
 # M14 Operator SDK and graph contract
 
+## M16.1 planned aggregate and result extension
+
+The implemented M14/M15 graph remains current. M16.1 only freezes a future
+extension: aggregate nodes refer to exact `AggregateCallId` values and closed
+function descriptors, state access is expressed as generic bounded exact/range
+reads, and terminal output carries canonical `ResultSchemaV1` plus typed rows.
+Only the Operator kernel dispatches CountStar, Count(nullable `int8`), SumInt8,
+MinInt8 or MaxInt8;
+Runtime continues to schedule the graph and persist generic deltas without
+matching a function name. See
+[AGGREGATE_FUNCTION_CONTRACT.md](AGGREGATE_FUNCTION_CONTRACT.md).
+
+No M16 graph codec, node execution, wide sink or Catalog cutover is implemented
+or proved by the M16.1 database-free reference slice.
+
 M14.2 implements the typed stateless graph path. M14.3 adds the sole generic
 keyed-state authority plus KeyBy, GroupedCount and GroupedSumInt8. Runtime uses
 canonical typed keys and set-based state/result persistence; typed NULL remains
