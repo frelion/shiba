@@ -144,6 +144,35 @@ pub fn state_read_set(
     crate::grouped::state_read_set(plan, batch)
 }
 
+/// Returns the exact keyed/partition reads for one canonical multi-source graph.
+/// Computes the exact grouped-state keys and partitions needed by one graph batch.
+///
+/// # Errors
+///
+/// Rejects graph, origin, layout, type, or input-bound violations.
+pub fn graph_state_read_set(
+    graph: &crate::OperatorGraph,
+    batch: &crate::MultiInputBatch,
+) -> Result<crate::StateReadSet, KernelError> {
+    crate::join::state_read_set(graph, batch)?.ok_or(KernelError::InvalidGraph)
+}
+
+/// Applies one canonical multi-source graph without database access.
+/// Applies one validated graph batch against its exact state snapshot.
+///
+/// # Errors
+///
+/// Rejects corrupt graph/state, invalid input, output amplification, or an
+/// invalid deterministic transition.
+pub fn apply_graph_plan(
+    graph: &crate::OperatorGraph,
+    state: &EncodedOperatorState,
+    snapshot: &crate::StateSnapshot,
+    batch: &crate::MultiInputBatch,
+) -> Result<OperatorTransition, KernelError> {
+    crate::join::apply(graph, state, snapshot, batch)?.ok_or(KernelError::InvalidGraph)
+}
+
 fn scalar_transition(plan: &CompiledPlan, value: i64) -> Result<OperatorTransition, KernelError> {
     if plan.output_contract
         != (OutputContract::Scalar {

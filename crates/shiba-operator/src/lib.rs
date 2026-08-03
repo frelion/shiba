@@ -10,6 +10,10 @@ mod graph_validation;
 mod grouped;
 mod grouped_plan;
 mod grouped_state;
+mod join;
+mod join_codec;
+mod join_plan;
+mod join_transition;
 mod kernel;
 mod materialize;
 mod model;
@@ -19,13 +23,15 @@ mod typed;
 
 pub use expression::{Expression, ExpressionError};
 pub use graph::{
-    ColumnBinding, DeltaBatch, GraphError, GraphTransition, NodeId, NodeInput, OperatorGraph,
-    OperatorNode, OperatorNodeKind, ResultDelta, ResultMutation, RowDelta,
+    ColumnBinding, DeltaBatch, GraphEffectOrigin, GraphError, GraphTransition, MultiInputBatch,
+    NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind, ResultDelta, ResultMutation,
+    RowDelta, SourceDeltaBatch, SourcePort,
 };
 pub use graph_eval::apply_graph;
 pub use graph_validation::source_typed_layout;
 pub use kernel::{
-    KernelError, apply_plan, decode_state, initial_state, initial_transition, state_read_set,
+    KernelError, apply_graph_plan, apply_plan, decode_state, graph_state_read_set, initial_state,
+    initial_transition, state_read_set,
 };
 pub use model::{
     EffectOrigin, EncodedOperatorState, KeyedMutation, ObjectAddress, OperatorId,
@@ -36,6 +42,7 @@ pub use plan::{
     StateContract,
 };
 pub use state::{
-    StateDelta, StateEntry, StateError, StateKey, StateMutation, StateReadSet, StateSnapshot,
+    StateDelta, StateEntry, StateError, StateKey, StateMutation, StatePartition, StateReadSet,
+    StateSnapshot,
 };
 pub use typed::{TypedError, TypedLayout, TypedRow, TypedValue, ValueType};

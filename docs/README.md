@@ -203,5 +203,8 @@ M14.4's accepted two-source authority is documented in
 [ADR 0006](adr/0006-m14-two-source-join-authority.md). It
 requires exactly two explicit SourceIds to share one slot/generation,
 transaction assembly, graph continuation/ACK, exported snapshot and graph-wide
-rebuild, with an exact right PK/UK index binding. This is a contract, not an
-implementation claim; its PG17/18 JOIN gates remain pending.
+rebuild, with an exact effective right PK/UK identity binding. M14.5 implements
+the pure GraphId/ordered-SourcePort Compiler and partition-state INNER JOIN
+kernel, including a 300-step differential and exact 20,000/20,001 fan-out
+gates. Runtime/Catalog, PG17/18 cross-schema live execution, bootstrap/rebuild
+and release evidence remain M14.6; M14 is not complete.

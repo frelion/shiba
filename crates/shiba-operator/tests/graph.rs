@@ -136,7 +136,7 @@ fn filter_compute_project_and_materialize_emit_exact_retractions() {
         },
         true,
     );
-    let layout = source_typed_layout(graph.source_id, &graph.source_layout).unwrap();
+    let layout = source_typed_layout(graph.sources[0].source_id, &graph.sources[0].layout).unwrap();
     let batch = DeltaBatch {
         origin: origin(),
         layout_identity: layout.identity,
@@ -187,7 +187,7 @@ fn null_filter_is_false_and_plan_or_layout_drift_fails_closed() {
         },
         false,
     );
-    let layout = source_typed_layout(graph.source_id, &graph.source_layout).unwrap();
+    let layout = source_typed_layout(graph.sources[0].source_id, &graph.sources[0].layout).unwrap();
     let batch = DeltaBatch {
         origin: origin(),
         layout_identity: layout.identity,
@@ -215,7 +215,7 @@ fn fixed_seed_project_differential_matches_keyed_reference_model() {
         },
         false,
     );
-    let layout = source_typed_layout(graph.source_id, &graph.source_layout).unwrap();
+    let layout = source_typed_layout(graph.sources[0].source_id, &graph.sources[0].layout).unwrap();
     let mut source = BTreeMap::<i64, Option<i64>>::new();
     let mut result = BTreeMap::<i64, Option<i64>>::new();
     let mut seed = 0x5eed_u64;
@@ -288,7 +288,7 @@ fn input_row_bound_fails_before_graph_evaluation() {
         },
         false,
     );
-    let layout = source_typed_layout(graph.source_id, &graph.source_layout).unwrap();
+    let layout = source_typed_layout(graph.sources[0].source_id, &graph.sources[0].layout).unwrap();
     let rows = (0..10_001)
         .map(|key| RowDelta {
             before: None,

@@ -32,6 +32,12 @@ pub fn apply_graph(
     for node in &graph.nodes {
         let (batch, layout) = match node.input {
             NodeInput::Source => (input, &source_layout),
+            NodeInput::SourcePort(source_id)
+                if graph.sources.len() == 1 && graph.sources[0].source_id == source_id =>
+            {
+                (input, &source_layout)
+            }
+            NodeInput::SourcePort(_) => return Err(GraphError::InvalidTopology),
             NodeInput::Node(node_id) => (
                 batches.get(&node_id).ok_or(GraphError::InvalidTopology)?,
                 layouts.get(&node_id).ok_or(GraphError::InvalidTopology)?,
@@ -70,6 +76,7 @@ pub fn apply_graph(
             OperatorNodeKind::GroupedCount { .. } | OperatorNodeKind::GroupedSumInt8 { .. } => {
                 return Err(GraphError::InvalidNode);
             }
+            OperatorNodeKind::InnerJoin { .. } => return Err(GraphError::InvalidNode),
             OperatorNodeKind::Materialize {
                 key_slot,
                 value_slot,

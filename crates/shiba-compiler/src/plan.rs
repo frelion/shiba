@@ -52,8 +52,9 @@ pub fn compile_plan(
         | OperatorOperationV1::GroupedSumInt8 { .. } => {
             let graph = crate::compile_graph(spec, source)?;
             let inputs = graph
-                .source_layout
+                .sources
                 .iter()
+                .flat_map(|source| &source.layout)
                 .enumerate()
                 .map(|(index, binding)| InputBinding {
                     role: if index == 0 {

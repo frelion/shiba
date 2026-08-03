@@ -3,9 +3,10 @@
 M14.2 implements the typed stateless graph path. M14.3 adds the sole generic
 keyed-state authority plus KeyBy, GroupedCount and GroupedSumInt8. Runtime uses
 canonical typed keys and set-based state/result persistence; typed NULL remains
-distinct from absent. M14.4 accepts the exact two-source JOIN authority in
-[JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md), but its production,
-PG17/18 and lifecycle evidence remains unproved. M14.3 is not M14 completion.
+distinct from absent. M14.4 accepts the exact two-source JOIN authority and
+M14.5 implements its pure GraphId/SourcePort Compiler and Operator kernel.
+Runtime, Catalog, PG17/18 cross-schema execution and graph lifecycle remain
+M14.6 work. M14.5 is not M14 completion.
 
 M14 extends the M13 database-free kernel; it does not add a SQL frontend or a
 second Runtime. This contract freezes graph identity, typed deltas, state,
@@ -102,10 +103,13 @@ Within one input transaction all deltas are netted against the pretransaction
 state and final after-images. A state or result key has at most one normalized
 final mutation. Observable behavior cannot depend on source-change order.
 
-## Accepted two-input INNER JOIN boundary
+## Pure two-input INNER JOIN boundary
 
-M14.4 is designed to admit exactly two explicit SourceIds in one database. One publication, one
-slot and one generation provide their common PostgreSQL transaction order. The
+M14.5 compiles exactly two explicit, canonically ordered `SourcePort` members
+under one nonzero `GraphId`; node inputs identify them as
+`SourcePort(SourceId)`. The right source binds its exact effective replica-
+identity PK/UK ObjectAddress. One publication, one slot and one generation will
+provide their common PostgreSQL transaction order in M14.6. The
 right join input is an exact non-null bigint PK or UK ObjectAddress; the join is
 bigint equality INNER JOIN. Schemas may differ. Outer, three-table and non-
 equality joins are excluded.
@@ -115,6 +119,12 @@ The M14 proof graph fixes its projection to left
 `(id bigint PK/UK, payload bigint NULL)`, materialized as
 `left.id -> right.payload`. A NULL join key does not match; a matched NULL
 payload is a typed NULL result.
+
+The pure kernel uses generic partitioned state for left membership and right
+payloads and computes mixed input batches from pre-state to final-state. Its
+fixed-seed 300-step relational differential covers mixed changes. Exact fan-out
+20,000 succeeds; 20,001 fails before returning a transition. Ordered affected-
+row indexes replace the initial quadratic scan with `O(n log n)` behavior.
 
 A graph transaction contains one WAL identity and changes tagged by SourceId.
 Changes to both relations in one PostgreSQL transaction enter one Runtime
@@ -127,8 +137,8 @@ A source can belong to at most one building or active graph. The right PK/UK
 index itself, not only its columns, is an exact durable ObjectAddress binding.
 Admission, bootstrap, rebuild, DDL, crash, privilege and performance evidence
 is frozen in the JOIN authority contract and
-[ADR 0006](adr/0006-m14-two-source-join-authority.md). None of this paragraph
-claims that the two-input production path is implemented.
+[ADR 0006](adr/0006-m14-two-source-join-authority.md). The pure compiler/kernel
+is implemented; this does not claim the Runtime/Catalog or PostgreSQL path.
 
 The continuation belongs to `(graph_id, slot_generation)` and records the exact
 commit LSN and ingress transaction identity. There are no left/right or node
@@ -194,13 +204,14 @@ smaller workload.
 ## Evidence and exclusions
 
 Every implemented expression and node has an independent deterministic
-reference model and fixed-seed randomized differential. Required JOIN gates cover I/U/D, NULL/Absent, key change,
-overflow, corrupt codecs, bounds, filter truth transitions, group lifecycle,
-join changes/fan-out/same-transaction two-side changes, rollback, kill, retry,
-replay, DDL, bootstrap, catch-up, rebuild, recovery and least privilege.
+reference model and fixed-seed randomized differential. Pure JOIN gates cover
+mixed I/U/D, NULL/Absent, corrupt state, exact fan-out bounds and pre-to-final
+semantics. Remaining PostgreSQL JOIN gates cover full-row left/right and same-
+transaction changes, bounded fan-out, rollback, kill, retry, replay, DDL,
+bootstrap, catch-up, rebuild, recovery and least privilege.
 Grouped materializations compare complete rows with independent SQL oracles on
-PG17.10 and PG18.4. Joined materialization comparison is an M14.4 acceptance
-gate and remains unproved.
+PG17.10 and PG18.4. Joined materialization comparison remains an unproved M14.6
+gate.
 
 M14 excludes SQL parsing, outer or three-table joins, windows, DISTINCT,
 Min/Max/Avg, plugins, schedulers and persisted intermediate deltas. M14 does not

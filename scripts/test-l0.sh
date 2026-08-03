@@ -449,7 +449,7 @@ join_contract = pathlib.Path("docs/JOIN_AUTHORITY_CONTRACT.md").read_text()
 join_adr = pathlib.Path("docs/adr/0006-m14-two-source-join-authority.md").read_text()
 for marker in (
     "One durable graph authority",
-    "Accepted two-input INNER JOIN boundary",
+    "Pure two-input INNER JOIN boundary",
     "graph/generation ownership mutex",
     "PG17/PG18 Apply medians are 782.302750/787.157125 ms",
 ):
@@ -475,6 +475,8 @@ if "Status: accepted for the M14.4 contract slice" not in join_adr:
     raise SystemExit("M14.4 JOIN authority ADR is not accepted")
 if "M14.4 accepted two-source JOIN authority" not in reuse_manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks M14.4 contract evidence")
+if "M14.5 pure multi-input INNER JOIN kernel" not in reuse_manifest:
+    raise SystemExit("REUSE_MANIFEST.md lacks M14.5 pure-kernel evidence")
 PY
 
 if rg -n \
@@ -491,6 +493,35 @@ if rg -n \
   echo "M14.3 concrete grouped operator dispatch leaked outside operator/compiler" >&2
   exit 1
 fi
+
+if rg -n \
+  'InnerJoin|JoinSpecV1|compile_join|left_source_id|right_source_id' \
+  crates/shiba-runtime/src crates/shiba-ingress/src sql/v2; then
+  echo "M14.5 concrete JOIN dispatch leaked outside operator/compiler" >&2
+  exit 1
+fi
+
+python3 - <<'PY'
+import pathlib
+
+identity = pathlib.Path("crates/shiba-protocol/src/identity.rs").read_text()
+graph = pathlib.Path("crates/shiba-operator/src/graph.rs").read_text()
+compiler = pathlib.Path("crates/shiba-compiler/src/join.rs").read_text()
+for marker in ("id_type!(GraphId", "pub struct GraphTransactionId"):
+    if marker not in identity:
+        raise SystemExit(f"M14.5 graph identity lacks marker: {marker}")
+for marker in (
+    "pub graph_id: GraphId",
+    "pub sources: Vec<SourcePort>",
+    "SourcePort(SourceId)",
+    "pub struct MultiInputBatch",
+):
+    if marker not in graph:
+        raise SystemExit(f"M14.5 canonical graph lacks marker: {marker}")
+for marker in ("effective_replica_identity", "Result<OperatorGraph, CompilerError>"):
+    if marker not in compiler:
+        raise SystemExit(f"M14.5 JOIN compiler lacks marker: {marker}")
+PY
 
 python3 - <<'PY'
 import pathlib

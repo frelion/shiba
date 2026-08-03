@@ -21,7 +21,9 @@ per-source continuations and ACK decisions are forbidden.
 The admitted compiled shape is fixed: nullable `left.right_key` equals the
 exact non-null bigint right PK/UK, then Project and Materialize emit
 `left.id -> right.payload`. NULL join keys do not match and a matched NULL
-payload stays typed NULL. Broader projections remain outside M14.
+payload stays typed NULL. That PK/UK is also the right source's exact effective
+replica identity index, so logical UPDATE/DELETE old keys and Join lookup
+identity cannot diverge. Broader projections remain outside M14.
 
 A source belongs to at most one building or active graph. The graph durably
 binds exact relation/column ObjectAddresses and the exact right bigint PK/UK

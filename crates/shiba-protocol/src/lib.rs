@@ -18,8 +18,8 @@ pub use digest::{
 };
 pub use error::{ProtocolError, ScopeMismatch};
 pub use identity::{
-    BootstrapBatchId, BootstrapId, CauseId, CommitFrontier, IngressTransactionId, InputSequence,
-    SlotGeneration, SourceId, SourceTransactionId,
+    BootstrapBatchId, BootstrapId, CauseId, CommitFrontier, GraphId, GraphTransactionId,
+    IngressTransactionId, InputSequence, SlotGeneration, SourceId, SourceTransactionId,
 };
 pub use lsn::{ParsePostgresLsnError, PostgresLsn};
 pub use version::{CatalogVersion, ProtocolVersion};

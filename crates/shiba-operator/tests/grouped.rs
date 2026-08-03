@@ -192,7 +192,7 @@ fn layout(plan: &CompiledPlan) -> TypedLayout {
     let PlanImplementation::Graph { graph } = &plan.implementation else {
         unreachable!()
     };
-    source_typed_layout(graph.source_id, &graph.source_layout).unwrap()
+    source_typed_layout(graph.sources[0].source_id, &graph.sources[0].layout).unwrap()
 }
 
 fn row(layout: &TypedLayout, id: i64, group: TypedValue, value: TypedValue) -> TypedRow {

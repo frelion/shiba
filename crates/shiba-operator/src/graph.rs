@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use shiba_protocol::SourceId;
+use shiba_protocol::{BootstrapBatchId, GraphId, GraphTransactionId, SourceId};
 
 use crate::{
     EffectOrigin, Expression, ObjectAddress, OperatorId, OutputContract, StateContract,
@@ -40,10 +40,20 @@ pub struct ColumnBinding {
     pub value_type: ValueType,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourcePort {
+    pub source_id: SourceId,
+    pub layout: Vec<ColumnBinding>,
+    pub identity_index: Option<ObjectAddress>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeInput {
+    /// Singleton-source input; graph cutover will canonicalize it to its sole port.
     Source,
+    SourcePort(SourceId),
     Node(NodeId),
 }
 
@@ -69,6 +79,14 @@ pub enum OperatorNodeKind {
         key_slot: u16,
         value_slot: u16,
     },
+    InnerJoin {
+        left_source_id: SourceId,
+        right_source_id: SourceId,
+        left_id_slot: u16,
+        left_key_slot: u16,
+        right_id_slot: u16,
+        right_payload_slot: u16,
+    },
     Materialize {
         key_slot: u16,
         value_slot: u16,
@@ -89,9 +107,8 @@ pub struct OperatorNode {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CanonicalGraph {
     pub(crate) format_version: u32,
-    pub(crate) operator_id: OperatorId,
-    pub(crate) source_id: SourceId,
-    pub(crate) source_layout: Vec<ColumnBinding>,
+    pub(crate) graph_id: GraphId,
+    pub(crate) sources: Vec<SourcePort>,
     pub(crate) nodes: Vec<OperatorNode>,
 }
 
@@ -99,9 +116,8 @@ pub(crate) struct CanonicalGraph {
 #[serde(deny_unknown_fields)]
 pub struct OperatorGraph {
     pub format_version: u32,
-    pub operator_id: OperatorId,
-    pub source_id: SourceId,
-    pub source_layout: Vec<ColumnBinding>,
+    pub graph_id: GraphId,
+    pub sources: Vec<SourcePort>,
     pub nodes: Vec<OperatorNode>,
     pub canonical_payload: Vec<u8>,
     pub digest: [u8; 32],
@@ -119,11 +135,31 @@ impl OperatorGraph {
         source_layout: Vec<ColumnBinding>,
         nodes: Vec<OperatorNode>,
     ) -> Result<Self, GraphError> {
+        Self::build_graph(
+            GraphId::new(operator_id.get()).map_err(|_| GraphError::InvalidTopology)?,
+            vec![SourcePort {
+                source_id,
+                layout: source_layout,
+                identity_index: None,
+            }],
+            nodes,
+        )
+    }
+
+    /// Builds the narrow canonical two-source graph admitted by M14.5.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate sources, missing right identity, topology or type drift.
+    pub fn build_graph(
+        graph_id: GraphId,
+        sources: Vec<SourcePort>,
+        nodes: Vec<OperatorNode>,
+    ) -> Result<Self, GraphError> {
         let canonical = CanonicalGraph {
             format_version: GRAPH_FORMAT_VERSION,
-            operator_id,
-            source_id,
-            source_layout,
+            graph_id,
+            sources,
             nodes,
         };
         crate::graph_validation::validate_graph(&canonical)?;
@@ -131,9 +167,8 @@ impl OperatorGraph {
         let digest = hash(GRAPH_DOMAIN, &canonical_payload);
         Ok(Self {
             format_version: canonical.format_version,
-            operator_id: canonical.operator_id,
-            source_id: canonical.source_id,
-            source_layout: canonical.source_layout,
+            graph_id: canonical.graph_id,
+            sources: canonical.sources,
             nodes: canonical.nodes,
             canonical_payload,
             digest,
@@ -148,11 +183,10 @@ impl OperatorGraph {
     pub fn from_canonical_payload(payload: &[u8], digest: [u8; 32]) -> Result<Self, GraphError> {
         let canonical: CanonicalGraph =
             serde_json::from_slice(payload).map_err(|_| GraphError::Codec)?;
-        let rebuilt = Self::build(
-            canonical.operator_id,
-            canonical.source_id,
-            canonical.source_layout,
-            canonical.nodes,
+        let rebuilt = Self::build_graph(
+            canonical.graph_id,
+            canonical.sources.clone(),
+            canonical.nodes.clone(),
         )?;
         if rebuilt.format_version != canonical.format_version
             || rebuilt.canonical_payload != payload
@@ -181,9 +215,8 @@ impl OperatorGraph {
     ) -> Result<(TypedLayout, BTreeMap<NodeId, TypedLayout>), GraphError> {
         crate::graph_validation::layout_graph(&CanonicalGraph {
             format_version: self.format_version,
-            operator_id: self.operator_id,
-            source_id: self.source_id,
-            source_layout: self.source_layout.clone(),
+            graph_id: self.graph_id,
+            sources: self.sources.clone(),
             nodes: self.nodes.clone(),
         })
     }
@@ -202,6 +235,27 @@ pub struct DeltaBatch {
     pub origin: EffectOrigin,
     pub layout_identity: [u8; 32],
     pub rows: Vec<RowDelta>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceDeltaBatch {
+    pub source_id: SourceId,
+    pub delta: DeltaBatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultiInputBatch {
+    pub origin: GraphEffectOrigin,
+    pub sources: Vec<SourceDeltaBatch>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphEffectOrigin {
+    Wal(GraphTransactionId),
+    Bootstrap(BootstrapBatchId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

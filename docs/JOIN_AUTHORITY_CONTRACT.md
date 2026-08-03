@@ -1,13 +1,24 @@
 # M14.4 two-source JOIN authority contract
 
-Status: accepted M14.4 design. Production implementation and PostgreSQL
-evidence are assigned to later M14.5/M14.6 slices.
+Status: M14.4 authority accepted; M14.5 pure Compiler/Operator kernel
+implemented. Runtime, Catalog and PostgreSQL evidence remain M14.6.
 
 M14.4 admits one narrow relational operation: a bigint equality INNER JOIN
 between exactly two explicitly registered `SourceId` values in the same
 PostgreSQL database. The sources may occupy different schemas. This contract
 does not admit name discovery, a third input, an outer join, a non-equality
 predicate, SQL text, or a second execution path.
+
+M14.5 gives the pure plan a nonzero `GraphId`, canonically ordered
+`SourcePort` members and explicit `SourcePort(SourceId)` node inputs. Compiler
+binds the exact effective right replica-identity index. The database-free
+kernel stores left membership and right values in generic partitioned state,
+evaluates both batches from one pre-state to one final state, and emits
+normalized keyed mutations. A fixed-seed 300-step relational differential
+covers mixed two-side changes. Fan-out 20,000 succeeds and 20,001 fails before
+returning a transition. Ordered affected-row indexes replace the initial
+quadratic scan with `O(n log n)` behavior. These are pure-code proofs, not
+PostgreSQL integration evidence.
 
 The compiled vertical slice has one unambiguous shape:
 
@@ -20,8 +31,11 @@ Project(left.id, right.payload) -> Materialize(left.id, right.payload)
 
 A NULL left join key has no match. A matched NULL right payload remains typed
 NULL in the keyed result; it is not absent. Compiler resolves all four column
-names and the exact right identity index once to ObjectAddresses. Runtime never
-uses those names or chooses a different current PK/UK.
+names and the exact right identity index once to ObjectAddresses. The admitted
+right PK/UK must also be that source's exact effective replica identity index;
+an arbitrary second lookup index is rejected because UPDATE/DELETE old-key WAL
+would not prove the same row identity. Runtime never uses those names or
+chooses a different current PK/UK.
 
 ## One graph, transport and progress authority
 
@@ -55,7 +69,8 @@ must atomically reject:
 - a source already owned by another building or active graph;
 - relation/column ObjectAddress drift or an invalidated member;
 - a missing, nullable, non-bigint, partial, expression, invalid or unready right
-  PK/UK index, or an index whose exact OID differs from the compiled binding;
+  PK/UK index, an index that is not the source's effective replica identity, or
+  an index whose exact OID differs from the compiled binding;
 - a noncanonical graph, input layout, plan digest or state/output contract;
 - insufficient control, scan, Apply, replication or result-reader privileges.
 
@@ -118,5 +133,6 @@ independently prove:
 
 The accepted contract adds no compatibility adapter, fallback, dual write,
 second continuation, persisted EffectStream/DeltaBatch or second Runtime.
-Until the tests above are green, two-source JOIN, graph-scoped lifecycle,
-bootstrap, rebuild and performance remain explicitly unproved.
+Until the tests above are green, the PostgreSQL two-source JOIN path,
+graph-scoped lifecycle, bootstrap, rebuild and performance remain explicitly
+unproved; the M14.5 pure compiler/kernel evidence does not close them.

@@ -18,6 +18,21 @@ pub(crate) fn validate_graph(graph: &CanonicalGraph) -> Result<(), GraphError> {
     {
         return Err(GraphError::InvalidTopology);
     }
+    if !(1..=2).contains(&graph.sources.len())
+        || graph
+            .sources
+            .windows(2)
+            .any(|pair| pair[0].source_id >= pair[1].source_id)
+        || graph.sources.len() == 2
+            && graph
+                .sources
+                .iter()
+                .filter(|source| source.identity_index.is_some())
+                .count()
+                != 1
+    {
+        return Err(GraphError::InvalidTopology);
+    }
     let (_, layouts) = layout_graph(graph)?;
     let materialized = graph
         .nodes
@@ -32,7 +47,7 @@ pub(crate) fn validate_graph(graph: &CanonicalGraph) -> Result<(), GraphError> {
         .iter()
         .filter_map(|node| match node.input {
             NodeInput::Node(id) => Some(id),
-            NodeInput::Source => None,
+            NodeInput::Source | NodeInput::SourcePort(_) => None,
         })
         .collect::<BTreeSet<_>>();
     if graph.nodes.iter().any(|node| {
@@ -42,6 +57,50 @@ pub(crate) fn validate_graph(graph: &CanonicalGraph) -> Result<(), GraphError> {
         return Err(GraphError::InvalidTopology);
     }
     validate_stateful_topology(graph)?;
+    validate_join_topology(graph)?;
+    Ok(())
+}
+
+fn validate_join_topology(graph: &CanonicalGraph) -> Result<(), GraphError> {
+    let joins = graph
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, OperatorNodeKind::InnerJoin { .. }))
+        .collect::<Vec<_>>();
+    if joins.is_empty() {
+        return if graph.sources.len() == 1 {
+            Ok(())
+        } else {
+            Err(GraphError::InvalidTopology)
+        };
+    }
+    if joins.len() != 1 || graph.nodes.len() != 2 {
+        return Err(GraphError::InvalidTopology);
+    }
+    let join = joins[0];
+    let OperatorNodeKind::InnerJoin {
+        left_source_id,
+        right_source_id,
+        ..
+    } = join.kind
+    else {
+        unreachable!()
+    };
+    if !graph
+        .sources
+        .iter()
+        .any(|source| source.source_id == left_source_id)
+        || !graph
+            .sources
+            .iter()
+            .any(|source| source.source_id == right_source_id && source.identity_index.is_some())
+        || left_source_id == right_source_id
+        || join.input != NodeInput::SourcePort(left_source_id)
+        || graph.nodes[1].input != NodeInput::Node(join.node_id)
+        || !matches!(graph.nodes[1].kind, OperatorNodeKind::Materialize { .. })
+    {
+        return Err(GraphError::InvalidTopology);
+    }
     Ok(())
 }
 
@@ -104,7 +163,8 @@ fn validate_stateful_topology(graph: &CanonicalGraph) -> Result<(), GraphError> 
 pub(crate) fn layout_graph(
     graph: &CanonicalGraph,
 ) -> Result<(TypedLayout, BTreeMap<NodeId, TypedLayout>), GraphError> {
-    let source = source_typed_layout(graph.source_id, &graph.source_layout)?;
+    let primary = graph.sources.first().ok_or(GraphError::InvalidTopology)?;
+    let source = source_typed_layout(primary.source_id, &primary.layout)?;
     let mut layouts = BTreeMap::new();
     let mut previous = None;
     for node in &graph.nodes {
@@ -114,7 +174,9 @@ pub(crate) fn layout_graph(
         previous = Some(node.node_id);
         let stateful = matches!(
             node.kind,
-            OperatorNodeKind::GroupedCount { .. } | OperatorNodeKind::GroupedSumInt8 { .. }
+            OperatorNodeKind::GroupedCount { .. }
+                | OperatorNodeKind::GroupedSumInt8 { .. }
+                | OperatorNodeKind::InnerJoin { .. }
         );
         if node
             .state_contract
@@ -125,9 +187,52 @@ pub(crate) fn layout_graph(
         }
         let input = match node.input {
             NodeInput::Source => &source,
+            NodeInput::SourcePort(source_id)
+                if graph.sources.iter().any(|port| port.source_id == source_id) =>
+            {
+                &source
+            }
+            NodeInput::SourcePort(_) => return Err(GraphError::InvalidTopology),
             NodeInput::Node(id) => layouts.get(&id).ok_or(GraphError::InvalidTopology)?,
         };
-        if let Some(types) = node_output_types(node, input)? {
+        let node_types = if let OperatorNodeKind::InnerJoin {
+            left_source_id,
+            right_source_id,
+            left_id_slot,
+            left_key_slot,
+            right_id_slot,
+            right_payload_slot,
+        } = node.kind
+        {
+            let left_port = graph
+                .sources
+                .iter()
+                .find(|port| port.source_id == left_source_id)
+                .ok_or(GraphError::InvalidTopology)?;
+            let input = source_typed_layout(left_port.source_id, &left_port.layout)?;
+            let right_port = graph
+                .sources
+                .iter()
+                .find(|port| port.source_id == right_source_id)
+                .ok_or(GraphError::InvalidTopology)?;
+            let right_layout = source_typed_layout(right_port.source_id, &right_port.layout)?;
+            if input.value_types.get(usize::from(left_id_slot)) != Some(&ValueType::Int8)
+                || input.value_types.get(usize::from(left_key_slot)) != Some(&ValueType::Int8)
+                || right_layout.value_types.get(usize::from(right_id_slot))
+                    != Some(&ValueType::Int8)
+                || right_layout
+                    .value_types
+                    .get(usize::from(right_payload_slot))
+                    != Some(&ValueType::Int8)
+                || right_port.identity_index.is_none()
+            {
+                return Err(GraphError::WrongType);
+            }
+            Some(vec![ValueType::Int8, ValueType::Int8])
+        } else {
+            node_output_types(node, input)?
+        };
+        if let Some(types) = node_types {
             let output = if matches!(node.kind, OperatorNodeKind::Filter { .. }) {
                 input.clone()
             } else {
@@ -187,6 +292,7 @@ fn node_output_types(
             }
             Some(vec![key, ValueType::Int8])
         }
+        OperatorNodeKind::InnerJoin { .. } => return Err(GraphError::InvalidNode),
         OperatorNodeKind::Materialize {
             key_slot,
             value_slot,

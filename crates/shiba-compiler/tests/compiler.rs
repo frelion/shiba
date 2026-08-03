@@ -168,8 +168,8 @@ fn project_declaration_compiles_to_canonical_graph_nodes() {
     assert_eq!(first.canonical_payload, second.canonical_payload);
     assert_eq!(first.digest, second.digest);
     assert_eq!(
-        first
-            .source_layout
+        first.sources[0]
+            .layout
             .iter()
             .map(|binding| binding.address)
             .collect::<Vec<_>>(),
@@ -266,8 +266,8 @@ fn graph_uses_the_full_descriptor_order_and_resolved_slots() {
     )
     .unwrap();
     assert_eq!(
-        graph
-            .source_layout
+        graph.sources[0]
+            .layout
             .iter()
             .map(|binding| binding.address.sub_id)
             .collect::<Vec<_>>(),

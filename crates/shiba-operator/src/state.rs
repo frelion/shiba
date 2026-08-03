@@ -30,6 +30,7 @@ impl StateKey {
 #[serde(deny_unknown_fields)]
 pub struct StateReadSet {
     pub keys: Vec<StateKey>,
+    pub partitions: Vec<StatePartition>,
 }
 
 impl StateReadSet {
@@ -44,7 +45,52 @@ impl StateReadSet {
         }
         keys.sort();
         keys.dedup();
-        Ok(Self { keys })
+        Ok(Self {
+            keys,
+            partitions: Vec::new(),
+        })
+    }
+
+    /// Builds a canonical read set containing exact keys and partition reads.
+    ///
+    /// # Errors
+    ///
+    /// Rejects absent or otherwise non-persistable typed keys.
+    pub fn with_partitions(
+        keys: Vec<StateKey>,
+        mut partitions: Vec<StatePartition>,
+    ) -> Result<Self, StateError> {
+        let mut read_set = Self::canonical(keys)?;
+        for partition in &partitions {
+            partition.validate()?;
+        }
+        partitions.sort();
+        partitions.dedup();
+        read_set.partitions = partitions;
+        Ok(read_set)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatePartition {
+    pub node_id: NodeId,
+    pub namespace: u16,
+    pub partition_key: TypedValue,
+}
+
+impl StatePartition {
+    fn validate(&self) -> Result<(), StateError> {
+        self.partition_key
+            .to_canonical_json()
+            .map(|_| ())
+            .map_err(|_| StateError::InvalidKey)
+    }
+
+    fn contains(&self, key: &StateKey) -> bool {
+        self.node_id == key.node_id
+            && self.namespace == key.namespace
+            && self.partition_key == key.partition_key
     }
 }
 
@@ -79,12 +125,21 @@ impl StateSnapshot {
     ///
     /// Rejects missing, extra, duplicate, or out-of-order entries.
     pub fn validate_exact(&self, read_set: &StateReadSet) -> Result<(), StateError> {
-        if self.entries.len() != read_set.keys.len()
-            || self
-                .entries
+        if self
+            .entries
+            .windows(2)
+            .any(|pair| pair[0].key >= pair[1].key)
+            || read_set
+                .keys
                 .iter()
-                .zip(&read_set.keys)
-                .any(|(entry, key)| &entry.key != key)
+                .any(|required| !self.entries.iter().any(|entry| &entry.key == required))
+            || self.entries.iter().any(|entry| {
+                !read_set.keys.contains(&entry.key)
+                    && !read_set
+                        .partitions
+                        .iter()
+                        .any(|partition| partition.contains(&entry.key))
+            })
         {
             return Err(StateError::SnapshotMismatch);
         }

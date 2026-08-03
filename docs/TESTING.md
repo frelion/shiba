@@ -1,10 +1,20 @@
 # Testing strategy
 
-## M14.4 accepted JOIN gates (not yet implemented)
+## M14.5 pure two-source JOIN gates
+
+Pure Compiler/Operator tests prove GraphId ownership, ordered SourcePorts,
+`SourcePort(SourceId)` inputs, exact effective right replica-identity binding,
+partition state and pre-to-final mixed-input semantics. A fixed-seed 300-step
+relational differential is green. Fan-out 20,000 succeeds and 20,001 fails;
+ordered affected-row indexes correct the initial `O(n^2)` scan to `O(n log n)`.
+Runtime/Catalog persistence, PG17/18 cross-schema live execution, graph
+bootstrap/rebuild and release evidence remain M14.6; M14 is not complete.
+
+## Remaining M14.6 PostgreSQL JOIN gates
 
 The accepted authority is in
 [JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md). The M14.4 contract is
-accepted; later M14.5/M14.6 production slices cannot be marked proved until the
+accepted; the M14.6 production slice cannot be marked proved until the
 same directed matrix passes independently on PG17.10 and PG18.4:
 
 - admission rejects source reuse, wrong database/publication/slot/generation,

@@ -88,8 +88,8 @@ fn grouped_declarations_compile_exact_slots_and_nullable_contracts() {
             panic!("expected graph")
         };
         assert_eq!(
-            graph
-                .source_layout
+            graph.sources[0]
+                .layout
                 .iter()
                 .map(|binding| binding.address.sub_id)
                 .collect::<Vec<_>>(),

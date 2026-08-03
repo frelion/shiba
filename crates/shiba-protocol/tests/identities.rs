@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use shiba_protocol::{
-    CauseId, CommitFrontier, IngressTransactionId, InputSequence, PostgresLsn, ProtocolError,
-    ScopeMismatch, SlotGeneration, SourceId, SourceTransactionId,
+    CauseId, CommitFrontier, GraphId, GraphTransactionId, IngressTransactionId, InputSequence,
+    PostgresLsn, ProtocolError, ScopeMismatch, SlotGeneration, SourceId, SourceTransactionId,
 };
 
 fn transaction(source: u64, generation: u64, lsn: &str, ingress: u64) -> SourceTransactionId {
@@ -26,6 +26,32 @@ fn strong_ids_reject_zero_and_preserve_ordering() {
     for encoded in ["0", "-1", "null", "\"1\""] {
         assert!(serde_json::from_str::<SourceId>(encoded).is_err());
     }
+}
+
+#[test]
+fn graph_transaction_is_nominal_strict_and_never_source_derived() {
+    let identity = GraphTransactionId::new(
+        GraphId::new(9).unwrap(),
+        SlotGeneration::new(4).unwrap(),
+        PostgresLsn::from_u64(80),
+        IngressTransactionId::new(12).unwrap(),
+    )
+    .unwrap();
+    let encoded = serde_json::to_string(&identity).unwrap();
+    assert_eq!(
+        serde_json::from_str::<GraphTransactionId>(&encoded).unwrap(),
+        identity
+    );
+    assert!(
+        serde_json::from_str::<GraphTransactionId>(
+            r#"{"graph_id":9,"slot_generation":4,"commit_lsn":"0/0","ingress_transaction_id":12}"#,
+        )
+        .is_err()
+    );
+    assert!(serde_json::from_str::<GraphTransactionId>(
+        r#"{"graph_id":9,"slot_generation":4,"commit_lsn":"0/50","ingress_transaction_id":12,"source_id":1}"#,
+    )
+    .is_err());
 }
 
 #[test]

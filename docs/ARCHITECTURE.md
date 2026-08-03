@@ -29,6 +29,14 @@ ObjectAddresses and the exact right bigint PK/UK index ObjectAddress are part
 of admission. A source may belong to at most one building or active graph.
 There is no per-source continuation, second Runtime or persisted DeltaBatch.
 
+M14.5 implements the database-free half: a nonzero `GraphId` owns ordered
+`SourcePort` values, `SourcePort(SourceId)` identifies node inputs, and the
+right port binds the exact effective replica-identity index. Compiler emits one
+canonical multi-input plan; the kernel uses generic partition state and
+computes mixed batches from pre-state to final-state with bounded normalized
+output. Runtime, Catalog, cross-schema PG17/18 live execution, bootstrap and
+rebuild remain M14.6 work.
+
 M13.1 froze the generic execution successor to the M9 aggregate-shaped API;
 M13.2 supplied its pure kernel, and M13.3 made that kernel the sole Runtime and
 Catalog execution path. See

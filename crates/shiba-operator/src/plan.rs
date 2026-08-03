@@ -221,14 +221,18 @@ fn validate_contract(plan: &CanonicalPlan) -> Result<(), PlanError> {
                 crate::OperatorNodeKind::Materialize { output, .. } => Some(output),
                 _ => None,
             });
-            graph.operator_id == plan.operator_id
-                && graph.source_id == plan.source_id
+            graph
+                .sources
+                .iter()
+                .find(|source| source.source_id == plan.source_id)
+                .is_some_and(|source| source.source_id == plan.source_id)
                 && graph.validate().is_ok()
                 && terminal_output == Some(&plan.output_contract)
                 && plan.inputs
                     == graph
-                        .source_layout
+                        .sources
                         .iter()
+                        .flat_map(|source| &source.layout)
                         .enumerate()
                         .map(|(index, binding)| InputBinding {
                             role: if index == 0 {

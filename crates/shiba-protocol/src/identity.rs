@@ -34,6 +34,7 @@ macro_rules! id_type {
 }
 
 id_type!(SourceId, "source ID");
+id_type!(GraphId, "graph ID");
 id_type!(SlotGeneration, "slot generation");
 id_type!(IngressTransactionId, "ingress transaction ID");
 id_type!(InputSequence, "input sequence");
@@ -119,6 +120,64 @@ impl<'de> Deserialize<'de> for SourceTransactionId {
         let raw = Raw::deserialize(deserializer)?;
         Self::new(
             raw.source_id,
+            raw.slot_generation,
+            raw.commit_lsn,
+            raw.ingress_transaction_id,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+/// Durable identity of one committed transaction for one graph generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct GraphTransactionId {
+    pub graph_id: GraphId,
+    pub slot_generation: SlotGeneration,
+    pub commit_lsn: PostgresLsn,
+    pub ingress_transaction_id: IngressTransactionId,
+}
+
+impl GraphTransactionId {
+    /// Creates an identity at an exact non-zero terminal commit boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::ZeroCommitLsn`] when `commit_lsn` is zero.
+    pub const fn new(
+        graph_id: GraphId,
+        slot_generation: SlotGeneration,
+        commit_lsn: PostgresLsn,
+        ingress_transaction_id: IngressTransactionId,
+    ) -> Result<Self, ProtocolError> {
+        if commit_lsn.is_zero() {
+            return Err(ProtocolError::ZeroCommitLsn);
+        }
+        Ok(Self {
+            graph_id,
+            slot_generation,
+            commit_lsn,
+            ingress_transaction_id,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for GraphTransactionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            graph_id: GraphId,
+            slot_generation: SlotGeneration,
+            commit_lsn: PostgresLsn,
+            ingress_transaction_id: IngressTransactionId,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Self::new(
+            raw.graph_id,
             raw.slot_generation,
             raw.commit_lsn,
             raw.ingress_transaction_id,

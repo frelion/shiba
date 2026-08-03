@@ -3,15 +3,17 @@
 #![forbid(unsafe_code)]
 
 mod graph;
+mod join;
 mod plan;
 
 use core::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 use shiba_operator::{ObjectAddress, OperatorId};
-use shiba_protocol::SourceId;
+use shiba_protocol::{GraphId, SourceId};
 
 pub use graph::compile_graph;
+pub use join::compile_join;
 pub use plan::compile_plan;
 
 pub const OPERATOR_SPEC_VERSION: u32 = 1;
@@ -124,6 +126,34 @@ pub enum OperatorOperationV1 {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinSpecV1 {
+    pub version: u32,
+    pub graph_id: GraphId,
+    pub left_source_id: SourceId,
+    pub right_source_id: SourceId,
+    pub left_id_column: String,
+    pub left_right_key_column: String,
+    pub right_id_column: String,
+    pub right_payload_column: String,
+    pub right_identity_index: ObjectAddress,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct IdentityIndexDescriptor {
+    pub address: ObjectAddress,
+    pub relation: ObjectAddress,
+    pub key_column: ObjectAddress,
+    pub unique: bool,
+    pub valid: bool,
+    pub ready: bool,
+    pub has_expression: bool,
+    pub has_predicate: bool,
+    pub effective_replica_identity: bool,
+}
+
 fn reject_blank<E: de::Error>(value: &str, field: &str) -> Result<(), E> {
     if value.trim().is_empty() {
         return Err(E::custom(format_args!("{field} cannot be blank")));
@@ -161,6 +191,8 @@ pub enum CompilerError {
     PlanRequired,
     GraphEncoding,
     PlanEncoding,
+    InvalidJoinSpec,
+    InvalidIdentityIndex,
 }
 
 impl fmt::Display for CompilerError {
@@ -187,6 +219,8 @@ impl fmt::Display for CompilerError {
             }
             Self::GraphEncoding => formatter.write_str("operator graph encoding failed"),
             Self::PlanEncoding => formatter.write_str("compiled plan encoding failed"),
+            Self::InvalidJoinSpec => formatter.write_str("two-source join declaration rejected"),
+            Self::InvalidIdentityIndex => formatter.write_str("right identity index rejected"),
         }
     }
 }
