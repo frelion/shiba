@@ -42,6 +42,17 @@ fn million_row_active_source_rebuild_is_bounded_and_catches_up_exactly() {
     let database_url = required("SHIBA_M12_PERFORMANCE_DATABASE_URL");
     let replication_url = required("SHIBA_M12_PERFORMANCE_REPLICATION_URL");
     let (mut admin, active) = admission::establish_active_source(&database_url, &replication_url);
+    // Preserve the frozen M12 CountRows+SumInt8 retained-WAL baseline. M13's
+    // keyed lifecycle is proved by the directed bootstrap/rebuild gates; adding
+    // a million logged projection rows would change this historical scenario.
+    admin
+        .batch_execute(
+            "DELETE FROM shiba_internal.operator_result_row WHERE operator_id = 3;
+             DELETE FROM shiba.operator_result WHERE operator_id = 3;
+             DELETE FROM shiba_internal.operator_state WHERE operator_id = 3;
+             DELETE FROM shiba_internal.operator_definition WHERE operator_id = 3;",
+        )
+        .expect("freeze CountRows+SumInt8 performance plan set");
     let fixture = RebuildFixture::install(&mut admin, active.publication_oid);
     admin
         .batch_execute(&format!(

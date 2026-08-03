@@ -31,6 +31,37 @@ pub(super) fn register_count_operator(client: &mut Client, source_id: u64, opera
     compile_and_register(client, &spec).expect("compile and register CountRows operator");
 }
 
+pub(super) fn decode_scalar_state(payload: &[u8]) -> i64 {
+    i64::from_be_bytes(
+        payload
+            .try_into()
+            .expect("scalar operator state is exactly one big-endian i64"),
+    )
+}
+
+pub(super) fn scalar_state(client: &mut Client, operator_id: i64) -> i64 {
+    let payload: Vec<u8> = client
+        .query_one(
+            "SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = $1",
+            &[&operator_id],
+        )
+        .expect("query opaque scalar operator state")
+        .get(0);
+    decode_scalar_state(&payload)
+}
+
+pub(super) fn scalar_state_sum(client: &mut Client) -> i64 {
+    client
+        .query(
+            "SELECT state_payload FROM shiba_internal.operator_state",
+            &[],
+        )
+        .expect("query opaque scalar operator states")
+        .into_iter()
+        .map(|row| decode_scalar_state(&row.get::<_, Vec<u8>>(0)))
+        .sum()
+}
+
 pub(super) struct PgoutputCapture {
     pub script: &'static str,
     pub env_prefix: &'static str,

@@ -19,13 +19,18 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
         .query_one(
             "SELECT
                 (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
         )
         .expect("query durable state");
-    (row.get(0), row.get(1), row.get(2), row.get(3))
+    (
+        row.get(0),
+        support::decode_scalar_state(&row.get::<_, Vec<u8>>(1)),
+        row.get(2),
+        row.get(3),
+    )
 }
 
 fn streamed_messages(wire: &[u8]) -> Vec<(usize, u8)> {

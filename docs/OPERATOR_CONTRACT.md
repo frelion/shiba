@@ -1,9 +1,9 @@
 # Operator and compiler contract
 
-This file records the M9 aggregate proof. M13.1 freezes its replacement in
-[the generic Operator Kernel contract](OPERATOR_KERNEL_CONTRACT.md). Until the
-M13.2--M13.4 replacement commits land, the implementation remains the M9 API;
-there will be no compatibility path after cutover.
+This file records the historical M9 aggregate proof. M13 replaced that API with
+[the generic Operator Kernel contract](OPERATOR_KERNEL_CONTRACT.md). The old
+execution path no longer exists; this document is evidence provenance, not a
+compatibility contract.
 
 ## Pure boundary
 

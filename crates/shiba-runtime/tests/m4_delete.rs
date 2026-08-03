@@ -21,13 +21,18 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
         .query_one(
             "SELECT
                 (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
         )
         .expect("query durable state");
-    (row.get(0), row.get(1), row.get(2), row.get(3))
+    (
+        row.get(0),
+        support::decode_scalar_state(&row.get::<_, Vec<u8>>(1)),
+        row.get(2),
+        row.get(3),
+    )
 }
 
 fn delete_key_tag(wire: &[u8]) -> usize {
@@ -78,7 +83,7 @@ fn prove_count_underflow(client: &mut Client, delete: &SourceTransaction) {
     client
         .batch_execute(
             "UPDATE shiba_internal.operator_state
-                 SET value_bigint = 0 WHERE operator_id = 1;
+                 SET state_payload = decode('0000000000000000', 'hex') WHERE operator_id = 1;
              UPDATE shiba.operator_result
                  SET value_bigint = 0 WHERE operator_id = 1;",
         )
@@ -92,7 +97,7 @@ fn prove_count_underflow(client: &mut Client, delete: &SourceTransaction) {
     client
         .batch_execute(
             "UPDATE shiba_internal.operator_state
-                 SET value_bigint = 2 WHERE operator_id = 1;
+                 SET state_payload = decode('0000000000000002', 'hex') WHERE operator_id = 1;
              UPDATE shiba.operator_result
                  SET value_bigint = 2 WHERE operator_id = 1;",
         )

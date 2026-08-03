@@ -10,7 +10,8 @@ operator ID and stores each strict specification, canonical compiled payload,
 digest, state codec and output contract. Ingress/Bootstrap/Rebuild must consume
 that set without kind, fixed-ID, fixed-count or column-position assumptions.
 M13.4 closed those production lifecycle regression gates without an adapter or
-parallel path. M13.5 retains the final release/performance evidence gate.
+parallel path. M13.5 closed the final PG17.10/PG18.4 release, performance and
+static-specialization evidence gates.
 
 ## Direction
 

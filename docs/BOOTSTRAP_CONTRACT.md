@@ -3,7 +3,7 @@
 ## M13 generic plan-set handoff
 
 M13.3 established the sole generic Runtime entry and scalar/keyed Result Sink.
-M13.4 must make bootstrap use that entry exclusively: it loads every durable
+M13.4 made bootstrap use that entry exclusively: it loads every durable
 compiled plan for the source in ascending operator-ID order, validates each
 canonical payload/digest/state/output contract once per batch, constructs one
 EffectBatch, and persists all transitions in the existing short Apply
@@ -368,10 +368,13 @@ M12.6 does not fork the M11 bootstrap contract. It applies the existing
 10,000-row bounded snapshot batches to one million rows after an active-source
 destructive prepare, then consumes one real 10,000-change WAL transaction
 through the existing catch-up and activation path. The source begins with a
-nonzero operator result set and a real continuation; its historical gate
-compared CountRows/SumInt8 with the SQL oracle. M13.4 must rerun that same path
-with Catalog-loaded arbitrary-cardinality plans and full keyed `ProjectRows`
-comparison; ordinary live ingress must remain usable.
+nonzero operator result set and a real continuation; its frozen performance
+gate compares CountRows/SumInt8 with the SQL oracle. M13.4 re-ran that path with
+Catalog-loaded arbitrary-cardinality plans, while separate directed
+bootstrap/rebuild gates compare every keyed `ProjectRows` row with their SQL
+oracle; ordinary live ingress remains usable. Keeping the million-row
+performance plan set fixed prevents keyed-result WAL volume from silently
+redefining the historical retained-WAL baseline.
 
 Limits fixed before the run are scan <= 12 s, catch-up <= 8 s, activation
 <= 2 s, total <= 25 s, RSS growth <= 128 MiB and retained WAL <= 256 MiB.

@@ -190,7 +190,7 @@ fn capture_inputs(
 fn results(client: &mut Client) -> Vec<(i64, i64, i64)> {
     client
         .query(
-            "SELECT result.operator_id, result.value_bigint, state.value_bigint
+            "SELECT result.operator_id, result.value_bigint, state.state_payload
              FROM shiba.operator_result AS result
              JOIN shiba_internal.operator_state AS state USING (operator_id)
              ORDER BY result.operator_id",
@@ -198,7 +198,13 @@ fn results(client: &mut Client) -> Vec<(i64, i64, i64)> {
         )
         .unwrap()
         .into_iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .map(|row| {
+            (
+                row.get(0),
+                row.get(1),
+                support::decode_scalar_state(&row.get::<_, Vec<u8>>(2)),
+            )
+        })
         .collect()
 }
 

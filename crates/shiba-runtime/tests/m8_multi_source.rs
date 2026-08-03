@@ -24,13 +24,17 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
         .query_one(
             "SELECT
                 (SELECT sum(value_bigint)::bigint FROM shiba.operator_result),
-                (SELECT sum(value_bigint)::bigint FROM shiba_internal.operator_state),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
         )
         .expect("query durable state");
-    (row.get(0), row.get(1), row.get(2), row.get(3))
+    (
+        row.get(0),
+        support::scalar_state_sum(client),
+        row.get(1),
+        row.get(2),
+    )
 }
 
 fn applied_rows(client: &mut Client) -> Vec<(i64, i64)> {

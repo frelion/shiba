@@ -62,8 +62,8 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
             "SELECT
                 (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
                 (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 2),
-                (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
-                (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 2),
+                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 2),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
@@ -72,8 +72,8 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
     (
         row.get(0),
         row.get(1),
-        row.get(2),
-        row.get(3),
+        support::decode_scalar_state(&row.get::<_, Vec<u8>>(2)),
+        support::decode_scalar_state(&row.get::<_, Vec<u8>>(3)),
         row.get(4),
         row.get(5),
     )

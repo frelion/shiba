@@ -110,12 +110,15 @@ does not calculate operator semantics.
 
 ## Frozen evidence and budgets
 
-M13.2 must pass pure reference-model and randomized differential tests for all
+M13.2 passed pure reference-model and randomized differential tests for all
 three implementations, including corrupt codecs, NULL/Absent, overflow and
-amplification. M13.3 proves atomic scalar/keyed PostgreSQL persistence and
-rollback. M13.4 re-proves M10--M12 without kind, fixed-ID or fixed-count
-knowledge. M13.5 runs the complete PG17.10/PG18.4 matrix and static forbidden-
-specialization scan.
+amplification. M13.3 proved atomic scalar/keyed PostgreSQL persistence and
+rollback. M13.4 re-proved M10--M12 without kind, fixed-ID or fixed-count
+knowledge. M13.5 ran the complete PG17.10/PG18.4 matrix and static forbidden-
+specialization scan: 49 unique scripts and 98 PostgreSQL invocations, all
+green. Five post-change Apply medians are 782.302750/787.157125 ms,
+approximately 1.8%/2.2% above the frozen baselines and below the 15% stop
+lines.
 
 The pre-change five-run medians are: PG17 decode 9.607167 ms, Apply 768.727625
 ms, replay 470.250 us; PG18 decode 9.537708 ms, Apply 770.174125 ms, replay

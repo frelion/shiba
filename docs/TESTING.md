@@ -21,10 +21,19 @@ M13.4 is green on PG17.10/18.4 across committed/streaming ingress, bootstrap,
 bootstrap recovery/roles, and rebuild contract/admission/snapshot/recovery/
 identity/governance. It includes full ProjectRows keyed SQL oracles and
 pre-destructive plan-digest drift rejection with zero production
-operator-kind/fixed-ID/fixed-count/column-position knowledge. M13.5
-enrolls all new scripts in the one-click PG17.10/PG18.4 release matrix and runs the
-forbidden-specialization scan. ProjectRows must compare every key and nullable
-value with an independent SQL oracle; a count or digest alone is insufficient.
+operator-kind/fixed-ID/fixed-count/column-position knowledge. M13.5 passed the
+one-click PG17.10/PG18.4 release matrix: 49 unique scripts and 98 PostgreSQL
+invocations. The forbidden-specialization scan is empty. ProjectRows compares
+every key and nullable value with an independent SQL oracle; a count or digest
+alone is insufficient.
+
+Five post-change same-machine CountRows+SumInt8 runs measured Apply medians of
+782.302750 ms on PG17 and 787.157125 ms on PG18. Relative to the frozen
+768.727625/770.174125 ms baselines, this is about +1.8%/+2.2%, below the 15%
+stop lines. The final historical M12 CountRows+SumInt8 performance gate observed
+retained WAL of 252,876,464/252,917,880 bytes, still below 256 MiB. Its plan set
+is intentionally frozen; ProjectRows lifecycle correctness is proved by the
+separate full-row M13 bootstrap/rebuild differential gates.
 
 ## Milestone gates
 

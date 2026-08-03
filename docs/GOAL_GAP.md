@@ -1,6 +1,6 @@
 # V2 goal gap during M13
 
-## M13.3 implementation status
+## M13 completion status
 
 M1–M9 are the reference correctness kernel, not a complete Shiba V2. They
 prove the transaction and recovery semantics that later architecture must
@@ -15,7 +15,7 @@ operator, effect, and sink contracts.
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
 | Source Apply | Current-row authority plus transaction-local before/after effects, including the narrow key-changing update needed by ProjectRows | Broader row shapes and identities |
 | EffectStream | Non-durable transaction-local EffectBatch | Persisted effects intentionally absent |
-| Runtime | Generic plan/state decode, ordered kernel dispatch and atomic scalar/keyed persistence through live/bootstrap/rebuild | Final M13 release/performance evidence |
+| Runtime | Generic plan/state decode, ordered kernel dispatch and atomic scalar/keyed persistence through live/bootstrap/rebuild | Broader value and output contracts |
 | Operator | Database-free CountRows, SumInt8 and non-aggregate ProjectRows on one kernel | More operator families remain out of scope |
 | Result Sink | Generic visibility header, scalar bigint arm and active-only nullable keyed rows | Non-bigint result types |
 
@@ -23,8 +23,9 @@ M13.2 implemented the pure generic plan/state/transition contract. M13.3 made it
 the sole Catalog/Runtime path and proved CountRows, SumInt8 and ProjectRows
 atomically against PG17.10/18.4 SQL oracles. M13.4 removed fixed operator
 IDs/counts/column positions from ingress, bootstrap and rebuild and re-proved
-the directed M10--M12 matrix; M13.5 must now close the release matrix,
-performance comparison, static scan and documentation evidence.
+the directed M10--M12 matrix. M13.5 closed the complete PG17.10/PG18.4 release
+matrix, five-run performance comparison, forbidden-specialization scan and
+documentation evidence.
 
 ## Proven reference boundary
 
@@ -41,6 +42,25 @@ SQL frontend, additional operator families, non-bigint result shapes, cross-host
 sustained soak, empirical heap peak, contention tail latency, automatic
 receiver supervision/reconnect, and broader binding/operator lifecycles remain
 outside the proved boundary.
+
+## M13.5 release evidence
+
+The fixed-order release runner passed 49 unique PostgreSQL scripts on both
+PG17.10 and PG18.4: 98 successful invocations. The required production scan for
+fixed CountRows/SumInt8 IDs, kinds and cardinality assumptions is empty. Five
+post-change same-machine CountRows+SumInt8 runs measured Apply medians of
+782.302750 ms on PG17 and 787.157125 ms on PG18, versus frozen pre-change
+medians of 768.727625/770.174125 ms: regressions of about 1.8%/2.2%, below the
+15% stop lines.
+
+The historical million-row M12 performance scenario remains the frozen
+CountRows+SumInt8 comparison rather than adding one million keyed projection
+rows. The final matrix observed PG17/PG18 scan 4.525961791/4.449666292 s,
+catch-up 1.974170791/2.101600625 s, activation 11.072250/12.180917 ms, total
+6.556642834/6.609238167 s, RSS +5,184/+5,152 KiB and retained WAL
+252,876,464/252,917,880 bytes. ProjectRows bootstrap, catch-up, rebuild and
+recovery correctness remain independently covered by their full keyed SQL
+oracles; no assertion or frozen threshold was removed.
 
 M11.1 defined the initialization contract. A new slot's
 `EXPORT_SNAPSHOT` result is the sole snapshot/WAL boundary; the snapshot name is
