@@ -1,5 +1,20 @@
 # Testing strategy
 
+## M15.1 SQL frontend contract gates
+
+M15.1 is docs-only. Static review freezes raw SQL -> canonical QuerySpec ->
+ObjectAddress-bound OperatorGraph authority, accepted/rejected SQL, identifiers,
+aliases, NULL/types, deterministic NodeIds/digests, DDL-safe registration,
+rebuild rebind, stable spans/errors and hard resource/performance bounds. ADR
+0007 freezes `sqlparser` 0.62.0 `PostgreSqlDialect` as the minimized-feature
+candidate; later tests must layer its recursion limit with Shiba bounds and
+normalize `Spanned`/`TokenWithSpan` locations to stable UTF-8 byte spans.
+
+M15.2+ must add pure golden/canonical/error/span/limit tests and PG17.10/PG18.4
+SQL-oracle, DDL-race, least-privilege and rebuild-rebind gates. All M1--M14
+tests remain enrolled and live Apply must contain no parser call. M15.1 claims
+no implementation evidence.
+
 ## M14.7 release evidence
 
 Commit `206f085` records the previous green release matrix: 51 enrolled scripts

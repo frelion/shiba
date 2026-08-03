@@ -1,5 +1,21 @@
 # V2 goal gap after M14
 
+## M15.1 SQL frontend contract status
+
+The next gap is frozen rather than implemented. A bounded SQL `SELECT` subset
+normalizes to canonical `QuerySpecV1`; a short PostgreSQL binder resolves only
+registered SourceIds and exact column ObjectAddresses, then the existing
+Compiler emits the sole executable OperatorGraph. Raw SQL, `sqlparser` AST and
+PostgreSQL server parse/optimizer trees are not authority. Rebuild rebinds the
+durable QuerySpec against explicit target descriptors and generation-specific
+effective identity.
+
+The contract fixes projection/filter/compute/grouped Count/Sum and narrow
+two-source INNER JOIN syntax, explicit rejections, identifiers/aliases,
+three-valued NULL semantics, stable spans/errors, DDL locking and hard bounds.
+`sqlparser` 0.62.0 `PostgreSqlDialect` is the candidate with minimized features;
+M15.2+ implementation and PG17.10/PG18.4 evidence remain unproved.
+
 ## M14.7 completion status
 
 M14 is complete at the declared Operator Development boundary. Commit

@@ -38,6 +38,7 @@ PG_CONFIG="$pg_config" cargo clippy -p shiba-catalog --no-default-features --fea
 PG_CONFIG="$pg_config" cargo clippy -p shiba-runtime --all-targets -- -D warnings
 PG_CONFIG="$pg_config" cargo clippy -p shiba-ingress --all-targets -- -D warnings
 git diff --check
+scripts/check-m15-contract.sh
 
 # An unborn branch has no tracked diff, so check every tracked-or-untracked
 # text file directly for whitespace damage and missing final newlines.

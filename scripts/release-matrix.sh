@@ -169,6 +169,7 @@ echo "Release matrix plan: $version17; $version18"
 echo "PG scripts: unique=$unique_pg_scripts foundation_per_version=$foundation_count m12_per_version=$m12_count m13_per_version=$m13_count m14_per_version=$m14_count invocations=$pg_invocations"
 
 echo "==> phase 1/7: formatting, check, and directed pure tests"
+scripts/check-m15-contract.sh
 cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo test -p shiba-operator -p shiba-compiler

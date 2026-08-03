@@ -1,5 +1,20 @@
 # Architecture boundary
 
+M15.1 freezes a bounded SQL declaration frontend in
+[SQL_FRONTEND_CONTRACT.md](SQL_FRONTEND_CONTRACT.md) and
+[ADR 0007](adr/0007-m15-sql-frontend.md). Raw SQL and parser AST are ephemeral;
+canonical `QuerySpecV1` is declarative authority and the exact ObjectAddress-
+bound `OperatorGraph` remains execution authority. A short registration
+transaction binds registered sources/columns and installs both stages; Runtime,
+Operator, Ingress, Bootstrap and Rebuild receive no SQL/parser types. Rebuild
+rebinds QuerySpec only against explicit target descriptors and binds that
+generation's effective identity index rather than storing its OID in QuerySpec.
+
+The candidate is `sqlparser` 0.62.0 `PostgreSqlDialect`, with minimized features
+and layered parser/Shiba bounds. Its approximate dialect and locations are input
+evidence, not authority; Shiba owns the allowlist, canonical semantics, stable
+UTF-8 byte spans and error codes. M15.1 changes no production execution path.
+
 M14.6 cuts the production lifecycle over to the graph boundary frozen in
 [OPERATOR_GRAPH_CONTRACT.md](OPERATOR_GRAPH_CONTRACT.md): one canonical typed
 graph owns its exact source membership, nodes, edges, terminal outputs and hard

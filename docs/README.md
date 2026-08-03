@@ -222,3 +222,11 @@ same-scene Apply medians are 771.019625/821.920250 ms, below the frozen
 899.648163/905.230694 ms ceilings. M14 is complete; this does not claim a SQL
 frontend, outer/three-table joins, windows, additional aggregates, plugins,
 scheduler, or complete V2.
+
+M15 SQL frontend work is governed by
+[SQL_FRONTEND_CONTRACT.md](SQL_FRONTEND_CONTRACT.md) and
+[ADR 0007](adr/0007-m15-sql-frontend.md). M15.1 freezes a narrow bounded
+`SELECT` subset, canonical QuerySpec authority, exact ObjectAddress binding,
+DDL-safe registration/rebuild rebind and stable diagnostics. It selects
+`sqlparser` 0.62.0 `PostgreSqlDialect` only as a parser candidate; no SQL
+frontend production path or new V2 completion claim exists yet.

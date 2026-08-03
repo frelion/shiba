@@ -1,0 +1,99 @@
+# M15 QuerySpecV1 contract
+
+## Authority
+
+QuerySpecV1 is the sole durable declaration authority.
+OperatorGraph is the sole Runtime execution authority.
+SQL text is non-authoritative provenance.
+`graph_definition.spec_payload` contains only exact canonical QuerySpecV1 bytes;
+`graph_payload` and `graph_digest` contain the only executable bound graph.
+
+In M15.2 `GraphOutputSpecV1` is deleted together with its complete-query recipe
+variants and decoder. There is no adapter, fallback, compatibility alias, dual write or
+second compiler path. Old recipe payloads fail closed after the cutover.
+
+## Envelope and canonical encoding
+
+`QuerySpecV1` has version 1, a nonzero GraphId, one or two ordered SourceIds,
+topologically ordered generic nodes and a bounded nonempty result set. Strict decoding
+denies unknown fields, versions and trailing bytes. It rejects zero, duplicate
+or unordered identities and noncanonical payloads.
+
+Canonical JSON uses fixed field order, tagged enums, decimal `i64`, no unstable
+map order and no insignificant whitespace. Its SHA-256 digest is domain-
+separated from OperatorGraph. Formatting, comments, keyword case, redundant
+parentheses, relation aliases and column aliases cannot change canonical bytes.
+
+## Generic nodes and edges
+
+Each node has ordered inputs from a SourceId or earlier NodeId and one operation:
+Filter, Project, Compute, KeyBy, Count, Sum, InnerJoin or Materialize. Count,
+Sum and grouped forms are assembled from nodes and edges. There are no complete-
+query `FilteredGroupedSum`, `ComputedProject`, `CountRowsSQL` or Join recipes.
+Each declared result points to one Materialize terminal. M15 SQL lowering emits
+exactly one; direct declarations retain bounded multiple terminals solely to
+preserve M14's already-proved atomic Count/Sum/Project graph contract.
+
+The Compiler assigns consecutive nonzero NodeIds by deterministic canonical
+pre-order. SQL, aliases and callers never supply them. Cycles, forward or
+disconnected references, duplicate terminals and wrong arity fail closed.
+
+## Expressions and types
+
+Expressions are column reference, bigint literal, typed NULL, checked bigint
+addition/subtraction, comparisons, `IS NULL`, `IS NOT NULL`, and three-valued
+`AND`/`OR`/`NOT`. Source-edge references retain normalized logical identifier
+and quoted status for bind/rebind; node-edge expressions use typed slots.
+
+No expression contains ObjectAddress, parser AST, SQL text, implicit cast,
+function name or executable code. Absent is an internal delta condition, never
+SQL NULL. Bare `SUM(bigint)` returns typed NULL for empty or all-NULL input;
+Count returns non-null zero. Overflow rolls back the complete Runtime transaction.
+
+## Binding and rebuild
+
+Registration resolves logical sources and columns once against registered
+SourceIds and locked PostgreSQL descriptors. The Compiler embeds exact relation,
+column and effective identity-index ObjectAddresses only in OperatorGraph.
+QuerySpec does not persist a generation-specific index OID.
+
+Rebuild validates durable canonical QuerySpec and recompiles against explicit
+target descriptors before destructive prepare. It never reparses SQL, uses
+caller SQL, copies the old graph or resolves `search_path`. A valid new target
+ObjectAddress yields a new graph/digest under the same logical QuerySpec;
+missing, ambiguous or incompatible bindings fail before prepare.
+
+Runtime, Ingress, Bootstrap, Operator and Result Sink do not interpret QuerySpec
+operations, identifiers or parser types. They load only OperatorGraph and its
+result contracts.
+
+## Result contract
+
+The terminal is either scalar bigint with explicit nullability or keyed bigint
+to nullable-bigint rows. Column aliases are ephemeral presentation metadata,
+not durable result identity, and cannot affect canonical QuerySpec. Contract,
+type or nullability drift fails registration or rebuild atomically.
+
+## Errors
+
+Codec/version/canonical failures, topology/type failures and PostgreSQL binding
+failures remain distinct. None falls back to GraphOutputSpecV1 or SQL. Frontend
+diagnostics retain a stable byte span only outside durable QuerySpec.
+
+## Bounds
+
+- one or two sources, at most 32 total nodes/results and at least one result;
+- at most 256 expression nodes, depth 32 and 64 boolean terms;
+- at most two projected items and a 256 KiB canonical payload;
+- all existing M14 graph/delta/fan-out/memory limits remain unchanged.
+
+Validation is linear or `O(n log n)` for bounded sorting with checked counters.
+No declaration node can create unbounded expansion.
+
+## M15.2 evidence
+
+Golden tests prove strict roundtrip, digest separation, semantic equivalence,
+deterministic NodeIds, every M14 shape through generic nodes, corrupt input
+rejection and graph behavior equivalence. PG17.10/PG18.4 M14 grouped, graph
+Runtime and Join lifecycle gates plus the complete release matrix are required
+before the M15.2 commit.
