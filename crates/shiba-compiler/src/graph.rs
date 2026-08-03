@@ -153,17 +153,17 @@ fn result_contract(
     layout: &TypedLayout,
 ) -> Result<(u16, u16, OutputContract), CompilerError> {
     match *shape {
-        QueryResultShapeV1::Scalar { value_slot }
-            if layout.value_types.get(usize::from(value_slot)) == Some(&ValueType::Int8) =>
-        {
-            Ok((
-                0,
-                value_slot,
-                OutputContract::Scalar {
-                    value_type: ValueType::Int8,
-                },
-            ))
-        }
+        QueryResultShapeV1::Scalar {
+            value_slot,
+            value_nullable,
+        } if layout.value_types.get(usize::from(value_slot)) == Some(&ValueType::Int8) => Ok((
+            0,
+            value_slot,
+            OutputContract::Scalar {
+                value_type: ValueType::Int8,
+                nullable: value_nullable,
+            },
+        )),
         QueryResultShapeV1::Keyed {
             key_slot,
             key_nullable,

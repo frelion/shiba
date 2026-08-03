@@ -41,6 +41,7 @@ git diff --check
 scripts/check-m15-contract.sh
 scripts/check-m15-parser.sh
 scripts/check-m15-registration.sh
+scripts/check-m15-aggregates.sh
 
 # An unborn branch has no tracked diff, so check every tracked-or-untracked
 # text file directly for whitespace damage and missing final newlines.

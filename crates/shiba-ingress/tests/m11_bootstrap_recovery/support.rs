@@ -71,11 +71,17 @@ fn graph_spec() -> QuerySpecV1 {
         results: vec![
             QueryResultV1 {
                 input_node: 1,
-                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+                shape: QueryResultShapeV1::Scalar {
+                    value_slot: 0,
+                    value_nullable: false,
+                },
             },
             QueryResultV1 {
                 input_node: 2,
-                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+                shape: QueryResultShapeV1::Scalar {
+                    value_slot: 0,
+                    value_nullable: false,
+                },
             },
         ],
     }

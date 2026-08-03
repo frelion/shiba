@@ -272,11 +272,23 @@ Apply/ACK, exact replay, complete key/value SQL differential, and rebuild to a
 changed target ObjectAddress followed by live ACK. Raw SQL/parser AST are not
 persisted and Runtime/Ingress remain parser-free.
 
-Later PG17.10 and PG18.4 directed tests must still prove grouped Count/Sum and
-cross-schema Join SQL oracles, least-privilege SQL registration and the remaining
-negative binding families. M15.4 has only directed two-version evidence. Its
-script is enrolled as gate 53, but the complete 53-script/106-invocation runner
-is reserved for M15.7 and is not claimed here.
+M15.5 directed tests prove scalar Count, PostgreSQL-compatible nullable scalar
+Sum, filtered grouped Count and grouped Sum on both PG17.10 and PG18.4. The
+Binder emits only generic QuerySpec nodes and output contracts. Scalar Sum's
+checked value and non-NULL input count occupy two StateKeys in the same
+`graph_node_state` authority; the explicit nullable scalar contract lets the
+generic sink publish typed NULL for empty/all-NULL input. There is no aggregate
+registration workflow or second state/result writer.
+
+`scripts/test-m15-sql-aggregates.sh` takes all four graphs through production
+registration, bootstrap/catch-up, live receiver Apply/ACK and full SQL oracles.
+It also proves predicate/group transitions, deleting the last non-NULL scalar
+input, overflow rollback with no continuation/feedback advance, retry/replay,
+and changed-ObjectAddress grouped-SUM rebuild. Failure-first tests fixed the
+sum-state zero/empty ambiguity and the generic scalar sink/catalog's previous
+non-NULL-only assumption. Cross-schema Join SQL, least-privilege registration
+and remaining negative binding families are M15.6/M15.7 work. The complete
+release runner remains reserved for M15.7 and is not claimed here.
 
 The final release runner retains exact script enrollment, every M1--M14 gate,
 the frozen parser/registration thresholds and a static scan proving SQL/parser
@@ -291,6 +303,7 @@ parameters, prepared statements, views, permissions inferred from SQL,
 scheduler, plugins, remote databases or cross-host failover. M15.1 freezes this
 contract. M15.2 completed the generic QuerySpec cutover, M15.3 completed the
 pure SQL-to-UnboundQuery parser, and M15.4 completed the Binder/registration and
-first single-source production SQL vertical. Aggregate SQL, two-table Join SQL,
-least-privilege registration, frontend/performance measurements and the full
-release matrix remain M15.5--M15.7 work.
+first single-source production SQL vertical. M15.5 completed the admitted
+single-source aggregate SQL verticals with nullable scalar output semantics.
+Two-table Join SQL, least-privilege registration, frontend/performance
+measurements and the full release matrix remain M15.6--M15.7 work.

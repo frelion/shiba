@@ -1,6 +1,6 @@
 # V2 goal gap after M14
 
-## M15.1--M15.4 SQL frontend status
+## M15.1--M15.5 SQL frontend status
 
 The bounded SQL `SELECT` parser emits an ephemeral `UnboundQuery`. M15.4 now
 implements a pure Binder for the first single-source projection/filter/compute
@@ -43,10 +43,19 @@ OperatorGraph authority, continuation, transaction ownership and ACK semantics
 are unchanged. The new script is enrolled as gate 53, but the complete
 53-script/106-invocation release matrix has not been run as M15.4 evidence.
 
-Still unproved are aggregate SQL (M15.5), two-table Join SQL (M15.6),
-least-privilege SQL registration, the frozen 10,000-query and registration
-performance/heap gates, and the final full matrix (M15.7). M15.4 is not M15
-completion.
+M15.5 now proves scalar Count, nullable scalar Sum, filtered grouped Count and
+grouped Sum through the same generic Binder, QuerySpec, OperatorGraph and
+Result Sink. Scalar SUM's checked sum and non-NULL count are two StateKeys in
+the sole `graph_node_state` authority; explicit scalar nullability preserves
+PostgreSQL empty/all-NULL semantics without a second state or result path.
+Directed PG17.10/PG18.4 evidence covers production registration, snapshot,
+catch-up, live Apply/ACK, rollback/retry/replay and changed-ObjectAddress
+rebuild against full SQL oracles. Failure-first tests corrected the prior
+zero-versus-empty state ambiguity and non-NULL-only scalar sink contract.
+
+Still unproved are two-table Join SQL (M15.6), least-privilege SQL registration,
+the frozen 10,000-query and registration performance/heap gates, and the final
+full matrix (M15.7). M15.5 is not M15 completion.
 
 ## M14.7 completion status
 
@@ -156,7 +165,7 @@ operator, effect, and sink contracts.
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
 | Catalog | Version, source facts/effective identity, sole canonical graph plan/membership, graph ingress/continuation/bootstrap, generic graph node state/results, sole `source_row_state`, complete M14 evidence | Broader graph shapes/types |
-| Compiler | Strict IR plus M15.4 pure binding of one SQL projection/filter/compute shape to an ObjectAddress-bound graph | Aggregate/Join SQL lowering and broader plan language |
+| Compiler | Strict IR plus M15.5 pure binding of projection/filter/compute and scalar/grouped Count/Sum SQL to ObjectAddress-bound graphs | Join SQL lowering and broader plan language |
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
 | Source Apply | SourceId-tagged current rows plus transaction-local before/after effects for every graph member | Broader row shapes and identities |
 | EffectStream | Non-durable transaction-local DeltaBatch/MultiInputBatch | Persisted effects intentionally absent |
@@ -183,7 +192,7 @@ count authority itself has been removed.
 
 ## Still unproved
 
-Aggregate/Join SQL frontend completion, additional operator families,
+Join SQL frontend completion, additional operator families,
 non-bigint result shapes, cross-host
 sustained soak, empirical heap peak, contention tail latency, automatic
 receiver supervision/reconnect, and broader binding/operator lifecycles remain
@@ -319,7 +328,8 @@ and 96 successful PG invocations.
 
 That green gate closes the declared active nullable-`int8` CountRows/SumInt8
 rebuild lifecycle, not V2. M15.4 later proves the first single-source SQL
-vertical; remaining product gaps include aggregate/Join SQL, additional
+vertical and M15.5 proves its admitted aggregate SQL shapes; remaining product
+gaps include Join SQL, additional
 source/operator/result shapes, TLS and credential
 rotation, automatic receiver supervision/reconnect, cross-host and failover
 operation, sustained soak/heap/tail-latency evidence, and defense against a

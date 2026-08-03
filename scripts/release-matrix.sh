@@ -93,6 +93,7 @@ m14_gates=(
 
 m15_gates=(
   test-m15-sql-vertical.sh
+  test-m15-sql-aggregates.sh
 )
 
 cd "$root"
@@ -186,6 +187,7 @@ echo "==> phase 1/8: formatting, check, and directed pure tests"
 scripts/check-m15-contract.sh
 scripts/check-m15-parser.sh
 scripts/check-m15-registration.sh
+scripts/check-m15-aggregates.sh
 cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo test -p shiba-operator -p shiba-compiler

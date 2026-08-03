@@ -17,6 +17,7 @@ fn graph() -> OperatorGraph {
     let source_id = SourceId::new(1).unwrap();
     let scalar = OutputContract::Scalar {
         value_type: ValueType::Int8,
+        nullable: false,
     };
     let keyed = OutputContract::KeyedRows {
         key_type: ValueType::Int8,
@@ -161,7 +162,7 @@ fn multiple_terminals_share_one_batch_and_generic_state() {
     let graph = graph();
     let input = input(&graph);
     let read_set = graph_state_read_set(&graph, &input).unwrap();
-    assert_eq!(read_set.keys.len(), 6);
+    assert_eq!(read_set.keys.len(), 7);
     let snapshot = StateSnapshot::new(
         &read_set,
         read_set
@@ -175,7 +176,7 @@ fn multiple_terminals_share_one_batch_and_generic_state() {
     )
     .unwrap();
     let transition = apply_graph_plan(&graph, &snapshot, &input).unwrap();
-    assert_eq!(transition.state_deltas.len(), 6);
+    assert_eq!(transition.state_deltas.len(), 7);
     assert_eq!(transition.results.len(), 5);
     assert_eq!(
         transition.results[0],

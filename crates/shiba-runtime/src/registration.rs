@@ -226,20 +226,26 @@ fn insert_results(
     let graph_id = bigint(graph.graph_id.get())?;
     for (result_id, output) in graph.result_contracts() {
         let (shape, key_type, key_nullable, value_type, value_nullable) = metadata(output);
-        let initial = if matches!(output, OutputContract::Scalar { .. }) {
-            Some(TypedValue::Int8(0))
-        } else {
-            None
+        let initial = match output {
+            OutputContract::Scalar { nullable: true, .. } => {
+                Some(TypedValue::Null(ValueType::Int8))
+            }
+            OutputContract::Scalar {
+                nullable: false, ..
+            } => Some(TypedValue::Int8(0)),
+            OutputContract::KeyedRows { .. } => None,
         };
         let payload = initial
             .as_ref()
             .map(TypedValue::to_canonical_json)
             .transpose()
             .map_err(|_| M2Error::InvalidOperatorDefinition)?;
+        let scalar_nullable = matches!(output, OutputContract::Scalar { nullable: true, .. });
         let value = initial
             .as_ref()
-            .map(crate::result_sink::scalar_int8)
-            .transpose()?;
+            .map(|value| crate::result_sink::scalar_value(value, scalar_nullable))
+            .transpose()?
+            .flatten();
         transaction.execute(
             "INSERT INTO shiba.graph_result (
                  graph_id, result_id, output_shape, output_key_type,
@@ -282,9 +288,10 @@ fn metadata(
     contract: &OutputContract,
 ) -> (&'static str, Option<&'static str>, bool, &'static str, bool) {
     match contract {
-        OutputContract::Scalar { value_type } => {
-            ("scalar", None, false, type_name(*value_type), false)
-        }
+        OutputContract::Scalar {
+            value_type,
+            nullable,
+        } => ("scalar", None, false, type_name(*value_type), *nullable),
         OutputContract::KeyedRows {
             key_type,
             key_nullable,

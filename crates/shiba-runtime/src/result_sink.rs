@@ -11,7 +11,9 @@ const MAX_GRAPH_RESULT_MUTATIONS: usize = 100_000;
 
 #[derive(Clone, Copy)]
 enum Shape {
-    Scalar,
+    Scalar {
+        value_nullable: bool,
+    },
     Keyed {
         key_nullable: bool,
         value_nullable: bool,
@@ -51,10 +53,11 @@ pub(crate) fn lock(
             "scalar"
                 if row.get::<_, Option<&str>>(2).is_none()
                     && !row.get::<_, bool>(3)
-                    && row.get::<_, &str>(4) == "int8"
-                    && !row.get::<_, bool>(5) =>
+                    && row.get::<_, &str>(4) == "int8" =>
             {
-                Shape::Scalar
+                Shape::Scalar {
+                    value_nullable: row.get(5),
+                }
             }
             "keyed"
                 if row.get::<_, Option<&str>>(2) == Some("int8")
@@ -87,8 +90,7 @@ pub(crate) fn persist(
     let mut mutation_count = 0usize;
     for result in results {
         let (node_id, shape) = match &result {
-            ResultDelta::Scalar { node_id, .. } => (i64::from(node_id.get()), Shape::Scalar),
-            ResultDelta::Keyed { node_id, .. } => (
+            ResultDelta::Scalar { node_id, .. } | ResultDelta::Keyed { node_id, .. } => (
                 i64::from(node_id.get()),
                 *locked
                     .contracts
@@ -101,10 +103,13 @@ pub(crate) fn persist(
         }
         match result {
             ResultDelta::Scalar { value, .. } => {
+                let Shape::Scalar { value_nullable } = shape else {
+                    return Err(M2Error::InvalidOperatorDefinition);
+                };
                 if activate {
-                    activate_scalar(transaction, graph_id, node_id, &value)?;
+                    activate_scalar(transaction, graph_id, node_id, &value, value_nullable)?;
                 } else if publish {
-                    persist_scalar(transaction, graph_id, node_id, &value)?;
+                    persist_scalar(transaction, graph_id, node_id, &value, value_nullable)?;
                 }
             }
             ResultDelta::Keyed { mutations, .. } => {
@@ -143,8 +148,9 @@ fn activate_scalar(
     graph_id: i64,
     result_id: i64,
     value: &TypedValue,
+    value_nullable: bool,
 ) -> Result<(), M2Error> {
-    let bigint = scalar_int8(value)?;
+    let bigint = scalar_value(value, value_nullable)?;
     let payload = value
         .to_canonical_json()
         .map_err(|_| M2Error::InvalidOperatorDefinition)?;
@@ -179,10 +185,18 @@ fn activate_keyed(
 }
 
 fn shape_matches(expected: Option<&Shape>, actual: Shape) -> bool {
-    matches!(
-        (expected, actual),
-        (Some(Shape::Scalar), Shape::Scalar) | (Some(Shape::Keyed { .. }), Shape::Keyed { .. })
-    )
+    match (expected, actual) {
+        (
+            Some(Shape::Scalar {
+                value_nullable: expected,
+            }),
+            Shape::Scalar {
+                value_nullable: actual,
+            },
+        ) => *expected == actual,
+        (Some(Shape::Keyed { .. }), Shape::Keyed { .. }) => true,
+        _ => false,
+    }
 }
 
 fn persist_scalar(
@@ -190,8 +204,9 @@ fn persist_scalar(
     graph_id: i64,
     result_id: i64,
     value: &TypedValue,
+    value_nullable: bool,
 ) -> Result<(), M2Error> {
-    let bigint = scalar_int8(value)?;
+    let bigint = scalar_value(value, value_nullable)?;
     let payload = value
         .to_canonical_json()
         .map_err(|_| M2Error::InvalidOperatorDefinition)?;
@@ -207,9 +222,10 @@ fn persist_scalar(
     Ok(())
 }
 
-pub(crate) fn scalar_int8(value: &TypedValue) -> Result<i64, M2Error> {
+pub(crate) fn scalar_value(value: &TypedValue, nullable: bool) -> Result<Option<i64>, M2Error> {
     match value {
-        TypedValue::Int8(value) => Ok(*value),
+        TypedValue::Int8(value) => Ok(Some(*value)),
+        TypedValue::Null(shiba_operator::ValueType::Int8) if nullable => Ok(None),
         _ => Err(M2Error::InvalidOperatorDefinition),
     }
 }

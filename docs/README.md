@@ -261,6 +261,28 @@ OperatorGraph authority are unchanged.
 
 The new gate is enrolled as the 53rd release script, but the complete
 53-script/106-invocation runner has not yet been executed as M15.4 evidence.
-Aggregate SQL (M15.5), two-table Join SQL (M15.6), least-privilege registration,
-the frozen frontend/performance measurements and the final full matrix (M15.7)
-remain unproved; M15 is not complete.
+
+M15.5 extends the same Binder and registration path to scalar `COUNT(*)`,
+PostgreSQL-compatible nullable scalar `SUM(bigint)`, filtered grouped count and
+grouped sum. The lowering is generic QuerySpec/OperatorGraph construction; the
+frontend does not call aggregate-specific Runtime, Ingress, Bootstrap or
+Rebuild paths. Scalar SUM stores its checked sum and non-NULL input count as two
+keys in the existing `graph_node_state` authority, allowing empty and all-NULL
+input to materialize typed NULL without adding another state authority. The
+generic scalar output contract now carries nullability, and the generic Result
+Sink persists either canonical `Int8` or typed `Null(Int8)` accordingly.
+
+Directed PG17.10/PG18.4 `test-m15-sql-aggregates.sh` runs all four aggregate
+graphs through registration, snapshot bootstrap, catch-up, production receiver,
+Apply/explicit ACK and SQL differential. It also proves NULL/group lifecycle,
+overflow rollback with no continuation or ACK advance, retry/replay, and a
+changed-ObjectAddress grouped-SUM rebuild followed by live ACK. Failure-first
+tests exposed and fixed both the missing non-NULL-count state needed to
+distinguish zero from no input and the scalar sink/catalog assumption that an
+active scalar must be non-NULL. No legacy implementation or SQL workflow was
+reused.
+
+Two-table Join SQL (M15.6), least-privilege registration, the frozen frontend/
+registration performance measurements and the final complete release matrix
+(M15.7) remain unproved; M15 is not complete. The directed M15.5 evidence is not
+a claim that the complete release runner has passed.

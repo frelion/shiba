@@ -51,11 +51,17 @@ fn spec(graph_id: u64, source_id: u64, input_column: &str) -> QuerySpecV1 {
         results: vec![
             QueryResultV1 {
                 input_node: 1,
-                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+                shape: QueryResultShapeV1::Scalar {
+                    value_slot: 0,
+                    value_nullable: false,
+                },
             },
             QueryResultV1 {
                 input_node: 2,
-                shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+                shape: QueryResultShapeV1::Scalar {
+                    value_slot: 0,
+                    value_nullable: false,
+                },
             },
         ],
     }

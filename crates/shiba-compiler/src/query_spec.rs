@@ -195,6 +195,7 @@ pub struct QueryResultV1 {
 pub enum QueryResultShapeV1 {
     Scalar {
         value_slot: u16,
+        value_nullable: bool,
     },
     Keyed {
         key_slot: u16,

@@ -46,8 +46,31 @@ Apply/ACK, exact replay and changed-ObjectAddress rebuild. QuerySpec remains the
 sole durable declaration and OperatorGraph the sole executable authority;
 rebuild recompiles the stored QuerySpec against the explicit target without
 reparsing SQL. This directed gate is enrolled in the now 53-script release
-runner, but the complete 53×2 runner, aggregate/Join SQL, registration least
-privilege and frontend/performance closure remain M15.5--M15.7 work.
+runner. At the M15.4 boundary the complete 53×2 runner, aggregate/Join SQL,
+registration least privilege and frontend/performance closure were still
+M15.5--M15.7 work; M15.5 subsequently closes the aggregate portion below.
+
+M15.5 extends that same control-plane and execution architecture to four SQL
+aggregate shapes: scalar Count, nullable scalar Sum, filtered grouped Count and
+grouped Sum. The Binder lowers each shape into ordinary QuerySpec nodes and
+generic output contracts; concrete Count/Sum dispatch remains confined to the
+database-independent Operator kernel. Runtime schedules the graph and persists
+state/result deltas by contract, without an aggregate-specific SQL workflow.
+
+PostgreSQL scalar SUM needs both a checked sum and knowledge of whether any
+non-NULL input exists. Those values are two typed keys owned by the same
+`graph_node_state` row authority and Runtime writer; they are not a second
+state store. `OutputContract::Scalar` carries explicit nullability, so the same
+generic Result Sink can atomically publish `Int8` or typed `Null(Int8)` with
+source rows, graph state and continuation. Failure-first tests corrected the
+previous one-key zero/empty ambiguity and the sink/catalog assumption that an
+active scalar could never be NULL.
+
+Directed PG17.10/PG18.4 production lifecycle evidence covers aggregate
+registration, one-snapshot bootstrap, WAL catch-up, live Apply/ACK,
+overflow rollback/retry/replay and grouped-SUM rebuild. It does not prove the
+M15.6 two-source Join SQL binding or M15.7 least-privilege, frozen performance
+and complete release matrix gates.
 
 M14.6 cuts the production lifecycle over to the graph boundary frozen in
 [OPERATOR_GRAPH_CONTRACT.md](OPERATOR_GRAPH_CONTRACT.md): one canonical typed
@@ -479,9 +502,9 @@ backoff policy, allocator/RSS peaks, cross-host soak, admission
 for `D + O` or replica identity `FULL`, composite UPDATE and broader old-tuple
 shapes, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving,
-production failover and persisted partial-stream recovery, aggregate/Join SQL
-binding and the final least-privilege/performance matrix beyond M15.4's first
-single-source PostgreSQL lifecycle,
+production failover and persisted partial-stream recovery, Join SQL binding and
+the final least-privilege/performance matrix beyond M15.5's aggregate
+PostgreSQL lifecycles,
 additional operator families beyond non-aggregate ProjectRows, broader result
 types, cross-host sustained soak, empirical heap peak, contention tail latency,
 and recovery workers
@@ -652,7 +675,8 @@ The comparison baseline is M11's pristine bootstrap: approximately 3.1 s scan,
 retirement and activation work, but still may not add a queue, per-row SQL path,
 second authority or parallel generation. M12.6 completes only the
 declared active nullable-`int8` CountRows/SumInt8 rebuild boundary. M15.4 later
-reuses it for the first SQL-declared changed-ObjectAddress rebuild; TLS,
+reuses it for the first SQL-declared changed-ObjectAddress rebuild and M15.5
+reuses the same lifecycle for grouped-SUM rebuild; TLS,
 automatic reconnect supervision, cross-host/failover operation, broader source
-shapes, aggregate/Join SQL registration and broader result/operator shapes remain
+shapes, Join SQL registration and broader result/operator shapes remain
 outside it.

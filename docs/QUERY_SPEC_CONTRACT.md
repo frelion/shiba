@@ -1,6 +1,6 @@
 # M15 QuerySpecV1 contract
 
-## M15.2 cutover and M15.4 binding status
+## M15.2 cutover and M15.5 binding status
 
 M15.2 replaced the complete-query `GraphSpecV1`/
 `GraphOutputSpecV1` recipes with this generic QuerySpec. Compiler version 2
@@ -142,3 +142,36 @@ ObjectAddresses rebuilt from the durable QuerySpec. A DDL-first column
 replacement creates an observed lock wait and returns stable `ddl_drift`
 without partial graph rows. The script is enrolled as release gate 53; a full
 53-script run on both versions is not claimed as M15.4 evidence.
+
+## M15.5 aggregate binding and lifecycle evidence
+
+The pure Binder now lowers the four admitted single-source aggregate families
+without adding a recipe or Runtime API: scalar `COUNT(*)`, scalar
+`SUM(bigint)`, filtered grouped count and grouped sum. Column names are resolved
+once to exact SourceDescriptor/ObjectAddress coordinates; canonical QuerySpec
+stores slots and typed expressions, never names as execution identity. Aliases
+and redundant parentheses normalize to the same canonical declaration.
+
+Scalar Count has a non-nullable bigint result contract. Scalar Sum has a
+nullable bigint result contract: empty input and all-NULL input produce typed
+NULL, while NULL rows contribute nothing to arithmetic. The Operator kernel
+keeps the checked sum and non-NULL input count as two generic StateKeys under
+the existing `graph_node_state` authority. QuerySpec describes output
+nullability; it does not expose those private state keys or create a second
+state authority. Grouped Sum retains an existing group with typed NULL while
+all values are NULL and retracts the result only when the group becomes empty.
+
+Pure Binder and kernel tests cover canonical lowering, wrong/missing/duplicate
+and non-bigint binding, NULL/state corruption and overflow. On PG17.10 and
+PG18.4, `scripts/test-m15-sql-aggregates.sh` proves all four declarations
+through the production registration/bootstrap/catch-up/live receiver/Apply/ACK
+path against complete SQL oracles. It additionally proves overflow rollback,
+retry and exact replay, plus changed-ObjectAddress grouped-SUM rebuild and
+post-activation live ACK. Failure-first evidence corrected two independent
+assumptions: sum-only state could not distinguish numeric zero from no non-NULL
+input, and the generic scalar sink/catalog rejected typed NULL active results.
+Both fixes remain inside existing plan/state/result authorities.
+
+This is directed two-version M15.5 evidence, not the M15.7 complete release
+matrix. Two-table Join SQL, least-privilege registration and frozen frontend/
+registration performance remain unproved.

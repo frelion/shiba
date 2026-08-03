@@ -7,6 +7,7 @@ use crate::ValueType;
 pub enum OutputContract {
     Scalar {
         value_type: ValueType,
+        nullable: bool,
     },
     KeyedRows {
         key_type: ValueType,

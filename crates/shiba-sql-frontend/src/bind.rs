@@ -6,9 +6,7 @@ use shiba_compiler::{
 use shiba_protocol::GraphId;
 
 use crate::bind_expression::{ExpressionType, lower, resolve_column};
-use crate::{
-    ColumnRef, ErrorCode, FrontendError, SelectExpression, UnboundExpression, UnboundQuery,
-};
+use crate::{ErrorCode, FrontendError, SelectExpression, UnboundExpression, UnboundQuery};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedSource {
@@ -35,8 +33,16 @@ pub fn bind_query(
     let [resolved] = sources else {
         return Err(binding(ErrorCode::UnknownRelation, query.span));
     };
-    if query.sources.len() != 1 || query.join.is_some() || query.group_by.is_some() {
+    if query.sources.len() != 1 || query.join.is_some() {
         return Err(binding(ErrorCode::UnsupportedSyntax, query.span));
+    }
+    if query.group_by.is_some()
+        || query
+            .projection
+            .iter()
+            .any(|item| matches!(item.expression, SelectExpression::Aggregate(_)))
+    {
+        return crate::bind_aggregate::bind(graph_id, query, resolved);
     }
     let [key_item, value_item] = query.projection.as_slice() else {
         return Err(binding(ErrorCode::UnsupportedSyntax, query.span));
@@ -50,7 +56,7 @@ pub fn bind_query(
     };
 
     let key = resolve_column(&resolved.descriptor, key_ref)?;
-    validate_identity(resolved, key, key_ref)?;
+    validate_identity(resolved, key, key_ref.span)?;
     let columns = referenced_columns(query, &resolved.descriptor, key)?;
     let slots = columns
         .iter()
@@ -128,10 +134,10 @@ pub fn bind_query(
     Ok(spec)
 }
 
-fn validate_identity(
+pub(crate) fn validate_identity(
     source: &ResolvedSource,
     key: &SourceColumnDescriptor,
-    key_ref: &ColumnRef,
+    span: crate::Span,
 ) -> Result<(), FrontendError> {
     let index = &source.identity;
     let descriptor = &source.descriptor;
@@ -151,7 +157,7 @@ fn validate_identity(
         || index.has_predicate
         || !index.effective_replica_identity
     {
-        return Err(binding(ErrorCode::IdentityMismatch, key_ref.span));
+        return Err(binding(ErrorCode::IdentityMismatch, span));
     }
     Ok(())
 }
@@ -196,7 +202,7 @@ fn referenced_columns<'a>(
     Ok(columns)
 }
 
-fn source_column(column: &SourceColumnDescriptor) -> QueryExpressionV1 {
+pub(crate) fn source_column(column: &SourceColumnDescriptor) -> QueryExpressionV1 {
     QueryExpressionV1::Column {
         field: QueryFieldV1 {
             input: 0,
@@ -225,6 +231,6 @@ fn predicate_span(query: &UnboundQuery) -> crate::Span {
         .map_or(query.span, UnboundExpression::span)
 }
 
-fn binding(code: ErrorCode, span: crate::Span) -> FrontendError {
+pub(crate) fn binding(code: ErrorCode, span: crate::Span) -> FrontendError {
     FrontendError::binding(code, span)
 }

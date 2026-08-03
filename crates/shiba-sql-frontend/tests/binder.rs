@@ -191,11 +191,6 @@ fn missing_wrong_type_and_identity_drift_fail_at_origin() {
 #[test]
 fn unsupported_shapes_and_more_than_two_source_columns_fail_closed() {
     let source = source(("id", "payload"), true);
-    assert_error(
-        "SELECT count(*) FROM app.events",
-        &source,
-        ErrorCode::UnsupportedSyntax,
-    );
     let mut wide = source.clone();
     wide.descriptor.columns.push(SourceColumnDescriptor {
         name: "guard".into(),

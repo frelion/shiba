@@ -75,8 +75,49 @@ PG18.4 `pg_config`. Both directed runs are green. They execute:
 `test-m15-sql-vertical.sh` is enrolled exactly once, so the current release
 runner now contains 53 PostgreSQL scripts (106 versioned invocations). M15.4
 acceptance uses the two directed invocations, not a claimed complete 53×2 run.
-M15.5 aggregate SQL, M15.6 Join SQL, and M15.7 least privilege, parser/
-registration performance and complete release matrix remain unproved.
+The following M15.5 section records its later directed aggregate evidence.
+M15.6 Join SQL and M15.7 least privilege, parser/registration performance and
+complete release matrix remain unproved.
+
+## M15.5 aggregate SQL lifecycle evidence
+
+Pure Binder tests cover canonical generic lowering for scalar `COUNT(*)`,
+nullable scalar `SUM(bigint)`, filtered grouped Count and grouped Sum, including
+alias/parenthesis equivalence, exact ObjectAddress binding and missing,
+duplicate, wrong-type and topology rejection. Operator tests prove scalar SUM's
+empty/all-NULL/value/delete-last-value transitions, checked overflow, corrupt
+state rejection and the exact two-key read set: checked sum plus non-NULL count
+inside the same `graph_node_state` authority. Scalar Count remains explicitly
+non-nullable.
+
+Run `scripts/test-m15-sql-aggregates.sh` separately with the absolute PG17.10
+and PG18.4 `pg_config`. Both directed runs are green. They execute:
+
+- four independent SQL registrations and canonical graph/result-contract
+  checks for scalar count, scalar nullable sum, filtered grouped count and
+  grouped sum;
+- exported-snapshot bootstrap, WAL catch-up, activation and production live
+  receiver Apply with explicit ACK for all four graphs;
+- complete scalar/keyed SQL differential, including empty and all-NULL SUM,
+  false/NULL/true predicate changes, group-key changes and empty-group removal;
+- injected grouped-SUM overflow with source rows, node state, public results and
+  continuation unchanged and replication feedback not advanced;
+- restored-state retry applied once, Apply-before-ACK restart converging through
+  `AlreadyApplied`, followed by explicit feedback;
+- changed-ObjectAddress grouped-SUM rebuild, catch-up, atomic activation and
+  post-rebuild live Apply/ACK.
+
+The first failure-first test exposed that sum-only private state cannot
+distinguish numeric zero from no non-NULL input; the fix adds a second generic
+StateKey under the existing state authority. The second exposed that the generic
+scalar sink/catalog rejected typed NULL active output; the fix propagates
+explicit scalar nullability through QuerySpec, compiled output contract and the
+same sink. Neither fix adds a writer, table or execution path, and no legacy
+implementation or SQL workflow was reused.
+
+These are directed PG17.10/PG18.4 M15.5 results. They do not claim the complete
+release matrix, M15.6 Join SQL, M15.7 least-privilege registration or frozen
+frontend/registration performance.
 
 ## M15.2 QuerySpec cutover evidence status
 

@@ -199,6 +199,7 @@ fn node_output_types(
             let valid = match output {
                 OutputContract::Scalar {
                     value_type: ValueType::Int8,
+                    ..
                 } => input.value_types.get(usize::from(*value_slot)) == Some(&ValueType::Int8),
                 OutputContract::KeyedRows {
                     key_type: ValueType::Int8,

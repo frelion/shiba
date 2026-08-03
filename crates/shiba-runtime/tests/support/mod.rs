@@ -129,7 +129,10 @@ pub(super) fn column(input: u8, name: &str) -> QueryExpressionV1 {
 pub(super) fn scalar_result(input_node: u16) -> QueryResultV1 {
     QueryResultV1 {
         input_node,
-        shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+        shape: QueryResultShapeV1::Scalar {
+            value_slot: 0,
+            value_nullable: false,
+        },
     }
 }
 

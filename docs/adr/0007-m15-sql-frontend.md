@@ -1,6 +1,6 @@
 # ADR 0007: bounded SQL frontend over QuerySpec
 
-Status: accepted for M15.1; implemented through the first M15.4 SQL vertical.
+Status: accepted for M15.1; implemented through the M15.5 aggregate SQL vertical.
 
 ## Context
 
@@ -51,8 +51,24 @@ M15.4 validates the decision with a pure Binder and a separate short-lived
 PostgreSQL registration adapter. The directed PG17.10/PG18.4 vertical preserves
 the existing QuerySpec/OperatorGraph authority through registration, bootstrap,
 live ACK/replay and changed-ObjectAddress rebuild. This is not evidence for the
-remaining aggregate/Join SQL shapes, least privilege, frontend performance or
-the final complete release matrix.
+remaining Join SQL shape, least privilege, frontend performance or the final
+complete release matrix.
+
+M15.5 validates that this boundary is not limited to projection/filter/compute.
+The same pure Binder lowers scalar Count, nullable scalar Sum, filtered grouped
+Count and grouped Sum into generic QuerySpec/OperatorGraph nodes. Scalar Sum's
+checked value and non-NULL input count are two StateKeys under the sole
+`graph_node_state` authority. Explicit scalar output nullability lets the same
+Runtime Result Sink publish typed NULL for empty/all-NULL input. No aggregate
+SQL workflow, state table, Runtime branch or writer is introduced.
+
+Failure-first tests corrected two independent semantic gaps: a single numeric
+sum state could not distinguish zero from no non-NULL input, and the generic
+scalar sink/catalog required every active scalar to contain a non-NULL bigint.
+Directed PG17.10/PG18.4 production lifecycle tests now prove bootstrap,
+catch-up, live Apply/ACK, rollback/retry/replay and aggregate rebuild against
+SQL oracles. They do not prove M15.6 Join SQL or M15.7 least privilege,
+performance and final release gates.
 
 ## Bounds
 

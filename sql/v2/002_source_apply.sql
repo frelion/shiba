@@ -52,14 +52,14 @@ CREATE TABLE shiba.graph_result (
     CONSTRAINT graph_result_sink_identity UNIQUE (graph_id, result_id, output_shape),
     CONSTRAINT graph_result_output_contract CHECK (
         (output_shape = 'scalar' AND output_key_type IS NULL
-         AND NOT output_key_nullable AND NOT output_value_nullable)
+         AND NOT output_key_nullable)
         OR (output_shape = 'keyed' AND output_key_type = 'int8')
     ),
     CONSTRAINT graph_result_visibility CHECK (
         (result_status = 'building' AND value_payload IS NULL AND value_bigint IS NULL)
         OR (result_status = 'active' AND (
             (output_shape = 'scalar' AND value_payload IS NOT NULL
-             AND value_bigint IS NOT NULL)
+             AND (value_bigint IS NOT NULL OR output_value_nullable))
             OR (output_shape = 'keyed' AND value_payload IS NULL
                 AND value_bigint IS NULL)
         ))

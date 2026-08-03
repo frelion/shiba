@@ -95,7 +95,10 @@ fn stateless(inputs: Vec<QueryInputV1>, operation: QueryOperationV1) -> QueryNod
 fn scalar(input_node: u16) -> QueryResultV1 {
     QueryResultV1 {
         input_node,
-        shape: QueryResultShapeV1::Scalar { value_slot: 0 },
+        shape: QueryResultShapeV1::Scalar {
+            value_slot: 0,
+            value_nullable: false,
+        },
     }
 }
 

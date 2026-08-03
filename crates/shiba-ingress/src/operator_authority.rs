@@ -187,13 +187,20 @@ fn output_matches(contract: &OutputContract, row: &postgres::Row) -> bool {
     let value_nullable: bool = row.get(4);
     value_type == "int8"
         && match contract {
-            OutputContract::Scalar { .. } => {
-                shape == "scalar" && key_type.is_none() && !key_nullable && !value_nullable
+            OutputContract::Scalar { nullable, .. } => {
+                shape == "scalar"
+                    && key_type.is_none()
+                    && !key_nullable
+                    && value_nullable == *nullable
             }
-            OutputContract::KeyedRows { nullable, .. } => {
+            OutputContract::KeyedRows {
+                key_nullable: expected_key_nullable,
+                nullable,
+                ..
+            } => {
                 shape == "keyed"
                     && key_type == Some("int8")
-                    && !key_nullable
+                    && key_nullable == *expected_key_nullable
                     && value_nullable == *nullable
             }
         }
