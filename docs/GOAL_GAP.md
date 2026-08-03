@@ -1,5 +1,22 @@
 # V2 goal gap entering M14
 
+## M14.4 accepted contract status
+
+M14.4 freezes and accepts the two-source JOIN authority and test obligations;
+it does not claim production implementation. M14.5/M14.6 must supply that
+implementation and evidence. Exactly two explicit sources must share
+one database/publication/slot/generation, graph continuation and ACK,
+exported-snapshot bootstrap and graph-wide rebuild. Admission binds exact
+relation/column ObjectAddresses and the exact right PK/UK index. See
+[JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md) and
+[ADR 0006](adr/0006-m14-two-source-join-authority.md).
+
+Still unproved are the JOIN node/Runtime path, graph lifecycle schema cutover,
+same-transaction two-side SQL differential, right-side fan-out, crash/replay,
+DDL, least-privilege bootstrap/rebuild and frozen PG17/18 performance matrix.
+No per-source continuation, second Runtime, persisted DeltaBatch or adapter is
+accepted as a way to close those gaps.
+
 ## M14.3 implementation status
 
 Typed values/rows/deltas, strict expressions, Filter, Compute, Project and
@@ -36,13 +53,13 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source/publication authority, canonical compiled plans/digests, opaque state, generic scalar/keyed results, sole `source_row_state`, one bootstrap lifecycle, complete M12 evidence | Broader value/result types and lifecycle automation |
-| Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
+| Catalog | Version, source/publication authority, canonical compiled plans/digests, opaque scalar/keyed node state, generic scalar/keyed results, sole `source_row_state`, one bootstrap lifecycle, complete M12 evidence | Graph-scoped two-source lifecycle authority is accepted but unimplemented |
+| Compiler | Strict IR to ObjectAddress-bound scalar, stateless graph and grouped plans | JOIN compilation, SQL frontend and broader plan language |
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
 | Source Apply | Current-row authority plus transaction-local before/after effects, including the narrow key-changing update needed by ProjectRows | Broader row shapes and identities |
 | EffectStream | Non-durable transaction-local EffectBatch | Persisted effects intentionally absent |
-| Runtime | Generic plan/state decode, ordered kernel dispatch and atomic scalar/keyed persistence through live/bootstrap/rebuild | Broader value and output contracts |
-| Operator | Database-free CountRows, SumInt8 and non-aggregate ProjectRows on one kernel | More operator families remain out of scope |
+| Runtime | Generic plan/state decode, ordered kernel dispatch and atomic scalar/keyed persistence through live/bootstrap/rebuild | Graph-scoped two-source transaction/lifecycle remains unimplemented |
+| Operator | Database-free CountRows, SumInt8, Filter/Compute/Project/Materialize, KeyBy and grouped count/sum on one kernel | Accepted two-source JOIN and broader operator families remain unimplemented |
 | Result Sink | Generic visibility header, scalar bigint arm and active-only nullable keyed rows | Non-bigint result types |
 
 M13.2 implemented the pure generic plan/state/transition contract. M13.3 made it

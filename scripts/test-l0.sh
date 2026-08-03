@@ -445,9 +445,11 @@ for phrase in (
 
 graph_contract = pathlib.Path("docs/OPERATOR_GRAPH_CONTRACT.md").read_text()
 graph_adr = pathlib.Path("docs/adr/0005-m14-operator-graph.md").read_text()
+join_contract = pathlib.Path("docs/JOIN_AUTHORITY_CONTRACT.md").read_text()
+join_adr = pathlib.Path("docs/adr/0006-m14-two-source-join-authority.md").read_text()
 for marker in (
     "One durable graph authority",
-    "Two-input INNER JOIN",
+    "Accepted two-input INNER JOIN boundary",
     "graph/generation ownership mutex",
     "PG17/PG18 Apply medians are 782.302750/787.157125 ms",
 ):
@@ -461,6 +463,18 @@ if "M14.2 typed stateless graph and Materialize" not in reuse_manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks M14.2 evidence")
 if "M14.3 generic grouped state and aggregates" not in reuse_manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks M14.3 evidence")
+for marker in (
+    "One graph, transport and progress authority",
+    "one publication, one logical slot and one slot generation",
+    "Progress belongs only to `(graph_id, slot_generation)`",
+    "non-null bigint primary-key or unique-key index `ObjectAddress`",
+):
+    if marker not in join_contract:
+        raise SystemExit(f"M14 JOIN authority contract lacks frozen marker: {marker}")
+if "Status: accepted for the M14.4 contract slice" not in join_adr:
+    raise SystemExit("M14.4 JOIN authority ADR is not accepted")
+if "M14.4 accepted two-source JOIN authority" not in reuse_manifest:
+    raise SystemExit("REUSE_MANIFEST.md lacks M14.4 contract evidence")
 PY
 
 if rg -n \

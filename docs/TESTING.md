@@ -1,5 +1,33 @@
 # Testing strategy
 
+## M14.4 accepted JOIN gates (not yet implemented)
+
+The accepted authority is in
+[JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md). The M14.4 contract is
+accepted; later M14.5/M14.6 production slices cannot be marked proved until the
+same directed matrix passes independently on PG17.10 and PG18.4:
+
+- admission rejects source reuse, wrong database/publication/slot/generation,
+  ObjectAddress drift, wrong right PK/UK index, invalid graph and missing roles;
+- full-row SQL differentials cover left-only, right-only and one PostgreSQL
+  transaction changing both sides, including right UPDATE/DELETE fan-out;
+- one graph transaction atomically rolls back source rows, node state, results
+  and graph continuation on decode/compute/sink/backend failure;
+- receive-before-Apply, commit-before-feedback, exact replay and feedback retry
+  never ACK an uncommitted or partial graph result;
+- one exported snapshot initializes both relations, catches up one slot and
+  activates once; rebuild replaces the complete graph generation;
+- relation/column/index/publication DDL drift fails closed by exact bound
+  identity, including same-shape right-index replacement;
+- split control/Apply/scanner, replication and reader roles succeed without
+  superuser; missing or swapped privileges fail closed;
+- frozen fan-out, set-based query-count, latency, RSS, retained-WAL and replay
+  thresholds prove bounded behavior without per-row SQL or an unbounded queue.
+
+The runner must also statically reject a per-source continuation, second
+Runtime, persisted DeltaBatch/EffectStream, adapter, fallback or dual write.
+These are acceptance requirements, not current evidence.
+
 ## M14.3 generic grouped-state gates
 
 `scripts/test-m14-grouped.sh` is green on PG17.10 and PG18.4. It compares every

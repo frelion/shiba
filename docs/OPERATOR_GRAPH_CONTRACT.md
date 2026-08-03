@@ -3,8 +3,9 @@
 M14.2 implements the typed stateless graph path. M14.3 adds the sole generic
 keyed-state authority plus KeyBy, GroupedCount and GroupedSumInt8. Runtime uses
 canonical typed keys and set-based state/result persistence; typed NULL remains
-distinct from absent. Two-input Join, graph-wide lifecycle and the full M14
-release/performance matrix remain unproved, so M14.3 is not M14 completion.
+distinct from absent. M14.4 accepts the exact two-source JOIN authority in
+[JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md), but its production,
+PG17/18 and lifecycle evidence remains unproved. M14.3 is not M14 completion.
 
 M14 extends the M13 database-free kernel; it does not add a SQL frontend or a
 second Runtime. This contract freezes graph identity, typed deltas, state,
@@ -101,13 +102,19 @@ Within one input transaction all deltas are netted against the pretransaction
 state and final after-images. A state or result key has at most one normalized
 final mutation. Observable behavior cannot depend on source-change order.
 
-## Two-input INNER JOIN
+## Accepted two-input INNER JOIN boundary
 
-M14 admits exactly two source relations in one database. One publication, one
+M14.4 is designed to admit exactly two explicit SourceIds in one database. One publication, one
 slot and one generation provide their common PostgreSQL transaction order. The
 right join input is an exact non-null bigint PK or UK ObjectAddress; the join is
 bigint equality INNER JOIN. Schemas may differ. Outer, three-table and non-
 equality joins are excluded.
+
+The M14 proof graph fixes its projection to left
+`(id bigint PK, right_key bigint NULL)` joined to right
+`(id bigint PK/UK, payload bigint NULL)`, materialized as
+`left.id -> right.payload`. A NULL join key does not match; a matched NULL
+payload is a typed NULL result.
 
 A graph transaction contains one WAL identity and changes tagged by SourceId.
 Changes to both relations in one PostgreSQL transaction enter one Runtime
@@ -115,6 +122,13 @@ transaction and one join evaluation. Right-side update/delete fan-out uses a
 bounded generic state partition read, never a source-table lookup or per-row
 SQL. Both input batches are evaluated as one pre-state to final-state change so
 intermediate ordering is not observable.
+
+A source can belong to at most one building or active graph. The right PK/UK
+index itself, not only its columns, is an exact durable ObjectAddress binding.
+Admission, bootstrap, rebuild, DDL, crash, privilege and performance evidence
+is frozen in the JOIN authority contract and
+[ADR 0006](adr/0006-m14-two-source-join-authority.md). None of this paragraph
+claims that the two-input production path is implemented.
 
 The continuation belongs to `(graph_id, slot_generation)` and records the exact
 commit LSN and ingress transaction identity. There are no left/right or node
@@ -128,16 +142,15 @@ graph and generation through the existing forward-only M12 lifecycle.
 Runtime owns the only Apply transaction. The fixed order is:
 
 1. graph/generation ownership mutex;
-2. exact graph header and digest;
-3. replay/continuation probe;
-4. source bindings in ascending SourceId order;
-5. current rows in `(SourceId, typed row key)` order;
-6. node state in canonical `(NodeId, namespace, state key)` order;
-7. pure graph computation;
-8. generic state deltas;
-9. generic result deltas;
-10. graph continuation last;
-11. commit, then and only then ACK.
+2. replay/continuation probe under the exact graph identity;
+3. source bindings in ascending SourceId order;
+4. current rows in `(SourceId, typed row key)` order;
+5. node state in canonical `(NodeId, namespace, state key)` order;
+6. pure graph computation;
+7. generic state deltas;
+8. generic result deltas;
+9. graph continuation last;
+10. commit, then and only then ACK.
 
 No network wait, snapshot scan, slot operation or user interaction occurs while
 these locks are held. A deadlock or serialization retry restarts the complete
@@ -180,13 +193,14 @@ smaller workload.
 
 ## Evidence and exclusions
 
-Every expression and node has an independent deterministic reference model and
-fixed-seed randomized differential. Gates cover I/U/D, NULL/Absent, key change,
+Every implemented expression and node has an independent deterministic
+reference model and fixed-seed randomized differential. Required JOIN gates cover I/U/D, NULL/Absent, key change,
 overflow, corrupt codecs, bounds, filter truth transitions, group lifecycle,
 join changes/fan-out/same-transaction two-side changes, rollback, kill, retry,
 replay, DDL, bootstrap, catch-up, rebuild, recovery and least privilege.
-Grouped and joined materializations compare complete rows with independent SQL
-oracles on PG17.10 and PG18.4.
+Grouped materializations compare complete rows with independent SQL oracles on
+PG17.10 and PG18.4. Joined materialization comparison is an M14.4 acceptance
+gate and remains unproved.
 
 M14 excludes SQL parsing, outer or three-table joins, windows, DISTINCT,
 Min/Max/Avg, plugins, schedulers and persisted intermediate deltas. M14 does not

@@ -198,3 +198,10 @@ ProjectRows execution variant. M14.3 adds the sole generic keyed-state
 authority plus KeyBy, GroupedCount and GroupedSumInt8, proved with complete
 PG17.10/PG18.4 keyed SQL differentials. Join, graph-wide lifecycle and the full
 M14 release/performance matrix remain later stages; M14 is not yet complete.
+M14.4's accepted two-source authority is documented in
+[JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md) and
+[ADR 0006](adr/0006-m14-two-source-join-authority.md). It
+requires exactly two explicit SourceIds to share one slot/generation,
+transaction assembly, graph continuation/ACK, exported snapshot and graph-wide
+rebuild, with an exact right PK/UK index binding. This is a contract, not an
+implementation claim; its PG17/18 JOIN gates remain pending.

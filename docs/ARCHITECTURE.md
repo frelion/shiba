@@ -19,6 +19,16 @@ Runtime loads and persists canonical typed keyed state/results set-wise in the
 same transaction as Source Apply and continuation. Two-input Join, graph-wide
 lifecycle and the full M14 release/performance matrix remain later work.
 
+M14.4 accepts, but has not implemented, the graph-wide two-source authority in
+[JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md) and
+[ADR 0006](adr/0006-m14-two-source-join-authority.md). Exactly
+two explicit SourceIds share one database/publication/slot/generation, one
+assembled pgoutput transaction, one graph continuation/ACK decision, one
+exported-snapshot bootstrap and one graph-wide rebuild. Exact relation/column
+ObjectAddresses and the exact right bigint PK/UK index ObjectAddress are part
+of admission. A source may belong to at most one building or active graph.
+There is no per-source continuation, second Runtime or persisted DeltaBatch.
+
 M13.1 froze the generic execution successor to the M9 aggregate-shaped API;
 M13.2 supplied its pure kernel, and M13.3 made that kernel the sole Runtime and
 Catalog execution path. See
