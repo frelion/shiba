@@ -59,6 +59,17 @@ pub(crate) fn establish_active_source(
         ),
     )
     .expect("register SumInt8");
+    compile_and_register(
+        &mut admin,
+        &operator_spec(
+            3,
+            OperatorOperationV1::ProjectRows {
+                key_column: "id".to_owned(),
+                input_column: "payload".to_owned(),
+            },
+        ),
+    )
+    .expect("register ProjectRows");
     let publication_oid = admin
         .query_one(
             "SELECT oid FROM pg_catalog.pg_publication WHERE pubname = $1",

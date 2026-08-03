@@ -150,7 +150,6 @@ fn replacement_is_exact_pre_active_and_reuses_reservation() {
         "from shiba_internal.source_continuation",
         "result.result_status <> 'building'",
         "delete from shiba_internal.source_row_state",
-        "replacement requires reset keyed results",
         "delete from shiba_internal.source_bootstrap",
         "delete from shiba_internal.source_ingress_config",
         "perform shiba_internal.reserve_source_bootstrap",
@@ -173,6 +172,7 @@ fn replacement_is_exact_pre_active_and_reuses_reservation() {
         "pg_drop_replication_slot",
         "confirmed_flush_lsn",
         "create table shiba_internal.bootstrap_batch",
+        "delete from shiba_internal.operator_result_row",
     ] {
         assert!(
             !sql.contains(forbidden),

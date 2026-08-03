@@ -134,14 +134,15 @@ pub(crate) fn prove_snapshot_restarts(
 
     admin
         .execute(
-            "UPDATE shiba_internal.operator_state SET value_bigint = $1 WHERE operator_id = 2",
-            &[&(i64::MAX - 50)],
+            "UPDATE shiba_internal.operator_state SET state_payload = $1 WHERE operator_id = 2",
+            &[&(i64::MAX - 50).to_be_bytes().as_slice()],
         )
         .expect("inject first-batch operator rollback");
     assert!(bootstrap.scan_next().is_err());
     admin
         .execute(
-            "UPDATE shiba_internal.operator_state SET value_bigint = 0 WHERE operator_id = 2",
+            "UPDATE shiba_internal.operator_state
+             SET state_payload = decode('0000000000000000', 'hex') WHERE operator_id = 2",
             &[],
         )
         .expect("restore failed batch state");

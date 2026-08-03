@@ -50,11 +50,31 @@ fn public_results(client: &mut Client) -> Vec<(i64, String, Option<i64>)> {
 fn private_state(client: &mut Client) -> Vec<(i64, i64)> {
     client
         .query(
-            "SELECT operator_id, value_bigint
-             FROM shiba_internal.operator_state ORDER BY operator_id",
+            "SELECT operator_id, state_payload
+             FROM shiba_internal.operator_state
+             WHERE operator_id IN (1, 2) ORDER BY operator_id",
             &[],
         )
         .expect("query private operator state")
+        .into_iter()
+        .map(|row| {
+            let payload: Vec<u8> = row.get(1);
+            (
+                row.get(0),
+                i64::from_be_bytes(payload.try_into().expect("int8 operator state")),
+            )
+        })
+        .collect()
+}
+
+fn projected_rows(client: &mut Client) -> Vec<(i64, Option<i64>)> {
+    client
+        .query(
+            "SELECT result_key_bigint, result_value_bigint
+             FROM shiba.operator_result_rows WHERE operator_id = 3 ORDER BY 1",
+            &[],
+        )
+        .expect("query active projected rows")
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
         .collect()
@@ -78,7 +98,8 @@ fn assert_building(client: &mut Client) {
         public_results(client),
         vec![
             (1, "building".to_owned(), None),
-            (2, "building".to_owned(), None)
+            (2, "building".to_owned(), None),
+            (3, "building".to_owned(), None),
         ]
     );
 }
@@ -131,11 +152,23 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         ),
     )
     .expect("register SumInt8");
+    compile_and_register(
+        &mut admin,
+        &operator_spec(
+            3,
+            OperatorOperationV1::ProjectRows {
+                key_column: "id".to_owned(),
+                input_column: "payload".to_owned(),
+            },
+        ),
+    )
+    .expect("register ProjectRows");
     assert_eq!(
         public_results(&mut admin),
         vec![
             (1, "active".to_owned(), Some(0)),
-            (2, "active".to_owned(), Some(0))
+            (2, "active".to_owned(), Some(0)),
+            (3, "active".to_owned(), None),
         ]
     );
     assert_eq!(
@@ -168,6 +201,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     let mut bootstrap = BootstrapSession::begin(&database_url, &replication_url, spec, options)
         .expect("begin exported-snapshot bootstrap");
     assert_building(&mut admin);
+    assert!(projected_rows(&mut admin).is_empty());
     assert_eq!(private_state(&mut admin), vec![(1, 0), (2, 0)]);
     assert_eq!(source_rows(&mut admin), Vec::<(i64, Option<i64>)>::new());
 
@@ -189,6 +223,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         }
     );
     assert_building(&mut admin);
+    assert!(projected_rows(&mut admin).is_empty());
     assert_eq!(private_state(&mut admin), vec![(1, 2), (2, 10)]);
     assert_eq!(source_rows(&mut admin), vec![(1, Some(10)), (2, None)]);
     assert_eq!(
@@ -210,6 +245,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         }
     );
     assert_building(&mut admin);
+    assert!(projected_rows(&mut admin).is_empty());
     assert_eq!(private_state(&mut admin), vec![(1, 3), (2, 40)]);
     assert_eq!(
         source_rows(&mut admin),
@@ -220,6 +256,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         SnapshotProgress::ScanComplete
     );
     assert_building(&mut admin);
+    assert!(projected_rows(&mut admin).is_empty());
 
     let mut catchup = bootstrap.into_catchup().expect("enter M10 catch-up");
     assert_eq!(
@@ -251,9 +288,11 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         public_results(&mut admin),
         vec![
             (1, "active".to_owned(), Some(3)),
-            (2, "active".to_owned(), Some(25))
+            (2, "active".to_owned(), Some(25)),
+            (3, "active".to_owned(), None),
         ]
     );
+    assert_eq!(projected_rows(&mut admin), source_rows(&mut admin));
     let oracle = admin
         .query_one(
             "SELECT count(*), COALESCE(sum(payload), 0)::bigint FROM source.events",
@@ -291,9 +330,11 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         public_results(&mut admin),
         vec![
             (1, "active".to_owned(), Some(4)),
-            (2, "active".to_owned(), Some(32))
+            (2, "active".to_owned(), Some(32)),
+            (3, "active".to_owned(), None),
         ]
     );
+    assert_eq!(projected_rows(&mut admin), source_rows(&mut admin));
     assert_eq!(private_state(&mut admin), vec![(1, 4), (2, 32)]);
     assert_eq!(
         source_rows(&mut admin),

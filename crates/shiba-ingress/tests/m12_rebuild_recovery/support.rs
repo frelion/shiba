@@ -108,6 +108,24 @@ pub(crate) fn assert_oracle(client: &mut Client) {
         .expect("query active results");
     assert_eq!(result[0].get::<_, i64>(0), oracle.get::<_, i64>(0));
     assert_eq!(result[1].get::<_, i64>(0), oracle.get::<_, i64>(1));
+    assert!(result[2].get::<_, Option<i64>>(0).is_none());
+    let expected = client
+        .query("SELECT id, payload FROM target.events ORDER BY id", &[])
+        .expect("query ProjectRows recovery oracle")
+        .into_iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, Option<i64>>(1)))
+        .collect::<Vec<_>>();
+    let actual = client
+        .query(
+            "SELECT result_key_bigint, result_value_bigint
+             FROM shiba.operator_result_rows WHERE operator_id = 3 ORDER BY 1",
+            &[],
+        )
+        .expect("query recovered ProjectRows")
+        .into_iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, Option<i64>>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
 }
 
 pub(crate) fn restart_postgres(mode: &str) {

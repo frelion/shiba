@@ -157,8 +157,30 @@ pub(crate) fn validate_rebuild_identity(
                         WHERE binding.binding_kind = 'column'
                           AND binding.address_classid = 'pg_class'::regclass
                           AND binding.address_objid = relation.address_objid
-                          AND binding.address_objsubid IN (1, 2)
+                          AND binding.address_objsubid > 0
+                          AND EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_attribute AS attribute
+                              WHERE attribute.attrelid = binding.address_objid
+                                AND attribute.attnum = binding.address_objsubid
+                                AND attribute.atttypid = 20
+                                AND NOT attribute.attisdropped)
                     ) = 2
+                    AND count(*) FILTER (
+                        WHERE binding.binding_kind = 'column'
+                          AND EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_attribute AS attribute
+                              WHERE attribute.attrelid = binding.address_objid
+                                AND attribute.attnum = binding.address_objsubid
+                                AND attribute.attnotnull)
+                    ) = 1
+                    AND count(*) FILTER (
+                        WHERE binding.binding_kind = 'column'
+                          AND EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_attribute AS attribute
+                              WHERE attribute.attrelid = binding.address_objid
+                                AND attribute.attnum = binding.address_objsubid
+                                AND NOT attribute.attnotnull)
+                    ) = 1
                     AND count(*) FILTER (
                         WHERE binding.binding_kind = 'identity_index'
                           AND binding.address_classid = 'pg_class'::regclass
@@ -167,7 +189,15 @@ pub(crate) fn validate_rebuild_identity(
                           AND identity.indisprimary AND identity.indisunique
                           AND identity.indisvalid AND identity.indisready
                           AND identity.indnkeyatts = 1 AND identity.indnatts = 1
-                          AND (identity.indkey::smallint[])[0] = 1
+                          AND (identity.indkey::smallint[])[0] = (
+                              SELECT key_binding.address_objsubid
+                              FROM shiba_internal.source_binding AS key_binding
+                              JOIN pg_catalog.pg_attribute AS key_attribute
+                                ON key_attribute.attrelid = key_binding.address_objid
+                               AND key_attribute.attnum = key_binding.address_objsubid
+                               AND key_attribute.attnotnull
+                              WHERE key_binding.source_id = $1
+                                AND key_binding.binding_kind = 'column')
                           AND identity.indexprs IS NULL
                           AND identity.indpred IS NULL
                     ) = 1

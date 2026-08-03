@@ -181,7 +181,8 @@ pub fn assert_no_apply(client: &mut Client, source_id: i64, expected_phase: Opti
                 "SELECT count(*)
                  FROM shiba_internal.operator_definition AS definition
                  JOIN shiba_internal.operator_state AS state USING (operator_id)
-                 WHERE definition.source_id = $1 AND state.value_bigint <> 0",
+                 WHERE definition.source_id = $1
+                   AND state.state_payload <> decode('0000000000000000', 'hex')",
                 &[&source_id],
             )
             .expect("count changed private operator states")

@@ -55,12 +55,16 @@ fn million_row_active_source_rebuild_is_bounded_and_catches_up_exactly() {
 
     let old_state = admin
         .query(
-            "SELECT value_bigint FROM shiba_internal.operator_state ORDER BY operator_id",
+            "SELECT state_payload FROM shiba_internal.operator_state
+             WHERE operator_id IN (1, 2) ORDER BY operator_id",
             &[],
         )
         .expect("read non-pristine operator state");
     assert_eq!(old_state.len(), 2);
-    assert!(old_state.iter().all(|row| row.get::<_, i64>(0) > 0));
+    assert!(old_state.iter().all(|row| {
+        let payload: Vec<u8> = row.get(0);
+        i64::from_be_bytes(payload.try_into().expect("int8 operator state")) > 0
+    }));
     let old_continuations: i64 = admin
         .query_one(
             "SELECT count(*) FROM shiba_internal.source_continuation WHERE source_id = 1",

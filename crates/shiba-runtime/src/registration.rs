@@ -8,6 +8,7 @@ use shiba_operator::{
     CompiledPlan, ObjectAddress, OutputContract, OutputDelta, ScalarValue, apply_plan,
     initial_state,
 };
+use shiba_protocol::SourceId;
 
 use crate::M2Error;
 use crate::source_preflight;
@@ -61,6 +62,125 @@ pub fn compile_and_register(
     let plan = register_in_transaction(&mut transaction, spec)?;
     transaction.commit()?;
     Ok(plan)
+}
+
+/// Recompiles the complete durable plan set against the current source binding.
+///
+/// The caller owns the rebuild-prepare transaction. This function is the sole
+/// definition writer for the destructive boundary: every strict durable spec
+/// is rebound, state is reset, keyed rows are cleared, and result headers stay
+/// `building` until bootstrap activation.
+///
+/// # Errors
+///
+/// Fails closed on a malformed spec, identity drift, compilation failure, or
+/// any incomplete authority row. The caller must roll back the transaction.
+pub fn recompile_registered_plans(
+    transaction: &mut Transaction<'_>,
+    source_id: SourceId,
+) -> Result<(), M2Error> {
+    recompile_registered_plans_inner(transaction, source_id).map_err(|error| match error {
+        RegistrationError::Compiler(_) => M2Error::InvalidOperatorDefinition,
+        RegistrationError::Runtime(error) => error,
+    })
+}
+
+fn recompile_registered_plans_inner(
+    transaction: &mut Transaction<'_>,
+    source_id: SourceId,
+) -> Result<(), RegistrationError> {
+    let source_key = as_bigint("source_id", source_id.get())?;
+    let rows = transaction.query(
+        "SELECT operator_id, spec_payload
+         FROM shiba_internal.operator_definition
+         WHERE source_id = $1 ORDER BY operator_id FOR UPDATE",
+        &[&source_key],
+    )?;
+    if rows.is_empty() {
+        return Err(M2Error::InvalidOperatorDefinition.into());
+    }
+    for row in rows {
+        let operator_id: i64 = row.get(0);
+        let spec_payload: Vec<u8> = row.get(1);
+        let spec =
+            OperatorSpecV1::from_json(&spec_payload).map_err(|_| CompilerError::PlanEncoding)?;
+        if spec.source_id != source_id
+            || as_bigint("operator_id", spec.operator_id.get())? != operator_id
+            || spec
+                .to_canonical_json()
+                .map_err(|_| CompilerError::PlanEncoding)?
+                != spec_payload
+        {
+            return Err(M2Error::InvalidOperatorDefinition.into());
+        }
+        replace_registered_plan(transaction, &spec)?;
+    }
+    Ok(())
+}
+
+fn replace_registered_plan(
+    transaction: &mut Transaction<'_>,
+    spec: &OperatorSpecV1,
+) -> Result<(), RegistrationError> {
+    let plan = compile_plan(spec, &source_descriptor(transaction, spec)?)?;
+    let state = initial_state(&plan).map_err(M2Error::from)?;
+    let initial = apply_plan(&plan, &state, &[]).map_err(M2Error::from)?;
+    let operator_id = as_bigint("operator_id", plan.operator_id.get())?;
+    let state_codec =
+        i32::try_from(state.codec_version).map_err(|_| M2Error::InvalidOperatorDefinition)?;
+    let (shape, value_type, key_type, nullable) = output_metadata(&plan.output_contract);
+    transaction.execute(
+        "DELETE FROM shiba_internal.operator_result_row WHERE operator_id = $1",
+        &[&operator_id],
+    )?;
+    let changed = transaction.execute(
+        "UPDATE shiba_internal.operator_definition SET
+             plan_format_version = $2, plan_payload = $3, plan_digest = $4,
+             state_codec_version = $5, output_shape = $6,
+             output_value_type = $7, output_key_type = $8,
+             output_value_nullable = $9
+         WHERE operator_id = $1 AND source_id = $10",
+        &[
+            &operator_id,
+            &i32::try_from(plan.format_version).map_err(|_| M2Error::InvalidOperatorDefinition)?,
+            &plan.canonical_payload,
+            &plan.digest.as_slice(),
+            &state_codec,
+            &shape,
+            &value_type,
+            &key_type,
+            &nullable,
+            &as_bigint("source_id", plan.source_id.get())?,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(M2Error::InvalidOperatorDefinition.into());
+    }
+    if transaction.execute(
+        "UPDATE shiba_internal.operator_state
+         SET codec_version = $2, state_payload = $3 WHERE operator_id = $1",
+        &[&operator_id, &state_codec, &state.payload],
+    )? != 1
+    {
+        return Err(M2Error::InvalidOperatorDefinition.into());
+    }
+    match initial.output_delta {
+        OutputDelta::ScalarReplacement {
+            value: ScalarValue::Int8(_),
+        } => {}
+        OutputDelta::KeyedMutations { ref mutations } if mutations.is_empty() => {}
+        _ => return Err(M2Error::InvalidOperatorDefinition.into()),
+    }
+    if transaction.execute(
+        "UPDATE shiba.operator_result SET result_status = 'building',
+             output_shape = $2, value_bigint = NULL
+         WHERE operator_id = $1",
+        &[&operator_id, &shape],
+    )? != 1
+    {
+        return Err(M2Error::InvalidOperatorDefinition.into());
+    }
+    Ok(())
 }
 
 fn register_in_transaction(

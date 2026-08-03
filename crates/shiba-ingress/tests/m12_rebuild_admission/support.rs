@@ -1,8 +1,7 @@
-use std::{num::NonZeroU64, time::Duration};
+use std::time::Duration;
 
 use postgres::Client;
 use shiba_ingress::{BootstrapOptions, RebuildIdentity, RebuildSpec};
-use shiba_operator::OperatorId;
 use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
 
 #[path = "../m12_rebuild_contract/support.rs"]
@@ -73,7 +72,7 @@ impl RebuildFixture {
     }
 
     pub(crate) fn spec(&self) -> RebuildSpec {
-        self.spec_with(self.old, self.target, 1, 2, 1, 2, 3)
+        self.spec_with(self.old, self.target, 1, 2, 3)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -81,8 +80,6 @@ impl RebuildFixture {
         &self,
         old: IdentityCoordinates,
         target: IdentityCoordinates,
-        count_operator: u64,
-        sum_operator: u64,
         old_bootstrap: u64,
         new_bootstrap: u64,
         new_generation: u64,
@@ -106,12 +103,6 @@ impl RebuildFixture {
                 slot_name: TARGET_SLOT.to_owned(),
                 slot_generation: SlotGeneration::new(new_generation).expect("new generation"),
             },
-            count_operator_id: OperatorId::new(
-                NonZeroU64::new(count_operator).expect("count operator ID"),
-            ),
-            sum_operator_id: OperatorId::new(
-                NonZeroU64::new(sum_operator).expect("sum operator ID"),
-            ),
         }
     }
 }
@@ -151,7 +142,6 @@ pub(crate) fn grant_prepare(client: &mut Client, role: &str) {
             "GRANT USAGE ON SCHEMA shiba_internal TO {role};
              GRANT EXECUTE ON FUNCTION shiba_internal.prepare_source_rebuild(
                  bigint, bigint, oid, oid, oid, name, bigint,
-                 bigint, bigint, integer,
                  bigint, regclass, regclass, oid, name, bigint
              ) TO {role};"
         ))

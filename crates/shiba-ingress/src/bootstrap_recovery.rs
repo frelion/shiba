@@ -233,7 +233,12 @@ fn replace_catalog_attempt(
     abandoned: &BootstrapSpec,
     replacement: &BootstrapSpec,
 ) -> Result<(), IngressError> {
-    apply.query_one(
+    let mut transaction = apply.transaction()?;
+    // Reset the abandoned attempt through the sole generic definition/state
+    // writer before the lifecycle function checks pristine replacement state.
+    // Any later replacement failure rolls this reset back with the attempt.
+    shiba_runtime::recompile_registered_plans(&mut transaction, replacement.source_id)?;
+    transaction.query_one(
         "SELECT shiba_internal.replace_pristine_source_bootstrap(
              $1, $2, $3::text::name, $4, $5, $6::bigint::oid,
              $7::text::name, $8
@@ -249,6 +254,7 @@ fn replace_catalog_attempt(
             &as_bigint(replacement.slot_generation.get())?,
         ],
     )?;
+    transaction.commit()?;
     Ok(())
 }
 

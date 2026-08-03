@@ -1,5 +1,6 @@
-use shiba_operator::OperatorId;
 use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+
+use crate::operator_authority::PlanFingerprint;
 
 /// Exact catalog and transport identity on one side of a rebuild transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,8 +19,6 @@ pub struct RebuildSpec {
     pub source_id: SourceId,
     pub expected: RebuildIdentity,
     pub target: RebuildIdentity,
-    pub count_operator_id: OperatorId,
-    pub sum_operator_id: OperatorId,
 }
 
 /// Durable identity retained after destructive prepare.
@@ -30,20 +29,16 @@ pub(crate) struct PreparedAuthority {
     pub(crate) retired_bootstrap_id: BootstrapId,
     pub(crate) retired_slot_name: String,
     pub(crate) retired_slot_generation: SlotGeneration,
-    pub(crate) count_operator_id: OperatorId,
-    pub(crate) sum_operator_id: OperatorId,
+    pub(crate) plans: Vec<PlanFingerprint>,
 }
 
 impl PreparedAuthority {
-    pub(crate) fn from_spec(spec: &RebuildSpec) -> Self {
-        Self {
-            source_id: spec.source_id,
-            target: spec.target.clone(),
-            retired_bootstrap_id: spec.expected.bootstrap_id,
-            retired_slot_name: spec.expected.slot_name.clone(),
-            retired_slot_generation: spec.expected.slot_generation,
-            count_operator_id: spec.count_operator_id,
-            sum_operator_id: spec.sum_operator_id,
-        }
+    pub(crate) fn matches_spec(&self, spec: &RebuildSpec) -> bool {
+        self.source_id == spec.source_id
+            && self.target == spec.target
+            && self.retired_bootstrap_id == spec.expected.bootstrap_id
+            && self.retired_slot_name == spec.expected.slot_name
+            && self.retired_slot_generation == spec.expected.slot_generation
+            && !self.plans.is_empty()
     }
 }

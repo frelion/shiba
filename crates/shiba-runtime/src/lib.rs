@@ -32,7 +32,7 @@ pub use pgoutput::{
 };
 pub use pgoutput_source::PgoutputSource;
 pub use processor::{ProcessOutcome, process};
-pub use registration::{RegistrationError, compile_and_register};
+pub use registration::{RegistrationError, compile_and_register, recompile_registered_plans};
 pub use streamed_pgoutput::{decode_streamed_changes, decode_streamed_changes_in_session};
 pub use transaction::{
     SourceChange, SourceInsert, SourcePayload, SourceTransaction, SourceUpdate, SourceUpdatePayload,

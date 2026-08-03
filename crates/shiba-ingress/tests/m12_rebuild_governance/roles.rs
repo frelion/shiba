@@ -34,8 +34,8 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
     admin
         .batch_execute(&format!(
             "REVOKE EXECUTE ON FUNCTION shiba_internal.prepare_source_rebuild(
-                 bigint, bigint, oid, oid, oid, name, bigint, bigint,
-                 bigint, integer, bigint, regclass, regclass, oid, name, bigint
+                 bigint, bigint, oid, oid, oid, name, bigint,
+                 bigint, regclass, regclass, oid, name, bigint
              ) FROM {CONTROL_ROLE};"
         ))
         .expect("remove rebuild admission EXECUTE");
@@ -47,8 +47,8 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
     admin
         .batch_execute(&format!(
             "GRANT EXECUTE ON FUNCTION shiba_internal.prepare_source_rebuild(
-                 bigint, bigint, oid, oid, oid, name, bigint, bigint,
-                 bigint, integer, bigint, regclass, regclass, oid, name, bigint
+                 bigint, bigint, oid, oid, oid, name, bigint,
+                 bigint, regclass, regclass, oid, name, bigint
              ) TO {CONTROL_ROLE};
              REVOKE SELECT ON target.events FROM {CONTROL_ROLE};"
         ))
@@ -179,9 +179,20 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
             .collect::<Vec<_>>(),
         vec![
             ("active".to_owned(), Some(1)),
-            ("active".to_owned(), Some(0))
+            ("active".to_owned(), Some(0)),
+            ("active".to_owned(), None),
         ]
     );
+    let projected = reader
+        .query(
+            "SELECT result_key_bigint, result_value_bigint
+             FROM shiba.operator_result_rows WHERE operator_id = 3 ORDER BY 1",
+            &[],
+        )
+        .expect("read split-role ProjectRows result");
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].get::<_, i64>(0), 11);
+    assert_eq!(projected[0].get::<_, Option<i64>>(1), None);
     let live = catchup.into_live().expect("handoff to normal ingress");
     live.detach().expect("detach split-role live receiver");
     drop(reader);

@@ -1,4 +1,5 @@
 use shiba_ingress::PreparedRebuild;
+use shiba_operator::{CompiledPlan, PlanImplementation};
 
 use crate::support::{
     IdentityCoordinates, RebuildFixture, assert_building, authority_snapshot,
@@ -111,18 +112,6 @@ pub(crate) fn prove_identity_shape_and_operator_plan(database_url: &str, replica
     );
     assert_eq!(authority_snapshot(&mut admin), before);
 
-    assert!(
-        PreparedRebuild::prepare(
-            database_url,
-            replication_url,
-            fixture.spec_with(fixture.old, fixture.target, 2, 1, 1, 2, 3),
-            options(),
-        )
-        .is_err(),
-        "operator IDs are exact target-plan coordinates"
-    );
-    assert_eq!(authority_snapshot(&mut admin), before);
-
     fixture.target = IdentityCoordinates {
         identity_index: replacement_identity,
         ..fixture.target
@@ -149,16 +138,25 @@ pub(crate) fn prove_identity_shape_and_operator_plan(database_url: &str, replica
     assert_eq!(binding, i64::from(replacement_identity));
     let sum_binding = admin
         .query_one(
-            "SELECT input_objid::bigint, input_objsubid FROM shiba_internal.operator_definition
+            "SELECT plan_payload, plan_digest FROM shiba_internal.operator_definition
              WHERE operator_id = 2",
             &[],
         )
         .expect("read compiled SumInt8 target binding");
-    assert_eq!(
-        sum_binding.get::<_, i64>(0),
-        i64::from(fixture.target.relation)
-    );
-    assert_eq!(sum_binding.get::<_, i32>(1), 2);
+    let payload: Vec<u8> = sum_binding.get(0);
+    let digest: Vec<u8> = sum_binding.get(1);
+    let plan = CompiledPlan::from_canonical_payload(
+        &payload,
+        digest.try_into().expect("32-byte plan digest"),
+    )
+    .expect("decode durable target SumInt8 plan");
+    match plan.implementation {
+        PlanImplementation::SumInt8 { input } => {
+            assert_eq!(input.object_id, fixture.target.relation);
+            assert_eq!(input.sub_id, 2);
+        }
+        _ => panic!("operator 2 must remain SumInt8"),
+    }
     prepared.detach().expect("release prepared rebuild owner");
 }
 

@@ -1,6 +1,6 @@
 # Testing strategy
 
-## M13 frozen gates
+## M13 gates and current evidence
 
 M13.1 records the pre-change five-run medians in
 `OPERATOR_KERNEL_CONTRACT.md`. PG17/PG18 Apply medians are 768.727625 and
@@ -8,10 +8,21 @@ M13.1 records the pre-change five-run medians in
 884.036769 and 885.700244 ms. Existing absolute decode, Apply, replay,
 bootstrap, ingress, rebuild, RSS and retained-WAL limits remain in force.
 
-M13.2 adds pure codec/model/randomized gates. M13.3 adds full scalar/keyed SQL
-differential and transaction rollback. M13.4 re-runs M10--M12 with zero
-operator-kind/fixed-ID knowledge outside compiler/operator tests. M13.5 enrolls
-all new scripts in the one-click PG17.10/PG18.4 release matrix and runs the
+M13.2 pure codec/model/randomized gates are green. M13.3 is green on PG17.10
+and PG18.4 through `scripts/test-m13-operator-kernel.sh`: CountRows, SumInt8 and
+ProjectRows consume one EffectBatch; INSERT/UPDATE/key-changing UPDATE/DELETE,
+NULL, exact replay, corrupt plan/state and keyed-sink failure are compared with
+full SQL rows, while state/results/source rows/continuation roll back together.
+The migrated `test-m9-registration.sh` and `test-m9-count-sum.sh` are also green
+on both versions. Catalog unit/clippy plus PG17/18 empty-install gates prove the
+new strict plan/state/output schema and transactional installation.
+
+M13.4 is green on PG17.10/18.4 across committed/streaming ingress, bootstrap,
+bootstrap recovery/roles, and rebuild contract/admission/snapshot/recovery/
+identity/governance. It includes full ProjectRows keyed SQL oracles and
+pre-destructive plan-digest drift rejection with zero production
+operator-kind/fixed-ID/fixed-count/column-position knowledge. M13.5
+enrolls all new scripts in the one-click PG17.10/PG18.4 release matrix and runs the
 forbidden-specialization scan. ProjectRows must compare every key and nullable
 value with an independent SQL oracle; a count or digest alone is insufficient.
 

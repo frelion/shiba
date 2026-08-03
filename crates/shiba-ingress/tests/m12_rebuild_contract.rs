@@ -29,7 +29,7 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
         .query_one(
             "SELECT bootstrap.phase, bootstrap.bootstrap_id, config.slot_generation,
                     (SELECT count(*) FROM shiba_internal.source_row_state WHERE source_id = 1),
-                    (SELECT array_agg(state.value_bigint ORDER BY state.operator_id)
+                    (SELECT array_agg(encode(state.state_payload, 'hex') ORDER BY state.operator_id)
                      FROM shiba_internal.operator_state state
                      JOIN shiba_internal.operator_definition definition USING (operator_id)
                      WHERE definition.source_id = 1),
@@ -48,10 +48,13 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
     assert_eq!(active_fact.get::<_, i64>(1), 1);
     assert_eq!(active_fact.get::<_, i64>(2), 2);
     assert!(active_fact.get::<_, i64>(3) > 0);
-    assert_eq!(active_fact.get::<_, Vec<i64>>(4), vec![4, 32]);
+    assert_eq!(
+        active_fact.get::<_, Vec<String>>(4),
+        vec!["0000000000000004", "0000000000000020", ""]
+    );
     assert_eq!(
         active_fact.get::<_, Vec<Option<i64>>>(5),
-        vec![Some(4), Some(32)]
+        vec![Some(4), Some(32), None]
     );
     assert!(active_fact.get::<_, i64>(6) > 0);
     let old_slot = admin

@@ -1,13 +1,15 @@
 # Transaction and recovery contract
 
-M13 preserves this recovery boundary while replacing operator internals. One
+M13.3 preserves this recovery boundary while replacing operator internals. One
 EffectBatch and all opaque state/typed scalar/keyed transitions remain inside
 the processor transaction; continuation is still last and ACK still requires
 durable Apply or exact replay. A codec, plan, arithmetic, output-bound or keyed
 sink failure aborts source rows, every operator state/result and continuation.
-Rebuild recovery reads only the target plan-set digest installed at destructive
-prepare; it cannot reconstruct plans by concrete kind, fixed ID or column
-position.
+Rebuild recovery must read only the complete ordered target plan set installed
+at destructive prepare and validate every canonical digest; it cannot
+reconstruct plans by concrete kind, fixed ID, fixed cardinality or column
+position. M13.4 still has to re-prove bootstrap/catch-up/rebuild recovery and
+ACK behavior with that generic set and `ProjectRows`.
 
 ## Proven transaction owners
 
@@ -330,13 +332,14 @@ continuation therefore remain unchanged. Admitted work remains synchronous, so
 database blocking propagates to the caller rather than accumulating in a
 Runtime-owned queue.
 
-M9.1 keeps PostgreSQL as the sole transaction owner while replacing the fixed
-calculation. Exact replay still returns before Source Apply. For new work,
+M9.1 established the transaction order that M13.3 now applies through the sole
+generic kernel. Exact replay still returns before Source Apply. For new work,
 Source Apply locks and reads existing rows as needed, writes each mutation once,
 and builds a non-durable EffectBatch. Runtime then locks operator state in
-ascending operator-ID order, evaluates pure CountRows, publishes state/result,
-and inserts continuation last. Any row-image, operator, state/result, database,
-or crash failure rolls the row mutation and every operator write back together.
+ascending operator-ID order, validates each plan/state, computes a pure
+transition, publishes scalar or keyed output, and inserts continuation last.
+Any row-image, plan/state decode, operator, sink, database, or crash failure
+rolls the row mutation and every operator write back together.
 
 Registration has its own single PostgreSQL transaction: binding lock,
 invalidation check, descriptor construction, pure compilation, definition,

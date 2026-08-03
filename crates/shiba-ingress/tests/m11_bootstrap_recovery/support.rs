@@ -83,13 +83,20 @@ pub(crate) fn install_source(client: &mut Client) -> u32 {
 pub(crate) fn states(client: &mut Client) -> Vec<(i64, i64)> {
     client
         .query(
-            "SELECT operator_id, value_bigint
-             FROM shiba_internal.operator_state ORDER BY operator_id",
+            "SELECT operator_id, state_payload
+             FROM shiba_internal.operator_state
+             WHERE operator_id IN (1, 2) ORDER BY operator_id",
             &[],
         )
         .expect("query operator states")
         .into_iter()
-        .map(|row| (row.get(0), row.get(1)))
+        .map(|row| {
+            let payload: Vec<u8> = row.get(1);
+            (
+                row.get(0),
+                i64::from_be_bytes(payload.try_into().expect("int8 operator state")),
+            )
+        })
         .collect()
 }
 

@@ -1,8 +1,7 @@
-use std::{num::NonZeroU64, time::Duration};
+use std::time::Duration;
 
 use postgres::Client;
 use shiba_ingress::{BootstrapOptions, PreparedRebuild, RebuildIdentity, RebuildSpec};
-use shiba_operator::OperatorId;
 use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
 
 #[path = "../m12_rebuild_admission/support.rs"]
@@ -123,7 +122,13 @@ pub(crate) fn assert_prepared_closed(client: &mut Client, target_slot: &str) {
             "SELECT
                 (SELECT count(*) FROM shiba_internal.source_row_state WHERE source_id = 1),
                 (SELECT count(*) FROM shiba_internal.source_continuation WHERE source_id = 1),
-                (SELECT count(*) FROM shiba_internal.operator_state WHERE value_bigint <> 0),
+                (SELECT count(*)
+                 FROM shiba_internal.operator_state AS state
+                 JOIN shiba_internal.operator_definition AS definition USING (operator_id)
+                 WHERE (definition.output_shape = 'scalar'
+                        AND state.state_payload <> decode('0000000000000000', 'hex'))
+                    OR (definition.output_shape = 'keyed'
+                        AND pg_catalog.octet_length(state.state_payload) <> 0)),
                 (SELECT count(*) FROM shiba.operator_result
                  WHERE result_status <> 'building' OR value_bigint IS NOT NULL),
                 (SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1)",
@@ -205,12 +210,20 @@ pub(crate) fn activate_prepared_fixture(client: &mut Client, prepared: PreparedR
                 (1, 10, NULL, true, 100, NULL),
                 (1, 11, NULL, true, NULL, NULL);
              UPDATE shiba_internal.operator_state
-             SET value_bigint = CASE operator_id WHEN 1 THEN 2 ELSE 100 END
+             SET state_payload = CASE operator_id
+                 WHEN 1 THEN decode('0000000000000002', 'hex')
+                 ELSE decode('0000000000000064', 'hex') END
              WHERE operator_id IN (1, 2);
              UPDATE shiba.operator_result
              SET result_status = 'active',
                  value_bigint = CASE operator_id WHEN 1 THEN 2 ELSE 100 END
              WHERE operator_id IN (1, 2);
+             UPDATE shiba.operator_result
+             SET result_status = 'active', value_bigint = NULL
+             WHERE operator_id = 3;
+             INSERT INTO shiba_internal.operator_result_row
+                 (operator_id, result_key_bigint, result_value_bigint)
+             VALUES (3, 10, 100), (3, 11, NULL);
              INSERT INTO shiba_internal.source_continuation
                  (source_id, slot_generation, commit_lsn, ingress_transaction_id)
              VALUES (1, 3, '{lsn}'::pg_lsn, 1);"
@@ -255,8 +268,6 @@ pub(crate) fn install_second_target(client: &mut Client, fixture: &RebuildFixtur
             slot_name: SECOND_SLOT.to_owned(),
             slot_generation: SlotGeneration::new(4).expect("new generation"),
         },
-        count_operator_id: OperatorId::new(NonZeroU64::new(1).expect("count ID")),
-        sum_operator_id: OperatorId::new(NonZeroU64::new(2).expect("sum ID")),
     }
 }
 

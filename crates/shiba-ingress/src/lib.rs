@@ -23,6 +23,7 @@ mod frame;
 mod governance;
 mod governed;
 mod limits;
+mod operator_authority;
 mod publication;
 mod rebuild;
 mod rebuild_abandoned;

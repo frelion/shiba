@@ -67,7 +67,7 @@ pub(crate) fn prove_same_source_exclusion_and_other_source_progress(
     let result = admin
         .query(
             "SELECT value_bigint FROM shiba.operator_result
-             WHERE operator_id IN (3, 4) ORDER BY operator_id",
+             WHERE operator_id IN (4, 5) ORDER BY operator_id",
             &[],
         )
         .expect("read independent public result")

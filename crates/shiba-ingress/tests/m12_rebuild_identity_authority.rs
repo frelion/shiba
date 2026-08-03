@@ -195,6 +195,37 @@ fn rebuild_identity_is_durable_and_revalidated_before_slot_work() {
         )
         .expect("restore address-class constraint and authority");
 
+    let plan_digest: Vec<u8> = admin
+        .query_one(
+            "SELECT plan_digest FROM shiba_internal.operator_definition WHERE operator_id = 3",
+            &[],
+        )
+        .expect("read durable ProjectRows plan digest")
+        .get(0);
+    admin
+        .execute(
+            "UPDATE shiba_internal.operator_definition
+             SET plan_digest = decode(repeat('00', 32), 'hex') WHERE operator_id = 3",
+            &[],
+        )
+        .expect("inject prepared plan-set drift");
+    let drifted = support::prepared_snapshot(&mut admin, support::TARGET_SLOT);
+    assert!(
+        support::resume(&database_url, &replication_url, 2, 3).is_err(),
+        "prepared worker must reject corrupt durable plan digest"
+    );
+    support::assert_prepared_closed(&mut admin, support::TARGET_SLOT);
+    assert_eq!(
+        support::prepared_snapshot(&mut admin, support::TARGET_SLOT),
+        drifted
+    );
+    admin
+        .execute(
+            "UPDATE shiba_internal.operator_definition SET plan_digest = $1 WHERE operator_id = 3",
+            &[&plan_digest],
+        )
+        .expect("restore exact ProjectRows plan digest");
+
     let resumed = support::resume(&database_url, &replication_url, 2, 3)
         .expect("exact restored authority resumes");
     support::activate_prepared_fixture(&mut admin, resumed);

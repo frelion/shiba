@@ -7,6 +7,7 @@ use crate::{
     connection_config::{open_apply, replication_database},
     governed::advisory_key,
     limits::ActivePermit,
+    operator_authority::load_plan_fingerprints,
     rebuild_model::{PreparedAuthority, RebuildSpec},
     rebuild_resume::load_prepared_authority,
     rebuild_validation::verify_rebuild_target,
@@ -76,6 +77,10 @@ impl PreparedRebuild {
 
         let mut transaction = apply.transaction()?;
         lock_target_relation(&mut transaction, spec.target.relation_oid)?;
+        // Destructive prepare must never repair a corrupt old authority. Decode
+        // and validate the complete durable plan set while the old binding is
+        // still the sole active authority.
+        load_plan_fingerprints(&mut transaction, spec.source_id)?;
         invoke_prepare_writer(&mut transaction, &spec)?;
         transaction.commit()?;
 
@@ -86,7 +91,7 @@ impl PreparedRebuild {
             spec.target.bootstrap_id,
             spec.target.slot_generation,
         )?;
-        if authority != PreparedAuthority::from_spec(&spec) {
+        if !authority.matches_spec(&spec) {
             return Err(IngressError::Governance(
                 "durable prepared rebuild differs from request",
             ));
@@ -215,16 +220,13 @@ fn invoke_prepare_writer(
     let source_id = as_bigint(spec.source_id.get())?;
     let old_bootstrap = as_bigint(spec.expected.bootstrap_id.get())?;
     let old_generation = as_bigint(spec.expected.slot_generation.get())?;
-    let count_operator = as_bigint(spec.count_operator_id.get())?;
-    let sum_operator = as_bigint(spec.sum_operator_id.get())?;
     let new_bootstrap = as_bigint(spec.target.bootstrap_id.get())?;
     let new_generation = as_bigint(spec.target.slot_generation.get())?;
     transaction.query_one(
         "SELECT shiba_internal.prepare_source_rebuild(
              $1, $2, $3::bigint::oid, $4::bigint::oid, $5::bigint::oid,
-             $6::text::name, $7, $8, $9, $10,
-             $11, $12::bigint::oid::regclass, $13::bigint::oid::regclass,
-             $14::bigint::oid, $15::text::name, $16
+             $6::text::name, $7, $8, $9::bigint::oid::regclass,
+             $10::bigint::oid::regclass, $11::bigint::oid, $12::text::name, $13
          )",
         &[
             &source_id,
@@ -234,9 +236,6 @@ fn invoke_prepare_writer(
             &i64::from(spec.expected.publication_oid),
             &spec.expected.slot_name,
             &old_generation,
-            &count_operator,
-            &sum_operator,
-            &2_i32,
             &new_bootstrap,
             &i64::from(spec.target.relation_oid),
             &i64::from(spec.target.identity_index_oid),
@@ -245,6 +244,7 @@ fn invoke_prepare_writer(
             &new_generation,
         ],
     )?;
+    shiba_runtime::recompile_registered_plans(transaction, spec.source_id)?;
     Ok(())
 }
 
@@ -254,10 +254,6 @@ fn quote_identifier(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use core::num::NonZeroU64;
-
-    use shiba_operator::OperatorId;
-
     use super::*;
     use crate::RebuildIdentity;
 
@@ -277,8 +273,6 @@ mod tests {
             source_id: SourceId::new(1).unwrap(),
             expected: identity(1, 1, "old_slot"),
             target: identity(2, 2, "new_slot"),
-            count_operator_id: OperatorId::new(NonZeroU64::new(1).unwrap()),
-            sum_operator_id: OperatorId::new(NonZeroU64::new(2).unwrap()),
         }
     }
 

@@ -41,22 +41,34 @@ pub(crate) fn verify_rebuild_target(
                         WHERE attrelid = $2::bigint::oid
                           AND attnum > 0 AND NOT attisdropped)
                AND EXISTS (
-                   SELECT 1 FROM pg_catalog.pg_attribute AS key
-                   JOIN pg_catalog.pg_attribute AS payload
-                     ON payload.attrelid = key.attrelid AND payload.attnum = 2
-                   WHERE key.attrelid = $2::bigint::oid AND key.attnum = 1
-                     AND key.atttypid = 20 AND key.attnotnull
-                     AND payload.atttypid = 20 AND NOT payload.attnotnull
-                     AND key.attgenerated = '' AND payload.attgenerated = '')
-               AND EXISTS (
                    SELECT 1 FROM pg_catalog.pg_index AS identity
+                   JOIN shiba_internal.source_binding AS key_binding
+                     ON key_binding.source_id = $1
+                    AND key_binding.binding_kind = 'column'
+                    AND key_binding.address_objid = identity.indrelid
+                    AND key_binding.address_objsubid =
+                        (identity.indkey::smallint[])[0]
+                   JOIN pg_catalog.pg_attribute AS key
+                     ON key.attrelid = identity.indrelid
+                    AND key.attnum = key_binding.address_objsubid
+                   JOIN shiba_internal.source_binding AS payload_binding
+                     ON payload_binding.source_id = $1
+                    AND payload_binding.binding_kind = 'column'
+                    AND payload_binding.address_objid = identity.indrelid
+                    AND payload_binding.address_objsubid <> key_binding.address_objsubid
+                   JOIN pg_catalog.pg_attribute AS payload
+                     ON payload.attrelid = identity.indrelid
+                    AND payload.attnum = payload_binding.address_objsubid
                    WHERE identity.indexrelid = $3::bigint::oid
                      AND identity.indrelid = $2::bigint::oid
                      AND identity.indisprimary AND identity.indisunique
                      AND identity.indisvalid AND identity.indisready
                      AND identity.indnkeyatts = 1 AND identity.indnatts = 1
-                     AND (identity.indkey::smallint[])[0] = 1
-                     AND identity.indexprs IS NULL AND identity.indpred IS NULL)
+                     AND identity.indexprs IS NULL AND identity.indpred IS NULL
+                     AND key.atttypid = 20 AND key.attnotnull
+                     AND payload.atttypid = 20 AND NOT payload.attnotnull
+                     AND key.attnum < payload.attnum
+                     AND key.attgenerated = '' AND payload.attgenerated = '')
                AND EXISTS (
                    SELECT 1
                    FROM shiba_internal.source_ingress_config AS config
@@ -74,9 +86,18 @@ pub(crate) fn verify_rebuild_target(
                    WHERE config.source_id = $1
                      AND config.publication_objid = $4::bigint::oid
                      AND NOT publication.puballtables AND member.prqual IS NULL
-                     AND config.publication_attnums = ARRAY[1::smallint, 2::smallint]
+                     AND config.publication_attnums = ARRAY(
+                         SELECT binding.address_objsubid::smallint
+                         FROM shiba_internal.source_binding AS binding
+                         WHERE binding.source_id = $1 AND binding.binding_kind = 'column'
+                         ORDER BY binding.address_objsubid)
                      AND (member.prattrs IS NULL OR
-                          member.prattrs::smallint[] = ARRAY[1::smallint, 2::smallint])
+                          member.prattrs::smallint[] = ARRAY(
+                              SELECT binding.address_objsubid::smallint
+                              FROM shiba_internal.source_binding AS binding
+                              WHERE binding.source_id = $1
+                                AND binding.binding_kind = 'column'
+                              ORDER BY binding.address_objsubid))
                      AND 1 = (SELECT count(*) FROM pg_catalog.pg_publication_rel
                               WHERE prpubid = publication.oid))",
             &[
@@ -117,8 +138,15 @@ fn reconcile_identity_rename(
                  AND slot_generation = $5 AND phase = 'rebuild_prepared')
            AND EXISTS (
                SELECT 1 FROM pg_catalog.pg_index AS identity
+               JOIN shiba_internal.source_binding AS key_binding
+                 ON key_binding.source_id = $1
+                AND key_binding.binding_kind = 'column'
+                AND key_binding.address_objid = identity.indrelid
+                AND key_binding.address_objsubid =
+                    (identity.indkey::smallint[])[0]
                JOIN pg_catalog.pg_attribute AS key
-                 ON key.attrelid = identity.indrelid AND key.attnum = 1
+                 ON key.attrelid = identity.indrelid
+                AND key.attnum = key_binding.address_objsubid
                JOIN pg_catalog.pg_class AS relation
                  ON relation.oid = identity.indrelid
                WHERE identity.indexrelid = $2::bigint::oid
@@ -126,7 +154,6 @@ fn reconcile_identity_rename(
                  AND identity.indisprimary AND identity.indisunique
                  AND identity.indisvalid AND identity.indisready
                  AND identity.indnkeyatts = 1 AND identity.indnatts = 1
-                 AND identity.indkey[0] = 1
                  AND identity.indexprs IS NULL AND identity.indpred IS NULL
                  AND key.atttypid = 20 AND key.attnotnull
                  AND relation.relkind = 'r' AND relation.relreplident = 'd')",

@@ -13,14 +13,33 @@ impl ScanLocator {
                     key.attname::text, payload.attname::text,
                     key.atttypid::bigint, key.attnotnull,
                     payload.atttypid::bigint, payload.attnotnull
-             FROM shiba_internal.source_binding AS binding
-             JOIN pg_catalog.pg_class AS class ON class.oid = binding.address_objid
+             FROM shiba_internal.source_binding AS relation_binding
+             JOIN pg_catalog.pg_class AS class
+               ON class.oid = relation_binding.address_objid
              JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = class.relnamespace
+             JOIN pg_catalog.pg_index AS identity
+               ON identity.indrelid = class.oid
+              AND identity.indisprimary AND identity.indisunique
+              AND identity.indisvalid AND identity.indisready
+              AND identity.indnkeyatts = 1 AND identity.indnatts = 1
+              AND identity.indexprs IS NULL AND identity.indpred IS NULL
+             JOIN shiba_internal.source_binding AS key_binding
+               ON key_binding.source_id = relation_binding.source_id
+              AND key_binding.binding_kind = 'column'
+              AND key_binding.address_objid = class.oid
+              AND key_binding.address_objsubid = (identity.indkey::smallint[])[0]
              JOIN pg_catalog.pg_attribute AS key
-               ON key.attrelid = class.oid AND key.attnum = 1
+               ON key.attrelid = class.oid AND key.attnum = key_binding.address_objsubid
+             JOIN shiba_internal.source_binding AS payload_binding
+               ON payload_binding.source_id = relation_binding.source_id
+              AND payload_binding.binding_kind = 'column'
+              AND payload_binding.address_objid = class.oid
+              AND payload_binding.address_objsubid <> key_binding.address_objsubid
              JOIN pg_catalog.pg_attribute AS payload
-               ON payload.attrelid = class.oid AND payload.attnum = 2
-             WHERE binding.source_id = $1 AND binding.binding_kind = 'relation'",
+               ON payload.attrelid = class.oid
+              AND payload.attnum = payload_binding.address_objsubid
+             WHERE relation_binding.source_id = $1
+               AND relation_binding.binding_kind = 'relation'",
             &[&source_id],
         )?;
         if row.get::<_, i64>(4) != 20

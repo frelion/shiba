@@ -4,6 +4,7 @@ use crate::{
     BootstrapSession, IngressError,
     bootstrap::{BootstrapSpec, ReservedBootstrap, as_bigint},
     connection_config::{open_apply, replication_database},
+    operator_authority::validate_prepared_plan_set,
     rebuild::PreparedRebuild,
     rebuild_model::PreparedAuthority,
     rebuild_validation::verify_rebuild_target,
@@ -103,8 +104,6 @@ fn verify_prepared_catalog(
     let target_generation = as_bigint(authority.target.slot_generation.get())?;
     let retired_bootstrap = as_bigint(authority.retired_bootstrap_id.get())?;
     let retired_generation = as_bigint(authority.retired_slot_generation.get())?;
-    let count_operator = as_bigint(authority.count_operator_id.get())?;
-    let sum_operator = as_bigint(authority.sum_operator_id.get())?;
     let exact: bool = client
         .query_opt(
             "SELECT
@@ -127,39 +126,23 @@ fn verify_prepared_catalog(
            AND config.source_binding_objsubid = 0
            AND 4 = (SELECT count(*) FROM shiba_internal.source_binding
                     WHERE source_id = $1)
-           AND 3 = (SELECT count(*) FROM shiba_internal.source_binding
-                    WHERE source_id = $1 AND address_objid = $9::bigint::oid
-                      AND ((binding_kind = 'relation' AND address_objsubid = 0)
-                           OR (binding_kind = 'column' AND address_objsubid IN (1, 2))))
+           AND 1 = (SELECT count(*) FROM shiba_internal.source_binding
+                    WHERE source_id = $1 AND binding_kind = 'relation'
+                      AND address_classid = 'pg_class'::regclass
+                      AND address_objid = $9::bigint::oid AND address_objsubid = 0)
+           AND 2 = (SELECT count(DISTINCT address_objsubid)
+                    FROM shiba_internal.source_binding
+                    WHERE source_id = $1 AND binding_kind = 'column'
+                      AND address_classid = 'pg_class'::regclass
+                      AND address_objid = $9::bigint::oid AND address_objsubid > 0)
            AND 1 = (SELECT count(*) FROM shiba_internal.source_binding
                     WHERE source_id = $1 AND binding_kind = 'identity_index'
-                      AND address_objid = $12::bigint::oid AND address_objsubid = 0)
+                      AND address_classid = 'pg_class'::regclass
+                      AND address_objid = $10::bigint::oid AND address_objsubid = 0)
            AND 0 = (SELECT count(*) FROM shiba_internal.source_row_state
                     WHERE source_id = $1)
            AND 0 = (SELECT count(*) FROM shiba_internal.source_continuation
                     WHERE source_id = $1)
-           AND 2 = (SELECT count(*) FROM shiba_internal.operator_definition
-                    WHERE source_id = $1)
-           AND 1 = (SELECT count(*) FROM shiba_internal.operator_definition AS definition
-                    JOIN shiba_internal.operator_state AS state USING (operator_id)
-                    JOIN shiba.operator_result AS result USING (operator_id, operator_kind)
-                    WHERE definition.source_id = $1 AND definition.operator_id = $10
-                      AND definition.operator_kind = 'count_rows'
-                      AND definition.input_objid IS NULL
-                      AND state.value_bigint = 0
-                      AND result.result_status = 'building'
-                      AND result.value_bigint IS NULL)
-           AND 1 = (SELECT count(*) FROM shiba_internal.operator_definition AS definition
-                    JOIN shiba_internal.operator_state AS state USING (operator_id)
-                    JOIN shiba.operator_result AS result USING (operator_id, operator_kind)
-                    WHERE definition.source_id = $1 AND definition.operator_id = $11
-                      AND definition.operator_kind = 'sum_int8'
-                      AND definition.input_classid = 'pg_class'::regclass
-                      AND definition.input_objid = $9::bigint::oid
-                      AND definition.input_objsubid = 2
-                      AND state.value_bigint = 0
-                      AND result.result_status = 'building'
-                      AND result.value_bigint IS NULL)
          FROM shiba_internal.source_bootstrap AS bootstrap
          JOIN shiba_internal.source_ingress_config AS config USING (source_id)
          WHERE bootstrap.source_id = $1
@@ -174,8 +157,6 @@ fn verify_prepared_catalog(
                 &retired_generation,
                 &i64::from(authority.target.publication_oid),
                 &i64::from(authority.target.relation_oid),
-                &count_operator,
-                &sum_operator,
                 &i64::from(authority.target.identity_index_oid),
             ],
         )?
@@ -183,7 +164,7 @@ fn verify_prepared_catalog(
     if !exact {
         return Err(IngressError::Governance("prepared rebuild catalog drifted"));
     }
-    Ok(())
+    validate_prepared_plan_set(client, authority.source_id, &authority.plans)
 }
 
 fn exact_old_slot(

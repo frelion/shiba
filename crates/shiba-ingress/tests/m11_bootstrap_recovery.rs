@@ -235,9 +235,9 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
 
     admin
         .execute(
-            "UPDATE shiba_internal.operator_state SET value_bigint = $1
+            "UPDATE shiba_internal.operator_state SET state_payload = $1
              WHERE operator_id = 2",
-            &[&(i64::MAX - 5)],
+            &[&(i64::MAX - 5).to_be_bytes().as_slice()],
         )
         .expect("inject bounded operator overflow");
     let overflowing = BootstrapBatch::new(
@@ -255,7 +255,8 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     assert_eq!(states(&mut admin), vec![(1, 2), (2, i64::MAX - 5)]);
     admin
         .execute(
-            "UPDATE shiba_internal.operator_state SET value_bigint = 30
+            "UPDATE shiba_internal.operator_state
+             SET state_payload = decode('000000000000001e', 'hex')
              WHERE operator_id = 2",
             &[],
         )

@@ -27,19 +27,21 @@ pub(crate) fn derive_source(
             "relation identity is not admitted",
         ));
     }
-    let primary_key: bool = transaction
-        .query_one(
-            "SELECT count(*) = 1 FROM pg_catalog.pg_index AS index
-             WHERE index.indrelid = $1::bigint::oid
-               AND index.indisprimary AND index.indnkeyatts = 1
-               AND index.indkey[0] = 1
-               AND index.indpred IS NULL AND index.indexprs IS NULL",
+    let key_subid: Option<i32> = transaction
+        .query_opt(
+            "SELECT (identity.indkey::smallint[])[0]::integer
+             FROM pg_catalog.pg_index AS identity
+             WHERE identity.indrelid = $1::bigint::oid
+               AND identity.indisprimary AND identity.indisunique
+               AND identity.indisvalid AND identity.indisready
+               AND identity.indnkeyatts = 1 AND identity.indnatts = 1
+               AND identity.indpred IS NULL AND identity.indexprs IS NULL",
             &[&relation_oid],
         )?
-        .get(0);
-    if !primary_key {
+        .map(|row| row.get(0));
+    let Some(key_subid) = key_subid else {
         return Err(IngressError::Governance("source requires primary int8 id"));
-    }
+    };
     let columns = transaction.query(
         "SELECT attribute.attnum::integer, attribute.atttypid::bigint,
                 attribute.attnotnull
@@ -49,11 +51,16 @@ pub(crate) fn derive_source(
          ORDER BY attribute.attnum",
         &[&relation_oid],
     )?;
-    let key_only = column_matches(&columns, 0, 1, true) && columns.len() == 1;
-    let nullable_payload = columns.len() == 2
-        && column_matches(&columns, 0, 1, true)
-        && column_matches(&columns, 1, 2, false);
-    if !key_only && !nullable_payload {
+    let column_subids: Vec<i32> = columns.iter().map(|row| row.get(0)).collect();
+    let published_subids: Vec<i16> = column_subids
+        .iter()
+        .map(|subid| i16::try_from(*subid))
+        .collect::<Result<_, _>>()
+        .map_err(|_| IngressError::Governance("source column identity is invalid"))?;
+    let key_admitted = column_matches(&columns, 0, key_subid, true);
+    let nullable_payload =
+        columns.len() == 2 && key_admitted && column_matches(&columns, 1, column_subids[1], false);
+    if !key_admitted || (columns.len() != 1 && !nullable_payload) {
         return Err(IngressError::Governance(
             "source column shape is not admitted",
         ));
@@ -63,17 +70,19 @@ pub(crate) fn derive_source(
         source_id,
         relation_class,
         relation_oid,
-        columns.len(),
+        &column_subids,
     )?;
     let decoded_relation_oid = u32::try_from(relation_oid)
         .map_err(|_| IngressError::Governance("relation OID is out of range"))?;
-    if published_columns == [1] {
+    let published_key = i16::try_from(key_subid)
+        .map_err(|_| IngressError::Governance("source key identity is invalid"))?;
+    if published_columns == [published_key] {
         Ok(PgoutputSource::new(
             source_id,
             generation,
             decoded_relation_oid,
         ))
-    } else if nullable_payload && published_columns == [1, 2] {
+    } else if nullable_payload && published_columns == published_subids.as_slice() {
         Ok(PgoutputSource::with_nullable_int8_payload(
             source_id,
             generation,
@@ -99,7 +108,7 @@ pub(crate) fn validate_bindings(
     source_id: SourceId,
     relation_class: i64,
     relation_oid: i64,
-    column_count: usize,
+    column_subids: &[i32],
 ) -> Result<Option<i64>, IngressError> {
     let source_key = i64::try_from(source_id.get())
         .map_err(|_| IngressError::Governance("source ID exceeds bigint"))?;
@@ -117,15 +126,15 @@ pub(crate) fn validate_bindings(
         )
     });
     let (m12_generation, expected_rows) = match marker {
-        None => (false, column_count + 1),
+        None => (false, column_subids.len() + 1),
         Some((None, None, None)) => {
-            if column_count != 2 {
+            if column_subids.len() != 2 {
                 return Err(IngressError::Governance("source binding set drifted"));
             }
             (false, 3)
         }
         Some((Some(bootstrap), Some(slot), Some(generation)))
-            if bootstrap > 0 && !slot.is_empty() && generation > 0 && column_count == 2 =>
+            if bootstrap > 0 && !slot.is_empty() && generation > 0 && column_subids.len() == 2 =>
         {
             (true, 4)
         }
@@ -145,7 +154,7 @@ pub(crate) fn validate_bindings(
         return Err(IngressError::Governance("source binding set drifted"));
     }
     let mut relation_seen = false;
-    let mut columns_seen = vec![false; column_count];
+    let mut columns_seen = vec![false; column_subids.len()];
     let mut identity_oid = None;
     for row in rows {
         let kind: &str = row.get(0);
@@ -158,9 +167,9 @@ pub(crate) fn validate_bindings(
         match (kind, subid) {
             ("relation", 0) if objid == relation_oid && !relation_seen => relation_seen = true,
             ("column", value) if objid == relation_oid && value > 0 => {
-                let index = usize::try_from(value - 1)
-                    .ok()
-                    .filter(|index| *index < column_count)
+                let index = column_subids
+                    .iter()
+                    .position(|subid| *subid == value)
                     .ok_or(IngressError::Governance("source binding address drifted"))?;
                 if columns_seen[index] {
                     return Err(IngressError::Governance("source binding address drifted"));
@@ -177,27 +186,44 @@ pub(crate) fn validate_bindings(
         return Err(IngressError::Governance("source binding set drifted"));
     }
     if let Some(identity_oid) = identity_oid {
-        let exact_primary: bool = transaction
-            .query_one(
-                "SELECT EXISTS (
-                   SELECT 1 FROM pg_catalog.pg_index AS identity
-                   WHERE identity.indexrelid = $1::bigint::oid
-                     AND identity.indrelid = $2::bigint::oid
-                     AND identity.indisprimary AND identity.indisunique
-                     AND identity.indisvalid AND identity.indisready
-                     AND identity.indnkeyatts = 1 AND identity.indnatts = 1
-                     AND identity.indkey[0] = 1
-                     AND identity.indexprs IS NULL AND identity.indpred IS NULL)",
-                &[&identity_oid, &relation_oid],
-            )?
-            .get(0);
-        if !exact_primary {
-            return Err(IngressError::Governance("identity binding drifted"));
-        }
+        validate_identity_binding(transaction, source_key, relation_oid, identity_oid)?;
         Ok(Some(identity_oid))
     } else if m12_generation {
         Err(IngressError::Governance("identity binding is missing"))
     } else {
         Ok(None)
+    }
+}
+
+fn validate_identity_binding(
+    transaction: &mut impl GenericClient,
+    source_id: i64,
+    relation_oid: i64,
+    identity_oid: i64,
+) -> Result<(), IngressError> {
+    let exact: bool = transaction
+        .query_one(
+            "SELECT EXISTS (
+               SELECT 1 FROM pg_catalog.pg_index AS identity
+               WHERE identity.indexrelid = $1::bigint::oid
+                 AND identity.indrelid = $2::bigint::oid
+                 AND identity.indisprimary AND identity.indisunique
+                 AND identity.indisvalid AND identity.indisready
+                 AND identity.indnkeyatts = 1 AND identity.indnatts = 1
+                 AND EXISTS (
+                     SELECT 1 FROM shiba_internal.source_binding AS key_binding
+                     WHERE key_binding.source_id = $3
+                       AND key_binding.binding_kind = 'column'
+                       AND key_binding.address_objid = identity.indrelid
+                       AND key_binding.address_objsubid =
+                           (identity.indkey::smallint[])[0])
+                 AND identity.indexprs IS NULL AND identity.indpred IS NULL)",
+            &[&identity_oid, &relation_oid, &source_id],
+        )?
+        .get(0);
+    if exact {
+        Ok(())
+    } else {
+        Err(IngressError::Governance("identity binding drifted"))
     }
 }

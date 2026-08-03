@@ -39,7 +39,7 @@ pub(crate) fn assert_building(client: &mut Client) {
             &[],
         )
         .expect("query public rebuild visibility");
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|row| {
         row.get::<_, &str>(0) == "building" && row.get::<_, Option<i64>>(1).is_none()
     }));
@@ -61,9 +61,9 @@ pub(crate) fn install_second_active_source(
         ))
         .expect("install independent source");
     for (operator_id, operation) in [
-        (3, OperatorOperationV1::CountRows),
+        (4, OperatorOperationV1::CountRows),
         (
-            4,
+            5,
             OperatorOperationV1::SumInt8 {
                 input_column: "payload".to_owned(),
             },
@@ -122,22 +122,25 @@ pub(crate) fn grant_rebuild_control(client: &mut Client) {
              GRANT SELECT, DELETE ON shiba_internal.source_invalidation TO {CONTROL_ROLE};
              GRANT SELECT ON shiba_internal.source_ingress_config TO {CONTROL_ROLE};
              GRANT SELECT ON
-                 shiba_internal.source_ingress_invalidation,
+                 shiba_internal.source_ingress_invalidation TO {CONTROL_ROLE};
+             GRANT SELECT, UPDATE ON
                  shiba_internal.operator_definition TO {CONTROL_ROLE};
              GRANT SELECT, UPDATE ON shiba_internal.source_bootstrap TO {CONTROL_ROLE};
              GRANT SELECT, INSERT, UPDATE ON shiba_internal.source_continuation TO {CONTROL_ROLE};
              GRANT SELECT, INSERT, UPDATE, DELETE ON shiba_internal.source_row_state TO {CONTROL_ROLE};
              GRANT SELECT, UPDATE ON shiba_internal.operator_state TO {CONTROL_ROLE};
+             GRANT SELECT, INSERT, UPDATE, DELETE
+                 ON shiba_internal.operator_result_row TO {CONTROL_ROLE};
              GRANT SELECT, UPDATE ON shiba.operator_result TO {CONTROL_ROLE};
              GRANT SELECT ON source.events, target.events TO {CONTROL_ROLE};
              GRANT EXECUTE ON FUNCTION shiba_internal.prepare_source_rebuild(
-                 bigint, bigint, oid, oid, oid, name, bigint, bigint,
-                 bigint, integer, bigint, regclass, regclass, oid, name, bigint
+                 bigint, bigint, oid, oid, oid, name, bigint,
+                 bigint, regclass, regclass, oid, name, bigint
              ) TO {CONTROL_ROLE};
              GRANT USAGE ON SCHEMA target TO {RECEIVER_ROLE};
              GRANT SELECT ON target.events TO {RECEIVER_ROLE};
              GRANT USAGE ON SCHEMA shiba TO {READER_ROLE};
-             GRANT SELECT ON shiba.operator_result TO {READER_ROLE};"
+             GRANT SELECT ON shiba.operator_result, shiba.operator_result_rows TO {READER_ROLE};"
         ))
         .expect("grant only rebuild execution capabilities");
 }

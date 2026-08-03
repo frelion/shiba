@@ -93,15 +93,6 @@ BEGIN
 
     DELETE FROM shiba_internal.source_row_state
     WHERE source_id = requested_source_id;
-    IF EXISTS (
-        SELECT 1
-        FROM shiba_internal.operator_result_row AS result_row
-        JOIN shiba_internal.operator_definition AS definition USING (operator_id)
-        WHERE definition.source_id = requested_source_id
-    ) THEN
-        RAISE EXCEPTION 'replacement requires reset keyed results';
-    END IF;
-
     DELETE FROM shiba_internal.source_bootstrap
     WHERE source_id = requested_source_id
       AND bootstrap_id = old_bootstrap_id

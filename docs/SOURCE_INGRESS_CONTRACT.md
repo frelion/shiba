@@ -1,5 +1,18 @@
 # Source Ingress contract
 
+## M13 lifecycle integration status
+
+M13.3 changed Runtime input only after a complete transaction has crossed the
+existing transport/decoder boundary; ACK authorization and slot authority are
+unchanged. The transaction now drives a Catalog-loaded ordered plan set and one
+generic scalar/keyed sink. Ingress must never carry a concrete operator kind,
+fixed operator ID/count or payload column position.
+
+M13.4 still has to re-prove committed and streamed ingress, bootstrap catch-up,
+rebuild handoff, crash/replay and ACK timing with arbitrary plan cardinality and
+`ProjectRows`. A failed plan/state decode or keyed sink remains an Apply failure:
+no continuation commits and no terminal feedback may advance.
+
 ## Ownership
 
 Source Ingress is a transport boundary, not a durable data authority. For each
@@ -413,8 +426,10 @@ and recovery obligations.
 ## M12.2 rebuild admission ingress
 
 `PreparedRebuild::prepare` accepts only explicit old and target BootstrapId,
-relation OID, identity-index OID, publication OID, slot name and generation,
-plus the exact CountRows/SumInt8 plan. It acquires normal per-source ownership,
+relation OID, identity-index OID, publication OID, slot name and generation.
+The operator definition authority supplies the complete ordered plan set; the
+request does not carry fixed operator IDs, a plan count or column positions.
+It acquires normal per-source ownership,
 keeps the old slot inactive, validates replication/apply database agreement,
 and performs relation, publication, replica-identity, operator, permission and
 target-slot preflight before destructive SQL. It never guesses an object from

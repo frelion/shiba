@@ -1,6 +1,3 @@
-use core::num::NonZeroU64;
-
-use shiba_operator::OperatorId;
 use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
 
 use crate::{
@@ -9,6 +6,7 @@ use crate::{
     connection_config::{open_apply, replication_database},
     governed::advisory_key,
     limits::ActivePermit,
+    operator_authority::load_plan_fingerprints,
     rebuild::PreparedRebuild,
     rebuild_model::{PreparedAuthority, RebuildIdentity},
     rebuild_validation::verify_rebuild_target,
@@ -140,12 +138,27 @@ pub(crate) fn load_rebuild_authority(
         ))?;
     let relation_class: i64 = row.get(5);
     let relation_oid: i64 = row.get(6);
-    let identity_oid = validate_bindings(transaction, source_id, relation_class, relation_oid, 2)?
-        .ok_or(IngressError::Governance(
-            "prepared rebuild identity binding is missing",
-        ))?;
-    let (count_operator_id, sum_operator_id) =
-        load_operator_ids(transaction, source_key, relation_class, relation_oid)?;
+    let column_subids = transaction
+        .query(
+            "SELECT attnum::integer FROM pg_catalog.pg_attribute
+             WHERE attrelid = $1::bigint::oid AND attnum > 0 AND NOT attisdropped
+             ORDER BY attnum",
+            &[&relation_oid],
+        )?
+        .into_iter()
+        .map(|column| column.get::<_, i32>(0))
+        .collect::<Vec<_>>();
+    let identity_oid = validate_bindings(
+        transaction,
+        source_id,
+        relation_class,
+        relation_oid,
+        &column_subids,
+    )?
+    .ok_or(IngressError::Governance(
+        "prepared rebuild identity binding is missing",
+    ))?;
+    let plans = load_plan_fingerprints(transaction, source_id)?;
     let authority = PreparedAuthority {
         source_id,
         target: RebuildIdentity {
@@ -159,55 +172,9 @@ pub(crate) fn load_rebuild_authority(
         retired_bootstrap_id: bootstrap_id(row.get(1))?,
         retired_slot_name: row.get(2),
         retired_slot_generation: slot_generation(row.get(3))?,
-        count_operator_id,
-        sum_operator_id,
+        plans,
     };
     Ok((authority, row.get(7)))
-}
-
-fn load_operator_ids(
-    transaction: &mut postgres::Transaction<'_>,
-    source_id: i64,
-    relation_class: i64,
-    relation_oid: i64,
-) -> Result<(OperatorId, OperatorId), IngressError> {
-    let rows = transaction.query(
-        "SELECT operator_id, operator_kind, input_classid::bigint,
-                input_objid::bigint, input_objsubid
-         FROM shiba_internal.operator_definition
-         WHERE source_id = $1 ORDER BY operator_id",
-        &[&source_id],
-    )?;
-    if rows.len() != 2 {
-        return Err(IngressError::Governance("prepared operator plan drifted"));
-    }
-    let mut count = None;
-    let mut sum = None;
-    for row in rows {
-        let id = operator_id(row.get(0))?;
-        match row.get::<_, &str>(1) {
-            "count_rows"
-                if count.is_none()
-                    && row.get::<_, Option<i64>>(2).is_none()
-                    && row.get::<_, Option<i64>>(3).is_none()
-                    && row.get::<_, Option<i32>>(4).is_none() =>
-            {
-                count = Some(id);
-            }
-            "sum_int8"
-                if sum.is_none()
-                    && row.get::<_, Option<i64>>(2) == Some(relation_class)
-                    && row.get::<_, Option<i64>>(3) == Some(relation_oid)
-                    && row.get::<_, Option<i32>>(4) == Some(2) =>
-            {
-                sum = Some(id);
-            }
-            _ => return Err(IngressError::Governance("prepared operator plan drifted")),
-        }
-    }
-    count
-        .zip(sum)
-        .ok_or(IngressError::Governance("prepared operator plan drifted"))
 }
 
 fn as_oid(value: i64, label: &'static str) -> Result<u32, IngressError> {
@@ -215,14 +182,6 @@ fn as_oid(value: i64, label: &'static str) -> Result<u32, IngressError> {
         .ok()
         .filter(|value| *value != 0)
         .ok_or(IngressError::InvalidIdentifier(label))
-}
-
-fn operator_id(value: i64) -> Result<OperatorId, IngressError> {
-    u64::try_from(value)
-        .ok()
-        .and_then(NonZeroU64::new)
-        .map(OperatorId::new)
-        .ok_or(IngressError::Governance("operator identity is invalid"))
 }
 
 fn bootstrap_id(value: i64) -> Result<BootstrapId, IngressError> {

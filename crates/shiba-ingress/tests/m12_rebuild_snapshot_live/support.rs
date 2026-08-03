@@ -24,7 +24,7 @@ pub(crate) fn assert_building(client: &mut Client) {
             &[],
         )
         .expect("query public result visibility");
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|row| {
         row.get::<_, &str>(0) == "building" && row.get::<_, Option<i64>>(1).is_none()
     }));
@@ -49,6 +49,7 @@ pub(crate) fn assert_active(client: &mut Client, count: i64, sum: i64) {
         vec![
             (1, "active".to_owned(), Some(count)),
             (2, "active".to_owned(), Some(sum)),
+            (3, "active".to_owned(), None),
         ]
     );
 }
@@ -64,6 +65,23 @@ pub(crate) fn assert_oracle(client: &mut Client, count: i64, sum: i64) {
         (oracle.get::<_, i64>(0), oracle.get::<_, i64>(1)),
         (count, sum)
     );
+    let expected = client
+        .query("SELECT id, payload FROM target.events ORDER BY id", &[])
+        .expect("query target keyed SQL oracle")
+        .into_iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, Option<i64>>(1)))
+        .collect::<Vec<_>>();
+    let actual = client
+        .query(
+            "SELECT result_key_bigint, result_value_bigint
+             FROM shiba.operator_result_rows WHERE operator_id = 3 ORDER BY 1",
+            &[],
+        )
+        .expect("query rebuilt ProjectRows")
+        .into_iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, Option<i64>>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
 }
 
 pub(crate) fn catalog_identity(client: &mut Client) -> Vec<Vec<String>> {
@@ -77,8 +95,10 @@ pub(crate) fn catalog_identity(client: &mut Client) -> Vec<Vec<String>> {
              SELECT * FROM shiba_internal.source_ingress_config ORDER BY source_id
          ) x",
         "SELECT row_to_json(x)::text FROM (
-             SELECT operator_id, source_id, compiler_version, operator_kind,
-                    input_classid, input_objid, input_objsubid
+             SELECT operator_id, source_id, compiler_version, plan_format_version,
+                    encode(plan_digest, 'hex') AS plan_digest,
+                    state_codec_version, output_shape, output_value_type,
+                    output_key_type, output_value_nullable
              FROM shiba_internal.operator_definition ORDER BY operator_id
          ) x",
         "SELECT row_to_json(x)::text FROM (

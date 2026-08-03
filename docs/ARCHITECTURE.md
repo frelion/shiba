@@ -1,11 +1,16 @@
 # Architecture boundary
 
-M13.1 freezes the generic execution successor to the M9 aggregate-shaped API.
-See [OPERATOR_KERNEL_CONTRACT.md](OPERATOR_KERNEL_CONTRACT.md): concrete plan
+M13.1 froze the generic execution successor to the M9 aggregate-shaped API;
+M13.2 supplied its pure kernel, and M13.3 made that kernel the sole Runtime and
+Catalog execution path. See
+[OPERATOR_KERNEL_CONTRACT.md](OPERATOR_KERNEL_CONTRACT.md): concrete plan
 dispatch is confined to `shiba-operator`; Runtime owns the PostgreSQL
-transaction and generic sink only; Ingress/Bootstrap/Rebuild consume an ordered
-durable plan set without kind, ID or cardinality assumptions. M13.2--M13.4 must
-replace the old path atomically rather than preserve an adapter.
+transaction and generic scalar/keyed sink only. Catalog durably orders plans by
+operator ID and stores each strict specification, canonical compiled payload,
+digest, state codec and output contract. Ingress/Bootstrap/Rebuild must consume
+that set without kind, fixed-ID, fixed-count or column-position assumptions.
+M13.4 closed those production lifecycle regression gates without an adapter or
+parallel path. M13.5 retains the final release/performance evidence gate.
 
 ## Direction
 
@@ -474,7 +479,8 @@ separate transport role is the narrowly trusted `REPLICATION` control-plane
 capability with target `SELECT`; the reader has only public-result `SELECT`.
 
 The target relation, publication, key/payload columns, primary identity-index
-and SumInt8 plan are compared by durable ObjectAddress. The exact
+and complete ordered compiled-plan set are compared by durable ObjectAddress
+bindings and canonical plan digests. The exact
 identity-index OID is held with `AccessShareLock` while `pg_relation_size`
 checks shape. A same-OID rename is not rejected by name; replacement,
 publication drift, replica-identity/column drift and post-prepare invalidation

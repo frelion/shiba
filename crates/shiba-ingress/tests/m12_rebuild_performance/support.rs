@@ -43,7 +43,7 @@ pub(crate) fn assert_building(client: &mut Client) {
             &[],
         )
         .expect("query rebuild result visibility");
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|row| {
         row.get::<_, &str>(0) == "building" && row.get::<_, Option<i64>>(1).is_none()
     }));
@@ -73,8 +73,26 @@ pub(crate) fn assert_differential(client: &mut Client) -> (i64, i64) {
         vec![
             ("active".to_owned(), Some(expected.0)),
             ("active".to_owned(), Some(expected.1)),
+            ("active".to_owned(), None),
         ]
     );
+    let expected_rows = client
+        .query("SELECT id, payload FROM target.events ORDER BY id", &[])
+        .expect("query ProjectRows oracle")
+        .into_iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, Option<i64>>(1)))
+        .collect::<Vec<_>>();
+    let actual_rows = client
+        .query(
+            "SELECT result_key_bigint, result_value_bigint
+             FROM shiba.operator_result_rows WHERE operator_id = 3 ORDER BY 1",
+            &[],
+        )
+        .expect("query rebuilt ProjectRows")
+        .into_iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, Option<i64>>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(actual_rows, expected_rows);
     let state = client
         .query_one(
             "SELECT count(*)::bigint, COALESCE(sum(payload_int8), 0)::bigint

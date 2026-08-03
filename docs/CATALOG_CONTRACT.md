@@ -1,26 +1,32 @@
 # Catalog contract
 
-## M13 generic operator authority (frozen, pending M13.3 cutover)
+## M13 generic operator authority
 
-M13 replaces the aggregate-specific layout rather than migrating or mirroring
-it. The sole definition authority will contain the strict declaration,
-canonical compiled-plan payload, format version, digest, state contract and
-output contract. Ordered exact ObjectAddress input bindings are children of
-that same definition and are written only by `compile_and_register`; they are
-not a second plan authority. Concrete operator names are not SQL constraints.
+M13.3 replaced the aggregate-specific layout rather than migrating or mirroring
+it. Each row in the sole `operator_definition` authority contains the strict
+declaration bytes, canonical compiled-plan payload, format version, exact
+32-byte digest, state codec and scalar/keyed output contract. Ordered exact
+ObjectAddress inputs are inside the canonical plan payload; they are not a
+second table or plan authority. `compile_and_register` is the sole writer and
+operator ID supplies the durable lock/execution order. Concrete operator names
+are absent from SQL constraints and workflow.
 
-Runtime remains the only state/result writer. State is an opaque versioned
-payload. Results have a generic visibility/header plus either one typed scalar
-payload or operator-owned keyed rows. Public scalar/keyed surfaces expose only
-active results. Registration and rebuild initialization call the same generic
-Runtime writer; Catalog SQL must not infer a concrete zero, patch an input by
-kind, or reset state independently.
+Runtime remains the only state/result writer. `operator_state` is an opaque
+versioned payload tied structurally to the definition codec. The generic
+`operator_result` header owns building/active visibility and scalar storage;
+`operator_result_row` owns keyed `(operator_id, key, nullable value)` rows.
+The public keyed view joins only active keyed headers, so building rows cannot
+leak a partial projection. Registration and rebuild initialization call the
+same generic Runtime writer; Catalog SQL does not infer a concrete zero, patch
+an input by kind, or reset state independently.
 
-At M12 destructive prepare, the registration/compiler writer installs the
-complete target plan set and digest in the same transaction that makes the
-target the sole building authority. Recovery validates that durable set;
-activation only publishes the same set. There is no candidate table,
-compatibility view, dual write or recovery-time kind reconstruction.
+At M12 destructive prepare, the registration/compiler writer must install the
+complete target plan set in ascending operator-ID order in the same transaction
+that makes the target the sole building authority. Recovery validates every
+canonical payload/digest/input/output contract in that durable set; activation
+only publishes the same authority. M13.4 still has to re-prove this handoff for
+arbitrary plan cardinality, including `ProjectRows`. There is no candidate
+table, compatibility view, dual write or recovery-time kind reconstruction.
 
 ## Installation authority
 
@@ -88,20 +94,20 @@ M8.2 changes no catalog contract. The deterministic concurrency gate proves
 each relation-kind row serializes only its owning source while the singleton
 count/result remains the one aggregate commit point.
 
-## M9.1 operator authority
+## M9.1 historical operator authority (superseded by M13.3)
 
-The clean-room install contains `operator_definition`, `operator_state`, and
-`shiba.operator_result`; it does not create or later drop old count tables.
-Definitions freeze compiler version, source ID, operator kind, and nullable or
-complete input ObjectAddress according to the kind. The registration adapter is
-the sole definition writer and verifies source binding existence/invalidation.
-Runtime alone updates state/result. State may be negative because SumInt8 is a
-signed aggregate; CountRows enforces non-negativity in its pure evaluator.
+M9.1 originally introduced `operator_definition`, `operator_state`, and
+`shiba.operator_result`; it did not create or later drop old count tables. Its
+definition rows froze compiler version, source ID, concrete kind and its input
+ObjectAddress. M13.3 replaced that aggregate-shaped schema in place with the
+generic authority described above; the old kind/input columns, constraints and
+execution path no longer exist.
 
-Each public result has the same operator ID/kind as its definition through a
-foreign key. Internal definition/state have no PUBLIC privileges; the public
-sink grants SELECT only. Installation seeds no operator: definition, zero state,
-and zero result are created atomically by explicit registration.
+The enduring M9 invariant is writer ownership: registration is the sole
+definition writer and Runtime alone updates state/result. Internal
+definition/state have no PUBLIC privileges; public sink surfaces grant SELECT
+only. Installation seeds no operator; explicit generic registration creates a
+definition, initial opaque state and matching output header atomically.
 
 Later tuple slices alter only the existing current-state table. M5.1 adds
 `payload_text` with int8/text mutual exclusion; it creates no fifth table,
@@ -279,11 +285,13 @@ permission and absent target slot. Permission is checked for `session_user`,
 not the definer identity.
 
 After exact-old CAS succeeds, one transaction replaces the old binding with
-the target relation, two columns and exact primary-index ObjectAddress, installs the
-target publication/slot/generation, rebinds SumInt8 to target column sub-ID 2,
-deletes current rows and the WAL continuation, resets both operator states to
-zero, clears old source/ingress invalidations, publishes `building/NULL`, and
-marks the same lifecycle `rebuild_prepared`. Pre-M12 active state has the proved
+the target relation, its dynamically resolved key/payload columns and exact
+primary-index ObjectAddress, installs the target publication/slot/generation,
+installs and initializes the complete generic compiled-plan set through the
+sole registration/Runtime writers, deletes current rows and the WAL
+continuation, clears old source/ingress invalidations, publishes every generic
+result header as `building/NULL`, and marks the same lifecycle
+`rebuild_prepared`. Pre-M12 active state has the proved
 three-row relation-plus-columns binding. Every M12-produced generation has four
 exact rows, including `binding_kind='identity_index'`. Its retired
 BootstrapId/slot/generation triple persists through later phases and is the

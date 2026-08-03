@@ -1,6 +1,6 @@
-# V2 goal gap after M12
+# V2 goal gap during M13
 
-## M13.1 contract status
+## M13.3 implementation status
 
 M1–M9 are the reference correctness kernel, not a complete Shiba V2. They
 prove the transaction and recovery semantics that later architecture must
@@ -10,31 +10,34 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap lifecycle, complete M12 rebuild admission/identity/recovery/governance/release evidence | Broader lifecycle automation and operator/result shapes |
+| Catalog | Version, source/publication authority, canonical compiled plans/digests, opaque state, generic scalar/keyed results, sole `source_row_state`, one bootstrap lifecycle, complete M12 evidence | Broader value/result types and lifecycle automation |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
-| Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
+| Source Apply | Current-row authority plus transaction-local before/after effects, including the narrow key-changing update needed by ProjectRows | Broader row shapes and identities |
 | EffectStream | Non-durable transaction-local EffectBatch | Persisted effects intentionally absent |
-| Runtime | Replay/recovery plus ordered registered-operator execution integrated with M10 ingress | Broader operators and production orchestration |
-| Operator | Database-free CountRows/SumInt8 contract; both integrated atomically | Add non-aggregate kinds |
-| Result Sink | Operator-keyed private state and public result | Non-bigint result shapes |
+| Runtime | Generic plan/state decode, ordered kernel dispatch and atomic scalar/keyed persistence through live/bootstrap/rebuild | Final M13 release/performance evidence |
+| Operator | Database-free CountRows, SumInt8 and non-aggregate ProjectRows on one kernel | More operator families remain out of scope |
+| Result Sink | Generic visibility header, scalar bigint arm and active-only nullable keyed rows | Non-bigint result types |
 
-M13.1 has frozen, but not yet implemented, the generic plan/state/transition
-and scalar/keyed sink contract. M13 is not complete until CountRows, SumInt8
-and ProjectRows use that sole path through live ingress, bootstrap and rebuild.
+M13.2 implemented the pure generic plan/state/transition contract. M13.3 made it
+the sole Catalog/Runtime path and proved CountRows, SumInt8 and ProjectRows
+atomically against PG17.10/18.4 SQL oracles. M13.4 removed fixed operator
+IDs/counts/column positions from ingress, bootstrap and rebuild and re-proved
+the directed M10--M12 matrix; M13.5 must now close the release matrix,
+performance comparison, static scan and documentation evidence.
 
 ## Proven reference boundary
 
 The synchronous Runtime has one PostgreSQL transaction owner and proves atomic
-source-row mutation, count/result publication, continuation, replay, crash
-rollback, same-source CAS, independent-source progress, DDL fail-closed
-admission, a 16 MiB/10,000-change input boundary, and PG17/18 reference latency
-ceilings. These facts constrain future slices; the fixed count authority itself
-has been removed.
+source-row mutation, generic scalar/keyed result publication, continuation,
+replay, crash rollback, same-source CAS, independent-source progress, DDL
+fail-closed admission, a 16 MiB/10,000-change input boundary, and PG17/18
+reference latency ceilings. These facts constrain future slices; the fixed
+count authority itself has been removed.
 
 ## Still unproved
 
-SQL frontend, non-aggregate operators, non-bigint result shapes, cross-host
+SQL frontend, additional operator families, non-bigint result shapes, cross-host
 sustained soak, empirical heap peak, contention tail latency, automatic
 receiver supervision/reconnect, and broader binding/operator lifecycles remain
 outside the proved boundary.
@@ -66,10 +69,12 @@ M11 is complete at its pristine nullable-int8 CountRows/SumInt8 scope. V2 is
 not complete. M12.1 freezes an offline rebuild: target identity becomes sole
 building authority at destructive prepare, old computation is retired, and
 activation promotes the same authority. It adds no candidate or parallel path.
-M12.2 now proves the production admission transaction: all preflight failures
+M12.2 proved the production admission transaction: all preflight failures
 preserve old active authority, exact-old CAS installs target as the sole
 `rebuild_prepared` building authority, results become `building/NULL`, old
-rows/continuation/invalidations retire and private state resets to zero. The
+rows/continuation/invalidations retire, and the then aggregate-shaped private
+state was reset. M13.4 re-proved the same atomic boundary using generic
+plan-derived initial state/output, including partial keyed recovery. The
 old inactive slot remains and the target slot is absent for forward recovery.
 The identity-index OID is an explicit CAS coordinate. Pre-M12 active state has
 the proved three-row binding; every M12-produced generation has a fourth exact

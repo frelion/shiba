@@ -42,7 +42,7 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         PreparedRebuild::prepare(
             &database_url,
             &replication_url,
-            fixture.spec_with(fixture.old, fixture.bad_target, 1, 2, 1, 2, 3),
+            fixture.spec_with(fixture.old, fixture.bad_target, 1, 2, 3),
             options(),
         )
         .is_err(),
@@ -68,7 +68,7 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         PreparedRebuild::prepare(
             &database_url,
             &replication_url,
-            fixture.spec_with(fixture.old, fixture.target, 1, 2, 99, 2, 3),
+            fixture.spec_with(fixture.old, fixture.target, 99, 2, 3),
             options(),
         )
         .is_err(),
@@ -79,7 +79,7 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         PreparedRebuild::prepare(
             &database_url,
             &replication_url,
-            fixture.spec_with(fixture.old, fixture.target, 1, 2, 1, 2, 4),
+            fixture.spec_with(fixture.old, fixture.target, 1, 2, 4),
             options(),
         )
         .is_err(),
@@ -133,23 +133,38 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         PreparedRebuild::prepare(
             &database_url,
             &replication_url,
-            fixture.spec_with(foreign_old, fixture.target, 1, 2, 1, 2, 3),
+            fixture.spec_with(foreign_old, fixture.target, 1, 2, 3),
             options(),
         )
         .is_err(),
         "foreign expected binding must fail exact old identity CAS"
     );
     assert_eq!(full_authority_snapshot(&mut admin), active_before);
-    assert!(
-        PreparedRebuild::prepare(
-            &database_url,
-            &replication_url,
-            fixture.spec_with(fixture.old, fixture.target, 2, 1, 1, 2, 3),
-            options(),
+    let plan_digest: Vec<u8> = admin
+        .query_one(
+            "SELECT plan_digest FROM shiba_internal.operator_definition WHERE operator_id = 3",
+            &[],
         )
-        .is_err(),
-        "mixed CountRows/SumInt8 identity must fail before mutation"
+        .expect("read exact ProjectRows plan digest")
+        .get(0);
+    admin
+        .execute(
+            "UPDATE shiba_internal.operator_definition
+             SET plan_digest = decode(repeat('00', 32), 'hex') WHERE operator_id = 3",
+            &[],
+        )
+        .expect("inject compiled plan drift");
+    assert!(
+        PreparedRebuild::prepare(&database_url, &replication_url, fixture.spec(), options())
+            .is_err(),
+        "corrupt generic plan must fail before destructive prepare"
     );
+    admin
+        .execute(
+            "UPDATE shiba_internal.operator_definition SET plan_digest = $1 WHERE operator_id = 3",
+            &[&plan_digest],
+        )
+        .expect("restore exact ProjectRows plan digest");
     assert_eq!(full_authority_snapshot(&mut admin), active_before);
 
     admin
@@ -275,14 +290,15 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
     assert_eq!(
         admin
             .query(
-                "SELECT value_bigint FROM shiba_internal.operator_state ORDER BY operator_id",
+                "SELECT encode(state_payload, 'hex')
+                 FROM shiba_internal.operator_state ORDER BY operator_id",
                 &[],
             )
             .expect("read reset private state")
             .into_iter()
-            .map(|row| row.get::<_, i64>(0))
+            .map(|row| row.get::<_, String>(0))
             .collect::<Vec<_>>(),
-        vec![0, 0]
+        vec!["0000000000000000", "0000000000000000", ""]
     );
     let results = admin
         .query(

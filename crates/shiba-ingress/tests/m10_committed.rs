@@ -47,8 +47,8 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
             "SELECT
                 (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
                 (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 2),
-                (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 1),
-                (SELECT value_bigint FROM shiba_internal.operator_state WHERE operator_id = 2),
+                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 2),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.source_continuation)",
             &[],
@@ -57,11 +57,15 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
     (
         row.get(0),
         row.get(1),
-        row.get(2),
-        row.get(3),
+        decode_int8_state(row.get(2)),
+        decode_int8_state(row.get(3)),
         row.get(4),
         row.get(5),
     )
+}
+
+fn decode_int8_state(payload: Vec<u8>) -> i64 {
+    i64::from_be_bytes(payload.try_into().expect("int8 operator state"))
 }
 
 #[test]
