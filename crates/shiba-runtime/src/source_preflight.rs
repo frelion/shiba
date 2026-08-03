@@ -119,7 +119,7 @@ pub(crate) fn validate(transaction: &mut Transaction<'_>, source_id: i64) -> Res
     Ok(())
 }
 
-fn validate_rebuild_identity(
+pub(crate) fn validate_rebuild_identity(
     transaction: &mut Transaction<'_>,
     source_id: i64,
 ) -> Result<(), M2Error> {

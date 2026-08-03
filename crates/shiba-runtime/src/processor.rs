@@ -42,6 +42,7 @@ fn process_in_transaction(
     let commit_lsn = identity.commit_lsn.to_string();
 
     source_preflight::lock_binding(transaction, source_id)?;
+    source_preflight::validate_rebuild_identity(transaction, source_id)?;
     source_preflight::validate_execution_authority(transaction, source_id, generation)?;
 
     if exact_replay(transaction, source_id, generation, &commit_lsn, ingress_id)? {
