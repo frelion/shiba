@@ -44,7 +44,9 @@ BEGIN
     VALUES
         (requested_source_id, 'relation', 'pg_class'::regclass, target_relation, 0),
         (requested_source_id, 'column', 'pg_class'::regclass, target_relation, 1),
-        (requested_source_id, 'column', 'pg_class'::regclass, target_relation, 2);
+        (requested_source_id, 'column', 'pg_class'::regclass, target_relation, 2),
+        (requested_source_id, 'identity_index', 'pg_class'::regclass,
+         target_identity_index, 0);
     UPDATE shiba_internal.source_ingress_config SET
         database_oid = target.database_oid,
         publication_objid = target_publication,

@@ -20,9 +20,11 @@ RETURNS TABLE (
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $function$
-DECLARE target record;
+DECLARE
+    target record;
+    m12_identity boolean;
 BEGIN
-    IF requested_source_id <= 0 OR expected_sum_input_subid <= 0
+    IF requested_source_id <= 0 OR expected_sum_input_subid <> 2
        OR new_bootstrap_id <= 0 OR new_bootstrap_id = expected_old_bootstrap_id
        OR target_slot = expected_old_slot
        OR target_generation <> expected_old_generation + 1 THEN
@@ -35,7 +37,8 @@ BEGIN
     PERFORM pg_catalog.pg_advisory_xact_lock(
         '-9223372036854775808'::bigint + requested_source_id
     );
-    PERFORM 1
+    SELECT bootstrap.retired_bootstrap_id IS NOT NULL
+    INTO STRICT m12_identity
     FROM shiba_internal.source_bootstrap AS bootstrap
     JOIN shiba_internal.source_ingress_config AS config
       ON config.source_id = bootstrap.source_id
@@ -51,7 +54,6 @@ BEGIN
       AND config.slot_name = expected_old_slot
       AND config.slot_generation = expected_old_generation
     FOR UPDATE OF bootstrap, config;
-    IF NOT FOUND THEN RAISE EXCEPTION 'stale active rebuild identity'; END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_catalog.pg_replication_slots AS slot
         WHERE slot.slot_name = expected_old_slot
@@ -62,8 +64,9 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'old slot is not exact inactive pgoutput authority';
     END IF;
-    IF 3 <> (SELECT count(*) FROM shiba_internal.source_binding
-             WHERE source_id = requested_source_id)
+    IF (CASE WHEN m12_identity THEN 4 ELSE 3 END) <>
+          (SELECT count(*) FROM shiba_internal.source_binding
+           WHERE source_id = requested_source_id)
        OR NOT EXISTS (
            SELECT 1 FROM shiba_internal.source_binding
            WHERE source_id = requested_source_id AND binding_kind = 'relation'
@@ -73,10 +76,19 @@ BEGIN
            WHERE source_id = requested_source_id AND binding_kind = 'column'
              AND address_objid = expected_old_relation
              AND address_objsubid IN (1, expected_sum_input_subid)
-       ) OR NOT EXISTS (
-           SELECT 1 FROM pg_catalog.pg_index AS old_identity
-           WHERE old_identity.indexrelid = expected_old_identity_index
-             AND old_identity.indrelid = expected_old_relation
+       ) OR (m12_identity AND NOT EXISTS (
+           SELECT 1 FROM shiba_internal.source_binding
+           WHERE source_id = requested_source_id
+             AND binding_kind = 'identity_index'
+             AND address_objid = expected_old_identity_index
+             AND address_objsubid = 0
+       )) OR NOT EXISTS (
+           SELECT 1 FROM pg_catalog.pg_class AS old_relation
+           JOIN pg_catalog.pg_index AS old_identity
+             ON old_identity.indrelid = old_relation.oid
+           WHERE old_relation.oid = expected_old_relation
+             AND old_relation.relkind = 'r' AND old_relation.relreplident = 'd'
+             AND old_identity.indexrelid = expected_old_identity_index
              AND old_identity.indisprimary AND old_identity.indisunique
              AND old_identity.indisvalid AND old_identity.indisready
              AND old_identity.indnkeyatts = 1 AND old_identity.indnatts = 1
@@ -87,7 +99,7 @@ BEGIN
         SELECT 1 FROM shiba_internal.source_binding
         WHERE source_id <> requested_source_id
           AND address_classid = 'pg_class'::regclass
-          AND address_objid = target_relation
+          AND address_objid IN (target_relation, target_identity_index)
     ) THEN RAISE EXCEPTION 'target objects are bound by another source'; END IF;
     IF 2 <> (SELECT count(*) FROM shiba_internal.operator_definition
              WHERE source_id = requested_source_id)

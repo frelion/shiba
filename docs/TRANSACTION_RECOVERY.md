@@ -491,9 +491,20 @@ slot is absent, so a crash at this point is unambiguously forward-recoverable
 without pretending slot DDL was transactional. M12.3 owns their exact cleanup/
 creation sequence.
 
+Recovery reads identity only from durable lifecycle facts. Pre-M12 active state
+has the exact three-row relation/column binding. An M12-produced generation has
+a fourth exact identity-index ObjectAddress, selected by the retired
+BootstrapId/slot/generation marker that persists through every later phase and
+is overwritten by the next rebuild's old triple. Recovery may narrowly
+reconcile a rename only when the index OID is unchanged and still denotes the
+current default primary key. A replacement OID fails closed; no different index
+is dynamically discovered or substituted.
+
 Old/foreign receiver tokens are additionally rejected by a receiver-local
 authorization capability even when their terminal LSN equals a current value.
 The capability is memory-only and cannot replace durable lifecycle/generation
 validation. The admission gate does not yet prove kill points after old-slot
 drop, new-slot creation, snapshot loss, scan/catch-up, activation or feedback;
-those remain M12.3--M12.4.
+those remain M12.3--M12.4. The corrected cardinality path initially failed on
+PG17 because unparenthesized PL/pgSQL `IF CASE` is invalid. Final PG17/18
+recovery evidence remains pending and is not claimed here.

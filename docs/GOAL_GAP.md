@@ -8,7 +8,7 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap lifecycle, and PG17/18-proved exact M12.2 active-source destructive admission | M12.3 slot/snapshot progression, crash/DDL/role matrix and final release gate remain |
+| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap lifecycle, M12.2 active-source destructive admission, and PG17/18-proven durable rebuild identity-index authority | M12.3 slot/snapshot progression, crash/DDL/role matrix and final release gate remain |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
 | Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
@@ -64,8 +64,17 @@ preserve old active authority, exact-old CAS installs target as the sole
 `rebuild_prepared` building authority, results become `building/NULL`, old
 rows/continuation/invalidations retire and private state resets to zero. The
 old inactive slot remains and the target slot is absent for forward recovery.
-The identity-index OID is an explicit CAS coordinate, not another binding row,
-and receiver-local token capability prevents a foreign old receiver from
+The identity-index OID is an explicit CAS coordinate. Pre-M12 active state has
+the proved three-row binding; every M12-produced generation has a fourth exact
+identity-index binding selected by its persistent retired identity marker.
+Recovery cannot dynamically substitute a replacement index: same-OID rename is
+the narrow reconciliation case and a new OID fails closed. The failure-first
+PG17 gate exposed invalid unparenthesized PL/pgSQL `IF CASE`. After correction,
+PG17.10 and PG18.4 independently pass
+`scripts/test-m12-rebuild-identity-authority.sh`: exact-four persistence,
+catalog-only resume, same-OID rename, unrelated DDL isolation, malformed binding
+rejection, repeated rebuild CAS, and replacement-OID rejection are proved.
+Receiver-local token capability prevents a foreign old receiver from
 authorizing Apply/ACK. The snapshot-to-live data path, full recovery/DDL/role
 matrix and performance remain M12.3--M12.6 work.
 

@@ -246,8 +246,18 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
             &[],
         )
         .expect("read sole M10/M11-compatible target binding set");
-    assert_eq!(binding_shape.get::<_, i64>(0), 3);
-    assert_eq!(binding_shape.get::<_, i64>(1), 0);
+    assert_eq!(binding_shape.get::<_, i64>(0), 4);
+    assert_eq!(binding_shape.get::<_, i64>(1), 1);
+    let prepared_identity: i64 = admin
+        .query_one(
+            "SELECT address_objid::bigint
+             FROM shiba_internal.source_binding
+             WHERE source_id = 1 AND binding_kind = 'identity_index'",
+            &[],
+        )
+        .expect("read exact prepared replica identity authority")
+        .get(0);
+    assert_eq!(prepared_identity, i64::from(fixture.target.identity_index));
 
     let retired = admin
         .query_one(

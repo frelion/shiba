@@ -205,7 +205,8 @@ scripts = [
         "m10-performance-ingress", "m10-shutdown-ingress",
         "m11-bootstrap-contract", "m11-bootstrap", "m11-recovery",
         "m11-bootstrap-performance", "m11-bootstrap-roles",
-        "m12-rebuild-contract",
+        "m12-rebuild-contract", "m12-rebuild-admission",
+        "m12-rebuild-identity-authority",
     )
 ]
 for path in scripts:

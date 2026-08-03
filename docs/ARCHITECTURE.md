@@ -390,15 +390,25 @@ current rows and continuation are gone, private operator states are zero, and
 old-generation invalidations are retired. The old inactive physical slot is
 deliberately retained and the target slot remains absent; their ordered,
 recoverable transport cleanup/creation belongs to M12.3. The default single-
-column bigint primary-key index OID is an explicit admission/CAS coordinate,
-not another durable binding row: `source_binding` remains exactly relation plus
-the two live columns.
+column bigint primary-key index OID is an explicit admission/CAS coordinate and,
+for an M12-produced generation, a fourth exact `source_binding` ObjectAddress
+beside the relation and two live columns. Pre-M12 active rows keep their proved
+three-row shape. A non-null retired BootstrapId/slot/generation triple persists
+through the M12 lifecycle and selects the four-row shape; recovery never guesses
+from live catalogs or silently substitutes another index.
+
+An index rename with the same OID permits only narrow reconciliation. A
+replacement index has a new OID and fails closed until explicit rebuild. This
+still reuses the one `source_binding` authority; no index registry is added.
 
 Receiver terminal capabilities now carry an unforgeable, process-local
 receiver authorization. A token from an old or foreign receiver fails even if
 its LSN happens to match; durable generation/lifecycle checks remain the
 catalog defense. This is no cursor authority and creates no durable state.
-PG17.10 and PG18.4 pass `scripts/test-m12-rebuild-admission.sh`, including
+The earlier PG17.10/PG18.4 `scripts/test-m12-rebuild-admission.sh` run covered
 invalid shape/permission/stale identity/active or preoccupied slot/foreign
 binding/mixed-plan rollback, single-winner concurrency and the exact successful
-building state.
+building state. The follow-on identity-authority gate was failure-first and
+initially exposed invalid unparenthesized PL/pgSQL `IF CASE` syntax on PG17.
+After correction, `scripts/test-m12-rebuild-identity-authority.sh` is green on
+PG17.10 and PG18.4. M12.3 slot retirement and snapshot-to-live remain separate.

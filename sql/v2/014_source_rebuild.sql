@@ -49,22 +49,21 @@ ALTER TABLE shiba_internal.source_bootstrap
         ))
     ),
     ADD CONSTRAINT source_bootstrap_retired_identity CHECK (
-        (phase = 'rebuild_prepared'
-         AND retired_bootstrap_id > 0
+        (retired_bootstrap_id IS NULL
+         AND retired_slot_name IS NULL
+         AND retired_slot_generation IS NULL
+         AND phase <> 'rebuild_prepared')
+        OR (retired_bootstrap_id > 0
          AND bootstrap_id <> retired_bootstrap_id
          AND retired_slot_name IS NOT NULL
          AND slot_name <> retired_slot_name
          AND retired_slot_generation > 0
          AND slot_generation = retired_slot_generation + 1)
-        OR (phase <> 'rebuild_prepared'
-            AND retired_bootstrap_id IS NULL
-            AND retired_slot_name IS NULL
-            AND retired_slot_generation IS NULL)
     );
 
 COMMENT ON COLUMN shiba_internal.source_bootstrap.retired_bootstrap_id IS
-    'Exact retired active bootstrap identity retained only during rebuild prepare';
+    'Exact retired active bootstrap identity marking an M12-produced lifecycle';
 COMMENT ON COLUMN shiba_internal.source_bootstrap.retired_slot_name IS
-    'Exact old slot to retire before the prepared rebuild can reserve its new slot';
+    'Exact old slot retired by the M12 lifecycle that produced this generation';
 COMMENT ON COLUMN shiba_internal.source_bootstrap.retired_slot_generation IS
     'Old generation rejected after the target generation becomes building authority';

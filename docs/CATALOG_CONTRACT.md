@@ -237,9 +237,10 @@ same-name/same-shape replacement. This is a documented deployment assumption
 and residual risk, not a database-enforced invariant. M12 adds no slot-birth
 marker, parallel candidate authority, alias, fallback or dual write.
 
-M12.1 is the frozen contract. M12.2 accepts the destructive writer and
-production admission transition on PG17.10 and PG18.4; later data-path and
-recovery claims still require M12.3--M12.6.
+M12.1 is the frozen contract. M12.2 established the destructive writer and its
+original production admission transition; the corrected durable index identity
+still awaits final PG17/18 evidence. Data-path and recovery claims require
+M12.3--M12.6.
 
 ## M12.2 admitted rebuild state
 
@@ -254,19 +255,29 @@ replica identity, exact single-table publication semantics, caller `SELECT`
 permission and absent target slot. Permission is checked for `session_user`,
 not the definer identity.
 
-After exact-old CAS succeeds, one transaction replaces the old relation and
-two column binding rows with the target relation and two columns, installs the
+After exact-old CAS succeeds, one transaction replaces the old binding with
+the target relation, two columns and exact primary-index ObjectAddress, installs the
 target publication/slot/generation, rebinds SumInt8 to target column sub-ID 2,
 deletes current rows and the WAL continuation, resets both operator states to
 zero, clears old source/ingress invalidations, publishes `building/NULL`, and
-marks the same lifecycle `rebuild_prepared`. The identity-index OID is an
-explicit old/target validation and CAS coordinate, not a fourth
-`source_binding` row; the durable binding set remains relation plus two
-columns. Deferred exact-ingress constraints permit this one atomic replacement
+marks the same lifecycle `rebuild_prepared`. Pre-M12 active state has the proved
+three-row relation-plus-columns binding. Every M12-produced generation has four
+exact rows, including `binding_kind='identity_index'`. Its retired
+BootstrapId/slot/generation triple persists through later phases and is the
+durable discriminator, not a row-count guess or live-catalog inference.
+Deferred exact-ingress constraints permit this one atomic replacement
 without exposing an intermediate authority.
 
+Same-OID index rename permits only narrow reconciliation after validating that
+it remains the current default primary key. Replacement OID fails closed;
+recovery cannot discover and substitute a different index. The existing
+`source_binding` table remains the sole identity authority.
+
 The old inactive physical slot still exists and the target physical slot does
-not. Catalog SQL neither drops nor creates either slot. PG17.10/PG18.4 prove
-that every failed preflight/CAS leaves an exact authority snapshot unchanged,
+not. Catalog SQL neither drops nor creates either slot. The earlier
+PG17.10/PG18.4 gate proved that failed preflight/CAS leaves its authority
+snapshot unchanged,
 two concurrent preparations have one winner, and success exposes only the
-state above. Snapshot creation, slot retirement and forward resume are M12.3.
+state above. The corrected four-row identity gate first exposed invalid
+PL/pgSQL `IF CASE` syntax on PG17, then passed on PG17.10 and PG18.4 after the
+fix. Snapshot creation, slot retirement and forward resume are M12.3.

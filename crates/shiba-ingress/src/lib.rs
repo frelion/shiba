@@ -25,6 +25,9 @@ mod governed;
 mod limits;
 mod publication;
 mod rebuild;
+mod rebuild_model;
+mod rebuild_resume;
+mod rebuild_validation;
 mod receive_loop;
 mod receiver;
 mod shutdown;
@@ -44,7 +47,8 @@ pub use limits::{
     BOOTSTRAP_CONNECTIONS_PER_SOURCE, CONNECTIONS_PER_SOURCE, MAX_ACTIVE_CONNECTIONS,
     MAX_ACTIVE_SOURCES,
 };
-pub use rebuild::{PreparedRebuild, RebuildIdentity, RebuildSpec};
+pub use rebuild::PreparedRebuild;
+pub use rebuild_model::{RebuildIdentity, RebuildSpec};
 pub(crate) use receiver::SourceReceiver;
 pub use shutdown::ShutdownHandle;
 pub use tokens::{

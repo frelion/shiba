@@ -1,5 +1,4 @@
 use postgres::Client;
-use shiba_operator::OperatorId;
 use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
 
 use crate::{
@@ -8,29 +7,11 @@ use crate::{
     connection_config::{open_apply, replication_database},
     governed::advisory_key,
     limits::ActivePermit,
+    rebuild_model::{PreparedAuthority, RebuildSpec},
+    rebuild_resume::load_prepared_authority,
+    rebuild_validation::verify_rebuild_target,
     transport::validate_slot,
 };
-
-/// Exact catalog and transport identity on one side of a rebuild transition.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RebuildIdentity {
-    pub bootstrap_id: BootstrapId,
-    pub relation_oid: u32,
-    pub identity_index_oid: u32,
-    pub publication_oid: u32,
-    pub slot_name: String,
-    pub slot_generation: SlotGeneration,
-}
-
-/// Exact old-authority CAS and the preflighted target authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RebuildSpec {
-    pub source_id: SourceId,
-    pub expected: RebuildIdentity,
-    pub target: RebuildIdentity,
-    pub count_operator_id: OperatorId,
-    pub sum_operator_id: OperatorId,
-}
 
 /// Exclusive owner of a durably prepared, forward-only rebuild.
 ///
@@ -38,10 +19,13 @@ pub struct RebuildSpec {
 /// no replication-slot operation. The target catalog identity is already the
 /// sole `building` authority when this value is returned.
 pub struct PreparedRebuild {
-    apply: Client,
-    spec: RebuildSpec,
-    advisory_key: i64,
-    _permit: ActivePermit,
+    pub(crate) apply: Client,
+    pub(crate) authority: PreparedAuthority,
+    pub(crate) options: BootstrapOptions,
+    pub(crate) apply_conninfo: String,
+    pub(crate) replication_conninfo: String,
+    pub(crate) advisory_key: i64,
+    pub(crate) permit: ActivePermit,
 }
 
 impl PreparedRebuild {
@@ -81,27 +65,45 @@ impl PreparedRebuild {
         invoke_prepare_writer(&mut transaction, &spec)?;
         transaction.commit()?;
 
+        let mut transaction = apply.transaction()?;
+        let authority = load_prepared_authority(
+            &mut transaction,
+            spec.source_id,
+            spec.target.bootstrap_id,
+            spec.target.slot_generation,
+        )?;
+        if authority != PreparedAuthority::from_spec(&spec) {
+            return Err(IngressError::Governance(
+                "durable prepared rebuild differs from request",
+            ));
+        }
+        verify_rebuild_target(&mut transaction, &authority)?;
+        transaction.commit()?;
+        drop(spec);
         Ok(Self {
             apply,
-            spec,
+            authority,
+            options,
+            apply_conninfo: apply_conninfo.to_owned(),
+            replication_conninfo: replication_conninfo.to_owned(),
             advisory_key,
-            _permit: permit,
+            permit,
         })
     }
 
     #[must_use]
     pub const fn source_id(&self) -> SourceId {
-        self.spec.source_id
+        self.authority.source_id
     }
 
     #[must_use]
     pub const fn target_bootstrap_id(&self) -> BootstrapId {
-        self.spec.target.bootstrap_id
+        self.authority.target.bootstrap_id
     }
 
     #[must_use]
     pub const fn target_generation(&self) -> SlotGeneration {
-        self.spec.target.slot_generation
+        self.authority.target.slot_generation
     }
 
     /// Explicitly releases the source owner after a prepared handoff.
@@ -240,7 +242,10 @@ fn quote_identifier(value: &str) -> String {
 mod tests {
     use core::num::NonZeroU64;
 
+    use shiba_operator::OperatorId;
+
     use super::*;
+    use crate::RebuildIdentity;
 
     fn identity(bootstrap: u64, generation: u64, slot: &str) -> RebuildIdentity {
         RebuildIdentity {

@@ -511,10 +511,12 @@ BootstrapId/generation, active old slot, occupied target slot, foreign target
 binding and mixed operator plan must fail with byte-for-byte-equivalent catalog
 state. Two concurrent exact requests produce one winner.
 
-The winning request must expose exactly one target relation plus two column
-bindings, target ingress config/generation and `rebuild_prepared` lifecycle;
-the primary-key identity-index OID is checked as an explicit CAS coordinate but
-is not inserted as another binding. It must also prove `building/NULL`, empty
+The winning request must expose exactly one target relation, two column bindings
+and one exact default-primary-key identity-index binding, target ingress
+config/generation and `rebuild_prepared` lifecycle. Pre-M12 old state is accepted
+only as the exact three-row shape; an M12-produced generation is accepted only
+as the exact four-row shape with its persistent retired identity marker. It must
+also prove `building/NULL`, empty
 current-row and continuation state, zero private operator values, retired old
 invalidations, an unchanged inactive old physical slot, and an absent target
 physical slot. A foreign old-receiver token with a matching LSN is rejected by
@@ -525,7 +527,14 @@ the initial test incorrectly expected a custom identity binding rather than the
 existing relation-plus-two-columns set; SECURITY DEFINER permission validation
 had to use `session_user`; PostgreSQL `bigint` values had to retain their exact
 64-bit type at the Rust boundary; and PL/pgSQL block-label plus deferred-
-constraint references required explicit qualification. These are clean-room
-runtime failures, not legacy evidence. M12.2 does not prove old-slot cleanup,
+constraint references required explicit qualification. The identity gate then
+failed first on PG17 because unparenthesized PL/pgSQL `IF CASE` is invalid.
+These are clean-room runtime failures, not legacy evidence. The independent
+`scripts/test-m12-rebuild-identity-authority.sh` gate is green on PG17.10 and
+PG18.4. It proves exact-four target persistence, recovery using only durable
+Catalog coordinates, same-OID rename reconciliation, unrelated index isolation,
+binding cardinality/kind/address rejection, a second rebuild whose old CAS comes
+from the durable fourth row, and fail-closed same-shaped primary-key replacement.
+M12.2 does not prove old-slot cleanup,
 new exported snapshot, snapshot-to-live differential, crash recovery, DDL/
 least-privilege breadth or performance.

@@ -66,5 +66,82 @@ pub(crate) fn validate(transaction: &mut Transaction<'_>, source_id: i64) -> Res
     if invalidated {
         return Err(M2Error::SourceInvalidated);
     }
+    validate_rebuild_identity(transaction, source_id)?;
+    Ok(())
+}
+
+fn validate_rebuild_identity(
+    transaction: &mut Transaction<'_>,
+    source_id: i64,
+) -> Result<(), M2Error> {
+    let Some(marker) = transaction.query_opt(
+        "SELECT retired_bootstrap_id IS NOT NULL,
+                retired_slot_name IS NOT NULL,
+                retired_slot_generation IS NOT NULL
+         FROM shiba_internal.source_bootstrap WHERE source_id = $1",
+        &[&source_id],
+    )?
+    else {
+        return Ok(());
+    };
+    let marker = [
+        marker.get::<_, bool>(0),
+        marker.get::<_, bool>(1),
+        marker.get::<_, bool>(2),
+    ];
+    if marker == [false; 3] {
+        return Ok(());
+    }
+    if marker != [true; 3] {
+        return Err(M2Error::SourceInvalidated);
+    }
+
+    let exact: bool = transaction
+        .query_one(
+            "SELECT count(*) = 4
+                    AND count(*) FILTER (
+                        WHERE binding.binding_kind = 'relation'
+                          AND binding.address_classid = 'pg_class'::regclass
+                          AND binding.address_objsubid = 0
+                    ) = 1
+                    AND count(*) FILTER (
+                        WHERE binding.binding_kind = 'column'
+                          AND binding.address_classid = 'pg_class'::regclass
+                          AND binding.address_objid = relation.address_objid
+                          AND binding.address_objsubid IN (1, 2)
+                    ) = 2
+                    AND count(*) FILTER (
+                        WHERE binding.binding_kind = 'identity_index'
+                          AND binding.address_classid = 'pg_class'::regclass
+                          AND binding.address_objsubid = 0
+                          AND identity.indrelid = relation.address_objid
+                          AND identity.indisprimary AND identity.indisunique
+                          AND identity.indisvalid AND identity.indisready
+                          AND identity.indnkeyatts = 1 AND identity.indnatts = 1
+                          AND (identity.indkey::smallint[])[0] = 1
+                          AND identity.indexprs IS NULL
+                          AND identity.indpred IS NULL
+                    ) = 1
+             FROM shiba_internal.source_binding AS binding
+             CROSS JOIN LATERAL (
+                 SELECT relation_binding.address_objid
+                 FROM shiba_internal.source_binding AS relation_binding
+                 JOIN pg_catalog.pg_class AS relation
+                   ON relation.oid = relation_binding.address_objid
+                  AND relation.relkind = 'r' AND relation.relreplident = 'd'
+                 WHERE relation_binding.source_id = $1
+                   AND relation_binding.binding_kind = 'relation'
+                   AND relation_binding.address_classid = 'pg_class'::regclass
+                   AND relation_binding.address_objsubid = 0
+             ) AS relation
+             LEFT JOIN pg_catalog.pg_index AS identity
+               ON identity.indexrelid = binding.address_objid
+             WHERE binding.source_id = $1",
+            &[&source_id],
+        )?
+        .get(0);
+    if !exact {
+        return Err(M2Error::SourceInvalidated);
+    }
     Ok(())
 }

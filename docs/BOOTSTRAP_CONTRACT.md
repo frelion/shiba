@@ -285,5 +285,11 @@ still present and the named target physical slot is absent. M12.3 must first
 reconcile those exact slot coordinates, then invoke the existing M11
 reservation/exported-snapshot scanner and its bounded batches. It may not reset
 to the old authority or synthesize snapshot/WAL identity. The target identity-
-index OID is validated explicitly but does not add a bootstrap checkpoint or
-source-binding row.
+index OID is validated explicitly and becomes the fourth exact
+`source_binding` row for an M12-produced generation; it adds no bootstrap
+checkpoint or second authority. Pre-M12 active state remains the exact
+three-row shape. The retired BootstrapId/slot/generation triple persists across
+creating, scanning, catch-up, active and recoverable failure phases, so
+recovery does not infer identity from current catalogs. Same-OID rename is the
+only narrow reconciliation; replacement OID fails closed. The corrected gate
+is green on PG17.10 and PG18.4; snapshot-to-live remains M12.3 work.

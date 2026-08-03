@@ -425,14 +425,19 @@ eligible: phase `rebuild_prepared` forbids ordinary M10 attach/receive/Apply/
 ACK. The old inactive slot remains for the M12.3 retirement step; the target
 slot is still absent. M11 scanner and Runtime can later resolve only the target
 authority. The default bigint primary-key index OID travels as an exact CAS
-coordinate even though the durable binding set remains relation plus two
-columns.
+coordinate. Pre-M12 active state uses the frozen three binding rows; every
+M12-produced generation also has the exact fourth identity-index binding. Its
+persistent retired identity triple selects that interpretation throughout
+recovery. Same-OID rename permits narrow reconciliation; replacement OID fails
+closed and cannot be dynamically substituted.
 
 All received terminal tokens also include a private authorization minted by
 their receiver instance. Apply and feedback reject a stale/foreign receiver's
 token before it can exploit an equal LSN. This is volatile capability checking,
 not a stored cursor, generation, continuation or slot identity; catalog
-lifecycle/generation validation remains mandatory. PG17.10 and PG18.4 pass the
-real active-source admission gate. M12.3 must still retire the exact old slot,
+lifecycle/generation validation remains mandatory. The earlier PG17.10/PG18.4
+admission gate predates the identity-authority correction. Its new
+failure-first run exposed invalid unparenthesized PL/pgSQL `IF CASE` syntax on
+PG17; the corrected gate is green on PG17.10 and PG18.4. M12.3 must still retire the exact old slot,
 create the exact new slot with `EXPORT_SNAPSHOT`, and drive the existing M11/
 M10 path.

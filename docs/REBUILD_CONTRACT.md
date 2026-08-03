@@ -52,6 +52,14 @@ fence and exact-old CAS. On commit:
 - the old generation loses eligibility to receive, Apply, ACK, attach or
   publish.
 
+Identity shape is explicit across the transition. Pre-M12 active state has
+exactly relation plus two column bindings. Every M12-produced generation adds
+the exact default-primary-key index ObjectAddress as a fourth row. Its non-null
+retired BootstrapId/slot/generation triple persists through all lifecycle
+phases and distinguishes that shape without inference. Recovery may narrowly
+reconcile an index rename only when the OID is unchanged; replacement OID fails
+closed and cannot be dynamically adopted.
+
 This commit is the destructive boundary. From it onward recovery is
 forward-only. Shiba cannot restore, relabel, adopt or fall back to the old
 authority. The target is already the only catalog authority, but is not yet
