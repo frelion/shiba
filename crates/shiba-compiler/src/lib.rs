@@ -2,11 +2,15 @@
 
 #![forbid(unsafe_code)]
 
+mod plan;
+
 use core::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 use shiba_operator::{CompiledOperator, CompiledOperatorKind, ObjectAddress, OperatorId};
 use shiba_protocol::SourceId;
+
+pub use plan::compile_plan;
 
 pub const OPERATOR_SPEC_VERSION: u32 = 1;
 /// `PostgreSQL`'s built-in `int8` type OID.
@@ -63,10 +67,18 @@ impl<'de> Deserialize<'de> for OperatorSpecV1 {
                 raw.version
             )));
         }
-        if let OperatorOperationV1::SumInt8 { input_column } = &raw.operation
-            && input_column.trim().is_empty()
-        {
-            return Err(de::Error::custom("sum_int8 input_column cannot be blank"));
+        match &raw.operation {
+            OperatorOperationV1::CountRows => {}
+            OperatorOperationV1::SumInt8 { input_column } => {
+                reject_blank::<D::Error>(input_column, "sum_int8 input_column")?;
+            }
+            OperatorOperationV1::ProjectRows {
+                key_column,
+                input_column,
+            } => {
+                reject_blank::<D::Error>(key_column, "project_rows key_column")?;
+                reject_blank::<D::Error>(input_column, "project_rows input_column")?;
+            }
         }
         Ok(Self {
             version: raw.version,
@@ -82,7 +94,20 @@ impl<'de> Deserialize<'de> for OperatorSpecV1 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperatorOperationV1 {
     CountRows,
-    SumInt8 { input_column: String },
+    SumInt8 {
+        input_column: String,
+    },
+    ProjectRows {
+        key_column: String,
+        input_column: String,
+    },
+}
+
+fn reject_blank<E: de::Error>(value: &str, field: &str) -> Result<(), E> {
+    if value.trim().is_empty() {
+        return Err(E::custom(format_args!("{field} cannot be blank")));
+    }
+    Ok(())
 }
 
 /// Live source metadata supplied to the pure compiler by Runtime.
@@ -111,6 +136,9 @@ pub enum CompilerError {
     MissingColumn(String),
     DuplicateColumn(String),
     WrongColumnType { column: String, type_oid: u32 },
+    NullableKey(String),
+    PlanEncoding,
+    LegacyApiDoesNotSupportProject,
 }
 
 impl fmt::Display for CompilerError {
@@ -129,6 +157,13 @@ impl fmt::Display for CompilerError {
                 formatter,
                 "source column {column:?} has type OID {type_oid}, expected 20"
             ),
+            Self::NullableKey(column) => {
+                write!(formatter, "project key column {column:?} must be non-null")
+            }
+            Self::PlanEncoding => formatter.write_str("compiled plan encoding failed"),
+            Self::LegacyApiDoesNotSupportProject => {
+                formatter.write_str("legacy aggregate API cannot compile project_rows")
+            }
         }
     }
 }
@@ -176,6 +211,9 @@ pub fn compile_operator(
             CompiledOperatorKind::SumInt8 {
                 input: column.address,
             }
+        }
+        OperatorOperationV1::ProjectRows { .. } => {
+            return Err(CompilerError::LegacyApiDoesNotSupportProject);
         }
     };
     Ok(CompiledOperator {

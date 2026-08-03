@@ -88,3 +88,43 @@ pub struct CompiledOperator {
     pub source_id: SourceId,
     pub kind: CompiledOperatorKind,
 }
+
+/// Runtime-opaque, strictly versioned operator state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncodedOperatorState {
+    pub codec_version: u32,
+    pub payload: Vec<u8>,
+}
+
+/// First typed result-value contract; SQL NULL is explicit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScalarValue {
+    Null,
+    Int8(i64),
+}
+
+/// One explicit keyed-result mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mutation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KeyedMutation {
+    Delete { key: i64 },
+    Upsert { key: i64, value: ScalarValue },
+}
+
+/// Persistence-only output selected by the compiled output contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "shape", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OutputDelta {
+    ScalarReplacement { value: ScalarValue },
+    KeyedMutations { mutations: Vec<KeyedMutation> },
+}
+
+/// Complete pure result of one plan/state/effect evaluation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorTransition {
+    pub next_state: EncodedOperatorState,
+    pub output_delta: OutputDelta,
+}
