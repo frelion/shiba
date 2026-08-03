@@ -18,10 +18,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -87,7 +87,7 @@ fn install_crash_trigger(client: &mut Client) {
              END
              $$;
              CREATE TRIGGER m6_stream_crash
-             AFTER INSERT ON shiba_internal.source_continuation
+             AFTER INSERT ON shiba_internal.graph_continuation
              FOR EACH ROW EXECUTE FUNCTION m6_stream_test.crash_after_continuation();",
         )
         .expect("install continuation crash point");
@@ -136,18 +136,27 @@ fn m6_real_stream_commit_crash_retry_and_replay() {
     let messages = streamed_messages(&wire);
     let commit = assert_segment_shape(&wire, &messages);
 
-    assert!(decode_streamed_changes(&wire[..commit], source).is_err());
+    assert!(
+        decode_streamed_changes(&wire[..commit], &support::singleton_graph(1, source)).is_err()
+    );
     assert_eq!(durable_state(&mut client), (0, 0, 0, 0));
-    assert!(decode_streamed_changes(&wire[..wire.len() - 1], source).is_err());
+    assert!(
+        decode_streamed_changes(
+            &wire[..wire.len() - 1],
+            &support::singleton_graph(1, source)
+        )
+        .is_err()
+    );
     let mut corrupt = wire.clone();
     corrupt[commit + 5] = 1;
-    assert!(decode_streamed_changes(&corrupt, source).is_err());
+    assert!(decode_streamed_changes(&corrupt, &support::singleton_graph(1, source)).is_err());
     let mut aborted = wire[..commit + 9].to_vec();
     aborted[commit] = b'A';
-    assert!(decode_streamed_changes(&aborted, source).is_err());
+    assert!(decode_streamed_changes(&aborted, &support::singleton_graph(1, source)).is_err());
     assert_eq!(durable_state(&mut client), (0, 0, 0, 0));
 
-    let transaction = decode_streamed_changes(&wire, source).expect("decode committed stream");
+    let transaction = decode_streamed_changes(&wire, &support::singleton_graph(1, source))
+        .expect("decode committed stream");
     install_crash_trigger(&mut client);
     assert!(process(&mut client, &transaction).is_err());
     let mut client = Client::connect(&connection, NoTls).expect("reconnect after crash");

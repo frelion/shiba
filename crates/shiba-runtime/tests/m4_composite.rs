@@ -17,10 +17,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -89,11 +89,13 @@ fn m4_real_pgoutput_composite_keys_and_bad_second_key_tag() {
     let second_tag = first_insert_second_key_tag(&bad_second_key);
     assert_eq!(bad_second_key[second_tag], b't');
     bad_second_key[second_tag] = b'n';
-    assert!(decode_committed_changes(&bad_second_key, source).is_err());
+    assert!(
+        decode_committed_changes(&bad_second_key, &support::singleton_graph(1, source)).is_err()
+    );
     assert_eq!(durable_state(&mut client), (0, 0, 0, 0));
 
-    let transaction =
-        decode_committed_changes(&wire, source).expect("decode composite transaction");
+    let transaction = decode_committed_changes(&wire, &support::singleton_graph(1, source))
+        .expect("decode composite transaction");
     assert_eq!(
         process(&mut client, &transaction).expect("apply composite transaction"),
         ProcessOutcome::Applied
@@ -123,7 +125,7 @@ fn m4_real_pgoutput_composite_keys_and_bad_second_key_tag() {
     );
     let result: i64 = client
         .query_one(
-            "SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1",
+            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001",
             &[],
         )
         .expect("query SQL result")

@@ -1,20 +1,17 @@
 use std::{
-    num::NonZeroU64,
     sync::mpsc::{self, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
 
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_ingress::{AttachOptions, GovernedSourceSession, ReplicationMode, StreamedInput};
-use shiba_operator::OperatorId;
-use shiba_protocol::{SlotGeneration, SourceId};
+use shiba_ingress::{AttachOptions, GovernedGraphSession, ReplicationMode, StreamedInput};
+use shiba_protocol::{GraphId, SlotGeneration};
 use shiba_runtime::{ProcessOutcome, compile_and_register};
 
 mod support;
 
-use support::{slot_lsn, wait_for_keepalive_reply, wait_for_slot_lsn};
+use support::{count_spec, slot_lsn, wait_for_keepalive_reply, wait_for_slot_lsn};
 
 const SLOT: &str = "shiba_m10_streaming_slot";
 const PUBLICATION: &str = "shiba_m10_streaming_pub";
@@ -26,32 +23,24 @@ fn required(name: &str) -> String {
         .unwrap_or_else(|_| panic!("scripts/test-m10-streaming-ingress.sh must set {name}"))
 }
 
-fn spec(operator_id: u64, operation: OperatorOperationV1) -> OperatorSpecV1 {
-    OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("non-zero operator")),
-        source_id: SourceId::new(1).expect("non-zero source"),
-        operation,
-    }
-}
-
 fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                COALESCE((SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 2), 0),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 2),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2),
+                COALESCE((SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 4), 0),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 3),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable streamed state");
     (
         row.get(0),
         row.get(1),
-        decode_int8_state(row.get(2)),
+        row.get::<_, Option<Vec<u8>>>(2)
+            .map_or(0, decode_int8_state),
         row.get::<_, Option<Vec<u8>>>(3)
             .map_or(0, decode_int8_state),
         row.get(4),
@@ -60,14 +49,14 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
 }
 
 fn decode_int8_state(payload: Vec<u8>) -> i64 {
-    i64::from_be_bytes(payload.try_into().expect("int8 operator state"))
+    i64::from_be_bytes(payload.try_into().expect("int8 node state"))
 }
 
-fn attach_session(database_url: &str, replication_url: &str) -> GovernedSourceSession {
-    GovernedSourceSession::attach(
+fn attach_session(database_url: &str, replication_url: &str) -> GovernedGraphSession {
+    GovernedGraphSession::attach(
         database_url,
         replication_url,
-        SourceId::new(1).expect("source ID"),
+        GraphId::new(1).expect("graph ID"),
         SlotGeneration::new(1).expect("slot generation"),
         AttachOptions::new(ReplicationMode::Streamed, Duration::from_secs(5))
             .expect("attach options"),
@@ -118,8 +107,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
              SELECT shiba_internal.register_source(1, 'source.events'::regclass);"
         ))
         .expect("install streamed source and binding");
-    compile_and_register(&mut admin, &spec(1, OperatorOperationV1::CountRows))
-        .expect("register CountRows");
+    compile_and_register(&mut admin, &count_spec(1)).expect("register CountRows graph");
     admin
         .query_one(
             "SELECT slot_name FROM pg_create_logical_replication_slot($1, 'pgoutput')",
@@ -135,7 +123,7 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
         .get(0);
     admin
         .execute(
-            "SELECT shiba_internal.configure_source_ingress(1, $1, $2, 1)",
+            "SELECT shiba_internal.configure_graph_ingress(1, $1, $2, 1)",
             &[&publication_oid, &SLOT],
         )
         .expect("configure governed streamed ingress");
@@ -436,16 +424,13 @@ fn production_streams_commit_abort_crash_and_limit_without_early_ack() {
     let limit_baseline = retry_apply_empty.end_lsn();
     drop(receiver);
 
-    compile_and_register(
-        &mut admin,
-        &spec(
-            2,
-            OperatorOperationV1::SumInt8 {
-                input_column: "payload".to_owned(),
-            },
-        ),
-    )
-    .expect("register SumInt8 after all admitted key-only Apply");
+    admin
+        .execute(
+            "UPDATE shiba_internal.graph_definition
+             SET compiler_version = compiler_version WHERE graph_id = 1",
+            &[],
+        )
+        .expect("emit unrelated internal graph Catalog WAL");
     let mut transaction = admin.transaction().expect("begin post-Sum empty stream");
     let post_sum_xid: i64 = transaction
         .query_one("SELECT pg_current_xact_id()::text::bigint", &[])

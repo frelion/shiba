@@ -1,132 +1,92 @@
--- M11.1's sole pristine reservation writer freezes source/publication identity,
--- reserves an absent slot name, and hides results in one PostgreSQL transaction.
+-- Sole pristine graph-bootstrap reservation writer. Slot creation remains a
+-- nontransactional replication-protocol step after this durable reservation.
 
-CREATE FUNCTION shiba_internal.reserve_source_bootstrap(
-    requested_bootstrap_id bigint,
-    requested_source_id bigint,
-    requested_publication oid,
-    requested_slot name,
-    requested_generation bigint
-)
-RETURNS void
-LANGUAGE plpgsql
-VOLATILE
-SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-AS $function$
-DECLARE
-    bound_relation oid;
-    current_database_oid oid;
-    configured_name name;
-    configured_insert boolean;
-    configured_update boolean;
-    configured_delete boolean;
-    configured_truncate boolean;
-    configured_via_root boolean;
-    configured_attnums smallint[];
+CREATE FUNCTION shiba_internal.reserve_graph_bootstrap(
+    requested_bootstrap_id bigint, requested_graph_id bigint,
+    requested_publication oid, requested_slot name, requested_generation bigint
+) RETURNS void LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $function$
+DECLARE current_database_oid oid; configured record; expected_members bigint;
 BEGIN
-    SELECT binding.address_objid INTO STRICT bound_relation
-    FROM shiba_internal.source_binding AS binding
-    WHERE binding.source_id = requested_source_id
-      AND binding.binding_kind = 'relation'
-      AND binding.address_objsubid = 0
-    FOR UPDATE;
-    IF EXISTS (SELECT 1 FROM shiba_internal.source_invalidation
-               WHERE source_id = requested_source_id) THEN
-        RAISE EXCEPTION 'source is invalidated';
-    END IF;
-    IF EXISTS (
-        SELECT 1 FROM shiba_internal.source_row_state
-        WHERE source_id = requested_source_id
-        UNION ALL
-        SELECT 1 FROM shiba_internal.source_continuation
-        WHERE source_id = requested_source_id
-    ) THEN
-        RAISE EXCEPTION 'bootstrap requires pristine source state';
-    END IF;
-
-    SELECT database.oid INTO STRICT current_database_oid
-    FROM pg_catalog.pg_database AS database
-    WHERE database.datname = pg_catalog.current_database();
-    SELECT pubname, pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot
-    INTO STRICT configured_name, configured_insert, configured_update,
-                configured_delete, configured_truncate, configured_via_root
-    FROM pg_catalog.pg_publication
-    WHERE oid = requested_publication AND NOT puballtables
-      AND pubinsert AND pubupdate AND pubdelete AND NOT pubviaroot;
-    SELECT CASE WHEN member.prattrs IS NULL THEN ARRAY(
-               SELECT attribute.attnum::smallint
-               FROM pg_catalog.pg_attribute AS attribute
-               WHERE attribute.attrelid = bound_relation
-                 AND attribute.attnum > 0 AND NOT attribute.attisdropped
-               ORDER BY attribute.attnum
-           ) ELSE ARRAY(
-               SELECT listed.attnum
-               FROM pg_catalog.unnest(member.prattrs::smallint[]) AS listed(attnum)
-               ORDER BY listed.attnum
-           ) END
-    INTO STRICT configured_attnums
-    FROM pg_catalog.pg_publication_rel AS member
-    WHERE member.prpubid = requested_publication
-      AND member.prrelid = bound_relation AND member.prqual IS NULL
-      AND 1 = (SELECT count(*) FROM pg_catalog.pg_publication_rel
-               WHERE prpubid = requested_publication);
-
+    PERFORM definition.graph_id FROM shiba_internal.graph_definition AS definition
+      WHERE definition.graph_id = requested_graph_id FOR UPDATE;
+    SELECT count(*) INTO expected_members FROM shiba_internal.graph_source_member
+      WHERE graph_id = requested_graph_id;
+    IF expected_members NOT IN (1, 2)
+       OR EXISTS (SELECT 1 FROM shiba_internal.source_row_state AS row_state
+                  JOIN shiba_internal.graph_source_member AS member USING (source_id)
+                  WHERE member.graph_id = requested_graph_id)
+       OR EXISTS (SELECT 1 FROM shiba_internal.graph_continuation
+                  WHERE graph_id = requested_graph_id)
+       OR EXISTS (SELECT 1 FROM shiba_internal.source_invalidation AS invalid
+                  JOIN shiba_internal.graph_source_member AS member USING (source_id)
+                  WHERE member.graph_id = requested_graph_id)
+    THEN RAISE EXCEPTION 'bootstrap requires pristine valid graph state'; END IF;
     IF EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots
                WHERE slot_name = requested_slot) THEN
         RAISE EXCEPTION 'bootstrap slot must not exist before reservation';
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM shiba_internal.operator_definition
-                   WHERE source_id = requested_source_id)
+    SELECT database.oid INTO STRICT current_database_oid FROM pg_catalog.pg_database AS database
+      WHERE database.datname = pg_catalog.current_database();
+    SELECT publication.pubname, publication.pubinsert, publication.pubupdate,
+           publication.pubdelete, publication.pubtruncate, publication.pubviaroot
+      INTO STRICT configured FROM pg_catalog.pg_publication AS publication
+      WHERE publication.oid = requested_publication AND NOT publication.puballtables
+        AND publication.pubinsert AND publication.pubupdate
+        AND publication.pubdelete AND NOT publication.pubviaroot;
+    IF expected_members <> (SELECT count(*) FROM pg_catalog.pg_publication_rel
+                            WHERE prpubid = requested_publication)
        OR EXISTS (
-           SELECT 1 FROM shiba_internal.operator_definition AS definition
-           LEFT JOIN shiba_internal.operator_state AS state USING (operator_id)
-           LEFT JOIN shiba.operator_result AS result USING (operator_id)
-           WHERE definition.source_id = requested_source_id
-             AND (state.operator_id IS NULL
-                  OR state.codec_version <> definition.state_codec_version
-                  OR result.operator_id IS NULL
-                  OR result.output_shape <> definition.output_shape
-                  OR result.result_status NOT IN ('active', 'building'))
-       ) OR EXISTS (
-           SELECT 1
-           FROM shiba_internal.operator_result_row AS result_row
-           JOIN shiba_internal.operator_definition AS definition USING (operator_id)
-           WHERE definition.source_id = requested_source_id
-       ) OR EXISTS (
-           SELECT 1
-           FROM shiba_internal.operator_node_state AS node_state
-           JOIN shiba_internal.operator_definition AS definition USING (operator_id)
-           WHERE definition.source_id = requested_source_id
-       ) THEN
-        RAISE EXCEPTION 'bootstrap requires pristine operator state';
-    END IF;
+        SELECT 1 FROM shiba_internal.graph_source_member AS member
+        JOIN shiba_internal.source_binding AS binding
+          ON binding.source_id = member.source_id
+         AND binding.binding_kind = 'relation' AND binding.address_objsubid = 0
+        LEFT JOIN pg_catalog.pg_publication_rel AS publication_member
+          ON publication_member.prpubid = requested_publication
+         AND publication_member.prrelid = binding.address_objid
+        WHERE member.graph_id = requested_graph_id
+          AND (publication_member.prrelid IS NULL OR publication_member.prqual IS NOT NULL)
+    ) THEN RAISE EXCEPTION 'publication member set does not match graph'; END IF;
 
-    INSERT INTO shiba_internal.source_ingress_config (
-        source_id, database_oid, publication_objid, publication_name,
+    INSERT INTO shiba_internal.graph_ingress_config (
+        graph_id, graph_digest, database_oid, publication_objid, publication_name,
         publication_insert, publication_update, publication_delete,
-        publication_truncate, publication_via_root, publication_attnums,
-        slot_name, slot_generation
-    ) VALUES (
-        requested_source_id, current_database_oid, requested_publication,
-        configured_name, configured_insert, configured_update,
-        configured_delete, configured_truncate, configured_via_root,
-        configured_attnums, requested_slot, requested_generation
-    );
-    INSERT INTO shiba_internal.source_bootstrap (
-        source_id, bootstrap_id, slot_name, slot_generation, phase
-    ) VALUES (
-        requested_source_id, requested_bootstrap_id,
-        requested_slot, requested_generation, 'creating'
-    );
-    UPDATE shiba.operator_result AS result
-    SET result_status = 'building', value_bigint = NULL
-    FROM shiba_internal.operator_definition AS definition
-    WHERE definition.source_id = requested_source_id
-      AND result.operator_id = definition.operator_id;
+        publication_truncate, publication_via_root, slot_name, slot_generation
+    ) SELECT graph_id, graph_digest, current_database_oid, requested_publication,
+             configured.pubname, configured.pubinsert, configured.pubupdate,
+             configured.pubdelete, configured.pubtruncate, configured.pubviaroot,
+             requested_slot, requested_generation
+      FROM shiba_internal.graph_definition WHERE graph_id = requested_graph_id;
+    INSERT INTO shiba_internal.graph_ingress_source
+        (graph_id, source_id, publication_attnums)
+    SELECT member.graph_id, member.source_id,
+        CASE WHEN publication_member.prattrs IS NULL THEN ARRAY(
+            SELECT attribute.attnum::smallint FROM pg_catalog.pg_attribute AS attribute
+            WHERE attribute.attrelid = binding.address_objid
+              AND attribute.attnum > 0 AND NOT attribute.attisdropped
+            ORDER BY attribute.attnum
+        ) ELSE ARRAY(SELECT listed.attnum FROM pg_catalog.unnest(
+            publication_member.prattrs::smallint[]) AS listed(attnum) ORDER BY listed.attnum) END
+      FROM shiba_internal.graph_source_member AS member
+      JOIN shiba_internal.source_binding AS binding ON binding.source_id = member.source_id
+       AND binding.binding_kind = 'relation' AND binding.address_objsubid = 0
+      JOIN pg_catalog.pg_publication_rel AS publication_member
+        ON publication_member.prpubid = requested_publication
+       AND publication_member.prrelid = binding.address_objid
+      WHERE member.graph_id = requested_graph_id;
+    INSERT INTO shiba_internal.graph_bootstrap (
+        graph_id, graph_digest, bootstrap_id, slot_name, slot_generation, phase
+    ) SELECT graph_id, graph_digest, requested_bootstrap_id, requested_slot,
+             requested_generation, 'creating'
+      FROM shiba_internal.graph_definition WHERE graph_id = requested_graph_id;
+    INSERT INTO shiba_internal.graph_bootstrap_checkpoint (graph_id, source_id)
+      SELECT graph_id, source_id FROM shiba_internal.graph_source_member
+      WHERE graph_id = requested_graph_id;
+    UPDATE shiba.graph_result SET result_status = 'building',
+        value_payload = NULL, value_bigint = NULL WHERE graph_id = requested_graph_id;
 END
 $function$;
 
-REVOKE ALL ON FUNCTION shiba_internal.reserve_source_bootstrap(
+REVOKE ALL ON FUNCTION shiba_internal.reserve_graph_bootstrap(
     bigint, bigint, oid, name, bigint
 ) FROM PUBLIC;

@@ -26,10 +26,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -44,7 +44,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
 fn public_result(client: &mut Client) -> i64 {
     client
         .query_one(
-            "SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1",
+            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001",
             &[],
         )
         .expect("query SQL result")
@@ -142,11 +142,7 @@ fn capture_committed_row_without_ack(
     )
 }
 
-#[test]
-#[ignore = "requires the isolated logical PostgreSQL cluster from scripts/test-m3.sh"]
-fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
-    let connection = CAPTURE.required("DATABASE_URL");
-    let mut client = Client::connect(&connection, NoTls).expect("connect to temporary PostgreSQL");
+fn install_source(client: &mut Client) -> PgoutputSource {
     client
         .batch_execute(
             "CREATE EXTENSION shiba_catalog;
@@ -167,24 +163,40 @@ fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
-    register_source(&mut client, "source_m3.events");
+    register_source(client, "source_m3.events");
     CAPTURE.create_slot();
+    source
+}
+
+#[test]
+#[ignore = "requires the isolated logical PostgreSQL cluster from scripts/test-m3.sh"]
+fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
+    let connection = CAPTURE.required("DATABASE_URL");
+    let mut client = Client::connect(&connection, NoTls).expect("connect to temporary PostgreSQL");
+    let source = install_source(&mut client);
 
     client
         .batch_execute("INSERT INTO source_m3.events VALUES (101), (102)")
         .expect("commit first real source transaction");
     let first_wire = CAPTURE.capture(&mut client, "first.pgoutput");
-    let first = decode_committed_changes(&first_wire, source).expect("decode first transaction");
+    let first = decode_committed_changes(&first_wire, &support::singleton_graph(1, source))
+        .expect("decode first transaction");
     assert_eq!(
         process(&mut client, &first).expect("apply first"),
         ProcessOutcome::Applied
     );
     assert_eq!(durable_state(&mut client), (2, 2, 2, 1));
 
-    assert!(decode_committed_changes(&first_wire[..first_wire.len() - 1], source).is_err());
+    assert!(
+        decode_committed_changes(
+            &first_wire[..first_wire.len() - 1],
+            &support::singleton_graph(1, source)
+        )
+        .is_err()
+    );
     let mut corrupt = first_wire.clone();
     corrupt[0] = b'X';
-    assert!(decode_committed_changes(&corrupt, source).is_err());
+    assert!(decode_committed_changes(&corrupt, &support::singleton_graph(1, source)).is_err());
     assert_eq!(durable_state(&mut client), (2, 2, 2, 1));
     assert_eq!(
         process(&mut client, &first).expect("exact replay"),
@@ -201,7 +213,8 @@ fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
         .get(0);
     let (second_wire, stopped_capture) =
         capture_committed_row_without_ack(&mut client, &slot_before, "unacked.pgoutput");
-    let second = decode_committed_changes(&second_wire, source).expect("decode after restart");
+    let second = decode_committed_changes(&second_wire, &support::singleton_graph(1, source))
+        .expect("decode after restart");
     assert_ne!(first.identity, second.identity);
     assert_eq!(
         process(&mut client, &second).expect("apply second"),
@@ -226,7 +239,8 @@ fn m3_real_pgoutput_replay_decode_failure_and_capture_restart() {
         thread::sleep(Duration::from_millis(10));
     }
     let replay_wire = CAPTURE.capture(&mut client, "replayed.pgoutput");
-    let replay = decode_committed_changes(&replay_wire, source).expect("decode slot replay");
+    let replay = decode_committed_changes(&replay_wire, &support::singleton_graph(1, source))
+        .expect("decode slot replay");
     assert_eq!(second, replay);
     assert_eq!(
         process(&mut client, &replay).expect("apply slot replay"),

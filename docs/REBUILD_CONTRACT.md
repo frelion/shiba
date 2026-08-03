@@ -1,6 +1,46 @@
 # M12 active-source rebuild contract
 
-## M12.1 scope
+## M14.6 graph-wide rebuild cutover
+
+Rebuild now owns the complete graph rather than one source or an operator plan
+set. Admission CASes the exact `GraphId`, canonical graph digest, ordered member
+bindings, publication/slot/generation and prior `graph_bootstrap` identity.
+Destructive prepare installs the target canonical graph as the only building
+authority, makes every graph result building/NULL, retires the sole
+`graph_continuation`, all member current rows and generic graph node/result
+state, and records forward-only lifecycle intent. It never installs a candidate
+graph or preserves an old execution path.
+
+The new generation uses one real exported snapshot for every member, bounded
+per-member child checkpoints, one slot catch-up and one fence. Activation only
+promotes that same target graph and all its terminal results atomically; it does
+not perform a second definition/binding switch. Old graph generation workers,
+tokens and ACK authorizations fail closed. Runtime and Ingress see no concrete
+node kinds, and intermediate deltas remain transaction-local.
+
+The source-scoped names in the M12 evidence below are historical. M14.6 replaces
+them with `graph_definition`, ordered `graph_source_member`,
+`graph_ingress_config`, `graph_continuation`, `graph_bootstrap`, subordinate
+member checkpoints, `graph_node_state` and graph results, without alias or
+dual write. M14.6 implementation/static gates prove that rebuild accepts and
+installs a complete canonical graph/result-contract set rather than named
+operators. The complete PG17.10/PG18.4 graph rebuild/recovery/performance matrix
+remains M14.7 release evidence.
+
+An invalidation on the old active generation is allowed as an explicit reason
+to request rebuild; requiring the invalid old authority to pass ordinary live
+preflight would make forward repair impossible. All target checks still occur
+before destructive prepare. Prepare retires the admitted old invalidation and
+installs exact target member/identity-index ObjectAddresses. Any DDL or
+publication invalidation committed after prepare blocks snapshot scan, catch-up,
+Apply and activation; recovery never clears it by guessing or falls back to the
+old graph.
+
+The rebuild writer receives all 22 ordered coordinates and result-contract
+values. In particular, the 22nd value-nullability array is bound explicitly;
+arity or contract mismatch fails before the destructive boundary.
+
+## M12.1 scope (historical baseline)
 
 M12 rebuilds an already active, non-pristine nullable-`int8` source with the
 existing CountRows and SumInt8 operators. M12.1 freezes the state machine and

@@ -1,10 +1,10 @@
 use std::time::Duration;
 
 use shiba_ingress::{
-    AttachOptions, BootstrapOptions, BootstrapSession, BootstrapSpec, GovernedSourceSession,
+    AttachOptions, BootstrapOptions, BootstrapSession, BootstrapSpec, GovernedGraphSession,
     ReplicationMode,
 };
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
 
 #[path = "m12_rebuild_contract/support.rs"]
 mod support;
@@ -29,18 +29,14 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
         .query_one(
             "SELECT bootstrap.phase, bootstrap.bootstrap_id, config.slot_generation,
                     (SELECT count(*) FROM shiba_internal.source_row_state WHERE source_id = 1),
-                    (SELECT array_agg(encode(state.state_payload, 'hex') ORDER BY state.operator_id)
-                     FROM shiba_internal.operator_state state
-                     JOIN shiba_internal.operator_definition definition USING (operator_id)
-                     WHERE definition.source_id = 1),
-                    (SELECT array_agg(result.value_bigint ORDER BY result.operator_id)
-                     FROM shiba.operator_result result
-                     JOIN shiba_internal.operator_definition definition USING (operator_id)
-                     WHERE definition.source_id = 1),
-                    (SELECT count(*) FROM shiba_internal.source_continuation WHERE source_id = 1)
-             FROM shiba_internal.source_bootstrap bootstrap
-             JOIN shiba_internal.source_ingress_config config USING (source_id)
-             WHERE bootstrap.source_id = 1",
+                    (SELECT array_agg(encode(state.state_payload, 'hex') ORDER BY state.node_id)
+                     FROM shiba_internal.graph_node_state state WHERE state.graph_id = 1),
+                    (SELECT array_agg(result.value_bigint ORDER BY result.result_id)
+                     FROM shiba.graph_result result WHERE result.graph_id = 1),
+                    (SELECT count(*) FROM shiba_internal.graph_continuation WHERE graph_id = 1)
+             FROM shiba_internal.graph_bootstrap bootstrap
+             JOIN shiba_internal.graph_ingress_config config USING (graph_id)
+             WHERE bootstrap.graph_id = 1",
             &[],
         )
         .expect("prove active non-pristine authority");
@@ -50,7 +46,7 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
     assert!(active_fact.get::<_, i64>(3) > 0);
     assert_eq!(
         active_fact.get::<_, Vec<String>>(4),
-        vec!["0000000000000004", "0000000000000020", ""]
+        vec!["0000000000000004", "0000000000000020"]
     );
     assert_eq!(
         active_fact.get::<_, Vec<Option<i64>>>(5),
@@ -71,7 +67,7 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
     assert!(
         admin
             .execute(
-                "SELECT shiba_internal.rotate_source_ingress_slot(1, 2, $1::text::name)",
+                "SELECT shiba_internal.rotate_graph_ingress_slot(1, 2, $1::text::name)",
                 &[&NEW_SLOT],
             )
             .is_err(),
@@ -82,7 +78,7 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
     assert!(
         admin
             .execute(
-                "SELECT shiba_internal.replace_pristine_source_bootstrap(
+                "SELECT shiba_internal.replace_pristine_graph_bootstrap(
                     1, 1, $1::text::name, 2, 2, $2::bigint::oid, $3::text::name, 3)",
                 &[&OLD_SLOT, &i64::from(active.publication_oid), &NEW_SLOT],
             )
@@ -92,10 +88,10 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
     assert_eq!(authority_snapshot(&mut admin), before);
 
     assert!(
-        GovernedSourceSession::attach(
+        GovernedGraphSession::attach(
             &database_url,
             &replication_url,
-            SourceId::new(1).expect("source ID"),
+            GraphId::new(1).expect("graph ID"),
             SlotGeneration::new(1).expect("stale generation"),
             AttachOptions::new(ReplicationMode::Committed, Duration::from_secs(5))
                 .expect("attach options"),
@@ -124,7 +120,7 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
     );
     let with_foreign = authority_snapshot(&mut admin);
     let replacement = BootstrapSpec {
-        source_id: active.source_id,
+        graph_id: active.graph_id,
         bootstrap_id: BootstrapId::new(2).expect("replacement bootstrap ID"),
         publication_oid: active.publication_oid,
         slot_name: FOREIGN_SLOT.to_owned(),

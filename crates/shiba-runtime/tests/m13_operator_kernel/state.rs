@@ -13,8 +13,8 @@ pub(super) fn durable(client: &mut Client) -> Durable {
     let scalar = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 2)",
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 101),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 102)",
             &[],
         )
         .expect("query scalar results");
@@ -23,7 +23,7 @@ pub(super) fn durable(client: &mut Client) -> Durable {
         keyed: pairs(
             client,
             "SELECT result_key_bigint, result_value_bigint
-             FROM shiba.operator_result_rows WHERE operator_id = 3 ORDER BY 1",
+             FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 103 ORDER BY 1",
         ),
         source: pairs(
             client,
@@ -32,8 +32,9 @@ pub(super) fn durable(client: &mut Client) -> Durable {
         ),
         states: client
             .query(
-                "SELECT operator_id, encode(state_payload, 'hex')
-                 FROM shiba_internal.operator_state ORDER BY operator_id",
+                "SELECT node_id, encode(state_payload, 'hex')
+                 FROM shiba_internal.graph_node_state
+                 WHERE graph_id = 1 AND namespace = 0 ORDER BY node_id",
                 &[],
             )
             .expect("query opaque states")
@@ -42,7 +43,7 @@ pub(super) fn durable(client: &mut Client) -> Durable {
             .collect(),
         continuations: client
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_continuation",
+                "SELECT count(*) FROM shiba_internal.graph_continuation",
                 &[],
             )
             .expect("query continuation")

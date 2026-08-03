@@ -2,7 +2,7 @@ use core::str::FromStr;
 use std::{num::NonZeroUsize, time::Duration};
 
 use postgres::Client;
-use shiba_protocol::{BootstrapId, PostgresLsn, SlotGeneration, SourceId};
+use shiba_protocol::{BootstrapId, GraphId, PostgresLsn, SlotGeneration, SourceId};
 use shiba_runtime::MAX_BOOTSTRAP_BATCH_ROWS;
 
 use crate::{
@@ -18,7 +18,7 @@ use crate::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BootstrapSpec {
-    pub source_id: SourceId,
+    pub graph_id: GraphId,
     pub bootstrap_id: BootstrapId,
     pub publication_oid: u32,
     pub slot_name: String,
@@ -70,9 +70,8 @@ pub struct BootstrapSession {
     pub(crate) spec: BootstrapSpec,
     pub(crate) options: BootstrapOptions,
     pub(crate) snapshot_name: String,
-    pub(crate) locator: ScanLocator,
-    pub(crate) next_ordinal: u64,
-    pub(crate) last_key: Option<i64>,
+    pub(crate) members: Vec<MemberScan>,
+    pub(crate) current_member: usize,
     pub(crate) apply_conninfo: String,
     pub(crate) replication_conninfo: String,
     pub(crate) advisory_key: i64,
@@ -103,7 +102,7 @@ impl BootstrapSession {
         if scanner_database != apply_database {
             return Err(IngressError::Governance("scanner database differs"));
         }
-        let advisory_key = advisory_key(spec.source_id)?;
+        let advisory_key = advisory_key(spec.graph_id)?;
         let acquired: bool = apply
             .query_one(
                 "SELECT pg_catalog.pg_try_advisory_lock($1)",
@@ -112,20 +111,20 @@ impl BootstrapSession {
             .get(0);
         if !acquired {
             return Err(IngressError::Governance(
-                "source already has an active session",
+                "graph already has an active session",
             ));
         }
-        let source_id = as_bigint(spec.source_id.get())?;
+        let graph_id = as_bigint(spec.graph_id.get())?;
         let bootstrap_id = as_bigint(spec.bootstrap_id.get())?;
         let generation = as_bigint(spec.slot_generation.get())?;
         let publication_oid = i64::from(spec.publication_oid);
         apply.query_one(
-            "SELECT shiba_internal.reserve_source_bootstrap(
+            "SELECT shiba_internal.reserve_graph_bootstrap(
                  $1, $2, $3::bigint::oid, $4::text::name, $5
              )",
             &[
                 &bootstrap_id,
-                &source_id,
+                &graph_id,
                 &publication_oid,
                 &spec.slot_name,
                 &generation,
@@ -155,17 +154,17 @@ impl BootstrapSession {
             advisory_key,
             permit,
         } = reserved;
-        let source_id = as_bigint(spec.source_id.get())?;
+        let graph_id = as_bigint(spec.graph_id.get())?;
         let bootstrap_id = as_bigint(spec.bootstrap_id.get())?;
         let replication = ReplicationTransport::connect(&replication_conninfo)?;
         let boundary = match replication.create_exported_slot(&spec.slot_name) {
             Ok(boundary) => boundary,
             Err(error) => {
                 apply.execute(
-                    "UPDATE shiba_internal.source_bootstrap
+                    "UPDATE shiba_internal.graph_bootstrap
                      SET phase = 'cleanup_pending'
-                     WHERE source_id = $1 AND bootstrap_id = $2 AND phase = 'creating'",
-                    &[&source_id, &bootstrap_id],
+                     WHERE graph_id = $1 AND bootstrap_id = $2 AND phase = 'creating'",
+                    &[&graph_id, &bootstrap_id],
                 )?;
                 return Err(error);
             }
@@ -176,22 +175,56 @@ impl BootstrapSession {
             return Err(IngressError::InvalidEnvelope("zero consistent point"));
         }
         if apply.execute(
-            "UPDATE shiba_internal.source_bootstrap
+            "UPDATE shiba_internal.graph_bootstrap
              SET consistent_point = $1::text::pg_lsn, phase = 'scanning'
-             WHERE source_id = $2 AND bootstrap_id = $3 AND phase = 'creating'",
-            &[&boundary.consistent_point, &source_id, &bootstrap_id],
+             WHERE graph_id = $2 AND bootstrap_id = $3 AND phase = 'creating'",
+            &[&boundary.consistent_point, &graph_id, &bootstrap_id],
         )? != 1
         {
             return Err(IngressError::Governance("bootstrap reservation drifted"));
         }
         let (config, confirmed_lsn) =
-            GovernedConfig::load(&mut apply, spec.source_id, spec.slot_generation, false)?;
+            GovernedConfig::load(&mut apply, spec.graph_id, spec.slot_generation, false)?;
         if confirmed_lsn != consistent_point.as_u64() {
             return Err(IngressError::Governance(
                 "slot confirmed LSN differs from consistent point",
             ));
         }
-        let locator = ScanLocator::load(&mut apply, source_id)?;
+        let member_rows = apply.query(
+            "SELECT member.source_id, checkpoint.last_batch_ordinal,
+                    checkpoint.last_source_row_id
+             FROM shiba_internal.graph_source_member AS member
+             JOIN shiba_internal.graph_bootstrap_checkpoint AS checkpoint
+               ON (checkpoint.graph_id, checkpoint.source_id) =
+                  (member.graph_id, member.source_id)
+             WHERE member.graph_id = $1 ORDER BY member.input_ordinal",
+            &[&graph_id],
+        )?;
+        if member_rows.is_empty() || member_rows.len() > 2 {
+            return Err(IngressError::Governance(
+                "graph bootstrap members are incomplete",
+            ));
+        }
+        let members = member_rows
+            .into_iter()
+            .map(|row| {
+                let raw: i64 = row.get(0);
+                let source_id = u64::try_from(raw)
+                    .ok()
+                    .and_then(|value| SourceId::new(value).ok())
+                    .ok_or(IngressError::Governance("source identity is invalid"))?;
+                let ordinal: i64 = row.get(1);
+                Ok(MemberScan {
+                    source_id,
+                    locator: ScanLocator::load(&mut apply, raw)?,
+                    next_ordinal: u64::try_from(ordinal)
+                        .ok()
+                        .and_then(|value| value.checked_add(1))
+                        .ok_or(IngressError::Governance("bootstrap ordinal is invalid"))?,
+                    last_key: row.get(2),
+                })
+            })
+            .collect::<Result<Vec<_>, IngressError>>()?;
         Ok(Self {
             apply,
             scanner,
@@ -200,9 +233,8 @@ impl BootstrapSession {
             spec,
             options,
             snapshot_name: boundary.snapshot_name,
-            locator,
-            next_ordinal: 1,
-            last_key: None,
+            members,
+            current_member: 0,
             apply_conninfo,
             replication_conninfo,
             advisory_key,
@@ -232,6 +264,13 @@ impl BootstrapSession {
             scanner: self.scanner,
         }
     }
+}
+
+pub(crate) struct MemberScan {
+    pub(crate) source_id: SourceId,
+    pub(crate) locator: ScanLocator,
+    pub(crate) next_ordinal: u64,
+    pub(crate) last_key: Option<i64>,
 }
 
 pub(crate) struct ReservedBootstrap {

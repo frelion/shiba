@@ -1,9 +1,9 @@
-use std::num::NonZeroU64;
+use std::num::NonZeroU32;
 
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_operator::OperatorId;
-use shiba_protocol::{SlotGeneration, SourceId};
+use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
+use shiba_operator::NodeId;
+use shiba_protocol::{GraphId, SlotGeneration, SourceId};
 use shiba_runtime::{
     M2Error, PgoutputSource, ProcessOutcome, compile_and_register, decode_committed_changes,
     process,
@@ -25,12 +25,41 @@ const CAPTURE: PgoutputCapture = PgoutputCapture {
     publication: "shiba_m14_grouped_pub",
 };
 
-fn spec(operator_id: u64, operation: OperatorOperationV1) -> OperatorSpecV1 {
-    OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("operator ID")),
-        source_id: SourceId::new(1).expect("source ID"),
-        operation,
+fn node(value: u32) -> NodeId {
+    NodeId::new(NonZeroU32::new(value).expect("node ID"))
+}
+
+fn spec() -> GraphSpecV1 {
+    let source_id = SourceId::new(1).expect("source ID");
+    GraphSpecV1 {
+        version: GRAPH_SPEC_VERSION,
+        graph_id: GraphId::new(1).expect("graph ID"),
+        sources: vec![source_id],
+        outputs: vec![
+            GraphOutputSpecV1::GroupedCount {
+                source_id,
+                key_column: "payload".into(),
+                key_node_id: node(1),
+                aggregate_node_id: node(2),
+                result_node_id: node(102),
+            },
+            GraphOutputSpecV1::GroupedSumInt8 {
+                source_id,
+                key_column: "payload".into(),
+                input_column: "id".into(),
+                key_node_id: node(4),
+                aggregate_node_id: node(5),
+                result_node_id: node(105),
+            },
+            GraphOutputSpecV1::GroupedSumInt8 {
+                source_id,
+                key_column: "id".into(),
+                input_column: "payload".into(),
+                key_node_id: node(7),
+                aggregate_node_id: node(8),
+                result_node_id: node(108),
+            },
+        ],
     }
 }
 
@@ -39,15 +68,18 @@ fn capture(
     source: PgoutputSource,
     sql: &str,
     name: &str,
-) -> shiba_runtime::SourceTransaction {
+) -> shiba_runtime::GraphTransaction {
     client
         .batch_execute(sql)
         .expect("commit grouped source DML");
-    decode_committed_changes(&CAPTURE.capture(client, name), source)
-        .expect("decode grouped source transaction")
+    decode_committed_changes(
+        &CAPTURE.capture(client, name),
+        &support::singleton_graph(1, source),
+    )
+    .expect("decode grouped source transaction")
 }
 
-fn apply_once(client: &mut Client, input: &shiba_runtime::SourceTransaction) {
+fn apply_once(client: &mut Client, input: &shiba_runtime::GraphTransaction) {
     assert_eq!(
         process(client, input).expect("apply grouped transaction"),
         ProcessOutcome::Applied
@@ -61,18 +93,18 @@ fn prove_permissions(client: &mut Client) {
         .expect("assume result-reader role");
     assert!(
         client
-            .query("SELECT * FROM shiba.operator_result_rows", &[])
+            .query("SELECT * FROM shiba.graph_result_rows", &[])
             .is_ok()
     );
     assert!(
         client
-            .query("SELECT * FROM shiba_internal.operator_node_state", &[])
+            .query("SELECT * FROM shiba_internal.graph_node_state", &[])
             .is_err()
     );
     assert!(
         client
             .execute(
-                "UPDATE shiba.operator_result SET value_bigint = 0 WHERE operator_id = 1",
+                "UPDATE shiba.graph_result SET value_bigint = 0 WHERE graph_id = 1 AND result_id = 102",
                 &[],
             )
             .is_err()
@@ -84,16 +116,13 @@ fn prove_permissions(client: &mut Client) {
 fn grouped_runtime_sql_is_set_based() {
     let keyed = include_str!("../src/keyed_state.rs");
     let sink = include_str!("../src/result_sink.rs");
-    for required in [
-        "FROM unnest(",
-        "ON CONFLICT (operator_id, node_id, namespace",
-    ] {
+    for required in ["FROM unnest(", "ON CONFLICT (graph_id, node_id, namespace"] {
         assert!(
             keyed.contains(required),
             "missing set-based keyed state SQL: {required}"
         );
     }
-    for required in ["key_payload = ANY($2)", "FROM unnest($2::bytea[]"] {
+    for required in ["key_payload = ANY($3)", "FROM unnest($3::bytea[]"] {
         assert!(
             sink.contains(required),
             "missing set-based result SQL: {required}"
@@ -118,30 +147,7 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
              SELECT shiba_internal.register_source(1, 'source.events'::regclass);",
         )
         .expect("install grouped source");
-    for operator in [
-        spec(
-            1,
-            OperatorOperationV1::GroupedCount {
-                key_column: "payload".into(),
-            },
-        ),
-        spec(
-            2,
-            OperatorOperationV1::GroupedSumInt8 {
-                key_column: "payload".into(),
-                input_column: "id".into(),
-            },
-        ),
-        spec(
-            3,
-            OperatorOperationV1::GroupedSumInt8 {
-                key_column: "id".into(),
-                input_column: "payload".into(),
-            },
-        ),
-    ] {
-        compile_and_register(&mut client, &operator).expect("register grouped plan");
-    }
+    compile_and_register(&mut client, &spec()).expect("register grouped graph");
     let relation: i64 = client
         .query_one("SELECT 'source.events'::regclass::oid::bigint", &[])
         .expect("source relation OID")
@@ -152,6 +158,7 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
         u32::try_from(relation).expect("relation OID fits"),
     );
     CAPTURE.create_slot();
+    support::configure_graph_ingress(&mut client, 1, CAPTURE.publication, CAPTURE.slot);
 
     let insert = capture(
         &mut client,
@@ -163,8 +170,8 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
     let null_key = client
         .query_one(
             "SELECT result_value_bigint, result_key_is_null, result_value_is_null
-             FROM shiba.operator_result_rows
-             WHERE operator_id = 1 AND result_key_is_null",
+             FROM shiba.graph_result_rows
+             WHERE graph_id = 1 AND result_id = 102 AND result_key_is_null",
             &[],
         )
         .expect("query NULL group count");
@@ -179,8 +186,8 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
     let all_null_sum = client
         .query_one(
             "SELECT result_value_bigint, result_value_is_null
-             FROM shiba.operator_result_rows
-             WHERE operator_id = 3 AND result_key_bigint = 3",
+             FROM shiba.graph_result_rows
+             WHERE graph_id = 1 AND result_id = 108 AND result_key_bigint = 3",
             &[],
         )
         .expect("query all-NULL SUM group");
@@ -221,8 +228,8 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
     apply_once(&mut client, &empty_group);
     let deleted_group: i64 = client
         .query_one(
-            "SELECT count(*) FROM shiba.operator_result_rows
-             WHERE operator_id IN (1, 2) AND result_key_bigint = 10",
+            "SELECT count(*) FROM shiba.graph_result_rows
+             WHERE graph_id = 1 AND result_id IN (102, 105) AND result_key_bigint = 10",
             &[],
         )
         .expect("query deleted empty group")
@@ -235,18 +242,18 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
         "INSERT INTO source.events VALUES (5,20)",
         "overflow.pgoutput",
     );
-    let operator2 = node_state_payload(&mut client, 2, 20);
+    let operator2 = node_state_payload(&mut client, 5, 20);
     let mut overflow = 2_i64.to_be_bytes().to_vec();
     overflow.extend_from_slice(&2_i64.to_be_bytes());
     overflow.extend_from_slice(&i64::MAX.to_be_bytes());
-    set_node_state_payload(&mut client, 2, 20, &overflow);
+    set_node_state_payload(&mut client, 5, 20, &overflow);
     let before_overflow = durable_snapshot(&mut client);
     assert!(matches!(
         process(&mut client, &overflow_input),
         Err(M2Error::Kernel(_))
     ));
     assert_eq!(durable_snapshot(&mut client), before_overflow);
-    set_node_state_payload(&mut client, 2, 20, &operator2);
+    set_node_state_payload(&mut client, 5, 20, &operator2);
     apply_once(&mut client, &overflow_input);
 
     let corrupt_input = capture(
@@ -255,15 +262,15 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
         "UPDATE source.events SET payload = 21 WHERE id = 5",
         "corrupt-state.pgoutput",
     );
-    let operator3 = node_state_payload(&mut client, 3, 5);
-    set_node_state_payload(&mut client, 3, 5, &[0]);
+    let operator3 = node_state_payload(&mut client, 8, 5);
+    set_node_state_payload(&mut client, 8, 5, &[0]);
     let before_corrupt = durable_snapshot(&mut client);
     assert!(matches!(
         process(&mut client, &corrupt_input),
         Err(M2Error::Kernel(_))
     ));
     assert_eq!(durable_snapshot(&mut client), before_corrupt);
-    set_node_state_payload(&mut client, 3, 5, &operator3);
+    set_node_state_payload(&mut client, 8, 5, &operator3);
     apply_once(&mut client, &corrupt_input);
     let after_retry = durable_snapshot(&mut client);
     assert_eq!(

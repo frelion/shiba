@@ -1,7 +1,8 @@
 # M14.4 two-source JOIN authority contract
 
 Status: M14.4 authority accepted; M14.5 pure Compiler/Operator kernel
-implemented. Runtime, Catalog and PostgreSQL evidence remain M14.6.
+implemented; M14.6 production graph authority and directed PG17.10/PG18.4
+Runtime evidence are complete. M14.7 release/performance evidence remains.
 
 M14.4 admits one narrow relational operation: a bigint equality INNER JOIN
 between exactly two explicitly registered `SourceId` values in the same
@@ -133,6 +134,9 @@ independently prove:
 
 The accepted contract adds no compatibility adapter, fallback, dual write,
 second continuation, persisted EffectStream/DeltaBatch or second Runtime.
-Until the tests above are green, the PostgreSQL two-source JOIN path,
-graph-scoped lifecycle, bootstrap, rebuild and performance remain explicitly
-unproved; the M14.5 pure compiler/kernel evidence does not close them.
+`scripts/test-m14-graph-runtime.sh` is green on PG17.10 and PG18.4 for the
+PostgreSQL two-source path: one transaction changes both sides atomically,
+right updates/deletes fan out or retract exactly, both join-key changes are
+handled, exact replay is a no-op, injected sink failure rolls back rows/results/
+continuation, and replacement of the exact right PK identity fails closed.
+Graph bootstrap/rebuild release and performance acceptance remains M14.7.

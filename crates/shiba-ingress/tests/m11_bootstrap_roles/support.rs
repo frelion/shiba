@@ -1,10 +1,10 @@
-use std::num::NonZeroU64;
+use std::num::NonZeroU32;
 
 use postgres::Client;
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
+use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
 use shiba_ingress::BootstrapSpec;
-use shiba_operator::OperatorId;
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+use shiba_operator::NodeId;
+use shiba_protocol::{BootstrapId, GraphId, SlotGeneration, SourceId};
 use shiba_runtime::compile_and_register;
 
 pub const SLOT: &str = "shiba_m11_roles_slot";
@@ -31,7 +31,7 @@ pub fn bootstrap_spec(
     slot: &str,
 ) -> BootstrapSpec {
     BootstrapSpec {
-        source_id: SourceId::new(source_id).expect("source ID"),
+        graph_id: GraphId::new(source_id).expect("graph ID"),
         bootstrap_id: BootstrapId::new(bootstrap_id).expect("bootstrap ID"),
         publication_oid,
         slot_name: slot.to_owned(),
@@ -60,52 +60,52 @@ pub fn install_fixture(admin: &mut Client) {
              GRANT USAGE ON SCHEMA shiba_internal, shiba, source TO {CONTROL_ROLE};
              GRANT SELECT, UPDATE ON shiba_internal.source_binding TO {CONTROL_ROLE};
              GRANT SELECT ON shiba_internal.source_invalidation,
-                 shiba_internal.source_ingress_config,
-                 shiba_internal.source_ingress_invalidation,
-                 shiba_internal.operator_definition TO {CONTROL_ROLE};
-             GRANT SELECT, UPDATE ON shiba_internal.source_bootstrap TO {CONTROL_ROLE};
-             GRANT SELECT, INSERT, UPDATE ON shiba_internal.source_continuation TO {CONTROL_ROLE};
+                 shiba_internal.graph_ingress_config,
+                 shiba_internal.graph_ingress_source,
+                 shiba_internal.graph_ingress_invalidation TO {CONTROL_ROLE};
+             GRANT SELECT, UPDATE ON shiba_internal.graph_definition,
+                 shiba_internal.graph_ingress_config,
+                 shiba_internal.graph_source_member TO {CONTROL_ROLE};
+             GRANT SELECT, UPDATE ON shiba_internal.graph_bootstrap,
+                 shiba_internal.graph_bootstrap_checkpoint TO {CONTROL_ROLE};
+             GRANT SELECT, INSERT, UPDATE ON shiba_internal.graph_continuation TO {CONTROL_ROLE};
              GRANT SELECT, INSERT, UPDATE, DELETE ON shiba_internal.source_row_state TO {CONTROL_ROLE};
              GRANT USAGE ON SEQUENCE shiba_internal.source_row_state_row_state_id_seq TO {CONTROL_ROLE};
-             GRANT SELECT, UPDATE ON shiba_internal.operator_state TO {CONTROL_ROLE};
-             GRANT SELECT, UPDATE ON shiba.operator_result TO {CONTROL_ROLE};
+             GRANT SELECT, INSERT, UPDATE, DELETE ON shiba_internal.graph_node_state TO {CONTROL_ROLE};
+             GRANT SELECT, UPDATE ON shiba.graph_result TO {CONTROL_ROLE};
+             GRANT SELECT, INSERT, UPDATE, DELETE ON shiba_internal.graph_result_row TO {CONTROL_ROLE};
              GRANT SELECT ON source.events, source.swapped TO {CONTROL_ROLE};
              GRANT USAGE ON SCHEMA source TO {RECEIVER_ROLE};
              GRANT SELECT ON source.events, source.swapped TO {RECEIVER_ROLE};
              GRANT USAGE ON SCHEMA shiba TO {READER_ROLE};
-             GRANT SELECT ON shiba.operator_result TO {READER_ROLE};"
+             GRANT SELECT ON shiba.graph_result, shiba.graph_result_rows TO {READER_ROLE};"
         ))
         .expect("install sources and split roles");
-    for (source_id, first_operator) in [(1, 1), (2, 3)] {
-        compile_and_register(
-            admin,
-            &operator_spec(source_id, first_operator, OperatorOperationV1::CountRows),
-        )
-        .expect("register CountRows");
-        compile_and_register(
-            admin,
-            &operator_spec(
-                source_id,
-                first_operator + 1,
-                OperatorOperationV1::SumInt8 {
-                    input_column: "payload".to_owned(),
-                },
-            ),
-        )
-        .expect("register SumInt8");
+    for source_id in [1, 2] {
+        compile_and_register(admin, &graph_spec(source_id)).expect("register graph");
     }
 }
 
-fn operator_spec(
-    source_id: u64,
-    operator_id: u64,
-    operation: OperatorOperationV1,
-) -> OperatorSpecV1 {
-    OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("operator ID")),
-        source_id: SourceId::new(source_id).expect("source ID"),
-        operation,
+fn graph_spec(source_id: u64) -> GraphSpecV1 {
+    let source_id_value = SourceId::new(source_id).expect("source ID");
+    let node = |value| NodeId::new(NonZeroU32::new(value).expect("node ID"));
+    GraphSpecV1 {
+        version: GRAPH_SPEC_VERSION,
+        graph_id: GraphId::new(source_id).expect("graph ID"),
+        sources: vec![source_id_value],
+        outputs: vec![
+            GraphOutputSpecV1::CountRows {
+                source_id: source_id_value,
+                aggregate_node_id: node(1),
+                result_node_id: node(2),
+            },
+            GraphOutputSpecV1::SumInt8 {
+                source_id: source_id_value,
+                input_column: "payload".to_owned(),
+                aggregate_node_id: node(3),
+                result_node_id: node(4),
+            },
+        ],
     }
 }
 
@@ -119,19 +119,13 @@ pub fn load_publication_oid(client: &mut Client, publication: &str) -> u32 {
         .get(0)
 }
 
-pub fn assert_results(
-    client: &mut Client,
-    first_operator: i64,
-    status: &str,
-    values: [Option<i64>; 2],
-) {
-    let second_operator = first_operator + 1;
+pub fn assert_results(client: &mut Client, graph_id: i64, status: &str, values: [Option<i64>; 2]) {
     let actual = client
         .query(
             "SELECT result_status, value_bigint
-             FROM shiba.operator_result
-             WHERE operator_id IN ($1, $2) ORDER BY operator_id",
-            &[&first_operator, &second_operator],
+             FROM shiba.graph_result
+             WHERE graph_id = $1 ORDER BY result_id",
+            &[&graph_id],
         )
         .expect("query public results")
         .into_iter()
@@ -160,7 +154,7 @@ pub fn assert_no_apply(client: &mut Client, source_id: i64, expected_phase: Opti
     assert_eq!(
         client
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_continuation WHERE source_id = $1",
+                "SELECT count(*) FROM shiba_internal.graph_continuation WHERE graph_id = $1",
                 &[&source_id],
             )
             .expect("count continuations")
@@ -169,7 +163,7 @@ pub fn assert_no_apply(client: &mut Client, source_id: i64, expected_phase: Opti
     );
     let phase = client
         .query_opt(
-            "SELECT phase FROM shiba_internal.source_bootstrap WHERE source_id = $1",
+            "SELECT phase FROM shiba_internal.graph_bootstrap WHERE graph_id = $1",
             &[&source_id],
         )
         .expect("query optional bootstrap")
@@ -178,11 +172,11 @@ pub fn assert_no_apply(client: &mut Client, source_id: i64, expected_phase: Opti
     assert_eq!(
         client
             .query_one(
-                "SELECT count(*)
-                 FROM shiba_internal.operator_definition AS definition
-                 JOIN shiba_internal.operator_state AS state USING (operator_id)
-                 WHERE definition.source_id = $1
-                   AND state.state_payload <> decode('0000000000000000', 'hex')",
+                "SELECT count(*) FROM shiba_internal.graph_node_state AS state
+                 WHERE state.graph_id = $1
+                   AND state.state_payload NOT IN (
+                       convert_to('{\"type\":\"int8\",\"value\":0}', 'UTF8'),
+                       convert_to('{\"type\":\"bool\",\"value\":true}', 'UTF8'))",
                 &[&source_id],
             )
             .expect("count changed private operator states")

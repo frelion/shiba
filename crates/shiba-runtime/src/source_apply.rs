@@ -1,77 +1,170 @@
-use postgres::{Row, Transaction};
-use shiba_operator::{EffectOrigin, RowDelta};
+use std::collections::BTreeMap;
 
-use crate::source_batch::{SourceBatch, SourceLayout};
+use postgres::{Row, Transaction};
+use shiba_operator::{
+    EffectOrigin, GraphEffectOrigin, MultiInputBatch, RowDelta, SourceDeltaBatch,
+};
+use shiba_protocol::SourceTransactionId;
+
+use crate::source_batch::SourceLayout;
 use crate::transaction::as_bigint;
 use crate::{
-    M2Error, SourceChange, SourcePayload, SourceTransaction, SourceUpdate, SourceUpdatePayload,
+    GraphTransaction, M2Error, SourceChange, SourcePayload, SourceUpdate, SourceUpdatePayload,
 };
 
 pub(crate) fn apply(
     transaction: &mut Transaction<'_>,
-    input: &SourceTransaction,
-) -> Result<SourceBatch, M2Error> {
-    let identity = input.identity;
-    let source_id = as_bigint("source_id", identity.source_id.get())?;
-    let layout = SourceLayout::load(transaction, source_id)?;
-    let mut rows = Vec::with_capacity(input.changes.len());
+    graph: &shiba_operator::OperatorGraph,
+    input: &GraphTransaction,
+) -> Result<MultiInputBatch, M2Error> {
+    lock_existing_rows(transaction, input)?;
+    let mut changes = BTreeMap::new();
+    for tagged in &input.changes {
+        changes
+            .entry(tagged.source_id)
+            .or_insert_with(Vec::new)
+            .push(&tagged.change);
+    }
+    if changes.keys().any(|source_id| {
+        !graph
+            .sources
+            .iter()
+            .any(|source| source.source_id == *source_id)
+    }) {
+        return Err(M2Error::InvalidOperatorDefinition);
+    }
 
-    for change in &input.changes {
-        rows.push(match change {
-            SourceChange::Insert(insert) => {
-                let (payload_present, payload_int8, payload_text) =
-                    value_columns(&insert.source_payload);
-                transaction.execute(
-                    "INSERT INTO shiba_internal.source_row_state (
-                         source_id, source_row_id, source_row_sub_id,
-                         payload_present, payload_int8, payload_text
-                     ) VALUES ($1, $2, $3, $4, $5, $6)",
-                    &[
-                        &source_id,
-                        &insert.source_row_id,
-                        &insert.source_row_sub_id,
-                        &payload_present,
-                        &payload_int8,
-                        &payload_text,
-                    ],
-                )?;
-                RowDelta {
-                    before: None,
-                    after: Some(layout.row(
-                        insert.source_row_id,
-                        insert.source_row_sub_id,
-                        &insert.source_payload,
-                    )?),
-                }
+    let mut sources = Vec::with_capacity(graph.sources.len());
+    for port in &graph.sources {
+        let source_id = as_bigint("source_id", port.source_id.get())?;
+        let layout = SourceLayout::load(transaction, source_id)?;
+        let source_identity = SourceTransactionId::new(
+            port.source_id,
+            input.identity.slot_generation,
+            input.identity.commit_lsn,
+            input.identity.ingress_transaction_id,
+        )
+        .map_err(|_| M2Error::IdentityConflict)?;
+        let source_changes = changes.remove(&port.source_id).unwrap_or_default();
+        let mut rows = Vec::with_capacity(source_changes.len());
+        for change in source_changes {
+            rows.push(apply_change(transaction, source_id, &layout, change)?);
+        }
+        sources.push(SourceDeltaBatch {
+            source_id: port.source_id,
+            delta: layout.batch(EffectOrigin::Wal(source_identity), rows),
+        });
+    }
+    Ok(MultiInputBatch {
+        origin: GraphEffectOrigin::Wal(input.identity),
+        sources,
+    })
+}
+
+fn lock_existing_rows(
+    transaction: &mut Transaction<'_>,
+    input: &GraphTransaction,
+) -> Result<(), M2Error> {
+    let mut coordinates = input
+        .changes
+        .iter()
+        .filter_map(|tagged| match &tagged.change {
+            SourceChange::Update(update) => {
+                Some((tagged.source_id.get(), update.source_row_id, None))
             }
-            SourceChange::Update(update) => apply_update(transaction, source_id, &layout, update)?,
             SourceChange::Delete {
                 source_row_id,
                 source_row_sub_id,
                 ..
-            } => {
-                let before = load_row(transaction, source_id, *source_row_id, *source_row_sub_id)?;
-                let changed = transaction.execute(
-                    "DELETE FROM shiba_internal.source_row_state
+            } => Some((tagged.source_id.get(), *source_row_id, *source_row_sub_id)),
+            SourceChange::Insert(_) => None,
+        })
+        .map(|(source_id, row_id, sub_id)| Ok((as_bigint("source_id", source_id)?, row_id, sub_id)))
+        .collect::<Result<Vec<_>, M2Error>>()?;
+    coordinates.sort();
+    if coordinates.is_empty() {
+        return Ok(());
+    }
+    let source_ids: Vec<i64> = coordinates.iter().map(|coordinate| coordinate.0).collect();
+    let row_ids: Vec<i64> = coordinates.iter().map(|coordinate| coordinate.1).collect();
+    let sub_ids: Vec<Option<i64>> = coordinates.iter().map(|coordinate| coordinate.2).collect();
+    let locked = transaction.query(
+        "SELECT state.source_id, state.source_row_id, state.source_row_sub_id
+         FROM unnest($1::bigint[], $2::bigint[], $3::bigint[])
+              AS requested(source_id, source_row_id, source_row_sub_id)
+         JOIN shiba_internal.source_row_state AS state
+           ON state.source_id = requested.source_id
+          AND state.source_row_id = requested.source_row_id
+          AND state.source_row_sub_id IS NOT DISTINCT FROM requested.source_row_sub_id
+         ORDER BY state.source_id, state.source_row_id, state.source_row_sub_id
+         FOR UPDATE OF state",
+        &[&source_ids, &row_ids, &sub_ids],
+    )?;
+    if locked.len() != coordinates.len() {
+        return Err(M2Error::MissingSourceRow);
+    }
+    Ok(())
+}
+
+fn apply_change(
+    transaction: &mut Transaction<'_>,
+    source_id: i64,
+    layout: &SourceLayout,
+    change: &SourceChange,
+) -> Result<RowDelta, M2Error> {
+    Ok(match change {
+        SourceChange::Insert(insert) => {
+            let (payload_present, payload_int8, payload_text) =
+                value_columns(&insert.source_payload);
+            transaction.execute(
+                "INSERT INTO shiba_internal.source_row_state (
+                         source_id, source_row_id, source_row_sub_id,
+                         payload_present, payload_int8, payload_text
+                     ) VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &source_id,
+                    &insert.source_row_id,
+                    &insert.source_row_sub_id,
+                    &payload_present,
+                    &payload_int8,
+                    &payload_text,
+                ],
+            )?;
+            RowDelta {
+                before: None,
+                after: Some(layout.row(
+                    insert.source_row_id,
+                    insert.source_row_sub_id,
+                    &insert.source_payload,
+                )?),
+            }
+        }
+        SourceChange::Update(update) => apply_update(transaction, source_id, layout, update)?,
+        SourceChange::Delete {
+            source_row_id,
+            source_row_sub_id,
+            ..
+        } => {
+            let before = load_row(transaction, source_id, *source_row_id, *source_row_sub_id)?;
+            let changed = transaction.execute(
+                "DELETE FROM shiba_internal.source_row_state
                      WHERE source_id = $1 AND source_row_id = $2
                        AND source_row_sub_id IS NOT DISTINCT FROM $3",
-                    &[&source_id, source_row_id, source_row_sub_id],
-                )?;
-                if changed != 1 {
-                    return Err(M2Error::MissingSourceRow);
-                }
-                RowDelta {
-                    before: Some(layout.row(
-                        before.source_row_id,
-                        before.source_row_sub_id,
-                        &before.payload,
-                    )?),
-                    after: None,
-                }
+                &[&source_id, source_row_id, source_row_sub_id],
+            )?;
+            if changed != 1 {
+                return Err(M2Error::MissingSourceRow);
             }
-        });
-    }
-    Ok(layout.batch(EffectOrigin::Wal(identity), rows))
+            RowDelta {
+                before: Some(layout.row(
+                    before.source_row_id,
+                    before.source_row_sub_id,
+                    &before.payload,
+                )?),
+                after: None,
+            }
+        }
+    })
 }
 
 fn apply_update(

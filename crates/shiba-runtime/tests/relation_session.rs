@@ -4,6 +4,8 @@ use shiba_runtime::{
     decode_committed_changes_in_session,
 };
 
+mod support;
+
 fn push_u16(bytes: &mut Vec<u8>, value: u16) {
     bytes.extend_from_slice(&value.to_be_bytes());
 }
@@ -59,15 +61,16 @@ fn connection_state_admits_omitted_relation_only_after_exact_validation() {
     let second = committed_wire(42, 2, 200, false);
 
     assert_eq!(
-        decode_committed_changes(&second, source),
+        decode_committed_changes(&second, &support::singleton_graph(1, source)),
         Err(PgoutputError::MessageOrder),
         "a stateless capture cannot invent prior relation validation"
     );
 
     let mut state = PgoutputRelationState::new();
-    decode_committed_changes_in_session(&first, source, &mut state)
+    let graph = support::singleton_graph(1, source);
+    decode_committed_changes_in_session(&first, &graph, &mut state)
         .expect("validate the first exact relation descriptor");
-    let decoded = decode_committed_changes_in_session(&second, source, &mut state)
+    let decoded = decode_committed_changes_in_session(&second, &graph, &mut state)
         .expect("same connection may omit unchanged relation metadata");
     assert_eq!(decoded.changes.len(), 1);
 
@@ -76,15 +79,20 @@ fn connection_state_admits_omitted_relation_only_after_exact_validation() {
         SlotGeneration::new(1).expect("generation"),
         42,
     );
+    let third = committed_wire(42, 4, 250, false);
     assert_eq!(
-        decode_committed_changes_in_session(&second, wrong_source, &mut state),
-        Err(PgoutputError::RelationMismatch),
-        "connection-local validation cannot cross source identity"
+        decode_committed_changes_in_session(
+            &third,
+            &support::singleton_graph(1, wrong_source),
+            &mut state,
+        ),
+        Err(PgoutputError::MessageOrder),
+        "connection-local validation cannot be reused under another graph descriptor"
     );
 
     let changed_relation = committed_wire(43, 3, 300, true);
     assert_eq!(
-        decode_committed_changes_in_session(&changed_relation, source, &mut state),
+        decode_committed_changes_in_session(&changed_relation, &graph, &mut state),
         Err(PgoutputError::RelationMismatch),
         "a repeated relation descriptor is always revalidated"
     );

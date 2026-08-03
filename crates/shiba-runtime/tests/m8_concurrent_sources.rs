@@ -7,7 +7,7 @@ use std::{
 use postgres::{Client, NoTls};
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{
-    PgoutputSource, ProcessOutcome, SourceTransaction, decode_committed_changes, process,
+    GraphTransaction, PgoutputSource, ProcessOutcome, decode_committed_changes, process,
 };
 
 mod support;
@@ -33,7 +33,7 @@ type ApplyReceiver = Receiver<Result<ProcessOutcome, String>>;
 fn spawn_process(
     connection: &str,
     application_name: &str,
-    input: SourceTransaction,
+    input: GraphTransaction,
 ) -> (ApplyReceiver, thread::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel();
     let connection = format!("{connection} application_name={application_name}");
@@ -78,9 +78,9 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT sum(value_bigint)::bigint FROM shiba.operator_result),
+                (SELECT sum(value_bigint)::bigint FROM shiba.graph_result),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -95,25 +95,25 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
 fn continuations(client: &mut Client) -> Vec<(i64, i64)> {
     client
         .query(
-            "SELECT source_id, count(*)
-             FROM shiba_internal.source_continuation
-             GROUP BY source_id ORDER BY source_id",
+            "SELECT graph_id, count(*)
+             FROM shiba_internal.graph_continuation
+             GROUP BY graph_id ORDER BY graph_id",
             &[],
         )
-        .expect("query per-source continuations")
+        .expect("query independent singleton-graph continuations")
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
         .collect()
 }
 
-fn operator_results(client: &mut Client) -> Vec<(i64, i64)> {
+fn graph_results(client: &mut Client) -> Vec<(i64, i64)> {
     client
         .query(
-            "SELECT operator_id, value_bigint
-             FROM shiba.operator_result ORDER BY operator_id",
+            "SELECT graph_id, value_bigint
+             FROM shiba.graph_result ORDER BY graph_id",
             &[],
         )
-        .expect("query per-source operator results")
+        .expect("query singleton-graph results")
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
         .collect()
@@ -197,13 +197,13 @@ fn capture_inputs(
     client: &mut Client,
     source1: PgoutputSource,
     source2: PgoutputSource,
-) -> (SourceTransaction, SourceTransaction, SourceTransaction) {
+) -> (GraphTransaction, GraphTransaction, GraphTransaction) {
     client
         .batch_execute("INSERT INTO source_m8_concurrent_one.events VALUES (1801)")
         .expect("commit source1 duplicate input");
     let source1_first = decode_committed_changes(
         &SOURCE1_CAPTURE.capture(client, "source1-first.pgoutput"),
-        source1,
+        &support::singleton_graph(1, source1),
     )
     .expect("decode source1 duplicate input");
     client
@@ -211,7 +211,7 @@ fn capture_inputs(
         .expect("commit source1 next input");
     let source1_next = decode_committed_changes(
         &SOURCE1_CAPTURE.capture(client, "source1-next.pgoutput"),
-        source1,
+        &support::singleton_graph(1, source1),
     )
     .expect("decode source1 next input");
     client
@@ -219,13 +219,13 @@ fn capture_inputs(
         .expect("commit source2 input");
     let source2_input = decode_committed_changes(
         &SOURCE2_CAPTURE.capture(client, "source2.pgoutput"),
-        source2,
+        &support::singleton_graph(2, source2),
     )
     .expect("decode source2 input");
     (source1_first, source1_next, source2_input)
 }
 
-fn prove_duplicate_serialization(client: &mut Client, connection: &str, input: &SourceTransaction) {
+fn prove_duplicate_serialization(client: &mut Client, connection: &str, input: &GraphTransaction) {
     hold_blocker(client);
     let (first_rx, first) = spawn_process(connection, "m8_source1_first", input.clone());
     wait_until_lock_waiting(client, "m8_source1_first", Some("advisory"));
@@ -247,15 +247,15 @@ fn prove_duplicate_serialization(client: &mut Client, connection: &str, input: &
     assert_eq!(first_outcome, ProcessOutcome::Applied);
     assert_eq!(duplicate_outcome, ProcessOutcome::AlreadyApplied);
     assert_eq!(durable_state(client), (1, 1, 1, 1));
-    assert_eq!(operator_results(client), vec![(1, 1), (2, 0)]);
+    assert_eq!(graph_results(client), vec![(1, 1), (2, 0)]);
     assert_eq!(continuations(client), vec![(1, 1)]);
 }
 
 fn prove_independent_progress(
     client: &mut Client,
     connection: &str,
-    source1: &SourceTransaction,
-    source2: &SourceTransaction,
+    source1: &GraphTransaction,
+    source2: &GraphTransaction,
 ) {
     hold_blocker(client);
     let (source1_rx, source1_task) =
@@ -273,7 +273,7 @@ fn prove_independent_progress(
     source2_task.join().expect("join source2 thread");
     wait_until_lock_waiting(client, "m8_source1_blocked", Some("advisory"));
     assert_eq!(durable_state(client), (2, 2, 2, 2));
-    assert_eq!(operator_results(client), vec![(1, 1), (2, 1)]);
+    assert_eq!(graph_results(client), vec![(1, 1), (2, 1)]);
     assert_eq!(continuations(client), vec![(1, 1), (2, 1)]);
     release_blocker(client);
     assert_eq!(
@@ -285,7 +285,7 @@ fn prove_independent_progress(
     );
     source1_task.join().expect("join blocked source1 thread");
     assert_eq!(durable_state(client), (3, 3, 3, 3));
-    assert_eq!(operator_results(client), vec![(1, 2), (2, 1)]);
+    assert_eq!(graph_results(client), vec![(1, 2), (2, 1)]);
     assert_eq!(continuations(client), vec![(1, 2), (2, 1)]);
     assert_eq!(
         process(client, source1).expect("replay source1"),

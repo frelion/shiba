@@ -1,193 +1,328 @@
-use core::num::NonZeroU32;
-
 use shiba_operator::{
-    ColumnBinding, Expression, NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind,
-    OutputContract, StateContract, ValueType,
+    Expression, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind, OutputContract,
+    SourcePort, StateContract, ValueType,
 };
 
-use crate::{CompilerError, OperatorOperationV1, OperatorSpecV1, SourceDescriptor};
+use crate::binding::{identity_for, int8, source, source_port};
+use crate::join_compile::{JoinArgs, compile_join};
+use crate::pipeline::compile_pipeline;
+use crate::{
+    CompilerError, GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1, IdentityIndexDescriptor,
+    SourceDescriptor,
+};
 
-/// Compiles the first non-aggregate declaration into ordinary graph nodes.
+/// Compiles one strict declaration into its only durable canonical graph.
 ///
 /// # Errors
 ///
-/// Rejects non-graph declarations, identity/type/nullability drift, ambiguous
-/// names, and any noncanonical graph.
+/// Rejects source, column, index, topology, type, or canonical encoding drift.
 pub fn compile_graph(
-    spec: &OperatorSpecV1,
-    source: &SourceDescriptor,
+    spec: &GraphSpecV1,
+    descriptors: &[SourceDescriptor],
+    indexes: &[IdentityIndexDescriptor],
 ) -> Result<OperatorGraph, CompilerError> {
-    if spec.source_id != source.source_id {
-        return Err(CompilerError::SourceMismatch);
+    let canonical_spec = spec
+        .to_canonical_json()
+        .ok()
+        .and_then(|bytes| GraphSpecV1::from_json(&bytes).ok());
+    if canonical_spec.as_ref() != Some(spec)
+        || spec.version != GRAPH_SPEC_VERSION
+        || descriptors
+            .iter()
+            .map(|source| source.source_id)
+            .collect::<Vec<_>>()
+            != spec.sources
+        || spec.sources.len() == 2
+            && (spec.outputs.len() != 1
+                || !matches!(spec.outputs[0], GraphOutputSpecV1::InnerJoin { .. }))
+        || indexes.len() != descriptors.len()
+    {
+        return Err(CompilerError::InvalidSpec);
     }
-    let source_layout = source
-        .columns
+    let mut sources = descriptors
         .iter()
-        .map(|column| {
-            let value_type = match column.type_oid {
-                crate::POSTGRES_INT8_TYPE_OID => ValueType::Int8,
-                crate::POSTGRES_TEXT_TYPE_OID => ValueType::Text,
-                type_oid => {
-                    return Err(CompilerError::WrongColumnType {
-                        column: column.name.clone(),
-                        type_oid,
-                    });
-                }
-            };
-            Ok(ColumnBinding {
-                address: column.address,
-                value_type,
-            })
+        .map(|source| {
+            identity_for(source, indexes).and_then(|index| source_port(source, Some(index.address)))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let nodes = match &spec.operation {
-        OperatorOperationV1::MaterializedProject {
-            key_column,
-            value_column,
-        } => {
-            let (key_slot, key) = resolve(source, key_column)?;
-            if key.nullable {
-                return Err(CompilerError::NullableKey(key_column.clone()));
-            }
-            let (value_slot, _) = resolve(source, value_column)?;
-            project_nodes(key_slot, value_slot)?
-        }
-        OperatorOperationV1::GroupedCount { key_column } => {
-            let (key_slot, key) = resolve(source, key_column)?;
-            grouped_nodes(key_slot, key.nullable, None, source_layout.len())?
-        }
-        OperatorOperationV1::GroupedSumInt8 {
-            key_column,
-            input_column,
-        } => {
-            let (key_slot, key) = resolve(source, key_column)?;
-            let (value_slot, _) = resolve(source, input_column)?;
-            grouped_nodes(
-                key_slot,
-                key.nullable,
-                Some(value_slot),
-                source_layout.len(),
-            )?
-        }
-        _ => return Err(CompilerError::PlanRequired),
-    };
-    OperatorGraph::build(spec.operator_id, spec.source_id, source_layout, nodes)
-        .map_err(|_| CompilerError::GraphEncoding)
+    let mut nodes = Vec::new();
+    for output in &spec.outputs {
+        compile_output(output, descriptors, indexes, &mut sources, &mut nodes)?;
+    }
+    nodes.sort_by_key(|node| node.node_id);
+    OperatorGraph::build(spec.graph_id, sources, nodes).map_err(|_| CompilerError::GraphEncoding)
 }
 
-fn project_nodes(key_slot: usize, value_slot: usize) -> Result<Vec<OperatorNode>, CompilerError> {
-    Ok(vec![
+fn compile_output(
+    output: &GraphOutputSpecV1,
+    sources: &[SourceDescriptor],
+    indexes: &[IdentityIndexDescriptor],
+    ports: &mut [SourcePort],
+    nodes: &mut Vec<OperatorNode>,
+) -> Result<(), CompilerError> {
+    if let Some(result) = compile_pipeline(output, sources, nodes) {
+        return result;
+    }
+    if let Some(result) = compile_scalar_output(output, sources, nodes) {
+        return result;
+    }
+    match output {
+        GraphOutputSpecV1::MaterializedProject {
+            source_id,
+            key_column,
+            value_column,
+            project_node_id,
+            result_node_id,
+        } => compile_project(
+            source(sources, *source_id)?,
+            key_column,
+            value_column,
+            (*project_node_id, *result_node_id),
+            nodes,
+        ),
+        GraphOutputSpecV1::GroupedCount {
+            source_id,
+            key_column,
+            key_node_id,
+            aggregate_node_id,
+            result_node_id,
+        } => grouped_nodes(
+            source(sources, *source_id)?,
+            key_column,
+            None,
+            (*key_node_id, *aggregate_node_id, *result_node_id),
+            nodes,
+        ),
+        GraphOutputSpecV1::GroupedSumInt8 {
+            source_id,
+            key_column,
+            input_column,
+            key_node_id,
+            aggregate_node_id,
+            result_node_id,
+        } => grouped_nodes(
+            source(sources, *source_id)?,
+            key_column,
+            Some(input_column),
+            (*key_node_id, *aggregate_node_id, *result_node_id),
+            nodes,
+        ),
+        GraphOutputSpecV1::CountRows { .. }
+        | GraphOutputSpecV1::SumInt8 { .. }
+        | GraphOutputSpecV1::ComputedProject { .. }
+        | GraphOutputSpecV1::FilteredGroupedCount { .. }
+        | GraphOutputSpecV1::FilteredGroupedSumInt8 { .. } => unreachable!(),
+        GraphOutputSpecV1::InnerJoin {
+            left_source_id,
+            right_source_id,
+            left_id_column,
+            left_right_key_column,
+            right_id_column,
+            right_payload_column,
+            right_identity_index,
+            join_node_id,
+            result_node_id,
+        } => compile_join(
+            sources,
+            indexes,
+            ports,
+            nodes,
+            &JoinArgs {
+                left_source_id: *left_source_id,
+                right_source_id: *right_source_id,
+                names: [
+                    left_id_column,
+                    left_right_key_column,
+                    right_id_column,
+                    right_payload_column,
+                ],
+                identity_index: *right_identity_index,
+                node_ids: (*join_node_id, *result_node_id),
+            },
+        ),
+    }
+}
+
+fn compile_scalar_output(
+    output: &GraphOutputSpecV1,
+    sources: &[SourceDescriptor],
+    nodes: &mut Vec<OperatorNode>,
+) -> Option<Result<(), CompilerError>> {
+    let (source_id, aggregate, result, input) = match output {
+        GraphOutputSpecV1::CountRows {
+            source_id,
+            aggregate_node_id,
+            result_node_id,
+        } => (*source_id, *aggregate_node_id, *result_node_id, None),
+        GraphOutputSpecV1::SumInt8 {
+            source_id,
+            input_column,
+            aggregate_node_id,
+            result_node_id,
+        } => (
+            *source_id,
+            *aggregate_node_id,
+            *result_node_id,
+            Some(input_column),
+        ),
+        _ => return None,
+    };
+    Some(source(sources, source_id).and_then(|source| {
+        let slot = input
+            .map(|name| int8(source, name).map(|found| found.0))
+            .transpose()?;
+        scalar_nodes(source_id, aggregate, result, slot, nodes);
+        Ok(())
+    }))
+}
+
+fn compile_project(
+    source: &SourceDescriptor,
+    key_name: &str,
+    value_name: &str,
+    ids: (shiba_operator::NodeId, shiba_operator::NodeId),
+    nodes: &mut Vec<OperatorNode>,
+) -> Result<(), CompilerError> {
+    let (key_slot, key) = int8(source, key_name)?;
+    let (value_slot, _) = int8(source, value_name)?;
+    if key.nullable {
+        return Err(CompilerError::NullableKey(key_name.into()));
+    }
+    nodes.extend(project_nodes(
+        source.source_id,
+        ids.0,
+        ids.1,
+        key_slot,
+        value_slot,
+    ));
+    Ok(())
+}
+
+fn scalar_nodes(
+    source_id: shiba_protocol::SourceId,
+    aggregate_id: shiba_operator::NodeId,
+    result_id: shiba_operator::NodeId,
+    sum_slot: Option<u16>,
+    nodes: &mut Vec<OperatorNode>,
+) {
+    nodes.push(OperatorNode {
+        node_id: aggregate_id,
+        input: NodeInput::SourcePort(source_id),
+        state_contract: Some(StateContract { codec_version: 1 }),
+        kind: sum_slot.map_or(OperatorNodeKind::CountRows, |input_slot| {
+            OperatorNodeKind::SumInt8 { input_slot }
+        }),
+    });
+    nodes.push(materialize(
+        result_id,
+        aggregate_id,
+        OutputContract::Scalar {
+            value_type: ValueType::Int8,
+        },
+        false,
+    ));
+}
+
+fn project_nodes(
+    source_id: shiba_protocol::SourceId,
+    project_id: shiba_operator::NodeId,
+    result_id: shiba_operator::NodeId,
+    key_slot: u16,
+    value_slot: u16,
+) -> Vec<OperatorNode> {
+    vec![
         OperatorNode {
-            node_id: node_id(1),
-            input: NodeInput::Source,
+            node_id: project_id,
+            input: NodeInput::SourcePort(source_id),
             state_contract: None,
             kind: OperatorNodeKind::Project {
                 expressions: vec![
-                    Expression::Column {
-                        slot: slot(key_slot)?,
-                    },
-                    Expression::Column {
-                        slot: slot(value_slot)?,
-                    },
+                    Expression::Column { slot: key_slot },
+                    Expression::Column { slot: value_slot },
                 ],
             },
         },
-        OperatorNode {
-            node_id: node_id(2),
-            input: NodeInput::Node(node_id(1)),
-            state_contract: None,
-            kind: OperatorNodeKind::Materialize {
-                key_slot: 0,
-                value_slot: 1,
-                output: OutputContract::KeyedRows {
-                    key_type: ValueType::Int8,
-                    key_nullable: false,
-                    value_type: ValueType::Int8,
-                    nullable: true,
-                },
+        materialize(
+            result_id,
+            project_id,
+            OutputContract::KeyedRows {
+                key_type: ValueType::Int8,
+                key_nullable: false,
+                value_type: ValueType::Int8,
+                nullable: true,
             },
-        },
-    ])
+            true,
+        ),
+    ]
 }
 
 fn grouped_nodes(
-    key_slot: usize,
-    key_nullable: bool,
-    value_slot: Option<usize>,
-    source_width: usize,
-) -> Result<Vec<OperatorNode>, CompilerError> {
-    let key_slot = slot(key_slot)?;
-    let grouped_key_slot = slot(source_width)?;
-    let aggregate = match value_slot {
-        None => OperatorNodeKind::GroupedCount {
-            key_slot: grouped_key_slot,
+    source: &SourceDescriptor,
+    key_name: &str,
+    value_name: Option<&String>,
+    ids: (
+        shiba_operator::NodeId,
+        shiba_operator::NodeId,
+        shiba_operator::NodeId,
+    ),
+    nodes: &mut Vec<OperatorNode>,
+) -> Result<(), CompilerError> {
+    let (key_slot, key) = int8(source, key_name)?;
+    let value_slot = value_name
+        .map(|name| int8(source, name).map(|found| found.0))
+        .transpose()?;
+    let grouped_key_slot =
+        u16::try_from(source.columns.len()).map_err(|_| CompilerError::GraphEncoding)?;
+    nodes.push(OperatorNode {
+        node_id: ids.0,
+        input: NodeInput::SourcePort(source.source_id),
+        state_contract: None,
+        kind: OperatorNodeKind::KeyBy {
+            key: Expression::Column { slot: key_slot },
         },
-        Some(value_slot) => OperatorNodeKind::GroupedSumInt8 {
-            key_slot: grouped_key_slot,
-            value_slot: slot(value_slot)?,
-        },
-    };
-    Ok(vec![
-        OperatorNode {
-            node_id: node_id(1),
-            input: NodeInput::Source,
-            state_contract: None,
-            kind: OperatorNodeKind::KeyBy {
-                key: Expression::Column { slot: key_slot },
+    });
+    nodes.push(OperatorNode {
+        node_id: ids.1,
+        input: NodeInput::Node(ids.0),
+        state_contract: Some(StateContract { codec_version: 1 }),
+        kind: value_slot.map_or(
+            OperatorNodeKind::GroupedCount {
+                key_slot: grouped_key_slot,
             },
-        },
-        OperatorNode {
-            node_id: node_id(2),
-            input: NodeInput::Node(node_id(1)),
-            state_contract: Some(StateContract { codec_version: 1 }),
-            kind: aggregate,
-        },
-        OperatorNode {
-            node_id: node_id(3),
-            input: NodeInput::Node(node_id(2)),
-            state_contract: None,
-            kind: OperatorNodeKind::Materialize {
-                key_slot: 0,
-                value_slot: 1,
-                output: OutputContract::KeyedRows {
-                    key_type: ValueType::Int8,
-                    key_nullable,
-                    value_type: ValueType::Int8,
-                    nullable: value_slot.is_some(),
-                },
+            |value_slot| OperatorNodeKind::GroupedSumInt8 {
+                key_slot: grouped_key_slot,
+                value_slot,
             },
+        ),
+    });
+    nodes.push(materialize(
+        ids.2,
+        ids.1,
+        OutputContract::KeyedRows {
+            key_type: ValueType::Int8,
+            key_nullable: key.nullable,
+            value_type: ValueType::Int8,
+            nullable: value_slot.is_some(),
         },
-    ])
+        true,
+    ));
+    Ok(())
 }
 
-fn resolve<'a>(
-    source: &'a SourceDescriptor,
-    name: &str,
-) -> Result<(usize, &'a crate::SourceColumnDescriptor), CompilerError> {
-    let mut matches = source
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, column)| column.name == name);
-    let (index, column) = matches
-        .next()
-        .ok_or_else(|| CompilerError::MissingColumn(name.into()))?;
-    if matches.next().is_some() {
-        return Err(CompilerError::DuplicateColumn(name.into()));
+pub(crate) fn materialize(
+    node_id: shiba_operator::NodeId,
+    input: shiba_operator::NodeId,
+    output: OutputContract,
+    keyed: bool,
+) -> OperatorNode {
+    OperatorNode {
+        node_id,
+        input: NodeInput::Node(input),
+        state_contract: None,
+        kind: OperatorNodeKind::Materialize {
+            key_slot: 0,
+            value_slot: u16::from(keyed),
+            output,
+        },
     }
-    if column.type_oid != crate::POSTGRES_INT8_TYPE_OID {
-        return Err(CompilerError::WrongColumnType {
-            column: name.into(),
-            type_oid: column.type_oid,
-        });
-    }
-    Ok((index, column))
-}
-
-fn node_id(value: u32) -> NodeId {
-    NodeId::new(NonZeroU32::new(value).expect("fixed nonzero node identity"))
-}
-
-fn slot(value: usize) -> Result<u16, CompilerError> {
-    u16::try_from(value).map_err(|_| CompilerError::GraphEncoding)
 }

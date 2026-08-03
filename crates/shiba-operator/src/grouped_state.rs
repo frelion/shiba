@@ -1,7 +1,4 @@
-use crate::{
-    EncodedOperatorState, KernelError, StateEntry, TypedRow, TypedValue, ValueType,
-    plan::STATE_CODEC_VERSION,
-};
+use crate::{EncodedOperatorState, KernelError, StateEntry, TypedRow, TypedValue, ValueType};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Aggregate {
@@ -24,7 +21,7 @@ pub(crate) fn decode(aggregate: Aggregate, entry: &StateEntry) -> Result<GroupSt
             sum: 0,
         });
     };
-    if state.codec_version != STATE_CODEC_VERSION {
+    if state.codec_version != 1 {
         return Err(KernelError::InvalidState);
     }
     let decoded = match aggregate {
@@ -61,7 +58,7 @@ pub(crate) fn encode(aggregate: Aggregate, state: GroupState) -> EncodedOperator
         payload.extend_from_slice(&state.sum.to_be_bytes());
     }
     EncodedOperatorState {
-        codec_version: STATE_CODEC_VERSION,
+        codec_version: 1,
         payload,
     }
 }

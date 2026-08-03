@@ -16,22 +16,28 @@ pub fn apply_graph(
     graph: &OperatorGraph,
     input: &DeltaBatch,
 ) -> Result<GraphTransition, GraphError> {
-    graph.validate()?;
-    let (source_layout, layouts) = graph.layouts()?;
-    if input.layout_identity != source_layout.identity {
-        return Err(GraphError::Layout);
-    }
-    if input.rows.len() > MAX_INPUT_DELTA_ROWS {
-        return Err(GraphError::OutputLimit);
-    }
-    validate_batch(input, &source_layout)?;
+    let (source_layout, layouts) = validated_layouts(graph, input)?;
     let mut budget = EvaluationBudget::new(input)?;
     let mut batches = BTreeMap::<NodeId, DeltaBatch>::new();
     let mut results = Vec::new();
     let mut emitted_rows = 0_usize;
     for node in &graph.nodes {
+        if matches!(
+            node.kind,
+            OperatorNodeKind::CountRows
+                | OperatorNodeKind::SumInt8 { .. }
+                | OperatorNodeKind::GroupedCount { .. }
+                | OperatorNodeKind::GroupedSumInt8 { .. }
+                | OperatorNodeKind::InnerJoin { .. }
+        ) {
+            continue;
+        }
+        if matches!(node.kind, OperatorNodeKind::Materialize { .. })
+            && matches!(node.input, NodeInput::Node(id) if !batches.contains_key(&id))
+        {
+            continue;
+        }
         let (batch, layout) = match node.input {
-            NodeInput::Source => (input, &source_layout),
             NodeInput::SourcePort(source_id)
                 if graph.sources.len() == 1 && graph.sources[0].source_id == source_id =>
             {
@@ -73,10 +79,11 @@ pub fn apply_graph(
                 budget.charge(&output, &mut emitted_rows)?;
                 batches.insert(node.node_id, output);
             }
-            OperatorNodeKind::GroupedCount { .. } | OperatorNodeKind::GroupedSumInt8 { .. } => {
-                return Err(GraphError::InvalidNode);
-            }
-            OperatorNodeKind::InnerJoin { .. } => return Err(GraphError::InvalidNode),
+            OperatorNodeKind::CountRows
+            | OperatorNodeKind::SumInt8 { .. }
+            | OperatorNodeKind::GroupedCount { .. }
+            | OperatorNodeKind::GroupedSumInt8 { .. }
+            | OperatorNodeKind::InnerJoin { .. } => unreachable!(),
             OperatorNodeKind::Materialize {
                 key_slot,
                 value_slot,
@@ -102,37 +109,26 @@ pub fn apply_graph(
             }
         }
     }
-    Ok(GraphTransition { results })
+    Ok(GraphTransition {
+        state_deltas: Vec::new(),
+        results,
+    })
 }
 
-pub(crate) fn apply_prefix(
+fn validated_layouts(
     graph: &OperatorGraph,
     input: &DeltaBatch,
-    stop_before: NodeId,
-) -> Result<(DeltaBatch, TypedLayout, EvaluationBudget, usize), GraphError> {
+) -> Result<(TypedLayout, BTreeMap<NodeId, TypedLayout>), GraphError> {
     graph.validate()?;
-    let (source_layout, layouts) = graph.layouts()?;
-    if input.layout_identity != source_layout.identity {
+    let layouts = graph.layouts()?;
+    if input.layout_identity != layouts.0.identity {
         return Err(GraphError::Layout);
     }
     if input.rows.len() > MAX_INPUT_DELTA_ROWS {
         return Err(GraphError::OutputLimit);
     }
-    validate_batch(input, &source_layout)?;
-    let mut current = input.clone();
-    let mut current_layout = source_layout;
-    let mut budget = EvaluationBudget::new(input)?;
-    let mut emitted_rows = 0;
-    for node in &graph.nodes {
-        if node.node_id == stop_before {
-            return Ok((current, current_layout, budget, emitted_rows));
-        }
-        let output_layout = layouts.get(&node.node_id).ok_or(GraphError::Layout)?;
-        current = transform_node(&node.kind, &current, &current_layout, output_layout)?;
-        budget.charge(&current, &mut emitted_rows)?;
-        current_layout = output_layout.clone();
-    }
-    Err(GraphError::InvalidTopology)
+    validate_batch(input, &layouts.0)?;
+    Ok(layouts)
 }
 
 fn validate_batch(batch: &DeltaBatch, layout: &TypedLayout) -> Result<(), GraphError> {

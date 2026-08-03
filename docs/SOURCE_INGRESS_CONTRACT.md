@@ -1,6 +1,39 @@
 # Source Ingress contract
 
-## M13 lifecycle integration status
+## M14.6 graph ingress cutover
+
+Ingress is now graph-scoped for both one- and two-member graphs. One
+`graph_ingress_config` binds the graph digest, database, publication, slot and
+generation; `graph_ingress_source` binds the exact ordered members and their
+publication columns. One replication stream assembles each PostgreSQL
+transaction once. The decoded changes are tagged by SourceId and delivered as
+one graph transaction, including transactions that change both members.
+
+Runtime acquires the graph/generation mutex, probes the sole
+`graph_continuation`, locks member bindings in SourceId order, applies all
+member row changes once, builds one transaction-local `MultiInputBatch`, runs
+the canonical `OperatorGraph`, persists generic node state/results, writes the
+graph continuation last and commits. Only then can the existing terminal ACK
+authorization advance. Ingress carries no concrete node kind, operator ID,
+fixed operator count or intermediate DeltaBatch, and it never advances a
+member independently.
+
+The source-scoped ingress configuration, invalidation and continuation names in
+the historical M10--M13 evidence below are superseded by their graph-scoped
+authorities. There is no compatibility path. The directed M14.6 graph Runtime
+gate is green on PG17.10/PG18.4: one real pgoutput transaction can carry both
+relation changes into one graph Apply; exact replay does not duplicate output,
+sink failure rolls back continuation, and exact identity-index replacement
+invalidates before mutation. M14.7 owns full receiver/bootstrap/rebuild release
+and performance evidence.
+
+Every `PgoutputSource` must agree with the durable effective identity index for
+its member. Default primary-key and explicit unique replica-identity sources
+are admitted; a relation with no effective identity is rejected without a
+partial binding. This member rule is checked independently of node kind, so
+Ingress never treats the JOIN right side as a special transport source.
+
+## M13 lifecycle integration status (historical baseline)
 
 M13.3 changed Runtime input only after a complete transaction has crossed the
 existing transport/decoder boundary; ACK authorization and slot authority are

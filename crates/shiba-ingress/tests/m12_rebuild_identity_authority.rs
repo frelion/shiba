@@ -1,8 +1,12 @@
 use shiba_ingress::PreparedRebuild;
 use shiba_protocol::{
-    IngressTransactionId, InputSequence, PostgresLsn, SlotGeneration, SourceId, SourceTransactionId,
+    GraphId, GraphTransactionId, IngressTransactionId, InputSequence, PostgresLsn, SlotGeneration,
+    SourceId,
 };
-use shiba_runtime::{M2Error, SourceInsert, SourcePayload, SourceTransaction, process};
+use shiba_runtime::{
+    GraphSourceChange, GraphTransaction, M2Error, SourceChange, SourceInsert, SourcePayload,
+    process,
+};
 
 #[path = "m12_rebuild_identity_authority/support.rs"]
 mod support;
@@ -22,7 +26,7 @@ fn rebuild_identity_is_durable_and_revalidated_before_slot_work() {
     PreparedRebuild::prepare(
         &database_url,
         &replication_url,
-        fixture.spec(),
+        &fixture.spec(),
         support::options(),
     )
     .expect("prepare exact target identity")
@@ -195,17 +199,17 @@ fn rebuild_identity_is_durable_and_revalidated_before_slot_work() {
         )
         .expect("restore address-class constraint and authority");
 
-    let plan_digest: Vec<u8> = admin
+    let graph_payload: Vec<u8> = admin
         .query_one(
-            "SELECT plan_digest FROM shiba_internal.operator_definition WHERE operator_id = 3",
+            "SELECT graph_payload FROM shiba_internal.graph_definition WHERE graph_id = 1",
             &[],
         )
         .expect("read durable ProjectRows plan digest")
         .get(0);
     admin
         .execute(
-            "UPDATE shiba_internal.operator_definition
-             SET plan_digest = decode(repeat('00', 32), 'hex') WHERE operator_id = 3",
+            "UPDATE shiba_internal.graph_definition SET graph_payload = decode('00', 'hex')
+             WHERE graph_id = 1",
             &[],
         )
         .expect("inject prepared plan-set drift");
@@ -221,8 +225,8 @@ fn rebuild_identity_is_durable_and_revalidated_before_slot_work() {
     );
     admin
         .execute(
-            "UPDATE shiba_internal.operator_definition SET plan_digest = $1 WHERE operator_id = 3",
-            &[&plan_digest],
+            "UPDATE shiba_internal.graph_definition SET graph_payload = $1 WHERE graph_id = 1",
+            &[&graph_payload],
         )
         .expect("restore exact ProjectRows plan digest");
 
@@ -238,13 +242,13 @@ fn rebuild_identity_is_durable_and_revalidated_before_slot_work() {
     let second_spec = support::install_second_target(&mut admin, &fixture);
     support::assert_exact_identity(
         &mut admin,
-        second_spec.expected.relation_oid,
-        second_spec.expected.identity_index_oid,
+        second_spec.expected.members[0].relation_oid,
+        second_spec.expected.members[0].identity_index_oid,
     );
     PreparedRebuild::prepare(
         &database_url,
         &replication_url,
-        second_spec.clone(),
+        &second_spec,
         support::options(),
     )
     .expect("repeat rebuild consumes exact old four-row CAS")
@@ -252,10 +256,10 @@ fn rebuild_identity_is_durable_and_revalidated_before_slot_work() {
     .expect("release second prepared worker");
     support::assert_exact_identity(
         &mut admin,
-        second_spec.target.relation_oid,
-        second_spec.target.identity_index_oid,
+        second_spec.target.members[0].relation_oid,
+        second_spec.target.members[0].identity_index_oid,
     );
-    let old_index = second_spec.target.identity_index_oid;
+    let old_index = second_spec.target.members[0].identity_index_oid;
     admin
         .batch_execute(
             "ALTER TABLE target_next.events DROP CONSTRAINT events_pkey;
@@ -298,26 +302,30 @@ fn rebuild_identity_is_durable_and_revalidated_before_slot_work() {
         )
         .expect("remove only the test-manufactured replacement invalidation");
     let runtime_before = support::prepared_snapshot(&mut admin, support::SECOND_SLOT);
-    let identity = SourceTransactionId::new(
-        SourceId::new(1).expect("source ID"),
+    let identity = GraphTransactionId::new(
+        GraphId::new(1).expect("graph ID"),
         SlotGeneration::new(4).expect("replacement generation"),
         PostgresLsn::from_u64(0x40_0000),
         IngressTransactionId::new(404).expect("ingress transaction ID"),
     )
     .expect("nonzero Runtime identity");
-    let input = SourceTransaction::new(
+    let input = GraphTransaction::new(
         identity,
-        vec![SourceInsert::with_payload(
-            InputSequence::new(1).expect("input sequence"),
-            404,
-            SourcePayload::Null,
-        )],
+        vec![GraphSourceChange {
+            source_id: SourceId::new(1).expect("source ID"),
+            change: SourceChange::Insert(SourceInsert::with_payload(
+                InputSequence::new(1).expect("input sequence"),
+                404,
+                SourcePayload::Null,
+            )),
+        }],
     )
     .expect("valid nullable-int8 INSERT transaction");
-    assert!(matches!(
-        process(&mut admin, &input),
-        Err(M2Error::SourceInvalidated)
-    ));
+    let apply_result = process(&mut admin, &input);
+    assert!(
+        matches!(apply_result, Err(M2Error::InvalidBootstrapPhase)),
+        "a prepared replacement generation must reject live Runtime Apply, got {apply_result:?}"
+    );
     support::assert_prepared_closed(&mut admin, support::SECOND_SLOT);
     assert_eq!(
         support::prepared_snapshot(&mut admin, support::SECOND_SLOT),

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use shiba_protocol::{InputSequence, SourceTransactionId};
+use shiba_protocol::{GraphTransactionId, InputSequence, SourceId};
 
 use crate::M2Error;
 
@@ -146,30 +146,26 @@ impl SourceInsert {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceTransaction {
-    pub identity: SourceTransactionId,
-    pub changes: Vec<SourceChange>,
+pub struct GraphSourceChange {
+    pub source_id: SourceId,
+    pub change: SourceChange,
 }
 
-impl SourceTransaction {
-    /// # Errors
-    /// Rejects invalid identity coordinates or INSERT facts.
-    pub fn new(identity: SourceTransactionId, inserts: Vec<SourceInsert>) -> Result<Self, M2Error> {
-        check_transaction_change_limit(inserts.len())?;
-        Self::from_changes(
-            identity,
-            inserts.into_iter().map(SourceChange::Insert).collect(),
-        )
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphTransaction {
+    pub identity: GraphTransactionId,
+    pub changes: Vec<GraphSourceChange>,
+}
 
+impl GraphTransaction {
     /// # Errors
-    /// Rejects empty, duplicate, or out-of-range changes.
-    pub fn from_changes(
-        identity: SourceTransactionId,
-        changes: Vec<SourceChange>,
+    /// Rejects empty, duplicate, or out-of-range relation-tagged changes.
+    pub fn new(
+        identity: GraphTransactionId,
+        changes: Vec<GraphSourceChange>,
     ) -> Result<Self, M2Error> {
         check_transaction_change_limit(changes.len())?;
-        validate_coordinate("source_id", identity.source_id.get())?;
+        validate_coordinate("graph_id", identity.graph_id.get())?;
         validate_coordinate("slot_generation", identity.slot_generation.get())?;
         validate_coordinate(
             "ingress_transaction_id",
@@ -181,8 +177,9 @@ impl SourceTransaction {
 
         let mut sequences = HashSet::with_capacity(changes.len());
         let mut rows = HashSet::with_capacity(changes.len());
-        for change in &changes {
-            let (sequence, row) = match change {
+        for tagged in &changes {
+            validate_coordinate("source_id", tagged.source_id.get())?;
+            let (sequence, row) = match &tagged.change {
                 SourceChange::Insert(insert) => (
                     insert.input_sequence.get(),
                     insert
@@ -207,7 +204,7 @@ impl SourceTransaction {
                 return Err(M2Error::DuplicateInputSequence(sequence));
             }
             if let Some((source_row_id, sub_id)) = row
-                && !rows.insert((source_row_id, sub_id))
+                && !rows.insert((tagged.source_id, source_row_id, sub_id))
             {
                 return Err(M2Error::DuplicateSourceRow(source_row_id));
             }

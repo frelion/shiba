@@ -76,7 +76,9 @@ install -m 0755 "$library_source" "$installed_library"
 
 mkdir -p "$socket"
 "$bindir/initdb" -D "$data" --no-locale --encoding=UTF8 --auth=trust >/dev/null
-"$bindir/pg_ctl" -D "$data" -o "-k '$socket' -p $port" -w start >/dev/null
+"$bindir/pg_ctl" -D "$data" \
+  -o "-k '$socket' -p $port -c wal_level=logical -c max_replication_slots=4" \
+  -w start >/dev/null
 started=1
 
 SHIBA_M2_DATABASE_URL="host=$socket port=$port dbname=postgres user=$(id -un)" \

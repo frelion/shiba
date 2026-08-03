@@ -2,7 +2,7 @@ use postgres::{Client, NoTls};
 use shiba_ingress::{
     BootstrapCatchupProgress, BootstrapCatchupSession, PreparedRebuild, SnapshotProgress,
 };
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
 
 use crate::support::{
     CONTROL_ROLE, READER_ROLE, RECEIVER_ROLE, RebuildFixture, as_role, assert_building,
@@ -27,34 +27,36 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
 
     let active_before = authority_snapshot(&mut admin);
     assert!(
-        PreparedRebuild::prepare(&reader_url, &receiver_url, fixture.spec(), options()).is_err(),
+        PreparedRebuild::prepare(&reader_url, &receiver_url, &fixture.spec(), options()).is_err(),
         "read-only result role cannot become rebuild control"
     );
     assert_eq!(authority_snapshot(&mut admin), active_before);
     admin
         .batch_execute(&format!(
-            "REVOKE EXECUTE ON FUNCTION shiba_internal.prepare_source_rebuild(
-                 bigint, bigint, oid, oid, oid, name, bigint,
-                 bigint, regclass, regclass, oid, name, bigint
+            "REVOKE EXECUTE ON FUNCTION shiba_internal.prepare_graph_rebuild(
+                 bigint, bytea, bigint, oid[], oid[], oid, name, bigint,
+                 bigint, bigint[], oid[], oid[], oid, name, bigint,
+                 bytea, bytea, bytea, bigint[], text[], boolean[], boolean[]
              ) FROM {CONTROL_ROLE};"
         ))
         .expect("remove rebuild admission EXECUTE");
     assert!(
-        PreparedRebuild::prepare(&control_url, &receiver_url, fixture.spec(), options()).is_err(),
+        PreparedRebuild::prepare(&control_url, &receiver_url, &fixture.spec(), options()).is_err(),
         "missing rebuild writer EXECUTE must fail before destructive prepare"
     );
     assert_eq!(authority_snapshot(&mut admin), active_before);
     admin
         .batch_execute(&format!(
-            "GRANT EXECUTE ON FUNCTION shiba_internal.prepare_source_rebuild(
-                 bigint, bigint, oid, oid, oid, name, bigint,
-                 bigint, regclass, regclass, oid, name, bigint
+            "GRANT EXECUTE ON FUNCTION shiba_internal.prepare_graph_rebuild(
+                 bigint, bytea, bigint, oid[], oid[], oid, name, bigint,
+                 bigint, bigint[], oid[], oid[], oid, name, bigint,
+                 bytea, bytea, bytea, bigint[], text[], boolean[], boolean[]
              ) TO {CONTROL_ROLE};
              REVOKE SELECT ON target.events FROM {CONTROL_ROLE};"
         ))
         .expect("exchange admission privilege for missing target SELECT");
     assert!(
-        PreparedRebuild::prepare(&control_url, &receiver_url, fixture.spec(), options()).is_err(),
+        PreparedRebuild::prepare(&control_url, &receiver_url, &fixture.spec(), options()).is_err(),
         "missing target SELECT must fail before destructive prepare"
     );
     assert_eq!(authority_snapshot(&mut admin), active_before);
@@ -65,7 +67,7 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
         ))
         .expect("exchange control read for missing receiver read privilege");
     assert!(
-        PreparedRebuild::prepare(&control_url, &receiver_url, fixture.spec(), options()).is_err(),
+        PreparedRebuild::prepare(&control_url, &receiver_url, &fixture.spec(), options()).is_err(),
         "receiver without target SELECT must fail before destructive prepare"
     );
     assert_eq!(authority_snapshot(&mut admin), active_before);
@@ -74,7 +76,7 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
         .expect("restore exact receiver read privilege");
     let active_value: Option<i64> = admin
         .query_one(
-            "SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1",
+            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2",
             &[],
         )
         .expect("read unchanged old result")
@@ -84,25 +86,26 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
         PreparedRebuild::prepare(
             &control_url,
             &as_role(replication_url, CONTROL_ROLE),
-            fixture.spec(),
+            &fixture.spec(),
             options()
         )
         .is_err(),
         "NOREPLICATION control credential cannot own transport"
     );
 
-    let prepared = PreparedRebuild::prepare(&control_url, &receiver_url, fixture.spec(), options())
-        .expect("non-superuser control accepts rebuild through exact SQL authority");
+    let prepared =
+        PreparedRebuild::prepare(&control_url, &receiver_url, &fixture.spec(), options())
+            .expect("non-superuser control accepts rebuild through exact SQL authority");
     assert_building(&mut admin);
     let mut reader = Client::connect(&reader_url, NoTls).expect("connect public result reader");
     assert!(
         reader
-            .query("SELECT * FROM shiba_internal.source_bootstrap", &[])
+            .query("SELECT * FROM shiba_internal.graph_bootstrap", &[])
             .is_err()
     );
     assert!(
         reader
-            .execute("UPDATE shiba.operator_result SET value_bigint = 1", &[])
+            .execute("UPDATE shiba.graph_result SET value_bigint = 1", &[])
             .is_err()
     );
     let mut bootstrap = prepared
@@ -113,7 +116,7 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
         .expect("commit target DELETE while exported snapshot is open");
     admin
         .batch_execute(&format!(
-            "REVOKE UPDATE ON shiba_internal.source_bootstrap FROM {CONTROL_ROLE}"
+            "REVOKE UPDATE ON shiba_internal.graph_bootstrap_checkpoint FROM {CONTROL_ROLE}"
         ))
         .expect("remove checkpoint privilege");
     assert!(
@@ -123,7 +126,7 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
     assert_building(&mut reader);
     admin
         .batch_execute(&format!(
-            "GRANT UPDATE ON shiba_internal.source_bootstrap TO {CONTROL_ROLE}"
+            "GRANT UPDATE ON shiba_internal.graph_bootstrap_checkpoint TO {CONTROL_ROLE}"
         ))
         .expect("restore checkpoint privilege");
     while bootstrap.scan_next().expect("retry exact snapshot batch")
@@ -151,7 +154,7 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
     let mut catchup = BootstrapCatchupSession::resume(
         &control_url,
         &receiver_url,
-        SourceId::new(1).expect("source ID"),
+        GraphId::new(1).expect("graph ID"),
         BootstrapId::new(2).expect("rebuild bootstrap ID"),
         SlotGeneration::new(3).expect("rebuild generation"),
         options(),
@@ -169,7 +172,7 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
     );
     let rows = reader
         .query(
-            "SELECT result_status, value_bigint FROM shiba.operator_result ORDER BY operator_id",
+            "SELECT result_status, value_bigint FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )
         .expect("read atomically activated public result");
@@ -186,7 +189,7 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
     let projected = reader
         .query(
             "SELECT result_key_bigint, result_value_bigint
-             FROM shiba.operator_result_rows WHERE operator_id = 3 ORDER BY 1",
+             FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 6 ORDER BY 1",
             &[],
         )
         .expect("read split-role ProjectRows result");
@@ -226,10 +229,10 @@ fn assert_role_shape(client: &mut Client) {
 fn catchup_snapshot(client: &mut Client) -> Vec<Vec<String>> {
     [
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_row_state ORDER BY source_row_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.operator_state ORDER BY operator_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.operator_result ORDER BY operator_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_continuation ORDER BY commit_lsn) x",
-        "SELECT row_to_json(x)::text FROM (SELECT phase, catchup_fence_lsn::text FROM shiba_internal.source_bootstrap) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_node_state ORDER BY graph_id, node_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.graph_result ORDER BY graph_id, result_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_continuation ORDER BY commit_lsn) x",
+        "SELECT row_to_json(x)::text FROM (SELECT phase, catchup_fence_lsn::text FROM shiba_internal.graph_bootstrap) x",
         "SELECT row_to_json(x)::text FROM (SELECT slot_name, confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots ORDER BY slot_name) x",
     ]
     .into_iter()

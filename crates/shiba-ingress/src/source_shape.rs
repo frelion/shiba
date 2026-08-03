@@ -22,7 +22,8 @@ pub(crate) fn derive_source(
             &[&relation_oid],
         )?
         .ok_or(IngressError::Governance("bound relation is missing"))?;
-    if relation.get::<_, &str>(0) != "r" || relation.get::<_, &str>(1) != "d" {
+    let replica_identity: &str = relation.get(1);
+    if relation.get::<_, &str>(0) != "r" || !matches!(replica_identity, "d" | "i") {
         return Err(IngressError::Governance(
             "relation identity is not admitted",
         ));
@@ -31,12 +32,21 @@ pub(crate) fn derive_source(
         .query_opt(
             "SELECT (identity.indkey::smallint[])[0]::integer
              FROM pg_catalog.pg_index AS identity
+             JOIN shiba_internal.source_binding AS binding
+               ON binding.source_id = $2 AND binding.binding_kind = 'identity_index'
+              AND binding.address_objid = identity.indexrelid
+              AND binding.address_objsubid = 0
              WHERE identity.indrelid = $1::bigint::oid
-               AND identity.indisprimary AND identity.indisunique
+               AND identity.indisunique
+               AND (identity.indisprimary OR identity.indisreplident)
                AND identity.indisvalid AND identity.indisready
                AND identity.indnkeyatts = 1 AND identity.indnatts = 1
                AND identity.indpred IS NULL AND identity.indexprs IS NULL",
-            &[&relation_oid],
+            &[
+                &relation_oid,
+                &i64::try_from(source_id.get())
+                    .map_err(|_| IngressError::Governance("source ID exceeds bigint"))?,
+            ],
         )?
         .map(|row| row.get(0));
     let Some(key_subid) = key_subid else {
@@ -76,18 +86,22 @@ pub(crate) fn derive_source(
         .map_err(|_| IngressError::Governance("relation OID is out of range"))?;
     let published_key = i16::try_from(key_subid)
         .map_err(|_| IngressError::Governance("source key identity is invalid"))?;
-    if published_columns == [published_key] {
+    if published_columns == [published_key] && replica_identity == "d" {
         Ok(PgoutputSource::new(
             source_id,
             generation,
             decoded_relation_oid,
         ))
     } else if nullable_payload && published_columns == published_subids.as_slice() {
-        Ok(PgoutputSource::with_nullable_int8_payload(
-            source_id,
-            generation,
-            decoded_relation_oid,
-        ))
+        Ok(if replica_identity == "i" {
+            PgoutputSource::with_nullable_int8_payload_replica_index(
+                source_id,
+                generation,
+                decoded_relation_oid,
+            )
+        } else {
+            PgoutputSource::with_nullable_int8_payload(source_id, generation, decoded_relation_oid)
+        })
     } else {
         Err(IngressError::Governance(
             "published column shape is not admitted",
@@ -112,37 +126,18 @@ pub(crate) fn validate_bindings(
 ) -> Result<Option<i64>, IngressError> {
     let source_key = i64::try_from(source_id.get())
         .map_err(|_| IngressError::Governance("source ID exceeds bigint"))?;
-    let marker = transaction.query_opt(
-        "SELECT retired_bootstrap_id, retired_slot_name::text,
-                retired_slot_generation
-         FROM shiba_internal.source_bootstrap WHERE source_id = $1",
-        &[&source_key],
-    )?;
-    let marker = marker.map(|row| {
-        (
-            row.get::<_, Option<i64>>(0),
-            row.get::<_, Option<String>>(1),
-            row.get::<_, Option<i64>>(2),
-        )
-    });
-    let (m12_generation, expected_rows) = match marker {
-        None => (false, column_subids.len() + 1),
-        Some((None, None, None)) => {
-            if column_subids.len() != 2 {
-                return Err(IngressError::Governance("source binding set drifted"));
-            }
-            (false, 3)
-        }
-        Some((Some(bootstrap), Some(slot), Some(generation)))
-            if bootstrap > 0 && !slot.is_empty() && generation > 0 && column_subids.len() == 2 =>
-        {
-            (true, 4)
-        }
-        Some((Some(_), Some(_), Some(_))) => {
-            return Err(IngressError::Governance("source binding set drifted"));
-        }
-        Some(_) => return Err(IngressError::Governance("rebuild marker is partial")),
-    };
+    let identity_rows: i64 = transaction
+        .query_one(
+            "SELECT count(*) FROM shiba_internal.source_binding
+         WHERE source_id = $1 AND binding_kind = 'identity_index'",
+            &[&source_key],
+        )?
+        .get(0);
+    if identity_rows > 1 {
+        return Err(IngressError::Governance("source binding set drifted"));
+    }
+    let m12_generation = identity_rows == 1;
+    let expected_rows = column_subids.len() + 1 + usize::from(m12_generation);
     let rows = transaction.query(
         "SELECT binding.binding_kind, binding.address_classid::bigint,
                 binding.address_objid::bigint, binding.address_objsubid
@@ -205,9 +200,12 @@ fn validate_identity_binding(
         .query_one(
             "SELECT EXISTS (
                SELECT 1 FROM pg_catalog.pg_index AS identity
+               JOIN pg_catalog.pg_class AS relation ON relation.oid = identity.indrelid
                WHERE identity.indexrelid = $1::bigint::oid
                  AND identity.indrelid = $2::bigint::oid
-                 AND identity.indisprimary AND identity.indisunique
+                 AND identity.indisunique
+                 AND ((relation.relreplident = 'd' AND identity.indisprimary)
+                      OR (relation.relreplident = 'i' AND identity.indisreplident))
                  AND identity.indisvalid AND identity.indisready
                  AND identity.indnkeyatts = 1 AND identity.indnatts = 1
                  AND EXISTS (

@@ -25,10 +25,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -78,7 +78,7 @@ fn install_crash_trigger(client: &mut Client) {
              END
              $$;
              CREATE TRIGGER m5_toast_crash
-             AFTER INSERT ON shiba_internal.source_continuation
+             AFTER INSERT ON shiba_internal.graph_continuation
              FOR EACH ROW EXECUTE FUNCTION m5_toast_test.crash_after_continuation();",
         )
         .expect("install continuation crash point");
@@ -141,7 +141,8 @@ fn m5_real_unchanged_toast_crash_retry_and_replay() {
     );
 
     let insert_wire = CAPTURE.capture(&mut client, "toast-insert.pgoutput");
-    let insert = decode_committed_changes(&insert_wire, source).expect("decode TOAST insert");
+    let insert = decode_committed_changes(&insert_wire, &support::singleton_graph(1, source))
+        .expect("decode TOAST insert");
     assert_eq!(
         process(&mut client, &insert).expect("apply TOAST insert"),
         ProcessOutcome::Applied
@@ -162,11 +163,12 @@ fn m5_real_unchanged_toast_crash_retry_and_replay() {
     assert_eq!(update_wire[payload_tag], b'u');
     let mut corrupt = update_wire.clone();
     corrupt[payload_tag] = b't';
-    assert!(decode_committed_changes(&corrupt, source).is_err());
+    assert!(decode_committed_changes(&corrupt, &support::singleton_graph(1, source)).is_err());
     assert_eq!(durable_state(&mut client), (1, 1, 1, 1));
     assert_eq!(applied_payload(&mut client), payload);
 
-    let update = decode_committed_changes(&update_wire, source).expect("decode unchanged TOAST");
+    let update = decode_committed_changes(&update_wire, &support::singleton_graph(1, source))
+        .expect("decode unchanged TOAST");
     install_crash_trigger(&mut client);
     assert!(process(&mut client, &update).is_err());
     let mut client = Client::connect(&connection, NoTls).expect("reconnect after crash");

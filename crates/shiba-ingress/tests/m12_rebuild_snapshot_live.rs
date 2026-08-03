@@ -1,14 +1,15 @@
 use std::time::Duration;
 
 use shiba_ingress::{
-    AttachOptions, BootstrapCatchupProgress, GovernedSourceSession, PreparedRebuild,
-    ReplicationMode,
+    AttachOptions, BootstrapCatchupProgress, GovernedGraphSession, PreparedRebuild, ReplicationMode,
 };
 use shiba_protocol::{
-    IngressTransactionId, InputSequence, PostgresLsn, SlotGeneration, SourceId, SourceTransactionId,
+    GraphId, GraphTransactionId, IngressTransactionId, InputSequence, PostgresLsn, SlotGeneration,
+    SourceId,
 };
 use shiba_runtime::{
-    M2Error, ProcessOutcome, SourceInsert, SourcePayload, SourceTransaction, process,
+    GraphSourceChange, GraphTransaction, M2Error, ProcessOutcome, SourceChange, SourceInsert,
+    SourcePayload, process,
 };
 
 #[path = "m12_rebuild_snapshot_live/support.rs"]
@@ -21,40 +22,46 @@ fn attach_options() -> AttachOptions {
         .expect("bounded attach options")
 }
 
-fn stale_generation_input() -> SourceTransaction {
-    let identity = SourceTransactionId::new(
-        SourceId::new(1).expect("source ID"),
+fn stale_generation_input() -> GraphTransaction {
+    let identity = GraphTransactionId::new(
+        GraphId::new(1).expect("graph ID"),
         SlotGeneration::new(2).expect("retired generation"),
         PostgresLsn::from_u64(0x50_0000),
         IngressTransactionId::new(502).expect("ingress transaction ID"),
     )
     .expect("nonzero stale transaction identity");
-    SourceTransaction::new(
+    GraphTransaction::new(
         identity,
-        vec![SourceInsert::with_payload(
-            InputSequence::new(1).expect("input sequence"),
-            502,
-            SourcePayload::Null,
-        )],
+        vec![GraphSourceChange {
+            source_id: SourceId::new(1).expect("source ID"),
+            change: SourceChange::Insert(SourceInsert::with_payload(
+                InputSequence::new(1).expect("input sequence"),
+                502,
+                SourcePayload::Null,
+            )),
+        }],
     )
     .expect("valid stale nullable-int8 INSERT")
 }
 
-fn premature_target_input() -> SourceTransaction {
-    let identity = SourceTransactionId::new(
-        SourceId::new(1).expect("source ID"),
+fn premature_target_input() -> GraphTransaction {
+    let identity = GraphTransactionId::new(
+        GraphId::new(1).expect("graph ID"),
         SlotGeneration::new(3).expect("target generation"),
         PostgresLsn::from_u64(0x50_0100),
         IngressTransactionId::new(503).expect("ingress transaction ID"),
     )
     .expect("nonzero target transaction identity");
-    SourceTransaction::new(
+    GraphTransaction::new(
         identity,
-        vec![SourceInsert::with_payload(
-            InputSequence::new(1).expect("input sequence"),
-            503,
-            SourcePayload::Null,
-        )],
+        vec![GraphSourceChange {
+            source_id: SourceId::new(1).expect("source ID"),
+            change: SourceChange::Insert(SourceInsert::with_payload(
+                InputSequence::new(1).expect("input sequence"),
+                503,
+                SourcePayload::Null,
+            )),
+        }],
     )
     .expect("valid premature target nullable-int8 INSERT")
 }
@@ -77,10 +84,10 @@ fn active_source_rebuilds_through_one_target_authority() {
         )
         .expect("make old and target authorities non-pristine");
 
-    let mut old_live = GovernedSourceSession::attach(
+    let mut old_live = GovernedGraphSession::attach(
         &database_url,
         &replication_url,
-        SourceId::new(1).expect("source ID"),
+        GraphId::new(1).expect("graph ID"),
         SlotGeneration::new(2).expect("old generation"),
         attach_options(),
     )
@@ -100,7 +107,7 @@ fn active_source_rebuilds_through_one_target_authority() {
     let prepared = PreparedRebuild::prepare(
         &database_url,
         &replication_url,
-        fixture.spec(),
+        &fixture.spec(),
         support::rebuild_options(),
     )
     .expect("atomically install sole target building authority");
@@ -135,10 +142,10 @@ fn active_source_rebuilds_through_one_target_authority() {
     assert!(support::continuation_generations(&mut admin).is_empty());
 
     assert!(
-        GovernedSourceSession::attach(
+        GovernedGraphSession::attach(
             &database_url,
             &replication_url,
-            SourceId::new(1).expect("source ID"),
+            GraphId::new(1).expect("graph ID"),
             SlotGeneration::new(2).expect("retired generation"),
             attach_options(),
         )
@@ -200,7 +207,7 @@ fn active_source_rebuilds_through_one_target_authority() {
     let lifecycle = admin
         .query_one(
             "SELECT phase, bootstrap_id, slot_generation
-             FROM shiba_internal.source_bootstrap WHERE source_id = 1",
+             FROM shiba_internal.graph_bootstrap WHERE graph_id = 1",
             &[],
         )
         .expect("query activated target lifecycle");

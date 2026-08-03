@@ -39,7 +39,7 @@ pub(crate) fn assert_building(client: &mut Client) {
     let rows = client
         .query(
             "SELECT result_status, value_bigint
-             FROM shiba.operator_result ORDER BY operator_id",
+             FROM shiba.graph_result WHERE graph_id = 1 AND result_id IN (2, 4) ORDER BY result_id",
             &[],
         )
         .expect("query rebuild result visibility");
@@ -61,7 +61,7 @@ pub(crate) fn assert_differential(client: &mut Client) -> (i64, i64) {
     let result = client
         .query(
             "SELECT result_status, value_bigint
-             FROM shiba.operator_result ORDER BY operator_id",
+             FROM shiba.graph_result WHERE graph_id = 1 AND result_id IN (2, 4) ORDER BY result_id",
             &[],
         )
         .expect("query rebuilt public results");

@@ -1,5 +1,6 @@
 use crate::pgoutput::PgoutputError;
 
+#[derive(Clone, Copy)]
 pub(crate) struct Cursor<'a> {
     input: &'a [u8],
     offset: usize,
@@ -25,13 +26,6 @@ impl<'a> Cursor<'a> {
 
     pub(crate) fn byte(&mut self) -> Result<u8, PgoutputError> {
         Ok(self.take(1)?[0])
-    }
-
-    pub(crate) fn peek(&self) -> Result<u8, PgoutputError> {
-        self.input
-            .get(self.offset)
-            .copied()
-            .ok_or(PgoutputError::Truncated)
     }
 
     pub(crate) fn u16(&mut self) -> Result<u16, PgoutputError> {

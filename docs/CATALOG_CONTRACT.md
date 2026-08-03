@@ -1,6 +1,61 @@
 # Catalog contract
 
-## M13 generic operator authority
+## M14.6 graph execution authority
+
+M14.6 replaces the M13 per-operator execution layout in place. The sole durable
+plan is `graph_definition`: strict declaration bytes, one canonical
+`OperatorGraph` payload/digest, graph format/compiler versions, source count and
+state codec. `graph_source_member` supplies the complete ordered one- or
+two-SourceId membership and enforces that a source belongs to at most one
+building or active graph. Registration/compiler code is the sole writer of the
+definition and membership; neither Runtime nor lifecycle code reconstructs a
+plan from node names.
+
+Each source member has one exact effective `identity_index` binding in the
+existing `source_binding` authority. Registration resolves either the default
+primary-key index or an explicit unique replica-identity index, persists its
+`pg_class` ObjectAddress, and rejects missing, multiple, partial, expression,
+invalid or non-ready identity. This rule applies to every single- and
+two-member graph, not only the JOIN right side.
+
+`graph_node_state` is Runtime's sole scalar/keyed private state authority.
+Scalar state uses the graph contract's unit key; keyed state uses canonical
+partition/item payloads. `shiba.graph_result` owns terminal output contracts,
+building/active visibility and scalar values;
+`shiba_internal.graph_result_row` owns private keyed rows and
+`shiba.graph_result_rows` exposes only active rows. Runtime is
+the sole state/result writer and persists `GraphTransition` generically. It
+does not match Filter, aggregate, Join or Materialize names.
+
+`graph_ingress_config`, `graph_ingress_source` and
+`graph_ingress_invalidation` bind one database-local publication, slot and
+generation to the exact graph and all ordered members. `graph_continuation` is
+the only compute/replay authority for that graph/slot generation.
+`graph_bootstrap` is the sole bootstrap/rebuild lifecycle and exported-snapshot
+authority; `graph_bootstrap_checkpoint` contains bounded child scan progress
+per member, not a second lifecycle or cursor. Source binding, invalidation and
+current rows remain the only SourceId-scoped facts.
+
+The cutover removes `operator_definition`, `operator_state`,
+`operator_node_state`, `operator_result`, `operator_result_row`,
+`source_continuation`, `source_ingress_config`,
+`source_ingress_invalidation`, and `source_bootstrap`. None survives as a view,
+alias, adapter or dual-write target. Catalog and directed graph Runtime tests
+are green on PG17.10/PG18.4; M14.7 owns the full lifecycle release/performance
+evidence.
+
+Failure-first integration exposed and fixed four contract defects. Keyed sink
+upserts now persist the canonical typed `value_payload` together with SQL
+projection columns. Rebuild prepare binds all 22 target coordinates/contracts,
+including the final value-nullability array, so a missing last argument cannot
+silently alter result identity. The member-cardinality trigger uses a valid
+`COALESCE(NEW.graph_id, OLD.graph_id)` expression for INSERT/UPDATE/DELETE.
+Finally, explicit rebuild may admit an already-invalid old authority as the
+reason to move forward, but destructive prepare installs exact target
+identities and any invalidation committed afterward blocks scan, Apply and
+activation.
+
+## M13 generic operator authority (historical, superseded by M14.6)
 
 M13.3 replaced the aggregate-specific layout rather than migrating or mirroring
 it. Each row in the sole `operator_definition` authority contains the strict
@@ -28,6 +83,8 @@ only publishes the same authority. M13.4 re-proved this handoff for arbitrary
 plan cardinality, including `ProjectRows`, across bootstrap, catch-up and active
 rebuild on PG17.10/PG18.4. There is no candidate
 table, compatibility view, dual write or recovery-time kind reconstruction.
+Those table names describe the M13 evidence baseline only; the current graph
+authority is the M14.6 layout above.
 
 ## Installation authority
 
@@ -41,10 +98,11 @@ legacy catalog table, publication, or change log participates.
 
 `CREATE EXTENSION` runs the extension SQL as one PostgreSQL transaction. It first
 creates the schemas, constrained identity, and restricted version function, then
-installs source-row/continuation and operator authority tables without seeded
-operators. If installation
-fails, PostgreSQL rolls back the whole installation; the empty-install test must
-prove there is no partial `shiba` or `shiba_internal` state. Extension upgrade,
+installs source facts and graph definition/membership, ingress, continuation,
+lifecycle, node-state and result authorities without a seeded graph. If
+installation fails, PostgreSQL rolls back the whole installation; the
+empty-install test must prove there is no partial `shiba` or `shiba_internal`
+state. Extension upgrade,
 external side effects, and migrations are out of scope.
 
 The extension does not perform remote calls, create replication resources, or

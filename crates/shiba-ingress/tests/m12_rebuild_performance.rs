@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use postgres::{Client, NoTls};
 use shiba_ingress::{
-    BOOTSTRAP_CONNECTIONS_PER_SOURCE, BootstrapCatchupProgress, BootstrapOptions, PreparedRebuild,
+    BOOTSTRAP_CONNECTIONS_PER_GRAPH, BootstrapCatchupProgress, BootstrapOptions, PreparedRebuild,
     SnapshotProgress,
 };
 use shiba_runtime::MAX_BOOTSTRAP_BATCH_ROWS;
@@ -38,21 +38,11 @@ const MAX_RETAINED_WAL_BYTES: i64 = 256 * 1024 * 1024;
 #[allow(clippy::too_many_lines, reason = "one frozen million-row M12 gate")]
 fn million_row_active_source_rebuild_is_bounded_and_catches_up_exactly() {
     assert_eq!(MAX_BOOTSTRAP_BATCH_ROWS, SNAPSHOT_BATCH_ROWS);
-    assert_eq!(BOOTSTRAP_CONNECTIONS_PER_SOURCE, 3);
+    assert_eq!(BOOTSTRAP_CONNECTIONS_PER_GRAPH, 3);
     let database_url = required("SHIBA_M12_PERFORMANCE_DATABASE_URL");
     let replication_url = required("SHIBA_M12_PERFORMANCE_REPLICATION_URL");
-    let (mut admin, active) = admission::establish_active_source(&database_url, &replication_url);
-    // Preserve the frozen M12 CountRows+SumInt8 retained-WAL baseline. M13's
-    // keyed lifecycle is proved by the directed bootstrap/rebuild gates; adding
-    // a million logged projection rows would change this historical scenario.
-    admin
-        .batch_execute(
-            "DELETE FROM shiba_internal.operator_result_row WHERE operator_id = 3;
-             DELETE FROM shiba.operator_result WHERE operator_id = 3;
-             DELETE FROM shiba_internal.operator_state WHERE operator_id = 3;
-             DELETE FROM shiba_internal.operator_definition WHERE operator_id = 3;",
-        )
-        .expect("freeze CountRows+SumInt8 performance plan set");
+    let (mut admin, active) =
+        admission::establish_active_scalar_source(&database_url, &replication_url);
     let fixture = RebuildFixture::install(&mut admin, active.publication_oid);
     admin
         .batch_execute(&format!(
@@ -66,19 +56,19 @@ fn million_row_active_source_rebuild_is_bounded_and_catches_up_exactly() {
 
     let old_state = admin
         .query(
-            "SELECT state_payload FROM shiba_internal.operator_state
-             WHERE operator_id IN (1, 2) ORDER BY operator_id",
+            "SELECT state_payload FROM shiba_internal.graph_node_state
+             WHERE graph_id = 1 AND node_id IN (1, 3) ORDER BY node_id",
             &[],
         )
         .expect("read non-pristine operator state");
     assert_eq!(old_state.len(), 2);
     assert!(old_state.iter().all(|row| {
         let payload: Vec<u8> = row.get(0);
-        i64::from_be_bytes(payload.try_into().expect("int8 operator state")) > 0
+        i64::from_be_bytes(payload.try_into().expect("int8 node state")) > 0
     }));
     let old_continuations: i64 = admin
         .query_one(
-            "SELECT count(*) FROM shiba_internal.source_continuation WHERE source_id = 1",
+            "SELECT count(*) FROM shiba_internal.graph_continuation WHERE graph_id = 1",
             &[],
         )
         .expect("read pre-rebuild continuation")
@@ -92,7 +82,7 @@ fn million_row_active_source_rebuild_is_bounded_and_catches_up_exactly() {
     let rebuild_started = Instant::now();
     let prepare_started = Instant::now();
     let prepared =
-        PreparedRebuild::prepare(&database_url, &replication_url, fixture.spec(), options)
+        PreparedRebuild::prepare(&database_url, &replication_url, &fixture.spec(), options)
             .expect("prepare million-row active rebuild");
     let prepare_elapsed = prepare_started.elapsed();
     assert!(
@@ -214,8 +204,8 @@ fn million_row_active_source_rebuild_is_bounded_and_catches_up_exactly() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_continuation
-                 WHERE source_id = 1 AND slot_generation = 3",
+                "SELECT count(*) FROM shiba_internal.graph_continuation
+                 WHERE graph_id = 1 AND slot_generation = 3",
                 &[],
             )
             .expect("query new-generation WAL continuation")

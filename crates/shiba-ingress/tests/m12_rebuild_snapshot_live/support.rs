@@ -20,7 +20,7 @@ pub(crate) fn assert_building(client: &mut Client) {
     let rows = client
         .query(
             "SELECT result_status, value_bigint
-             FROM shiba.operator_result ORDER BY operator_id",
+             FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )
         .expect("query public result visibility");
@@ -33,8 +33,8 @@ pub(crate) fn assert_building(client: &mut Client) {
 pub(crate) fn assert_active(client: &mut Client, count: i64, sum: i64) {
     let rows = client
         .query(
-            "SELECT operator_id, result_status, value_bigint
-             FROM shiba.operator_result ORDER BY operator_id",
+            "SELECT result_id, result_status, value_bigint
+             FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )
         .expect("query active public results");
@@ -47,9 +47,9 @@ pub(crate) fn assert_active(client: &mut Client, count: i64, sum: i64) {
             ))
             .collect::<Vec<_>>(),
         vec![
-            (1, "active".to_owned(), Some(count)),
-            (2, "active".to_owned(), Some(sum)),
-            (3, "active".to_owned(), None),
+            (2, "active".to_owned(), Some(count)),
+            (4, "active".to_owned(), Some(sum)),
+            (6, "active".to_owned(), None),
         ]
     );
 }
@@ -74,7 +74,7 @@ pub(crate) fn assert_oracle(client: &mut Client, count: i64, sum: i64) {
     let actual = client
         .query(
             "SELECT result_key_bigint, result_value_bigint
-             FROM shiba.operator_result_rows WHERE operator_id = 3 ORDER BY 1",
+             FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 6 ORDER BY 1",
             &[],
         )
         .expect("query rebuilt ProjectRows")
@@ -92,18 +92,16 @@ pub(crate) fn catalog_identity(client: &mut Client) -> Vec<Vec<String>> {
              FROM shiba_internal.source_binding ORDER BY binding_kind, address_objsubid
          ) x",
         "SELECT row_to_json(x)::text FROM (
-             SELECT * FROM shiba_internal.source_ingress_config ORDER BY source_id
+             SELECT * FROM shiba_internal.graph_ingress_config ORDER BY graph_id
          ) x",
         "SELECT row_to_json(x)::text FROM (
-             SELECT operator_id, source_id, compiler_version, plan_format_version,
-                    encode(plan_digest, 'hex') AS plan_digest,
-                    state_codec_version, output_shape, output_value_type,
-                    output_key_type, output_value_nullable
-             FROM shiba_internal.operator_definition ORDER BY operator_id
+             SELECT graph_id, source_count, compiler_version, graph_format_version,
+                    encode(graph_digest, 'hex') AS graph_digest, state_codec_version
+             FROM shiba_internal.graph_definition ORDER BY graph_id
          ) x",
         "SELECT row_to_json(x)::text FROM (
-             SELECT source_id, bootstrap_id, slot_name, slot_generation
-             FROM shiba_internal.source_bootstrap ORDER BY source_id
+             SELECT graph_id, bootstrap_id, slot_name, slot_generation
+             FROM shiba_internal.graph_bootstrap ORDER BY graph_id
          ) x",
     ]
     .into_iter()
@@ -121,13 +119,13 @@ pub(crate) fn catalog_identity(client: &mut Client) -> Vec<Vec<String>> {
 pub(crate) fn rebuild_state_snapshot(client: &mut Client) -> Vec<Vec<String>> {
     [
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_binding ORDER BY binding_kind, address_objsubid) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_ingress_config ORDER BY source_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_bootstrap ORDER BY source_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_ingress_config ORDER BY graph_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_bootstrap ORDER BY graph_id) x",
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_row_state ORDER BY source_row_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.operator_definition ORDER BY operator_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.operator_state ORDER BY operator_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.operator_result ORDER BY operator_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_continuation ORDER BY slot_generation, commit_lsn) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_definition ORDER BY graph_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_node_state ORDER BY graph_id, node_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.graph_result ORDER BY graph_id, result_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_continuation ORDER BY slot_generation, commit_lsn) x",
         "SELECT row_to_json(x)::text FROM (
              SELECT slot_name, slot_type, plugin, database, temporary, active,
                     two_phase, failover, synced, restart_lsn::text,
@@ -165,8 +163,8 @@ pub(crate) fn source_rows(client: &mut Client) -> Vec<(i64, Option<i64>)> {
 pub(crate) fn continuation_generations(client: &mut Client) -> Vec<i64> {
     client
         .query(
-            "SELECT slot_generation FROM shiba_internal.source_continuation
-             WHERE source_id = 1 ORDER BY commit_lsn",
+            "SELECT slot_generation FROM shiba_internal.graph_continuation
+             WHERE graph_id = 1 ORDER BY commit_lsn",
             &[],
         )
         .expect("query WAL-only continuation")

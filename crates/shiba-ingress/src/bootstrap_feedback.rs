@@ -24,14 +24,13 @@ impl BootstrapCatchupSession {
             .pending_fence
             .take()
             .ok_or(IngressError::FeedbackMismatch)?;
-        if token.source_id() != self.spec.source_id
-            || token.bootstrap_id() != self.spec.bootstrap_id
+        if token.graph_id() != self.spec.graph_id || token.bootstrap_id() != self.spec.bootstrap_id
         {
             return Err(IngressError::FeedbackMismatch);
         }
         activate_bootstrap(
             &mut self.apply,
-            self.spec.source_id,
+            self.spec.graph_id,
             self.spec.bootstrap_id,
             token.message_lsn(),
             token.end_lsn(),

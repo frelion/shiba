@@ -4,8 +4,8 @@ use std::{
     time::Duration,
 };
 
-use shiba_ingress::{AttachOptions, GovernedSourceSession, PreparedRebuild, ReplicationMode};
-use shiba_protocol::{SlotGeneration, SourceId};
+use shiba_ingress::{AttachOptions, GovernedGraphSession, PreparedRebuild, ReplicationMode};
+use shiba_protocol::{GraphId, SlotGeneration};
 
 #[path = "m12_rebuild_admission/support.rs"]
 mod support;
@@ -29,8 +29,8 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
     let active_before = full_authority_snapshot(&mut admin);
     let active_result = admin
         .query(
-            "SELECT operator_id, result_status, value_bigint
-             FROM shiba.operator_result ORDER BY operator_id",
+            "SELECT result_id, result_status, value_bigint
+             FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )
         .expect("read active public result");
@@ -42,7 +42,7 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         PreparedRebuild::prepare(
             &database_url,
             &replication_url,
-            fixture.spec_with(fixture.old, fixture.bad_target, 1, 2, 3),
+            &fixture.spec_with(fixture.old, fixture.bad_target, 1, 2, 3),
             options(),
         )
         .is_err(),
@@ -58,7 +58,7 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
     grant_prepare(&mut admin, "shiba_m12_denied");
     let denied_url = format!("{database_url} user=shiba_m12_denied");
     assert!(
-        PreparedRebuild::prepare(&denied_url, &replication_url, fixture.spec(), options(),)
+        PreparedRebuild::prepare(&denied_url, &replication_url, &fixture.spec(), options(),)
             .is_err(),
         "session user without target SELECT must fail before mutation"
     );
@@ -68,7 +68,7 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         PreparedRebuild::prepare(
             &database_url,
             &replication_url,
-            fixture.spec_with(fixture.old, fixture.target, 99, 2, 3),
+            &fixture.spec_with(fixture.old, fixture.target, 99, 2, 3),
             options(),
         )
         .is_err(),
@@ -79,7 +79,7 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         PreparedRebuild::prepare(
             &database_url,
             &replication_url,
-            fixture.spec_with(fixture.old, fixture.target, 1, 2, 4),
+            &fixture.spec_with(fixture.old, fixture.target, 1, 2, 4),
             options(),
         )
         .is_err(),
@@ -87,10 +87,10 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
     );
     assert_eq!(full_authority_snapshot(&mut admin), active_before);
 
-    let active_receiver = GovernedSourceSession::attach(
+    let active_receiver = GovernedGraphSession::attach(
         &database_url,
         &replication_url,
-        SourceId::new(1).expect("source ID"),
+        GraphId::new(1).expect("graph ID"),
         SlotGeneration::new(2).expect("active old generation"),
         AttachOptions::new(ReplicationMode::Committed, Duration::from_secs(5))
             .expect("attach options"),
@@ -98,7 +98,7 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
     .expect("hold old slot active");
     let while_active = full_authority_snapshot(&mut admin);
     assert!(
-        PreparedRebuild::prepare(&database_url, &replication_url, fixture.spec(), options(),)
+        PreparedRebuild::prepare(&database_url, &replication_url, &fixture.spec(), options(),)
             .is_err(),
         "rebuild must not race an active old receiver"
     );
@@ -114,7 +114,7 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         .expect("preoccupy target slot");
     let preoccupied = full_authority_snapshot(&mut admin);
     assert!(
-        PreparedRebuild::prepare(&database_url, &replication_url, fixture.spec(), options(),)
+        PreparedRebuild::prepare(&database_url, &replication_url, &fixture.spec(), options(),)
             .is_err(),
         "preoccupied target slot must not be adopted"
     );
@@ -133,36 +133,36 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         PreparedRebuild::prepare(
             &database_url,
             &replication_url,
-            fixture.spec_with(foreign_old, fixture.target, 1, 2, 3),
+            &fixture.spec_with(foreign_old, fixture.target, 1, 2, 3),
             options(),
         )
         .is_err(),
         "foreign expected binding must fail exact old identity CAS"
     );
     assert_eq!(full_authority_snapshot(&mut admin), active_before);
-    let plan_digest: Vec<u8> = admin
+    let spec_payload: Vec<u8> = admin
         .query_one(
-            "SELECT plan_digest FROM shiba_internal.operator_definition WHERE operator_id = 3",
+            "SELECT spec_payload FROM shiba_internal.graph_definition WHERE graph_id = 1",
             &[],
         )
         .expect("read exact ProjectRows plan digest")
         .get(0);
     admin
         .execute(
-            "UPDATE shiba_internal.operator_definition
-             SET plan_digest = decode(repeat('00', 32), 'hex') WHERE operator_id = 3",
+            "UPDATE shiba_internal.graph_definition SET spec_payload = decode('00', 'hex')
+             WHERE graph_id = 1",
             &[],
         )
         .expect("inject compiled plan drift");
     assert!(
-        PreparedRebuild::prepare(&database_url, &replication_url, fixture.spec(), options())
+        PreparedRebuild::prepare(&database_url, &replication_url, &fixture.spec(), options())
             .is_err(),
         "corrupt generic plan must fail before destructive prepare"
     );
     admin
         .execute(
-            "UPDATE shiba_internal.operator_definition SET plan_digest = $1 WHERE operator_id = 3",
-            &[&plan_digest],
+            "UPDATE shiba_internal.graph_definition SET spec_payload = $1 WHERE graph_id = 1",
+            &[&spec_payload],
         )
         .expect("restore exact ProjectRows plan digest");
     assert_eq!(full_authority_snapshot(&mut admin), active_before);
@@ -174,7 +174,7 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         .query_one(
             "SELECT
                 (SELECT count(*) FROM shiba_internal.source_invalidation WHERE source_id = 1),
-                (SELECT count(*) FROM shiba_internal.source_ingress_invalidation WHERE source_id = 1)",
+                (SELECT count(*) FROM shiba_internal.graph_ingress_invalidation WHERE graph_id = 1)",
             &[],
         )
         .expect("read old-generation invalidation");
@@ -190,10 +190,10 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         let spec = fixture.spec();
         workers.push(thread::spawn(move || {
             barrier.wait();
-            let result = PreparedRebuild::prepare(&apply, &replication, spec, options());
+            let result = PreparedRebuild::prepare(&apply, &replication, &spec, options());
             match result {
                 Ok(prepared) => {
-                    assert_eq!(prepared.source_id(), SourceId::new(1).expect("source ID"));
+                    assert_eq!(prepared.graph_id(), GraphId::new(1).expect("graph ID"));
                     assert_eq!(prepared.target_generation().get(), 3);
                     assert_eq!(prepared.target_bootstrap_id().get(), 2);
                     prepared.detach().expect("detach prepared admission");
@@ -229,9 +229,9 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
                     bootstrap.retired_bootstrap_id,
                     bootstrap.retired_slot_name::text,
                     bootstrap.retired_slot_generation
-             FROM shiba_internal.source_ingress_config AS config
-             JOIN shiba_internal.source_bootstrap AS bootstrap USING (source_id)
-             WHERE config.source_id = 1",
+             FROM shiba_internal.graph_ingress_config AS config
+             JOIN shiba_internal.graph_bootstrap AS bootstrap USING (graph_id)
+             WHERE config.graph_id = 1",
             &[&i64::from(fixture.target.relation)],
         )
         .expect("read sole target building authority");
@@ -278,9 +278,9 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         .query_one(
             "SELECT
                 (SELECT count(*) FROM shiba_internal.source_row_state WHERE source_id = 1),
-                (SELECT count(*) FROM shiba_internal.source_continuation WHERE source_id = 1),
+                (SELECT count(*) FROM shiba_internal.graph_continuation WHERE graph_id = 1),
                 (SELECT count(*) FROM shiba_internal.source_invalidation WHERE source_id = 1),
-                (SELECT count(*) FROM shiba_internal.source_ingress_invalidation WHERE source_id = 1)",
+                (SELECT count(*) FROM shiba_internal.graph_ingress_invalidation WHERE graph_id = 1)",
             &[],
         )
         .expect("prove old generation retirement");
@@ -291,18 +291,19 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
         admin
             .query(
                 "SELECT encode(state_payload, 'hex')
-                 FROM shiba_internal.operator_state ORDER BY operator_id",
+                 FROM shiba_internal.graph_node_state WHERE graph_id = 1 ORDER BY node_id",
                 &[],
             )
             .expect("read reset private state")
             .into_iter()
             .map(|row| row.get::<_, String>(0))
             .collect::<Vec<_>>(),
-        vec!["0000000000000000", "0000000000000000", ""]
+        Vec::<String>::new()
     );
     let results = admin
         .query(
-            "SELECT result_status, value_bigint FROM shiba.operator_result ORDER BY operator_id",
+            "SELECT result_status, value_bigint FROM shiba.graph_result
+             WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )
         .expect("read hidden public results");
@@ -328,10 +329,10 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
     assert!(!old_slot.get::<_, bool>(0));
 
     assert!(
-        GovernedSourceSession::attach(
+        GovernedGraphSession::attach(
             &database_url,
             &replication_url,
-            SourceId::new(1).expect("source ID"),
+            GraphId::new(1).expect("graph ID"),
             SlotGeneration::new(2).expect("retired generation"),
             AttachOptions::new(ReplicationMode::Committed, Duration::from_secs(5))
                 .expect("attach options"),

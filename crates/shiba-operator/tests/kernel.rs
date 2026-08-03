@@ -1,232 +1,207 @@
-use core::num::NonZeroU64;
-use std::collections::BTreeMap;
+use core::num::NonZeroU32;
 
 use shiba_operator::{
-    ColumnBinding, CompiledPlan, DeltaBatch, EffectOrigin, EncodedOperatorState, InputBinding,
-    InputRole, KernelError, ObjectAddress, OperatorId, OutputContract, OutputDelta,
-    PlanImplementation, RowDelta, StateSnapshot, TypedRow, TypedValue, ValueType, apply_plan,
-    decode_state, initial_state, source_typed_layout,
+    ColumnBinding, DeltaBatch, EffectOrigin, Expression, GraphEffectOrigin, MultiInputBatch,
+    NodeId, NodeInput, ObjectAddress, OperatorGraph, OperatorNode, OperatorNodeKind,
+    OutputContract, ResultDelta, RowDelta, SourceDeltaBatch, SourcePort, StateContract, StateEntry,
+    StateSnapshot, TypedRow, TypedValue, ValueType, apply_graph_plan, graph_state_read_set,
+    source_typed_layout,
 };
-use shiba_protocol::{
-    IngressTransactionId, PostgresLsn, SlotGeneration, SourceId, SourceTransactionId,
-};
+use shiba_protocol::{BootstrapBatchId, BootstrapId, GraphId, SourceId};
 
-fn address(sub_id: i32) -> ObjectAddress {
-    ObjectAddress {
-        class_id: 1_259,
-        object_id: 16_384,
-        sub_id,
-    }
+fn node(value: u32) -> NodeId {
+    NodeId::new(NonZeroU32::new(value).unwrap())
 }
 
-fn source_id() -> SourceId {
-    SourceId::new(1).unwrap()
-}
-
-fn plan(id: u64, implementation: PlanImplementation) -> CompiledPlan {
-    let inputs = match &implementation {
-        PlanImplementation::CountRows => Vec::new(),
-        PlanImplementation::SumInt8 { input, .. } => vec![InputBinding {
-            role: InputRole::Payload,
-            address: *input,
-        }],
-        PlanImplementation::Graph { .. } => unreachable!("graph tests own graph plans"),
+fn graph() -> OperatorGraph {
+    let source_id = SourceId::new(1).unwrap();
+    let scalar = OutputContract::Scalar {
+        value_type: ValueType::Int8,
     };
-    CompiledPlan::build(
-        OperatorId::new(NonZeroU64::new(id).unwrap()),
-        source_id(),
-        inputs,
-        OutputContract::Scalar {
-            value_type: ValueType::Int8,
-        },
-        implementation,
-    )
-    .unwrap()
-}
-
-fn origin() -> EffectOrigin {
-    EffectOrigin::Wal(
-        SourceTransactionId::new(
-            source_id(),
-            SlotGeneration::new(1).unwrap(),
-            PostgresLsn::from_u64(1),
-            IngressTransactionId::new(1).unwrap(),
-        )
-        .unwrap(),
-    )
-}
-
-fn layout() -> shiba_operator::TypedLayout {
-    source_typed_layout(
-        source_id(),
-        &[
-            ColumnBinding {
-                address: address(1),
-                value_type: ValueType::Int8,
-            },
-            ColumnBinding {
-                address: address(2),
-                value_type: ValueType::Int8,
-            },
-        ],
-    )
-    .unwrap()
-}
-
-fn row(key: i64, payload: Option<i64>) -> TypedRow {
-    let layout = layout();
-    TypedRow::new(
-        &layout,
-        vec![
-            TypedValue::Int8(key),
-            payload.map_or(TypedValue::Null(ValueType::Int8), TypedValue::Int8),
-        ],
-    )
-    .unwrap()
-}
-
-fn batch(delta: RowDelta) -> DeltaBatch {
-    DeltaBatch {
-        origin: origin(),
-        layout_identity: layout().identity,
-        rows: vec![delta],
-    }
-}
-
-fn scalar(plan: &CompiledPlan, state: &EncodedOperatorState, batch: &DeltaBatch) -> i64 {
-    let transition = apply_plan(plan, state, &empty_snapshot(), batch).unwrap();
-    let OutputDelta::ScalarReplacement {
-        value: TypedValue::Int8(value),
-    } = transition.output_delta
-    else {
-        panic!("expected int8 scalar")
+    let keyed = OutputContract::KeyedRows {
+        key_type: ValueType::Int8,
+        key_nullable: false,
+        value_type: ValueType::Int8,
+        nullable: true,
     };
-    value
-}
-
-fn empty_snapshot() -> StateSnapshot {
-    StateSnapshot {
-        entries: Vec::new(),
-    }
-}
-
-#[test]
-fn count_and_sum_use_one_typed_batch_and_checked_state() {
-    let count = plan(1, PlanImplementation::CountRows);
-    let sum = plan(
-        2,
-        PlanImplementation::SumInt8 {
-            input: address(2),
-            input_slot: 1,
-        },
-    );
-    let input = batch(RowDelta {
-        before: None,
-        after: Some(row(1, Some(10))),
-    });
-    assert_eq!(scalar(&count, &initial_state(&count).unwrap(), &input), 1);
-    assert_eq!(scalar(&sum, &initial_state(&sum).unwrap(), &input), 10);
-    let max = EncodedOperatorState {
-        codec_version: 1,
-        payload: i64::MAX.to_be_bytes().to_vec(),
-    };
-    assert_eq!(
-        apply_plan(&sum, &max, &empty_snapshot(), &input),
-        Err(KernelError::Overflow)
-    );
-}
-
-#[test]
-fn corrupt_scalar_plan_state_and_absent_input_fail_closed() {
-    let count = plan(1, PlanImplementation::CountRows);
-    let mut corrupt = count.clone();
-    corrupt.digest[0] ^= 1;
-    assert_eq!(initial_state(&corrupt), Err(KernelError::InvalidPlan));
-    let bad_state = EncodedOperatorState {
-        codec_version: 1,
-        payload: vec![0],
-    };
-    assert_eq!(
-        decode_state(&count, &bad_state),
-        Err(KernelError::InvalidState)
-    );
-
-    let sum = plan(
-        2,
-        PlanImplementation::SumInt8 {
-            input: address(2),
-            input_slot: 1,
-        },
-    );
-    let typed_layout = layout();
-    let absent =
-        TypedRow::new(&typed_layout, vec![TypedValue::Int8(1), TypedValue::Absent]).unwrap();
-    assert_eq!(
-        apply_plan(
-            &sum,
-            &initial_state(&sum).unwrap(),
-            &empty_snapshot(),
-            &batch(RowDelta {
-                before: None,
-                after: Some(absent),
+    OperatorGraph::build(
+        GraphId::new(7).unwrap(),
+        vec![SourcePort {
+            source_id,
+            layout: vec![binding(1), binding(2)],
+            identity_index: Some(ObjectAddress {
+                class_id: 1_259,
+                object_id: 11_000,
+                sub_id: 0,
             }),
-        ),
-        Err(KernelError::AbsentInput)
-    );
+        }],
+        vec![
+            stateful(1, source_id, OperatorNodeKind::CountRows),
+            terminal(2, 1, scalar.clone(), 0, 0),
+            stateful(3, source_id, OperatorNodeKind::SumInt8 { input_slot: 1 }),
+            terminal(4, 3, scalar, 0, 0),
+            OperatorNode {
+                node_id: node(5),
+                input: NodeInput::SourcePort(source_id),
+                state_contract: None,
+                kind: OperatorNodeKind::Project {
+                    expressions: vec![
+                        Expression::Column { slot: 0 },
+                        Expression::Column { slot: 1 },
+                    ],
+                },
+            },
+            terminal(6, 5, keyed.clone(), 0, 1),
+            OperatorNode {
+                node_id: node(7),
+                input: NodeInput::SourcePort(source_id),
+                state_contract: None,
+                kind: OperatorNodeKind::KeyBy {
+                    key: Expression::Column { slot: 0 },
+                },
+            },
+            OperatorNode {
+                node_id: node(8),
+                input: NodeInput::Node(node(7)),
+                state_contract: Some(StateContract { codec_version: 1 }),
+                kind: OperatorNodeKind::GroupedCount { key_slot: 2 },
+            },
+            terminal(9, 8, keyed.clone(), 0, 1),
+            OperatorNode {
+                node_id: node(10),
+                input: NodeInput::SourcePort(source_id),
+                state_contract: None,
+                kind: OperatorNodeKind::KeyBy {
+                    key: Expression::Column { slot: 0 },
+                },
+            },
+            OperatorNode {
+                node_id: node(11),
+                input: NodeInput::Node(node(10)),
+                state_contract: Some(StateContract { codec_version: 1 }),
+                kind: OperatorNodeKind::GroupedSumInt8 {
+                    key_slot: 2,
+                    value_slot: 1,
+                },
+            },
+            terminal(12, 11, keyed, 0, 1),
+        ],
+    )
+    .unwrap()
+}
+
+fn binding(sub_id: i32) -> ColumnBinding {
+    ColumnBinding {
+        address: ObjectAddress {
+            class_id: 1_259,
+            object_id: 10_000,
+            sub_id,
+        },
+        value_type: ValueType::Int8,
+    }
+}
+
+fn stateful(id: u32, source_id: SourceId, kind: OperatorNodeKind) -> OperatorNode {
+    OperatorNode {
+        node_id: node(id),
+        input: NodeInput::SourcePort(source_id),
+        state_contract: Some(StateContract { codec_version: 1 }),
+        kind,
+    }
+}
+
+fn terminal(
+    id: u32,
+    input: u32,
+    output: OutputContract,
+    key_slot: u16,
+    value_slot: u16,
+) -> OperatorNode {
+    OperatorNode {
+        node_id: node(id),
+        input: NodeInput::Node(node(input)),
+        state_contract: None,
+        kind: OperatorNodeKind::Materialize {
+            key_slot,
+            value_slot,
+            output,
+        },
+    }
+}
+
+fn input(graph: &OperatorGraph) -> MultiInputBatch {
+    let source_id = graph.sources[0].source_id;
+    let layout = source_typed_layout(source_id, &graph.sources[0].layout).unwrap();
+    let batch_id = BootstrapBatchId::new(BootstrapId::new(2).unwrap(), 1).unwrap();
+    let row = |id, value| TypedRow::new(&layout, vec![TypedValue::Int8(id), value]).unwrap();
+    MultiInputBatch {
+        origin: GraphEffectOrigin::Bootstrap(batch_id),
+        sources: vec![SourceDeltaBatch {
+            source_id,
+            delta: DeltaBatch {
+                origin: EffectOrigin::Bootstrap(batch_id),
+                layout_identity: layout.identity,
+                rows: vec![
+                    RowDelta {
+                        before: None,
+                        after: Some(row(1, TypedValue::Int8(10))),
+                    },
+                    RowDelta {
+                        before: None,
+                        after: Some(row(2, TypedValue::Null(ValueType::Int8))),
+                    },
+                ],
+            },
+        }],
+    }
 }
 
 #[test]
-fn deterministic_random_sequence_matches_count_and_sum_models() {
-    let count = plan(1, PlanImplementation::CountRows);
-    let sum = plan(
-        2,
-        PlanImplementation::SumInt8 {
-            input: address(2),
-            input_slot: 1,
-        },
+fn multiple_terminals_share_one_batch_and_generic_state() {
+    let graph = graph();
+    let input = input(&graph);
+    let read_set = graph_state_read_set(&graph, &input).unwrap();
+    assert_eq!(read_set.keys.len(), 6);
+    let snapshot = StateSnapshot::new(
+        &read_set,
+        read_set
+            .keys
+            .iter()
+            .map(|key| StateEntry {
+                key: key.clone(),
+                state: None,
+            })
+            .collect(),
+    )
+    .unwrap();
+    let transition = apply_graph_plan(&graph, &snapshot, &input).unwrap();
+    assert_eq!(transition.state_deltas.len(), 6);
+    assert_eq!(transition.results.len(), 5);
+    assert_eq!(
+        transition.results[0],
+        ResultDelta::Scalar {
+            node_id: node(2),
+            value: TypedValue::Int8(2)
+        }
     );
-    let mut count_state = initial_state(&count).unwrap();
-    let mut sum_state = initial_state(&sum).unwrap();
-    let mut rows = BTreeMap::<i64, Option<i64>>::new();
-    let mut seed = 0x5eed_u64;
-    for _ in 0..1_000 {
-        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-        let key = i64::try_from(seed % 32).unwrap();
-        let before = rows.get(&key).copied();
-        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-        let after = match seed % 3 {
-            0 => None,
-            1 => Some(None),
-            _ => Some(Some(i64::try_from((seed >> 8) % 101).unwrap() - 50)),
-        };
-        if before.is_none() && after.is_none() {
-            continue;
+    assert_eq!(
+        transition.results[1],
+        ResultDelta::Scalar {
+            node_id: node(4),
+            value: TypedValue::Int8(10)
         }
-        let input = batch(RowDelta {
-            before: before.map(|value| row(key, value)),
-            after: after.map(|value| row(key, value)),
-        });
-        count_state = apply_plan(&count, &count_state, &empty_snapshot(), &input)
-            .unwrap()
-            .next_state;
-        sum_state = apply_plan(&sum, &sum_state, &empty_snapshot(), &input)
-            .unwrap()
-            .next_state;
-        match after {
-            Some(value) => {
-                rows.insert(key, value);
-            }
-            None => {
-                rows.remove(&key);
-            }
-        }
-        assert_eq!(
-            decode_state(&count, &count_state).unwrap(),
-            i64::try_from(rows.len()).unwrap()
-        );
-        assert_eq!(
-            decode_state(&sum, &sum_state).unwrap(),
-            rows.values().flatten().sum::<i64>()
-        );
-    }
+    );
+    assert!(matches!(
+        transition.results[2],
+        ResultDelta::Keyed { node_id, ref mutations } if node_id == node(6) && mutations.len() == 2
+    ));
+}
+
+#[test]
+fn typed_state_partition_values_require_exact_canonical_json() {
+    let value = TypedValue::Null(ValueType::Int8);
+    let encoded = value.to_canonical_json().unwrap();
+    assert_eq!(TypedValue::from_canonical_json(&encoded).unwrap(), value);
+    assert!(TypedValue::from_canonical_json(b"{ \"type\":\"int8\",\"value\":1}").is_err());
+    assert!(TypedValue::from_canonical_json(br#"{"type":"absent"}"#).is_err());
 }

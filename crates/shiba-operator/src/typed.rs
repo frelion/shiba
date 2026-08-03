@@ -55,6 +55,22 @@ impl TypedValue {
         serde_json::to_vec(self).map_err(|_| TypedError::Codec)
     }
 
+    /// Decodes one exact persistent typed value from canonical JSON.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, noncanonical, absent, oversized, or trailing input.
+    pub fn from_canonical_json(input: &[u8]) -> Result<Self, TypedError> {
+        let value: Self = serde_json::from_slice(input).map_err(|_| TypedError::Codec)?;
+        if matches!(value, Self::Absent)
+            || matches!(&value, Self::Text(text) if text.len() > MAX_TEXT_BYTES)
+            || value.to_canonical_json()? != input
+        {
+            return Err(TypedError::Codec);
+        }
+        Ok(value)
+    }
+
     pub(crate) fn validate(&self, expected: ValueType) -> Result<(), TypedError> {
         if matches!(self, Self::Absent) {
             return Ok(());

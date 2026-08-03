@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 
 use shiba_operator::{
     ColumnBinding, DeltaBatch, EffectOrigin, EncodedOperatorState, GraphEffectOrigin,
-    KeyedMutation, MultiInputBatch, NodeId, NodeInput, ObjectAddress, OperatorGraph, OperatorNode,
-    OperatorNodeKind, OutputContract, OutputDelta, SourceDeltaBatch, SourcePort, StateContract,
-    StateDelta, StateEntry, StateMutation, StateSnapshot, TypedLayout, TypedRow, TypedValue,
-    ValueType, apply_graph_plan, graph_state_read_set, source_typed_layout,
+    MultiInputBatch, NodeId, NodeInput, ObjectAddress, OperatorGraph, OperatorNode,
+    OperatorNodeKind, OutputContract, ResultDelta, ResultMutation, SourceDeltaBatch, SourcePort,
+    StateContract, StateDelta, StateEntry, StateMutation, StateSnapshot, TypedLayout, TypedRow,
+    TypedValue, ValueType, apply_graph_plan, graph_state_read_set, source_typed_layout,
 };
 use shiba_protocol::{
     GraphId, GraphTransactionId, IngressTransactionId, PostgresLsn, SlotGeneration, SourceId,
@@ -37,7 +37,7 @@ fn graph() -> OperatorGraph {
         value_type: ValueType::Int8,
         nullable: true,
     };
-    OperatorGraph::build_graph(
+    OperatorGraph::build(
         GraphId::new(9).unwrap(),
         vec![
             SourcePort {
@@ -52,7 +52,11 @@ fn graph() -> OperatorGraph {
             SourcePort {
                 source_id: left,
                 layout: vec![binding(20_000, 1), binding(20_000, 2)],
-                identity_index: None,
+                identity_index: Some(ObjectAddress {
+                    class_id: 1_259,
+                    object_id: 21_000,
+                    sub_id: 0,
+                }),
             },
         ],
         vec![
@@ -153,7 +157,7 @@ fn evaluate(
     graph: &OperatorGraph,
     state: &mut BTreeMap<shiba_operator::StateKey, EncodedOperatorState>,
     input: &MultiInputBatch,
-) -> Result<Vec<KeyedMutation>, shiba_operator::KernelError> {
+) -> Result<Vec<ResultMutation>, shiba_operator::KernelError> {
     let read_set = graph_state_read_set(graph, input)?;
     let mut entries = BTreeMap::new();
     for key in &read_set.keys {
@@ -176,11 +180,7 @@ fn evaluate(
             .collect(),
     )
     .unwrap();
-    let scalar = EncodedOperatorState {
-        codec_version: 1,
-        payload: Vec::new(),
-    };
-    let transition = apply_graph_plan(graph, &scalar, &snapshot, input)?;
+    let transition = apply_graph_plan(graph, &snapshot, input)?;
     for delta in transition.state_deltas {
         match delta {
             StateDelta {
@@ -197,21 +197,22 @@ fn evaluate(
             }
         }
     }
-    let OutputDelta::KeyedMutations { mutations } = transition.output_delta else {
+    let ResultDelta::Keyed { mutations, .. } = transition.results.into_iter().next().unwrap()
+    else {
         panic!()
     };
     Ok(mutations)
 }
 
-fn apply_output(output: &mut BTreeMap<i64, Option<i64>>, mutations: Vec<KeyedMutation>) {
+fn apply_output(output: &mut BTreeMap<i64, Option<i64>>, mutations: Vec<ResultMutation>) {
     for mutation in mutations {
         match mutation {
-            KeyedMutation::Delete {
+            ResultMutation::Delete {
                 key: TypedValue::Int8(id),
             } => {
                 output.remove(&id);
             }
-            KeyedMutation::Upsert {
+            ResultMutation::Upsert {
                 key: TypedValue::Int8(id),
                 value,
             } => {
@@ -245,7 +246,7 @@ fn both_sides_share_one_pre_to_final_transition() {
     );
     assert_eq!(
         evaluate(&graph, &mut state, &first).unwrap(),
-        vec![KeyedMutation::Upsert {
+        vec![ResultMutation::Upsert {
             key: TypedValue::Int8(10),
             value: TypedValue::Null(ValueType::Int8)
         }]
@@ -264,7 +265,7 @@ fn both_sides_share_one_pre_to_final_transition() {
     );
     assert_eq!(
         evaluate(&graph, &mut state, &both).unwrap(),
-        vec![KeyedMutation::Upsert {
+        vec![ResultMutation::Upsert {
             key: TypedValue::Int8(10),
             value: TypedValue::Int8(7)
         }]
@@ -280,7 +281,7 @@ fn both_sides_share_one_pre_to_final_transition() {
     );
     assert_eq!(
         evaluate(&graph, &mut state, &right_update).unwrap(),
-        vec![KeyedMutation::Upsert {
+        vec![ResultMutation::Upsert {
             key: TypedValue::Int8(10),
             value: TypedValue::Null(ValueType::Int8)
         }]
@@ -296,7 +297,7 @@ fn both_sides_share_one_pre_to_final_transition() {
     );
     assert_eq!(
         evaluate(&graph, &mut state, &right_delete).unwrap(),
-        vec![KeyedMutation::Delete {
+        vec![ResultMutation::Delete {
             key: TypedValue::Int8(10)
         }]
     );
@@ -426,6 +427,12 @@ fn right_fanout_accepts_twenty_thousand_and_rejects_next() {
 #[test]
 fn corrupt_missing_extra_state_and_graph_digest_fail_closed() {
     let graph = graph();
+    let mut missing_identity = graph.sources.clone();
+    missing_identity[0].identity_index = None;
+    assert!(OperatorGraph::build(graph.graph_id, missing_identity, graph.nodes.clone()).is_err());
+    let mut duplicate_identity = graph.sources.clone();
+    duplicate_identity[1].identity_index = duplicate_identity[0].identity_index;
+    assert!(OperatorGraph::build(graph.graph_id, duplicate_identity, graph.nodes.clone()).is_err());
     let input = batch(
         &graph,
         1,
@@ -439,18 +446,7 @@ fn corrupt_missing_extra_state_and_graph_digest_fail_closed() {
     let empty = StateSnapshot {
         entries: Vec::new(),
     };
-    assert!(
-        apply_graph_plan(
-            &graph,
-            &EncodedOperatorState {
-                codec_version: 1,
-                payload: vec![]
-            },
-            &empty,
-            &input
-        )
-        .is_err()
-    );
+    assert!(apply_graph_plan(&graph, &empty, &input).is_err());
     let mut extra_entries = read_set
         .keys
         .iter()
@@ -482,16 +478,5 @@ fn corrupt_missing_extra_state_and_graph_digest_fail_closed() {
         })
         .collect();
     let snapshot = StateSnapshot::new(&read_set, entries).unwrap();
-    assert!(
-        apply_graph_plan(
-            &graph,
-            &EncodedOperatorState {
-                codec_version: 1,
-                payload: vec![]
-            },
-            &snapshot,
-            &input
-        )
-        .is_err()
-    );
+    assert!(apply_graph_plan(&graph, &snapshot, &input).is_err());
 }

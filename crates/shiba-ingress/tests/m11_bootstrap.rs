@@ -1,22 +1,19 @@
 use std::{
-    num::NonZeroU64,
     thread,
     time::{Duration, Instant},
 };
 
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
 use shiba_ingress::{
     BootstrapCatchupProgress, BootstrapOptions, BootstrapSession, BootstrapSpec, SnapshotProgress,
 };
-use shiba_operator::OperatorId;
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
 use shiba_runtime::{ProcessOutcome, compile_and_register};
 
 #[allow(dead_code)]
 mod support;
 
-use support::{slot_lsn, wait_for_slot_lsn};
+use support::{count_sum_project_spec, slot_lsn, wait_for_slot_lsn};
 
 const SLOT: &str = "shiba_m11_bootstrap_slot";
 const PUBLICATION: &str = "shiba_m11_bootstrap_pub";
@@ -25,20 +22,11 @@ fn required(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("scripts/test-m11-bootstrap.sh must set {name}"))
 }
 
-fn operator_spec(operator_id: u64, operation: OperatorOperationV1) -> OperatorSpecV1 {
-    OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("operator ID")),
-        source_id: SourceId::new(1).expect("source ID"),
-        operation,
-    }
-}
-
 fn public_results(client: &mut Client) -> Vec<(i64, String, Option<i64>)> {
     client
         .query(
-            "SELECT operator_id, result_status, value_bigint
-             FROM shiba.operator_result ORDER BY operator_id",
+            "SELECT result_id, result_status, value_bigint
+             FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )
         .expect("query public results")
@@ -50,9 +38,9 @@ fn public_results(client: &mut Client) -> Vec<(i64, String, Option<i64>)> {
 fn private_state(client: &mut Client) -> Vec<(i64, i64)> {
     client
         .query(
-            "SELECT operator_id, state_payload
-             FROM shiba_internal.operator_state
-             WHERE operator_id IN (1, 2) ORDER BY operator_id",
+            "SELECT node_id, state_payload
+             FROM shiba_internal.graph_node_state
+             WHERE graph_id = 1 AND node_id IN (1, 3) ORDER BY node_id",
             &[],
         )
         .expect("query private operator state")
@@ -61,7 +49,7 @@ fn private_state(client: &mut Client) -> Vec<(i64, i64)> {
             let payload: Vec<u8> = row.get(1);
             (
                 row.get(0),
-                i64::from_be_bytes(payload.try_into().expect("int8 operator state")),
+                i64::from_be_bytes(payload.try_into().expect("int8 node state")),
             )
         })
         .collect()
@@ -71,7 +59,7 @@ fn projected_rows(client: &mut Client) -> Vec<(i64, Option<i64>)> {
     client
         .query(
             "SELECT result_key_bigint, result_value_bigint
-             FROM shiba.operator_result_rows WHERE operator_id = 3 ORDER BY 1",
+             FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 6 ORDER BY 1",
             &[],
         )
         .expect("query active projected rows")
@@ -97,9 +85,9 @@ fn assert_building(client: &mut Client) {
     assert_eq!(
         public_results(client),
         vec![
-            (1, "building".to_owned(), None),
             (2, "building".to_owned(), None),
-            (3, "building".to_owned(), None),
+            (4, "building".to_owned(), None),
+            (6, "building".to_owned(), None),
         ]
     );
 }
@@ -137,38 +125,13 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
              INSERT INTO source.events VALUES (1, 10), (2, NULL), (3, 30);"
         ))
         .expect("install source with existing rows");
-    compile_and_register(
-        &mut admin,
-        &operator_spec(1, OperatorOperationV1::CountRows),
-    )
-    .expect("register CountRows");
-    compile_and_register(
-        &mut admin,
-        &operator_spec(
-            2,
-            OperatorOperationV1::SumInt8 {
-                input_column: "payload".to_owned(),
-            },
-        ),
-    )
-    .expect("register SumInt8");
-    compile_and_register(
-        &mut admin,
-        &operator_spec(
-            3,
-            OperatorOperationV1::MaterializedProject {
-                key_column: "id".to_owned(),
-                value_column: "payload".to_owned(),
-            },
-        ),
-    )
-    .expect("register ProjectRows");
+    compile_and_register(&mut admin, &count_sum_project_spec(1)).expect("register graph");
     assert_eq!(
         public_results(&mut admin),
         vec![
-            (1, "active".to_owned(), Some(0)),
             (2, "active".to_owned(), Some(0)),
-            (3, "active".to_owned(), None),
+            (4, "active".to_owned(), Some(0)),
+            (6, "active".to_owned(), None),
         ]
     );
     assert_eq!(
@@ -190,7 +153,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         .expect("read publication OID")
         .get(0);
     let spec = BootstrapSpec {
-        source_id: SourceId::new(1).expect("source ID"),
+        graph_id: GraphId::new(1).expect("graph ID"),
         bootstrap_id: BootstrapId::new(1).expect("bootstrap ID"),
         publication_oid,
         slot_name: SLOT.to_owned(),
@@ -202,7 +165,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         .expect("begin exported-snapshot bootstrap");
     assert_building(&mut admin);
     assert!(projected_rows(&mut admin).is_empty());
-    assert_eq!(private_state(&mut admin), vec![(1, 0), (2, 0)]);
+    assert!(private_state(&mut admin).is_empty());
     assert_eq!(source_rows(&mut admin), Vec::<(i64, Option<i64>)>::new());
 
     admin
@@ -224,12 +187,12 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     );
     assert_building(&mut admin);
     assert!(projected_rows(&mut admin).is_empty());
-    assert_eq!(private_state(&mut admin), vec![(1, 2), (2, 10)]);
+    assert_eq!(private_state(&mut admin), vec![(1, 2), (3, 10)]);
     assert_eq!(source_rows(&mut admin), vec![(1, Some(10)), (2, None)]);
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_continuation",
+                "SELECT count(*) FROM shiba_internal.graph_continuation",
                 &[]
             )
             .expect("snapshot must not create continuation")
@@ -246,7 +209,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     );
     assert_building(&mut admin);
     assert!(projected_rows(&mut admin).is_empty());
-    assert_eq!(private_state(&mut admin), vec![(1, 3), (2, 40)]);
+    assert_eq!(private_state(&mut admin), vec![(1, 3), (3, 40)]);
     assert_eq!(
         source_rows(&mut admin),
         vec![(1, Some(10)), (2, None), (3, Some(30))]
@@ -264,7 +227,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         BootstrapCatchupProgress::TransactionApplied
     );
     assert_building(&mut admin);
-    assert_eq!(private_state(&mut admin), vec![(1, 3), (2, 25)]);
+    assert_eq!(private_state(&mut admin), vec![(1, 3), (3, 25)]);
     assert_eq!(
         source_rows(&mut admin),
         vec![(1, Some(20)), (2, None), (4, Some(5))]
@@ -272,7 +235,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_continuation",
+                "SELECT count(*) FROM shiba_internal.graph_continuation",
                 &[]
             )
             .expect("query real WAL continuation")
@@ -287,9 +250,9 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     assert_eq!(
         public_results(&mut admin),
         vec![
-            (1, "active".to_owned(), Some(3)),
-            (2, "active".to_owned(), Some(25)),
-            (3, "active".to_owned(), None),
+            (2, "active".to_owned(), Some(3)),
+            (4, "active".to_owned(), Some(25)),
+            (6, "active".to_owned(), None),
         ]
     );
     assert_eq!(projected_rows(&mut admin), source_rows(&mut admin));
@@ -302,8 +265,8 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     assert_eq!((oracle.get::<_, i64>(0), oracle.get::<_, i64>(1)), (3, 25));
     let fence_lsn: String = admin
         .query_one(
-            "SELECT catchup_fence_lsn::text FROM shiba_internal.source_bootstrap
-             WHERE source_id = 1",
+            "SELECT catchup_fence_lsn::text FROM shiba_internal.graph_bootstrap
+             WHERE graph_id = 1",
             &[],
         )
         .expect("read immutable catch-up fence")
@@ -329,13 +292,13 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     assert_eq!(
         public_results(&mut admin),
         vec![
-            (1, "active".to_owned(), Some(4)),
-            (2, "active".to_owned(), Some(32)),
-            (3, "active".to_owned(), None),
+            (2, "active".to_owned(), Some(4)),
+            (4, "active".to_owned(), Some(32)),
+            (6, "active".to_owned(), None),
         ]
     );
     assert_eq!(projected_rows(&mut admin), source_rows(&mut admin));
-    assert_eq!(private_state(&mut admin), vec![(1, 4), (2, 32)]);
+    assert_eq!(private_state(&mut admin), vec![(1, 4), (3, 32)]);
     assert_eq!(
         source_rows(&mut admin),
         vec![(1, Some(20)), (2, None), (4, Some(5)), (5, Some(7))]
@@ -343,7 +306,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_continuation",
+                "SELECT count(*) FROM shiba_internal.graph_continuation",
                 &[]
             )
             .expect("query WAL-only continuations")

@@ -3,9 +3,8 @@ use crate::join_transition::{
     affected_ids, apply_left, apply_right, decode_snapshot, index_left, joined_row, state_deltas,
 };
 use crate::{
-    EncodedOperatorState, KernelError, KeyedMutation, MultiInputBatch, OperatorGraph,
-    OperatorTransition, OutputDelta, StateKey, StatePartition, StateReadSet, StateSnapshot,
-    TypedRow, TypedValue, ValueType,
+    GraphTransition, KernelError, MultiInputBatch, OperatorGraph, StateKey, StatePartition,
+    StateReadSet, StateSnapshot, TypedRow, TypedValue, ValueType,
 };
 
 pub(crate) const LEFT_NAMESPACE: u16 = 20;
@@ -45,16 +44,12 @@ pub(crate) fn state_read_set(
 
 pub(crate) fn apply(
     graph: &OperatorGraph,
-    scalar_state: &EncodedOperatorState,
     snapshot: &StateSnapshot,
     batch: &MultiInputBatch,
-) -> Result<Option<OperatorTransition>, KernelError> {
+) -> Result<Option<GraphTransition>, KernelError> {
     let Some(spec) = join_spec(graph)? else {
         return Ok(None);
     };
-    if scalar_state.codec_version != 1 || !scalar_state.payload.is_empty() {
-        return Err(KernelError::InvalidState);
-    }
     let read_set = state_read_set(graph, batch)?.ok_or(KernelError::InvalidGraph)?;
     snapshot
         .validate_exact(&read_set)
@@ -94,21 +89,9 @@ pub(crate) fn apply(
         spec.value_nullable,
     )
     .map_err(|_| KernelError::InvalidTransition)?;
-    let crate::ResultDelta::Keyed { mutations, .. } = result;
-    Ok(Some(OperatorTransition {
-        next_state: scalar_state.clone(),
+    Ok(Some(GraphTransition {
         state_deltas,
-        output_delta: OutputDelta::KeyedMutations {
-            mutations: mutations
-                .into_iter()
-                .map(|mutation| match mutation {
-                    crate::ResultMutation::Delete { key } => KeyedMutation::Delete { key },
-                    crate::ResultMutation::Upsert { key, value } => {
-                        KeyedMutation::Upsert { key, value }
-                    }
-                })
-                .collect(),
-        },
+        results: vec![result],
     }))
 }
 

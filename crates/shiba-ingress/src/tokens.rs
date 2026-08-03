@@ -1,17 +1,17 @@
-use shiba_protocol::{BootstrapId, SourceId};
-use shiba_runtime::{ProcessOutcome, SourceTransaction};
+use shiba_protocol::{BootstrapId, GraphId};
+use shiba_runtime::{GraphTransaction, ProcessOutcome};
 
 /// A decoded committed input held before Runtime Apply.
 #[derive(Debug)]
 pub struct ReceivedInput {
-    transaction: SourceTransaction,
+    transaction: GraphTransaction,
     end_lsn: u64,
     authorization: u64,
 }
 
 impl ReceivedInput {
     pub(crate) const fn new(
-        transaction: SourceTransaction,
+        transaction: GraphTransaction,
         end_lsn: u64,
         authorization: u64,
     ) -> Self {
@@ -22,12 +22,12 @@ impl ReceivedInput {
         }
     }
 
-    pub(crate) const fn raw_transaction(&self) -> &SourceTransaction {
+    pub(crate) const fn raw_transaction(&self) -> &GraphTransaction {
         &self.transaction
     }
 
     #[must_use]
-    pub const fn transaction(&self) -> &SourceTransaction {
+    pub const fn transaction(&self) -> &GraphTransaction {
         &self.transaction
     }
 
@@ -93,7 +93,7 @@ pub struct EmptyCommitted {
 /// Exact attempt-bound terminal fence awaiting durable activation.
 #[derive(Debug)]
 pub struct BootstrapFence {
-    source_id: SourceId,
+    graph_id: GraphId,
     bootstrap_id: BootstrapId,
     message_lsn: u64,
     end_lsn: u64,
@@ -102,14 +102,14 @@ pub struct BootstrapFence {
 
 impl BootstrapFence {
     pub(crate) const fn new(
-        source_id: SourceId,
+        graph_id: GraphId,
         bootstrap_id: BootstrapId,
         message_lsn: u64,
         end_lsn: u64,
         authorization: u64,
     ) -> Self {
         Self {
-            source_id,
+            graph_id,
             bootstrap_id,
             message_lsn,
             end_lsn,
@@ -122,8 +122,8 @@ impl BootstrapFence {
     }
 
     #[must_use]
-    pub const fn source_id(&self) -> SourceId {
-        self.source_id
+    pub const fn graph_id(&self) -> GraphId {
+        self.graph_id
     }
 
     #[must_use]

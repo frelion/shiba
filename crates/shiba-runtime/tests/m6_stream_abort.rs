@@ -52,10 +52,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -250,7 +250,7 @@ fn m6_real_stream_abort_never_applies_then_slot_commits() {
     receiver.stop();
     let abort_wire = strip_streamed_delimiters(&raw_abort);
     assert_abort_shape(&abort_wire);
-    assert!(decode_streamed_changes(&abort_wire, source).is_err());
+    assert!(decode_streamed_changes(&abort_wire, &support::singleton_graph(1, source)).is_err());
     assert_eq!(durable_state(&mut client), (0, 0, 0, 0));
 
     client
@@ -262,7 +262,8 @@ fn m6_real_stream_abort_never_applies_then_slot_commits() {
         .expect("commit replacement streamed transaction");
     let commit_wire = CAPTURE.capture_streamed(&mut client, "streamed-commit.pgoutput");
     assert_commit_shape(&commit_wire);
-    let committed = decode_streamed_changes(&commit_wire, source).expect("decode committed stream");
+    let committed = decode_streamed_changes(&commit_wire, &support::singleton_graph(1, source))
+        .expect("decode committed stream");
     assert_eq!(
         process(&mut client, &committed).expect("apply committed stream"),
         ProcessOutcome::Applied

@@ -1,17 +1,14 @@
 use std::{
-    num::NonZeroU64,
     process::Command,
     time::{Duration, Instant},
 };
 
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
 use shiba_ingress::{
-    BOOTSTRAP_CONNECTIONS_PER_SOURCE, BootstrapCatchupProgress, BootstrapOptions, BootstrapSession,
+    BOOTSTRAP_CONNECTIONS_PER_GRAPH, BootstrapCatchupProgress, BootstrapOptions, BootstrapSession,
     BootstrapSpec, SnapshotProgress,
 };
-use shiba_operator::OperatorId;
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
 use shiba_runtime::{MAX_BOOTSTRAP_BATCH_ROWS, ProcessOutcome, compile_and_register};
 
 const SLOT: &str = "shiba_m11_bootstrap_performance_slot";
@@ -30,14 +27,10 @@ fn required(name: &str) -> String {
         .unwrap_or_else(|_| panic!("scripts/test-m11-bootstrap-performance.sh must set {name}"))
 }
 
-fn operator_spec(operator_id: u64, operation: OperatorOperationV1) -> OperatorSpecV1 {
-    OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("operator ID")),
-        source_id: SourceId::new(1).expect("source ID"),
-        operation,
-    }
-}
+#[path = "support/mod.rs"]
+#[allow(dead_code)]
+mod test_support;
+use test_support::count_sum_spec;
 
 fn rss_kib() -> Option<u64> {
     let pid = std::process::id().to_string();
@@ -58,8 +51,8 @@ fn rss_kib() -> Option<u64> {
 fn public_results(client: &mut Client) -> Vec<(i64, String, Option<i64>)> {
     client
         .query(
-            "SELECT operator_id, result_status, value_bigint
-             FROM shiba.operator_result ORDER BY operator_id",
+            "SELECT result_id, result_status, value_bigint
+             FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )
         .expect("query public results")
@@ -84,8 +77,8 @@ fn assert_differential(client: &mut Client) -> (i64, i64) {
     assert_eq!(
         public_results(client),
         vec![
-            (1, "active".to_owned(), Some(oracle.0)),
-            (2, "active".to_owned(), Some(oracle.1)),
+            (2, "active".to_owned(), Some(oracle.0)),
+            (4, "active".to_owned(), Some(oracle.1)),
         ]
     );
     let row_state = client
@@ -104,7 +97,7 @@ fn assert_differential(client: &mut Client) -> (i64, i64) {
 #[allow(clippy::too_many_lines, reason = "one frozen million-row M11 gate")]
 fn million_row_snapshot_is_bounded_and_catches_up_exactly() {
     assert_eq!(MAX_BOOTSTRAP_BATCH_ROWS, SNAPSHOT_BATCH_ROWS);
-    assert_eq!(BOOTSTRAP_CONNECTIONS_PER_SOURCE, 3);
+    assert_eq!(BOOTSTRAP_CONNECTIONS_PER_GRAPH, 3);
     let database_url = required("SHIBA_M11_PERFORMANCE_DATABASE_URL");
     let replication_url = required("SHIBA_M11_PERFORMANCE_REPLICATION_URL");
     let mut admin = Client::connect(&database_url, NoTls).expect("connect admin database");
@@ -122,21 +115,7 @@ fn million_row_snapshot_is_bounded_and_catches_up_exactly() {
              FROM generate_series(1::bigint, {SNAPSHOT_ROWS}::bigint) AS rows(id);"
         ))
         .expect("install million-row snapshot fixture");
-    compile_and_register(
-        &mut admin,
-        &operator_spec(1, OperatorOperationV1::CountRows),
-    )
-    .expect("register CountRows");
-    compile_and_register(
-        &mut admin,
-        &operator_spec(
-            2,
-            OperatorOperationV1::SumInt8 {
-                input_column: "payload".to_owned(),
-            },
-        ),
-    )
-    .expect("register SumInt8");
+    compile_and_register(&mut admin, &count_sum_spec(1)).expect("register graph");
 
     let publication_oid: u32 = admin
         .query_one(
@@ -151,7 +130,7 @@ fn million_row_snapshot_is_bounded_and_catches_up_exactly() {
         &database_url,
         &replication_url,
         BootstrapSpec {
-            source_id: SourceId::new(1).expect("source ID"),
+            graph_id: GraphId::new(1).expect("graph ID"),
             bootstrap_id: BootstrapId::new(1).expect("bootstrap ID"),
             publication_oid,
             slot_name: SLOT.to_owned(),
@@ -163,8 +142,8 @@ fn million_row_snapshot_is_bounded_and_catches_up_exactly() {
     assert_eq!(
         public_results(&mut admin),
         vec![
-            (1, "building".to_owned(), None),
             (2, "building".to_owned(), None),
+            (4, "building".to_owned(), None),
         ]
     );
 
@@ -202,8 +181,8 @@ fn million_row_snapshot_is_bounded_and_catches_up_exactly() {
             assert_eq!(
                 public_results(&mut admin),
                 vec![
-                    (1, "building".to_owned(), None),
                     (2, "building".to_owned(), None),
+                    (4, "building".to_owned(), None),
                 ]
             );
         }
@@ -261,7 +240,7 @@ fn million_row_snapshot_is_bounded_and_catches_up_exactly() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_continuation",
+                "SELECT count(*) FROM shiba_internal.graph_continuation",
                 &[],
             )
             .expect("query WAL-only continuation")

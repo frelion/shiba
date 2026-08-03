@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use postgres::{Client, NoTls};
 use shiba_ingress::{BootstrapOptions, BootstrapSession, BootstrapSpec, SnapshotProgress};
-use shiba_protocol::{BootstrapBatchId, BootstrapId, SlotGeneration, SourceId};
+use shiba_protocol::{BootstrapBatchId, BootstrapId, GraphId, SlotGeneration, SourceId};
 use shiba_runtime::{
     BootstrapBatch, BootstrapProcessOutcome, SnapshotRow, process_bootstrap_batch,
 };
@@ -26,10 +26,11 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     let mut admin = Client::connect(&database_url, NoTls).expect("connect test database");
     let publication_oid = install_source(&mut admin);
     let source_id = SourceId::new(1).expect("source ID");
+    let graph_id = GraphId::new(1).expect("graph ID");
     let options = BootstrapOptions::new(2, Duration::from_secs(5)).expect("bootstrap options");
 
     let failed_spec = BootstrapSpec {
-        source_id,
+        graph_id,
         bootstrap_id: BootstrapId::new(10).expect("failed bootstrap ID"),
         publication_oid,
         slot_name: FAILED_SLOT.to_owned(),
@@ -37,12 +38,12 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     };
     admin
         .query_one(
-            "SELECT shiba_internal.reserve_source_bootstrap(
+            "SELECT shiba_internal.reserve_graph_bootstrap(
                  $1, $2, $3::bigint::oid, $4::text::name, $5
              )",
             &[
                 &i64::try_from(failed_spec.bootstrap_id.get()).expect("bootstrap bigint"),
-                &i64::try_from(source_id.get()).expect("source bigint"),
+                &i64::try_from(graph_id.get()).expect("graph bigint"),
                 &i64::from(publication_oid),
                 &FAILED_SLOT,
                 &i64::try_from(failed_spec.slot_generation.get()).expect("generation bigint"),
@@ -62,7 +63,7 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     );
 
     let abandoned_spec = BootstrapSpec {
-        source_id,
+        graph_id,
         bootstrap_id: BootstrapId::new(11).expect("abandoned bootstrap ID"),
         publication_oid,
         slot_name: OLD_SLOT.to_owned(),
@@ -99,7 +100,7 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     assert!(
         competing
             .to_string()
-            .contains("source already has an active session"),
+            .contains("graph already has an active session"),
         "unexpected competing-worker failure: {competing}"
     );
 
@@ -111,6 +112,7 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
         }
     );
     let exact = BootstrapBatch::new(
+        graph_id,
         source_id,
         BootstrapBatchId::new(abandoned_spec.bootstrap_id, 1).expect("batch ID"),
         vec![
@@ -130,13 +132,13 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
         BootstrapProcessOutcome::AlreadyApplied
     );
     assert_eq!(checkpoint(&mut admin), ("scanning".to_owned(), 1, Some(2)));
-    assert_eq!(states(&mut admin), vec![(1, 2), (2, 30)]);
+    assert_eq!(states(&mut admin), vec![(1, 2), (3, 30)]);
 
     drop(bootstrap);
     let bootstrap_id = BootstrapId::new(12).expect("replacement bootstrap ID");
     let generation = SlotGeneration::new(3).expect("replacement generation");
     let stale_replacement = BootstrapSpec {
-        source_id,
+        graph_id,
         bootstrap_id,
         publication_oid,
         slot_name: SLOT.to_owned(),
@@ -160,7 +162,7 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
         )
         .expect("create foreign replacement slot");
     let foreign_replacement = BootstrapSpec {
-        source_id,
+        graph_id,
         bootstrap_id,
         publication_oid,
         slot_name: FOREIGN_SLOT.to_owned(),
@@ -181,11 +183,11 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
         .query_one("SELECT pg_drop_replication_slot($1)", &[&FOREIGN_SLOT])
         .expect("drop test-owned foreign slot");
     assert_eq!(checkpoint(&mut admin), ("scanning".to_owned(), 1, Some(2)));
-    assert_eq!(states(&mut admin), vec![(1, 2), (2, 30)]);
+    assert_eq!(states(&mut admin), vec![(1, 2), (3, 30)]);
     assert_eq!(rows(&mut admin), vec![(1, Some(10)), (2, Some(20))]);
 
     let spec = BootstrapSpec {
-        source_id,
+        graph_id,
         bootstrap_id,
         publication_oid,
         slot_name: SLOT.to_owned(),
@@ -200,12 +202,12 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     )
     .expect("restart abandoned partial scan");
     assert_eq!(checkpoint(&mut admin), ("scanning".to_owned(), 0, None));
-    assert_eq!(states(&mut admin), vec![(1, 0), (2, 0)]);
+    assert!(states(&mut admin).is_empty());
     assert!(rows(&mut admin).is_empty());
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba.operator_result
+                "SELECT count(*) FROM shiba.graph_result
                  WHERE result_status = 'building' AND value_bigint IS NULL",
                 &[],
             )
@@ -235,12 +237,13 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
 
     admin
         .execute(
-            "UPDATE shiba_internal.operator_state SET state_payload = $1
-             WHERE operator_id = 2",
+            "UPDATE shiba_internal.graph_node_state SET state_payload = $1
+             WHERE graph_id = 1 AND node_id = 3",
             &[&(i64::MAX - 5).to_be_bytes().as_slice()],
         )
         .expect("inject bounded operator overflow");
     let overflowing = BootstrapBatch::new(
+        graph_id,
         source_id,
         BootstrapBatchId::new(bootstrap_id, 2).expect("batch ID"),
         vec![SnapshotRow {
@@ -252,13 +255,12 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     assert!(process_bootstrap_batch(&mut admin, &overflowing).is_err());
     assert_eq!(rows(&mut admin), vec![(1, Some(10)), (2, Some(20))]);
     assert_eq!(checkpoint(&mut admin), ("scanning".to_owned(), 1, Some(2)));
-    assert_eq!(states(&mut admin), vec![(1, 2), (2, i64::MAX - 5)]);
+    assert_eq!(states(&mut admin), vec![(1, 2), (3, i64::MAX - 5)]);
     admin
         .execute(
-            "UPDATE shiba_internal.operator_state
-             SET state_payload = decode('000000000000001e', 'hex')
-             WHERE operator_id = 2",
-            &[],
+            "UPDATE shiba_internal.graph_node_state SET state_payload = $1
+             WHERE graph_id = 1 AND node_id = 3",
+            &[&30_i64.to_be_bytes().as_slice()],
         )
         .expect("restore operator state after failure injection");
     assert_eq!(
@@ -287,7 +289,7 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     recovery_catchup::prove_feedback_and_cutover_recovery(
         &database_url,
         &replication_url,
-        source_id,
+        graph_id,
         bootstrap_id,
         generation,
         options,

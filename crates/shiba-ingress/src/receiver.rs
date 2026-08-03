@@ -1,7 +1,7 @@
 use postgres::Client;
-use shiba_protocol::{BootstrapId, SourceId};
+use shiba_protocol::{BootstrapId, GraphId};
 use shiba_runtime::{
-    PgoutputRelationState, PgoutputSource, SourceTransaction, decode_committed_changes_in_session,
+    GraphTransaction, PgoutputGraph, PgoutputRelationState, decode_committed_changes_in_session,
     decode_streamed_changes_in_session, process,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,8 +92,8 @@ impl SourceReceiver {
 
     pub(crate) fn receive_bootstrap_one(
         &mut self,
-        source: PgoutputSource,
-        source_id: SourceId,
+        graph: &PgoutputGraph,
+        graph_id: GraphId,
         bootstrap_id: BootstrapId,
         expected_content: &str,
         shutdown: &ShutdownHandle,
@@ -111,7 +111,7 @@ impl SourceReceiver {
                 }
                 self.feedback.mark_fence(fence.end_lsn, self.authorization);
                 return Ok(BootstrapInput::Fence(BootstrapFence::new(
-                    source_id,
+                    graph_id,
                     bootstrap_id,
                     fence.message_lsn,
                     fence.end_lsn,
@@ -120,7 +120,7 @@ impl SourceReceiver {
             }
             let transaction = decode_committed_changes_in_session(
                 &assembled.bytes,
-                source,
+                graph,
                 &mut self.relation_state,
             )?;
             Ok(BootstrapInput::Transaction(
@@ -139,7 +139,7 @@ impl SourceReceiver {
     /// Fails closed on mode, state, transport, framing, or decode errors.
     pub fn receive_one(
         &mut self,
-        source: PgoutputSource,
+        graph: &PgoutputGraph,
         shutdown: &ShutdownHandle,
     ) -> Result<ReceivedInput, IngressError> {
         self.ready()?;
@@ -151,7 +151,7 @@ impl SourceReceiver {
         let result = self.receive_committed_wire(shutdown).and_then(|assembled| {
             let transaction = decode_committed_changes_in_session(
                 &assembled.bytes,
-                source,
+                graph,
                 &mut self.relation_state,
             )?;
             Ok(self.set_outstanding(transaction, assembled.end_lsn))
@@ -169,7 +169,7 @@ impl SourceReceiver {
     /// semantic decode errors poison the receiver.
     pub fn receive_streamed_one(
         &mut self,
-        source: PgoutputSource,
+        graph: &PgoutputGraph,
         shutdown: &ShutdownHandle,
     ) -> Result<StreamedInput, IngressError> {
         self.ready()?;
@@ -180,7 +180,7 @@ impl SourceReceiver {
         }
         let result = self
             .receive_stream_terminal(shutdown)
-            .and_then(|terminal| self.handle_stream_terminal(source, terminal));
+            .and_then(|terminal| self.handle_stream_terminal(graph, terminal));
         if result.is_err() {
             self.failed = true;
         }
@@ -295,14 +295,14 @@ impl SourceReceiver {
 
     fn handle_stream_terminal(
         &mut self,
-        source: PgoutputSource,
+        graph: &PgoutputGraph,
         terminal: StreamTerminal,
     ) -> Result<StreamedInput, IngressError> {
         match terminal {
             StreamTerminal::Committed(assembled) => {
                 let transaction = decode_streamed_changes_in_session(
                     &assembled.bytes,
-                    source,
+                    graph,
                     &mut self.relation_state,
                 )?;
                 Ok(StreamedInput::Transaction(
@@ -335,7 +335,7 @@ impl SourceReceiver {
         }
     }
 
-    fn set_outstanding(&mut self, transaction: SourceTransaction, end_lsn: u64) -> ReceivedInput {
+    fn set_outstanding(&mut self, transaction: GraphTransaction, end_lsn: u64) -> ReceivedInput {
         self.outstanding_lsn = Some(end_lsn);
         ReceivedInput::new(transaction, end_lsn, self.authorization)
     }

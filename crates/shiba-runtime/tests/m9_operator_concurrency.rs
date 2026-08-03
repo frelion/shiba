@@ -1,22 +1,18 @@
 use std::{
-    num::NonZeroU64,
     sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
 };
 
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_operator::OperatorId;
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{
-    PgoutputSource, ProcessOutcome, SourceTransaction, compile_and_register,
-    decode_committed_changes, process,
+    GraphTransaction, PgoutputSource, ProcessOutcome, decode_committed_changes, process,
 };
 
 mod support;
 
-use support::{PgoutputCapture, register_count_operator};
+use support::PgoutputCapture;
 
 const ADVISORY_KEY: i64 = 90_002;
 const CAPTURE1: PgoutputCapture = PgoutputCapture {
@@ -37,7 +33,7 @@ type ProcessReceiver = Receiver<Result<ProcessOutcome, String>>;
 fn spawn_process(
     connection: &str,
     name: &str,
-    input: SourceTransaction,
+    input: GraphTransaction,
 ) -> (ProcessReceiver, thread::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel();
     let connection = format!("{connection} application_name={name}");
@@ -74,21 +70,6 @@ fn wait_for_lock(client: &mut Client, name: &str, event: Option<&str>) {
         assert!(Instant::now() < deadline, "{name} did not wait for a lock");
         thread::sleep(Duration::from_millis(10));
     }
-}
-
-fn register_sum(client: &mut Client, source_id: u64, operator_id: u64) {
-    compile_and_register(
-        client,
-        &OperatorSpecV1 {
-            version: OPERATOR_SPEC_VERSION,
-            operator_id: OperatorId::new(NonZeroU64::new(operator_id).unwrap()),
-            source_id: SourceId::new(source_id).unwrap(),
-            operation: OperatorOperationV1::SumInt8 {
-                input_column: "payload".into(),
-            },
-        },
-    )
-    .expect("register SumInt8");
 }
 
 fn install(client: &mut Client) -> (PgoutputSource, PgoutputSource) {
@@ -136,8 +117,7 @@ fn install(client: &mut Client) -> (PgoutputSource, PgoutputSource) {
             &[],
         )
         .expect("register source one");
-    register_count_operator(client, 1, 1);
-    register_sum(client, 1, 2);
+    support::register_count_sum_graph(client, 1);
     client
         .query_one(
             "SELECT shiba_internal.register_source(
@@ -145,10 +125,11 @@ fn install(client: &mut Client) -> (PgoutputSource, PgoutputSource) {
             &[],
         )
         .expect("register source two");
-    register_count_operator(client, 2, 3);
-    register_sum(client, 2, 4);
+    support::register_count_sum_graph(client, 2);
     CAPTURE1.create_slot();
     CAPTURE2.create_slot();
+    support::configure_graph_ingress(client, 1, CAPTURE1.publication, CAPTURE1.slot);
+    support::configure_graph_ingress(client, 2, CAPTURE2.publication, CAPTURE2.slot);
     (
         PgoutputSource::with_nullable_int8_payload(
             SourceId::new(1).unwrap(),
@@ -167,33 +148,46 @@ fn capture_inputs(
     client: &mut Client,
     source1: PgoutputSource,
     source2: PgoutputSource,
-) -> (SourceTransaction, SourceTransaction, SourceTransaction) {
+) -> (GraphTransaction, GraphTransaction, GraphTransaction) {
     client
         .batch_execute("INSERT INTO source_m9_concurrency_one.events VALUES (1, 10)")
         .unwrap();
-    let first = decode_committed_changes(&CAPTURE1.capture(client, "one-first.pgoutput"), source1)
-        .expect("decode source one first transaction");
+    let first = decode_committed_changes(
+        &CAPTURE1.capture(client, "one-first.pgoutput"),
+        &support::singleton_graph(1, source1),
+    )
+    .expect("decode source one first transaction");
     client
         .batch_execute("INSERT INTO source_m9_concurrency_one.events VALUES (2, 7)")
         .unwrap();
-    let second =
-        decode_committed_changes(&CAPTURE1.capture(client, "one-second.pgoutput"), source1)
-            .expect("decode source one second transaction");
+    let second = decode_committed_changes(
+        &CAPTURE1.capture(client, "one-second.pgoutput"),
+        &support::singleton_graph(1, source1),
+    )
+    .expect("decode source one second transaction");
     client
         .batch_execute("INSERT INTO source_m9_concurrency_two.events VALUES (1, 5)")
         .unwrap();
-    let independent = decode_committed_changes(&CAPTURE2.capture(client, "two.pgoutput"), source2)
-        .expect("decode source two transaction");
+    let independent = decode_committed_changes(
+        &CAPTURE2.capture(client, "two.pgoutput"),
+        &support::singleton_graph(2, source2),
+    )
+    .expect("decode source two transaction");
     (first, second, independent)
 }
 
 fn results(client: &mut Client) -> Vec<(i64, i64, i64)> {
     client
         .query(
-            "SELECT result.operator_id, result.value_bigint, state.state_payload
-             FROM shiba.operator_result AS result
-             JOIN shiba_internal.operator_state AS state USING (operator_id)
-             ORDER BY result.operator_id",
+            "SELECT ((result.graph_id - 1) * 2 + result.result_id - 1000),
+                    result.value_bigint,
+                    COALESCE(state.state_payload, decode('0000000000000000','hex'))
+             FROM shiba.graph_result AS result
+             LEFT JOIN shiba_internal.graph_node_state AS state
+               ON state.graph_id = result.graph_id
+              AND state.node_id = result.result_id - 1000
+              AND state.namespace = 0
+             ORDER BY result.graph_id, result.result_id",
             &[],
         )
         .unwrap()
@@ -211,8 +205,8 @@ fn results(client: &mut Client) -> Vec<(i64, i64, i64)> {
 fn continuations(client: &mut Client) -> Vec<(i64, i64)> {
     client
         .query(
-            "SELECT source_id, ingress_transaction_id
-             FROM shiba_internal.source_continuation ORDER BY source_id, commit_lsn",
+            "SELECT graph_id, ingress_transaction_id
+             FROM shiba_internal.graph_continuation ORDER BY graph_id, commit_lsn",
             &[],
         )
         .unwrap()

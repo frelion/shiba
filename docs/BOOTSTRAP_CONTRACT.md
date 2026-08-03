@@ -1,6 +1,32 @@
 # M11 consistent bootstrap contract
 
-## M13 generic plan-set handoff
+## M14.6 graph bootstrap authority
+
+Bootstrap now initializes the complete one- or two-member graph. One
+`graph_bootstrap` row owns the lifecycle, exact graph digest, slot generation,
+exported snapshot boundary, catch-up fence and activation. Each ordered member
+has one bounded `graph_bootstrap_checkpoint`; these child checkpoints only
+record committed scan progress and are not independent lifecycles,
+continuations or WAL cursors.
+
+All member scans import the same exported snapshot. A batch tags rows with the
+exact SourceId, enters the same generic graph execution path used by live Apply,
+and commits current rows, generic `graph_node_state`, terminal graph results and
+that member checkpoint atomically. Catch-up consumes the one graph slot and
+advances only `graph_continuation`. Activation publishes all terminal results
+and promotes the same graph authority once; partial member or node output
+remains building/unavailable.
+
+Bootstrap does not know concrete nodes or rebuild plans by name. Intermediate
+`DeltaBatch`/`MultiInputBatch` values are transaction-local. The source-scoped
+bootstrap and operator-plan-set terminology below records the M11--M13 evidence
+baseline and is superseded, without an adapter, by this graph lifecycle.
+M14.6 implementation and static gates prove that one- and two-member bootstrap
+load the durable graph and share one lifecycle/snapshot with subordinate member
+checkpoints. The complete PG17.10/PG18.4 bootstrap/catch-up/restart matrix is a
+remaining M14.7 release gate; M14.6 does not claim it here.
+
+## M13 generic plan-set handoff (historical baseline)
 
 M13.3 established the sole generic Runtime entry and scalar/keyed Result Sink.
 M13.4 made bootstrap use that entry exclusively: it loads every durable

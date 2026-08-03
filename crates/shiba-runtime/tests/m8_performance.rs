@@ -2,11 +2,12 @@ use std::time::{Duration, Instant};
 
 use postgres::{Client, NoTls};
 use shiba_protocol::{
-    IngressTransactionId, InputSequence, PostgresLsn, SlotGeneration, SourceId, SourceTransactionId,
+    GraphId, GraphTransactionId, IngressTransactionId, InputSequence, PostgresLsn, SlotGeneration,
+    SourceId,
 };
 use shiba_runtime::{
-    M2Error, PgoutputSource, ProcessOutcome, SourceChange, SourceInsert, SourceTransaction,
-    decode_committed_changes, process,
+    GraphSourceChange, GraphTransaction, M2Error, PgoutputSource, ProcessOutcome, SourceChange,
+    SourceInsert, decode_committed_changes, process,
 };
 
 mod support;
@@ -45,10 +46,11 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state
+                 WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -67,9 +69,9 @@ fn assert_within(operation: &str, measured: Duration, limit: Duration) {
     );
 }
 
-fn test_identity() -> SourceTransactionId {
-    SourceTransactionId::new(
-        SourceId::new(1).expect("non-zero source"),
+fn test_identity() -> GraphTransactionId {
+    GraphTransactionId::new(
+        GraphId::new(1).expect("non-zero graph"),
         SlotGeneration::new(1).expect("non-zero generation"),
         PostgresLsn::from_u64(1),
         IngressTransactionId::new(1).expect("non-zero ingress transaction"),
@@ -88,18 +90,26 @@ fn oversized_inserts() -> Vec<SourceInsert> {
         .collect()
 }
 
+fn tagged(inserts: Vec<SourceInsert>) -> Vec<GraphSourceChange> {
+    let source_id = SourceId::new(1).expect("non-zero source");
+    inserts
+        .into_iter()
+        .map(|insert| GraphSourceChange {
+            source_id,
+            change: SourceChange::Insert(insert),
+        })
+        .collect()
+}
+
 #[test]
 fn constructors_reject_more_than_10000_changes() {
     let inserts = oversized_inserts();
     assert!(matches!(
-        SourceTransaction::new(test_identity(), inserts.clone()),
+        GraphTransaction::new(test_identity(), tagged(inserts.clone())),
         Err(M2Error::TransactionLimitExceeded)
     ));
     assert!(matches!(
-        SourceTransaction::from_changes(
-            test_identity(),
-            inserts.into_iter().map(SourceChange::Insert).collect()
-        ),
+        GraphTransaction::new(test_identity(), tagged(inserts)),
         Err(M2Error::TransactionLimitExceeded)
     ));
 }
@@ -130,8 +140,8 @@ fn m8_real_pgoutput_10000_change_latency_is_bounded() {
     let wire = CAPTURE.capture(&mut client, "performance.pgoutput");
 
     let started = Instant::now();
-    let transaction =
-        decode_committed_changes(&wire, source).expect("decode 10,000-row transaction");
+    let transaction = decode_committed_changes(&wire, &support::singleton_graph(1, source))
+        .expect("decode 10,000-row transaction");
     let decode_elapsed = started.elapsed();
     assert_eq!(transaction.changes.len(), 10_000);
 
@@ -153,7 +163,7 @@ fn m8_real_pgoutput_10000_change_latency_is_bounded() {
 
     let mut forged_changes = transaction.changes.clone();
     forged_changes.push(transaction.changes[0].clone());
-    let forged = SourceTransaction {
+    let forged = GraphTransaction {
         identity: transaction.identity,
         changes: forged_changes,
     };

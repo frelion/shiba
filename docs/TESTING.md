@@ -1,5 +1,41 @@
 # Testing strategy
 
+## M14.6 graph lifecycle cutover gates
+
+The production cutover under test has one canonical `OperatorGraph`, ordered
+one/two-source membership, one graph ingress configuration and slot generation,
+one graph continuation, generic graph node state/results, one graph bootstrap
+lifecycle with subordinate member checkpoints, and graph-wide rebuild. The
+single-source case is a one-member graph; there is no old Runtime, per-source
+continuation, operator table, adapter or dual write.
+
+Static and Catalog tests must prove the superseded source/operator execution
+authorities are absent and Runtime/Ingress/Bootstrap/Rebuild do not mention
+concrete nodes. Runtime tests must prove one PostgreSQL transaction changing
+either or both members constructs one multi-input batch, locks sources and state
+canonically, persists all deltas and writes continuation last. Failure at any
+point must leave all members, state/results and continuation old; ACK must remain
+unauthorized until commit or exact graph replay.
+
+`scripts/test-m14-graph-runtime.sh` is green on PG17.10 and PG18.4. It proves a
+one-member Count graph and two-member cross-schema JOIN use the same Runtime;
+both relations enter one decoded PostgreSQL transaction; right UPDATE/DELETE
+fan-out, both join-key changes, full keyed rows, retry/exact replay, injected
+sink rollback and exact right-PK replacement behave atomically. It also proves
+default primary-key binding, an explicit unique replica-identity binding, and
+failure without any durable binding for a relation with no effective identity.
+
+Pure Compiler tests additionally prove strict `ComputedProject`,
+`FilteredGroupedCount` and `FilteredGroupedSumInt8` pipelines and graph terminal
+result contracts. Runtime persists those contracts generically and contains no
+node-kind dispatch. Failure-first tests caught canonical keyed value payload,
+the rebuild writer's 22nd value-nullability parameter, member-trigger COALESCE
+syntax, and old-versus-post-prepare invalidation semantics; each now fails
+closed at its owning boundary.
+
+M14.7 separately owns full receiver/bootstrap/rebuild enrollment, regression,
+performance and release evidence, including the frozen M8--M13 thresholds.
+
 ## M14.5 pure two-source JOIN gates
 
 Pure Compiler/Operator tests prove GraphId ownership, ordered SourcePorts,
@@ -7,36 +43,35 @@ Pure Compiler/Operator tests prove GraphId ownership, ordered SourcePorts,
 partition state and pre-to-final mixed-input semantics. A fixed-seed 300-step
 relational differential is green. Fan-out 20,000 succeeds and 20,001 fails;
 ordered affected-row indexes correct the initial `O(n^2)` scan to `O(n log n)`.
-Runtime/Catalog persistence, PG17/18 cross-schema live execution, graph
-bootstrap/rebuild and release evidence remain M14.6; M14 is not complete.
+M14.6 supplies Runtime/Catalog persistence and the graph lifecycle cutover; its
+directed PG17/18 graph Runtime evidence is green. Full bootstrap/rebuild and
+release evidence belongs to M14.7; M14 is not complete.
 
-## Remaining M14.6 PostgreSQL JOIN gates
+## Directed M14.6 PostgreSQL JOIN gates
 
 The accepted authority is in
 [JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md). The M14.4 contract is
-accepted; the M14.6 production slice cannot be marked proved until the
-same directed matrix passes independently on PG17.10 and PG18.4:
+accepted and implemented by the graph cutover. The following directed Runtime
+portion passes independently on PG17.10 and PG18.4:
 
-- admission rejects source reuse, wrong database/publication/slot/generation,
-  ObjectAddress drift, wrong right PK/UK index, invalid graph and missing roles;
-- full-row SQL differentials cover left-only, right-only and one PostgreSQL
+- registration rejects missing effective identity and durably binds default PK
+  or explicit replica-identity index; exact replacement invalidates the graph;
+- complete expected keyed rows cover left-only, right-only and one PostgreSQL
   transaction changing both sides, including right UPDATE/DELETE fan-out;
 - one graph transaction atomically rolls back source rows, node state, results
-  and graph continuation on decode/compute/sink/backend failure;
-- receive-before-Apply, commit-before-feedback, exact replay and feedback retry
-  never ACK an uncommitted or partial graph result;
-- one exported snapshot initializes both relations, catches up one slot and
-  activates once; rebuild replaces the complete graph generation;
-- relation/column/index/publication DDL drift fails closed by exact bound
-  identity, including same-shape right-index replacement;
-- split control/Apply/scanner, replication and reader roles succeed without
-  superuser; missing or swapped privileges fail closed;
-- frozen fan-out, set-based query-count, latency, RSS, retained-WAL and replay
-  thresholds prove bounded behavior without per-row SQL or an unbounded queue.
+  and graph continuation on injected sink failure, then retry applies once;
+- exact replay returns a no-op without duplicating rows or continuation;
+- relation/index drift fails closed by exact bound identity, including
+  same-shape right-index replacement.
 
-The runner must also statically reject a per-source continuation, second
+M14.7 retains the complete one-snapshot bootstrap, graph rebuild/recovery,
+split-role, publication/column drift, performance and release portions of the
+matrix; those are not inferred from this directed Runtime test.
+
+The runner statically rejects a per-source continuation, second
 Runtime, persisted DeltaBatch/EffectStream, adapter, fallback or dual write.
-These are acceptance requirements, not current evidence.
+These static M14.6 requirements are current evidence; full release enrollment
+is M14.7.
 
 ## M14.3 generic grouped-state gates
 

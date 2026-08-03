@@ -4,6 +4,69 @@ use std::{
 };
 
 use postgres::Client;
+use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
+use shiba_operator::NodeId;
+use shiba_protocol::{GraphId, SourceId};
+
+#[allow(dead_code)]
+pub const TEST_GRAPH_ID: u64 = 1;
+
+#[allow(dead_code)]
+pub fn node_id(value: u32) -> NodeId {
+    NodeId::new(std::num::NonZeroU32::new(value).expect("node ID"))
+}
+
+#[allow(dead_code)]
+pub fn count_sum_spec(source_id: u64) -> GraphSpecV1 {
+    let source_id = SourceId::new(source_id).expect("source ID");
+    GraphSpecV1 {
+        version: GRAPH_SPEC_VERSION,
+        graph_id: GraphId::new(TEST_GRAPH_ID).expect("graph ID"),
+        sources: vec![source_id],
+        outputs: vec![
+            GraphOutputSpecV1::CountRows {
+                source_id,
+                aggregate_node_id: node_id(1),
+                result_node_id: node_id(2),
+            },
+            GraphOutputSpecV1::SumInt8 {
+                source_id,
+                input_column: "payload".to_owned(),
+                aggregate_node_id: node_id(3),
+                result_node_id: node_id(4),
+            },
+        ],
+    }
+}
+
+#[allow(dead_code)]
+pub fn count_sum_project_spec(source_id: u64) -> GraphSpecV1 {
+    let mut spec = count_sum_spec(source_id);
+    let source_id = SourceId::new(source_id).expect("source ID");
+    spec.outputs.push(GraphOutputSpecV1::MaterializedProject {
+        source_id,
+        key_column: "id".to_owned(),
+        value_column: "payload".to_owned(),
+        project_node_id: node_id(5),
+        result_node_id: node_id(6),
+    });
+    spec
+}
+
+#[allow(dead_code)]
+pub fn count_spec(source_id: u64) -> GraphSpecV1 {
+    let source_id = SourceId::new(source_id).expect("source ID");
+    GraphSpecV1 {
+        version: GRAPH_SPEC_VERSION,
+        graph_id: GraphId::new(TEST_GRAPH_ID).expect("graph ID"),
+        sources: vec![source_id],
+        outputs: vec![GraphOutputSpecV1::CountRows {
+            source_id,
+            aggregate_node_id: node_id(1),
+            result_node_id: node_id(2),
+        }],
+    }
+}
 
 pub fn slot_lsn(client: &mut Client, slot: &str) -> u64 {
     let value: String = client

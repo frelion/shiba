@@ -17,10 +17,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -135,7 +135,8 @@ fn m7_column_type_rollback_commit_and_rename_invalidation() {
         .batch_execute("INSERT INTO source_m7_column.events VALUES (1301)")
         .expect("commit first pending source transaction");
     let first_wire = CAPTURE.capture(&mut client, "before-type-rollback.pgoutput");
-    let first = decode_committed_changes(&first_wire, source).expect("decode first pending row");
+    let first = decode_committed_changes(&first_wire, &support::singleton_graph(1, source))
+        .expect("decode first pending row");
     client
         .batch_execute(
             "BEGIN;
@@ -166,7 +167,8 @@ fn m7_column_type_rollback_commit_and_rename_invalidation() {
         .batch_execute("INSERT INTO source_m7_column.events VALUES (1302)")
         .expect("commit second pending source transaction");
     let second_wire = CAPTURE.capture(&mut client, "before-type-commit.pgoutput");
-    let second = decode_committed_changes(&second_wire, source).expect("decode second pending row");
+    let second = decode_committed_changes(&second_wire, &support::singleton_graph(1, source))
+        .expect("decode second pending row");
     client
         .batch_execute(
             "ALTER TABLE source_m7_column.events

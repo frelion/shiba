@@ -3,13 +3,13 @@
     reason = "each integration test compiles only its support subset"
 )]
 
-use std::{fs, num::NonZeroU64, path::PathBuf, process::Command};
+use std::{fs, num::NonZeroU32, path::PathBuf, process::Command};
 
 use postgres::Client;
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_operator::OperatorId;
-use shiba_protocol::SourceId;
-use shiba_runtime::compile_and_register;
+use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
+use shiba_operator::NodeId;
+use shiba_protocol::{GraphId, SourceId};
+use shiba_runtime::{PgoutputGraph, PgoutputSource, compile_and_register};
 
 pub(super) fn register_source(client: &mut Client, relation_name: &str) {
     client
@@ -22,13 +22,73 @@ pub(super) fn register_source(client: &mut Client, relation_name: &str) {
 }
 
 pub(super) fn register_count_operator(client: &mut Client, source_id: u64, operator_id: u64) {
-    let spec = OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("non-zero operator id")),
-        source_id: SourceId::new(source_id).expect("non-zero source id"),
-        operation: OperatorOperationV1::CountRows,
+    let source_id = SourceId::new(source_id).expect("non-zero source id");
+    let aggregate_node_id = node_id(operator_id);
+    let result_node_id = node_id(operator_id.checked_add(1_000).expect("result node ID"));
+    let spec = GraphSpecV1 {
+        version: GRAPH_SPEC_VERSION,
+        graph_id: GraphId::new(source_id.get()).expect("source-backed graph ID"),
+        sources: vec![source_id],
+        outputs: vec![GraphOutputSpecV1::CountRows {
+            source_id,
+            aggregate_node_id,
+            result_node_id,
+        }],
     };
-    compile_and_register(client, &spec).expect("compile and register CountRows operator");
+    compile_and_register(client, &spec).expect("compile and register CountRows graph");
+}
+
+pub(super) fn register_count_sum_graph(client: &mut Client, source_id: u64) {
+    let source_id = SourceId::new(source_id).expect("non-zero source id");
+    let spec = GraphSpecV1 {
+        version: GRAPH_SPEC_VERSION,
+        graph_id: GraphId::new(source_id.get()).expect("source-backed graph ID"),
+        sources: vec![source_id],
+        outputs: vec![
+            GraphOutputSpecV1::CountRows {
+                source_id,
+                aggregate_node_id: node_id(1),
+                result_node_id: node_id(1_001),
+            },
+            GraphOutputSpecV1::SumInt8 {
+                source_id,
+                input_column: "payload".into(),
+                aggregate_node_id: node_id(2),
+                result_node_id: node_id(1_002),
+            },
+        ],
+    };
+    compile_and_register(client, &spec).expect("compile and register CountRows + SumInt8 graph");
+}
+
+pub(super) fn singleton_graph(graph_id: u64, source: PgoutputSource) -> PgoutputGraph {
+    PgoutputGraph::single(GraphId::new(graph_id).expect("non-zero graph ID"), source)
+        .expect("valid singleton graph descriptor")
+}
+
+pub(super) fn configure_graph_ingress(
+    client: &mut Client,
+    graph_id: i64,
+    publication: &str,
+    slot: &str,
+) {
+    let publication_oid: u32 = client
+        .query_one(
+            "SELECT oid FROM pg_catalog.pg_publication WHERE pubname = $1",
+            &[&publication],
+        )
+        .expect("read publication OID")
+        .get(0);
+    client
+        .execute(
+            "SELECT shiba_internal.configure_graph_ingress($1, $2::oid, $3::name, 1)",
+            &[&graph_id, &publication_oid, &slot],
+        )
+        .expect("configure exact graph ingress");
+}
+
+fn node_id(value: u64) -> NodeId {
+    NodeId::new(NonZeroU32::new(u32::try_from(value).expect("node ID in u32")).expect("node ID"))
 }
 
 pub(super) fn decode_scalar_state(payload: &[u8]) -> i64 {
@@ -42,7 +102,8 @@ pub(super) fn decode_scalar_state(payload: &[u8]) -> i64 {
 pub(super) fn scalar_state(client: &mut Client, operator_id: i64) -> i64 {
     let payload: Vec<u8> = client
         .query_one(
-            "SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = $1",
+            "SELECT state_payload FROM shiba_internal.graph_node_state
+             WHERE graph_id = 1 AND node_id = $1 AND namespace = 0",
             &[&operator_id],
         )
         .expect("query opaque scalar operator state")
@@ -53,7 +114,7 @@ pub(super) fn scalar_state(client: &mut Client, operator_id: i64) -> i64 {
 pub(super) fn scalar_state_sum(client: &mut Client) -> i64 {
     client
         .query(
-            "SELECT state_payload FROM shiba_internal.operator_state",
+            "SELECT state_payload FROM shiba_internal.graph_node_state WHERE namespace = 0",
             &[],
         )
         .expect("query opaque scalar operator states")

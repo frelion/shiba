@@ -173,7 +173,7 @@ fn exported_slot_snapshot_is_exact_repeatable_and_ephemeral() {
 
     let shiba_state_exists: bool = writer
         .query_one(
-            "SELECT to_regclass('shiba_internal.source_continuation') IS NOT NULL",
+            "SELECT to_regclass('shiba_internal.graph_continuation') IS NOT NULL",
             &[],
         )
         .expect("check absence of Shiba durable state")

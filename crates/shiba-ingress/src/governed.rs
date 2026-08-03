@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use postgres::Client;
-use shiba_protocol::{SlotGeneration, SourceId};
+use shiba_protocol::{GraphId, SlotGeneration};
 
 use crate::{
     AbortedTransaction, DurableTransaction, EmptyCommitted, IngressError, ReceivedInput,
@@ -47,7 +47,7 @@ impl AttachOptions {
 }
 
 /// Governed owner of exactly one Apply and one replication connection.
-pub struct GovernedSourceSession {
+pub struct GovernedGraphSession {
     receiver: Option<SourceReceiver>,
     apply: Client,
     config: GovernedConfig,
@@ -56,7 +56,7 @@ pub struct GovernedSourceSession {
     _permit: ActivePermit,
 }
 
-impl GovernedSourceSession {
+impl GovernedGraphSession {
     /// Attaches to existing catalog, publication, and slot authorities.
     ///
     /// # Errors
@@ -65,7 +65,7 @@ impl GovernedSourceSession {
     pub fn attach(
         apply_conninfo: &str,
         replication_conninfo: &str,
-        source_id: SourceId,
+        graph_id: GraphId,
         expected_slot_generation: SlotGeneration,
         options: AttachOptions,
     ) -> Result<Self, IngressError> {
@@ -75,7 +75,7 @@ impl GovernedSourceSession {
         if apply_database != replication_database {
             return Err(IngressError::Governance("connection databases differ"));
         }
-        let advisory_key = advisory_key(source_id)?;
+        let advisory_key = advisory_key(graph_id)?;
         let acquired: bool = apply
             .query_one(
                 "SELECT pg_catalog.pg_try_advisory_lock($1)",
@@ -84,23 +84,23 @@ impl GovernedSourceSession {
             .get(0);
         if !acquired {
             return Err(IngressError::Governance(
-                "source already has an active session",
+                "graph already has an active session",
             ));
         }
 
         if apply
             .query_opt(
-                "SELECT phase FROM shiba_internal.source_bootstrap WHERE source_id = $1",
-                &[&i64::try_from(source_id.get())
-                    .map_err(|_| IngressError::Governance("source ID exceeds bigint"))?],
+                "SELECT phase FROM shiba_internal.graph_bootstrap WHERE graph_id = $1",
+                &[&i64::try_from(graph_id.get())
+                    .map_err(|_| IngressError::Governance("graph ID exceeds bigint"))?],
             )?
             .is_some_and(|row| row.get::<_, &str>(0) != "active")
         {
-            return Err(IngressError::Governance("source bootstrap is not active"));
+            return Err(IngressError::Governance("graph bootstrap is not active"));
         }
 
         let (config, confirmed_lsn) =
-            GovernedConfig::load(&mut apply, source_id, expected_slot_generation, false)?;
+            GovernedConfig::load(&mut apply, graph_id, expected_slot_generation, false)?;
         if config.database_name != apply_database {
             return Err(IngressError::Governance(
                 "conninfo database does not match catalog",
@@ -137,9 +137,9 @@ impl GovernedSourceSession {
     /// Revalidates all durable/live authority before entering receive.
     pub fn receive_one(&mut self) -> Result<ReceivedInput, IngressError> {
         self.revalidate()?;
-        let source = self.config.source;
+        let graph = self.config.graph.clone();
         let shutdown = self.shutdown.clone();
-        self.receiver_mut()?.receive_one(source, &shutdown)
+        self.receiver_mut()?.receive_one(&graph, &shutdown)
     }
 
     /// Receives one governed protocol-v2 terminal.
@@ -148,9 +148,9 @@ impl GovernedSourceSession {
     /// Revalidates all durable/live authority before entering receive.
     pub fn receive_streamed_one(&mut self) -> Result<StreamedInput, IngressError> {
         self.revalidate()?;
-        let source = self.config.source;
+        let graph = self.config.graph.clone();
         let shutdown = self.shutdown.clone();
-        self.receiver_mut()?.receive_streamed_one(source, &shutdown)
+        self.receiver_mut()?.receive_streamed_one(&graph, &shutdown)
     }
 
     /// Applies an exact received input with the session-owned Apply client.
@@ -227,8 +227,8 @@ impl GovernedSourceSession {
     }
 
     #[must_use]
-    pub const fn source_id(&self) -> SourceId {
-        self.config.source_id
+    pub const fn graph_id(&self) -> GraphId {
+        self.config.graph_id
     }
 
     #[must_use]
@@ -253,14 +253,13 @@ impl GovernedSourceSession {
     }
 }
 
-pub(crate) fn advisory_key(source_id: SourceId) -> Result<i64, IngressError> {
-    // Positive SQL bigint source IDs map bijectively into the reserved negative
-    // session-lock range (MIN+1..=-1), disjoint from positive application keys.
-    let source = i64::try_from(source_id.get())
-        .map_err(|_| IngressError::Governance("source ID exceeds bigint"))?;
-    i64::MIN
-        .checked_add(source)
-        .ok_or(IngressError::Governance("source advisory key overflow"))
+pub(crate) fn advisory_key(graph_id: GraphId) -> Result<i64, IngressError> {
+    const GRAPH_LOCK_DOMAIN: i64 = -4_611_686_018_427_387_904;
+    let graph = i64::try_from(graph_id.get())
+        .map_err(|_| IngressError::Governance("graph ID exceeds bigint"))?;
+    GRAPH_LOCK_DOMAIN
+        .checked_add(graph)
+        .ok_or(IngressError::Governance("graph advisory key overflow"))
 }
 
 #[cfg(test)]

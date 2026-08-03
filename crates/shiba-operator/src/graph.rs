@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 use shiba_protocol::{BootstrapBatchId, GraphId, GraphTransactionId, SourceId};
 
 use crate::{
-    EffectOrigin, Expression, ObjectAddress, OperatorId, OutputContract, StateContract,
-    TypedLayout, TypedRow, TypedValue, ValueType,
+    EffectOrigin, Expression, ObjectAddress, OutputContract, StateContract, TypedLayout, TypedRow,
+    TypedValue, ValueType,
 };
 
 pub const GRAPH_FORMAT_VERSION: u32 = 1;
@@ -51,8 +51,6 @@ pub struct SourcePort {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeInput {
-    /// Singleton-source input; graph cutover will canonicalize it to its sole port.
-    Source,
     SourcePort(SourceId),
     Node(NodeId),
 }
@@ -60,6 +58,10 @@ pub enum NodeInput {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperatorNodeKind {
+    CountRows,
+    SumInt8 {
+        input_slot: u16,
+    },
     Filter {
         predicate: Expression,
     },
@@ -130,28 +132,6 @@ impl OperatorGraph {
     ///
     /// Rejects invalid topology, layouts, expressions, state, or output contracts.
     pub fn build(
-        operator_id: OperatorId,
-        source_id: SourceId,
-        source_layout: Vec<ColumnBinding>,
-        nodes: Vec<OperatorNode>,
-    ) -> Result<Self, GraphError> {
-        Self::build_graph(
-            GraphId::new(operator_id.get()).map_err(|_| GraphError::InvalidTopology)?,
-            vec![SourcePort {
-                source_id,
-                layout: source_layout,
-                identity_index: None,
-            }],
-            nodes,
-        )
-    }
-
-    /// Builds the narrow canonical two-source graph admitted by M14.5.
-    ///
-    /// # Errors
-    ///
-    /// Rejects duplicate sources, missing right identity, topology or type drift.
-    pub fn build_graph(
         graph_id: GraphId,
         sources: Vec<SourcePort>,
         nodes: Vec<OperatorNode>,
@@ -183,7 +163,7 @@ impl OperatorGraph {
     pub fn from_canonical_payload(payload: &[u8], digest: [u8; 32]) -> Result<Self, GraphError> {
         let canonical: CanonicalGraph =
             serde_json::from_slice(payload).map_err(|_| GraphError::Codec)?;
-        let rebuilt = Self::build_graph(
+        let rebuilt = Self::build(
             canonical.graph_id,
             canonical.sources.clone(),
             canonical.nodes.clone(),
@@ -208,6 +188,20 @@ impl OperatorGraph {
             return Err(GraphError::DigestMismatch);
         }
         Ok(())
+    }
+
+    /// Returns the generic result-sink contracts exposed by this graph.
+    ///
+    /// Concrete terminal-node dispatch remains inside the database-independent
+    /// operator kernel; Runtime and Ingress only consume result identities and
+    /// output shapes.
+    pub fn result_contracts(&self) -> impl Iterator<Item = (NodeId, &OutputContract)> {
+        self.nodes.iter().filter_map(|node| {
+            let OperatorNodeKind::Materialize { output, .. } = &node.kind else {
+                return None;
+            };
+            Some((node.node_id, output))
+        })
     }
 
     pub(crate) fn layouts(
@@ -268,6 +262,10 @@ pub enum ResultMutation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "shape", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResultDelta {
+    Scalar {
+        node_id: NodeId,
+        value: TypedValue,
+    },
     Keyed {
         node_id: NodeId,
         mutations: Vec<ResultMutation>,
@@ -276,6 +274,7 @@ pub enum ResultDelta {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphTransition {
+    pub state_deltas: Vec<crate::StateDelta>,
     pub results: Vec<ResultDelta>,
 }
 

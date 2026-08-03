@@ -1,9 +1,9 @@
-use std::num::NonZeroU64;
+use std::num::NonZeroU32;
 
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_operator::OperatorId;
-use shiba_protocol::{SlotGeneration, SourceId};
+use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
+use shiba_operator::NodeId;
+use shiba_protocol::{GraphId, SlotGeneration, SourceId};
 use shiba_runtime::{
     M2Error, PgoutputSource, ProcessOutcome, compile_and_register, decode_committed_changes,
     process,
@@ -23,12 +23,36 @@ const CAPTURE: PgoutputCapture = PgoutputCapture {
     publication: "shiba_m13_operator_kernel_pub",
 };
 
-fn spec(operator_id: u64, operation: OperatorOperationV1) -> OperatorSpecV1 {
-    OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("operator id")),
-        source_id: SourceId::new(1).expect("source id"),
-        operation,
+fn node(value: u32) -> NodeId {
+    NodeId::new(NonZeroU32::new(value).expect("node id"))
+}
+
+fn spec() -> GraphSpecV1 {
+    let source_id = SourceId::new(1).expect("source id");
+    GraphSpecV1 {
+        version: GRAPH_SPEC_VERSION,
+        graph_id: GraphId::new(1).expect("graph id"),
+        sources: vec![source_id],
+        outputs: vec![
+            GraphOutputSpecV1::CountRows {
+                source_id,
+                aggregate_node_id: node(1),
+                result_node_id: node(101),
+            },
+            GraphOutputSpecV1::SumInt8 {
+                source_id,
+                input_column: "payload".into(),
+                aggregate_node_id: node(2),
+                result_node_id: node(102),
+            },
+            GraphOutputSpecV1::MaterializedProject {
+                source_id,
+                key_column: "id".into(),
+                value_column: "payload".into(),
+                project_node_id: node(3),
+                result_node_id: node(103),
+            },
+        ],
     }
 }
 
@@ -37,10 +61,11 @@ fn capture(
     source: PgoutputSource,
     sql: &str,
     name: &str,
-) -> (Vec<u8>, shiba_runtime::SourceTransaction) {
+) -> (Vec<u8>, shiba_runtime::GraphTransaction) {
     client.batch_execute(sql).expect("commit source DML");
     let wire = CAPTURE.capture(client, name);
-    let input = decode_committed_changes(&wire, source).expect("decode committed pgoutput");
+    let input = decode_committed_changes(&wire, &support::singleton_graph(1, source))
+        .expect("decode committed pgoutput");
     (wire, input)
 }
 
@@ -59,7 +84,7 @@ fn install_sink_failure(client: &mut Client) {
              CREATE FUNCTION m13_failure.reject_keyed_sink() RETURNS trigger
              LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'keyed sink failure'; END $$;
              CREATE TRIGGER reject_keyed_sink BEFORE INSERT OR UPDATE OR DELETE
-             ON shiba_internal.operator_result_row FOR EACH ROW
+             ON shiba_internal.graph_result_row FOR EACH ROW
              EXECUTE FUNCTION m13_failure.reject_keyed_sink();",
         )
         .expect("install keyed sink failure");
@@ -82,24 +107,7 @@ fn generic_kernel_persists_scalar_and_keyed_outputs_atomically() {
              SELECT shiba_internal.register_source(1, 'source.events'::regclass);",
         )
         .expect("install source authority");
-    for operator in [
-        spec(1, OperatorOperationV1::CountRows),
-        spec(
-            2,
-            OperatorOperationV1::SumInt8 {
-                input_column: "payload".into(),
-            },
-        ),
-        spec(
-            3,
-            OperatorOperationV1::MaterializedProject {
-                key_column: "id".into(),
-                value_column: "payload".into(),
-            },
-        ),
-    ] {
-        compile_and_register(&mut client, &operator).expect("register generic plan");
-    }
+    compile_and_register(&mut client, &spec()).expect("register generic graph");
     let relation: i64 = client
         .query_one("SELECT 'source.events'::regclass::oid::bigint", &[])
         .expect("relation oid")
@@ -110,6 +118,7 @@ fn generic_kernel_persists_scalar_and_keyed_outputs_atomically() {
         u32::try_from(relation).expect("relation oid fits"),
     );
     CAPTURE.create_slot();
+    support::configure_graph_ingress(&mut client, 1, CAPTURE.publication, CAPTURE.slot);
 
     let (_, insert) = capture(
         &mut client,
@@ -197,51 +206,51 @@ fn generic_kernel_persists_scalar_and_keyed_outputs_atomically() {
     let before_corrupt = durable(&mut client);
     let plan: Vec<u8> = client
         .query_one(
-            "SELECT plan_payload FROM shiba_internal.operator_definition WHERE operator_id=3",
+            "SELECT graph_payload FROM shiba_internal.graph_definition WHERE graph_id=1",
             &[],
         )
         .unwrap()
         .get(0);
-    client.execute("UPDATE shiba_internal.operator_definition SET plan_payload=plan_payload || decode('20','hex') WHERE operator_id=3", &[]).unwrap();
+    client.execute("UPDATE shiba_internal.graph_definition SET graph_payload=graph_payload || decode('20','hex') WHERE graph_id=1", &[]).unwrap();
     assert!(matches!(
         process(&mut client, &corrupt_input),
         Err(M2Error::InvalidOperatorDefinition)
     ));
     client
         .execute(
-            "UPDATE shiba_internal.operator_definition SET plan_payload=$1 WHERE operator_id=3",
+            "UPDATE shiba_internal.graph_definition SET graph_payload=$1 WHERE graph_id=1",
             &[&plan],
         )
         .unwrap();
     assert_eq!(durable(&mut client), before_corrupt);
     let state: Vec<u8> = client
         .query_one(
-            "SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id=1",
+            "SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id=1 AND node_id=1 AND namespace=0",
             &[],
         )
         .unwrap()
         .get(0);
-    client.execute("UPDATE shiba_internal.operator_state SET state_payload=decode('00','hex') WHERE operator_id=1", &[]).unwrap();
+    client.execute("UPDATE shiba_internal.graph_node_state SET state_payload=decode('00','hex') WHERE graph_id=1 AND node_id=1 AND namespace=0", &[]).unwrap();
     assert!(matches!(
         process(&mut client, &corrupt_input),
         Err(M2Error::Kernel(_))
     ));
     client
         .execute(
-            "UPDATE shiba_internal.operator_state SET state_payload=$1 WHERE operator_id=1",
+            "UPDATE shiba_internal.graph_node_state SET state_payload=$1 WHERE graph_id=1 AND node_id=1 AND namespace=0",
             &[&state],
         )
         .unwrap();
     assert_eq!(durable(&mut client), before_corrupt);
 
-    client.batch_execute("UPDATE shiba_internal.operator_state SET state_payload=decode('7fffffffffffffff','hex') WHERE operator_id=2; UPDATE shiba.operator_result SET value_bigint=9223372036854775807 WHERE operator_id=2").unwrap();
+    client.batch_execute("UPDATE shiba_internal.graph_node_state SET state_payload=decode('7fffffffffffffff','hex') WHERE graph_id=1 AND node_id=2 AND namespace=0; UPDATE shiba.graph_result SET value_bigint=9223372036854775807 WHERE graph_id=1 AND result_id=102").unwrap();
     let overflow = durable(&mut client);
     assert!(matches!(
         process(&mut client, &corrupt_input),
         Err(M2Error::Kernel(_))
     ));
     assert_eq!(durable(&mut client), overflow);
-    client.batch_execute("UPDATE shiba_internal.operator_state SET state_payload=decode('0000000000000028','hex') WHERE operator_id=2; UPDATE shiba.operator_result SET value_bigint=40 WHERE operator_id=2").unwrap();
+    client.batch_execute("UPDATE shiba_internal.graph_node_state SET state_payload=decode('0000000000000028','hex') WHERE graph_id=1 AND node_id=2 AND namespace=0; UPDATE shiba.graph_result SET value_bigint=40 WHERE graph_id=1 AND result_id=102").unwrap();
     assert_eq!(
         process(&mut client, &corrupt_input).unwrap(),
         ProcessOutcome::Applied

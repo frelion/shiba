@@ -1,21 +1,18 @@
 use std::{
-    num::NonZeroU64,
     sync::mpsc::{self, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
 };
 
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_ingress::{AttachOptions, GovernedSourceSession, IngressError, ReplicationMode};
-use shiba_operator::OperatorId;
-use shiba_protocol::{SlotGeneration, SourceId};
+use shiba_ingress::{AttachOptions, GovernedGraphSession, IngressError, ReplicationMode};
+use shiba_protocol::{GraphId, SlotGeneration};
 use shiba_runtime::compile_and_register;
 
 #[allow(dead_code)]
 mod support;
 
-use support::slot_lsn;
+use support::{count_spec, slot_lsn};
 
 const SLOT: &str = "shiba_m10_shutdown_slot";
 const PUBLICATION: &str = "shiba_m10_shutdown_pub";
@@ -26,11 +23,11 @@ fn required(name: &str) -> String {
         .unwrap_or_else(|_| panic!("scripts/test-m10-shutdown-ingress.sh must set {name}"))
 }
 
-fn attach(database_url: &str, replication_url: &str) -> GovernedSourceSession {
-    GovernedSourceSession::attach(
+fn attach(database_url: &str, replication_url: &str) -> GovernedGraphSession {
+    GovernedGraphSession::attach(
         database_url,
         replication_url,
-        SourceId::new(1).expect("source ID"),
+        GraphId::new(1).expect("graph ID"),
         SlotGeneration::new(1).expect("slot generation"),
         AttachOptions::new(ReplicationMode::Committed, Duration::from_secs(5))
             .expect("attach options"),
@@ -42,9 +39,9 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -67,16 +64,7 @@ fn idle_receive_shutdown_is_bounded_and_preserves_durable_state() {
              SELECT shiba_internal.register_source(1, 'source.events'::regclass);"
         ))
         .expect("install shutdown fixture");
-    compile_and_register(
-        &mut admin,
-        &OperatorSpecV1 {
-            version: OPERATOR_SPEC_VERSION,
-            operator_id: OperatorId::new(NonZeroU64::new(1).expect("operator ID")),
-            source_id: SourceId::new(1).expect("source ID"),
-            operation: OperatorOperationV1::CountRows,
-        },
-    )
-    .expect("register CountRows");
+    compile_and_register(&mut admin, &count_spec(1)).expect("register CountRows");
     admin
         .query_one(
             "SELECT slot_name FROM pg_create_logical_replication_slot($1, 'pgoutput')",
@@ -92,7 +80,7 @@ fn idle_receive_shutdown_is_bounded_and_preserves_durable_state() {
         .get(0);
     admin
         .execute(
-            "SELECT shiba_internal.configure_source_ingress(1, $1, $2, 1)",
+            "SELECT shiba_internal.configure_graph_ingress(1, $1, $2, 1)",
             &[&publication_oid, &SLOT],
         )
         .expect("configure shutdown ingress");

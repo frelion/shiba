@@ -1,20 +1,12 @@
-use std::{
-    num::NonZeroU64,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_operator::OperatorId;
 use shiba_protocol::{SlotGeneration, SourceId};
-use shiba_runtime::{
-    M2Error, PgoutputSource, ProcessOutcome, compile_and_register, decode_committed_changes,
-    process,
-};
+use shiba_runtime::{M2Error, PgoutputSource, ProcessOutcome, decode_committed_changes, process};
 
 mod support;
 
-use support::{PgoutputCapture, register_source};
+use support::PgoutputCapture;
 
 const DECODE_LIMIT: Duration = Duration::from_secs(2);
 const APPLY_LIMIT: Duration = Duration::from_secs(10);
@@ -44,28 +36,18 @@ fn source(client: &mut Client) -> PgoutputSource {
     )
 }
 
-fn register_sum(client: &mut Client) {
-    let spec = OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(2).expect("non-zero operator")),
-        source_id: SourceId::new(1).expect("non-zero source"),
-        operation: OperatorOperationV1::SumInt8 {
-            input_column: "payload".to_owned(),
-        },
-    };
-    compile_and_register(client, &spec).expect("compile and register SumInt8");
-}
-
 fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 2),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 2),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id=1 AND result_id=1001),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id=1 AND result_id=1002),
+                (SELECT state_payload FROM shiba_internal.graph_node_state
+                 WHERE graph_id=1 AND node_id=1 AND namespace=0),
+                (SELECT state_payload FROM shiba_internal.graph_node_state
+                 WHERE graph_id=1 AND node_id=2 AND namespace=0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query count and sum durable state");
@@ -92,17 +74,17 @@ fn install_ordered_failure(client: &mut Client) {
             "CREATE SCHEMA m9_operator_performance_test;
              CREATE TABLE m9_operator_performance_test.update_order (
                  ordinal bigint GENERATED ALWAYS AS IDENTITY,
-                 operator_id bigint NOT NULL
+                 node_id bigint NOT NULL
              );
              CREATE FUNCTION m9_operator_performance_test.fail_second()
              RETURNS trigger LANGUAGE plpgsql AS $$
              BEGIN
-                 INSERT INTO m9_operator_performance_test.update_order (operator_id)
-                 VALUES (NEW.operator_id);
-                 IF NEW.operator_id = 2 THEN
+                 INSERT INTO m9_operator_performance_test.update_order (node_id)
+                 VALUES (NEW.node_id);
+                 IF NEW.node_id = 2 THEN
                      IF NOT EXISTS (
                          SELECT 1 FROM m9_operator_performance_test.update_order
-                         WHERE operator_id = 1
+                         WHERE node_id = 1
                      ) THEN
                          RAISE EXCEPTION 'operator order violation';
                      END IF;
@@ -112,7 +94,7 @@ fn install_ordered_failure(client: &mut Client) {
              END
              $$;
              CREATE TRIGGER m9_ordered_failure
-             BEFORE UPDATE ON shiba_internal.operator_state
+             BEFORE UPDATE ON shiba_internal.graph_node_state
              FOR EACH ROW EXECUTE FUNCTION
                  m9_operator_performance_test.fail_second();",
         )
@@ -128,8 +110,8 @@ fn prove_ordered_atomic_failure(
         .batch_execute("INSERT INTO source_m9_performance.events VALUES (10001, 2)")
         .expect("commit failure-case source transaction");
     let wire = CAPTURE.capture(client, "ordered-failure.pgoutput");
-    let transaction =
-        decode_committed_changes(&wire, source).expect("decode failure-case transaction");
+    let transaction = decode_committed_changes(&wire, &support::singleton_graph(1, source))
+        .expect("decode failure-case transaction");
     install_ordered_failure(client);
     let error = process(client, &transaction).expect_err("second operator must fail");
     let M2Error::Postgres(error) = error else {
@@ -167,9 +149,15 @@ fn m9_count_and_sum_10000_change_latency_and_atomicity_are_bounded() {
         )
         .expect("install performance source objects");
     let source = source(&mut client);
-    register_source(&mut client, "source_m9_performance.events");
-    register_sum(&mut client);
+    client
+        .query_one(
+            "SELECT shiba_internal.register_source(1, 'source_m9_performance.events'::regclass)",
+            &[],
+        )
+        .expect("register source");
+    support::register_count_sum_graph(&mut client, 1);
     CAPTURE.create_slot();
+    support::configure_graph_ingress(&mut client, 1, CAPTURE.publication, CAPTURE.slot);
     client
         .batch_execute(
             "INSERT INTO source_m9_performance.events
@@ -180,8 +168,8 @@ fn m9_count_and_sum_10000_change_latency_and_atomicity_are_bounded() {
     let wire = CAPTURE.capture(&mut client, "count-sum-performance.pgoutput");
 
     let started = Instant::now();
-    let transaction =
-        decode_committed_changes(&wire, source).expect("decode fixed count+sum transaction");
+    let transaction = decode_committed_changes(&wire, &support::singleton_graph(1, source))
+        .expect("decode fixed count+sum transaction");
     let decode_elapsed = started.elapsed();
     assert_eq!(transaction.changes.len(), 10_000);
 

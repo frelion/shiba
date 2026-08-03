@@ -29,6 +29,7 @@ mod rebuild;
 mod rebuild_abandoned;
 mod rebuild_handoff;
 mod rebuild_model;
+mod rebuild_prepare;
 mod rebuild_resume;
 mod rebuild_validation;
 mod receive_loop;
@@ -45,13 +46,13 @@ pub use assembler::{AssembledTransaction, CommittedAssembler};
 pub use bootstrap::{BootstrapOptions, BootstrapSession, BootstrapSpec, SnapshotProgress};
 pub use bootstrap_catchup::{BootstrapCatchupProgress, BootstrapCatchupSession};
 pub use envelope::{ReplicationMessage, encode_feedback, parse_replication_message};
-pub use governed::{AttachOptions, GovernedSourceSession};
+pub use governed::{AttachOptions, GovernedGraphSession};
 pub use limits::{
-    BOOTSTRAP_CONNECTIONS_PER_SOURCE, CONNECTIONS_PER_SOURCE, MAX_ACTIVE_CONNECTIONS,
-    MAX_ACTIVE_SOURCES,
+    BOOTSTRAP_CONNECTIONS_PER_GRAPH, CONNECTIONS_PER_GRAPH, MAX_ACTIVE_CONNECTIONS,
+    MAX_ACTIVE_GRAPHS,
 };
 pub use rebuild::PreparedRebuild;
-pub use rebuild_model::{RebuildIdentity, RebuildSpec};
+pub use rebuild_model::{RebuildIdentity, RebuildMemberIdentity, RebuildSpec};
 pub(crate) use receiver::SourceReceiver;
 pub use shutdown::ShutdownHandle;
 pub use tokens::{
@@ -100,7 +101,7 @@ impl fmt::Display for IngressError {
                 formatter.write_str("replication receiver failed closed and must restart")
             }
             Self::ShutdownRequested => formatter.write_str("source ingress shutdown requested"),
-            Self::Governance(reason) => write!(formatter, "source governance failed: {reason}"),
+            Self::Governance(reason) => write!(formatter, "graph governance failed: {reason}"),
             Self::Database(error) => write!(formatter, "governance database failed: {error}"),
             Self::Libpq(error) => {
                 write!(formatter, "logical replication transport failed: {error}")

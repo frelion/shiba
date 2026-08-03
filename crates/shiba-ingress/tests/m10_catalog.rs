@@ -1,5 +1,11 @@
 use libpq::{Connection, Status};
 use postgres::{Client, NoTls};
+use shiba_protocol::GraphId;
+use shiba_runtime::compile_and_register;
+
+#[path = "support/mod.rs"]
+#[allow(dead_code)]
+mod test_support;
 
 const ACTIVE_SLOT: &str = "shiba_m10_catalog_active";
 const MAIN_SLOT: &str = "shiba_m10_catalog_main";
@@ -41,7 +47,7 @@ fn configure(
     generation: i64,
 ) -> Result<u64, postgres::Error> {
     client.execute(
-        "SELECT shiba_internal.configure_source_ingress($1, $2, $3, $4)",
+        "SELECT shiba_internal.configure_graph_ingress($1, $2, $3, $4)",
         &[&source_id, &publication, &slot, &generation],
     )
 }
@@ -53,7 +59,7 @@ fn rotate(
     slot: &str,
 ) -> Result<u64, postgres::Error> {
     client.execute(
-        "SELECT shiba_internal.rotate_source_ingress_slot($1, $2, $3)",
+        "SELECT shiba_internal.rotate_graph_ingress_slot($1, $2, $3)",
         &[&source_id, &generation, &slot],
     )
 }
@@ -114,6 +120,11 @@ fn catalog_configures_invalidates_and_rotates_without_managing_slots() {
              SELECT shiba_internal.register_source(4, 'source.four'::regclass);",
         )
         .expect("install catalog fixtures");
+    for source_id in 1..=4 {
+        let mut graph = test_support::count_spec(source_id);
+        graph.graph_id = GraphId::new(source_id).expect("graph ID");
+        compile_and_register(&mut admin, &graph).expect("register catalog graph");
+    }
 
     for slot in [MAIN_SLOT, OLD_SLOT, NEW_SLOT, THIRD_SLOT, ACTIVE_SLOT] {
         create_logical_slot(&mut admin, slot);
@@ -139,7 +150,7 @@ fn catalog_configures_invalidates_and_rotates_without_managing_slots() {
     let configured = admin
         .query_one(
             "SELECT publication_objid, slot_name::text, slot_generation
-             FROM shiba_internal.source_ingress_config WHERE source_id = 1",
+             FROM shiba_internal.graph_ingress_config WHERE graph_id = 1",
             &[],
         )
         .expect("read atomic configuration");
@@ -162,8 +173,8 @@ fn catalog_configures_invalidates_and_rotates_without_managing_slots() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_ingress_config
-                 WHERE source_id = 4",
+                "SELECT count(*) FROM shiba_internal.graph_ingress_config
+                 WHERE graph_id = 4",
                 &[],
             )
             .expect("failed configuration remains absent")
@@ -183,8 +194,8 @@ fn catalog_configures_invalidates_and_rotates_without_managing_slots() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_ingress_invalidation
-                 WHERE source_id = 1",
+                "SELECT count(*) FROM shiba_internal.graph_ingress_invalidation
+                 WHERE graph_id = 1",
                 &[],
             )
             .expect("rollback leaves no ingress invalidation")
@@ -197,8 +208,8 @@ fn catalog_configures_invalidates_and_rotates_without_managing_slots() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_ingress_invalidation
-                 WHERE source_id = 1",
+                "SELECT count(*) FROM shiba_internal.graph_ingress_invalidation
+                 WHERE graph_id = 1",
                 &[],
             )
             .expect("committed invalidation persists")
@@ -211,8 +222,8 @@ fn catalog_configures_invalidates_and_rotates_without_managing_slots() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_ingress_invalidation
-                 WHERE source_id = 1",
+                "SELECT count(*) FROM shiba_internal.graph_ingress_invalidation
+                 WHERE graph_id = 1",
                 &[],
             )
             .expect("re-add does not clear invalidation")
@@ -230,8 +241,8 @@ fn catalog_configures_invalidates_and_rotates_without_managing_slots() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_ingress_invalidation
-                 WHERE source_id = 1",
+                "SELECT count(*) FROM shiba_internal.graph_ingress_invalidation
+                 WHERE graph_id = 1",
                 &[],
             )
             .expect("same-name recreation does not restore authority")
@@ -249,9 +260,10 @@ fn catalog_configures_invalidates_and_rotates_without_managing_slots() {
     assert!(rotate(&mut admin, 2, 2, PHYSICAL_SLOT).is_err());
     admin
         .execute(
-            "INSERT INTO shiba_internal.source_continuation
-             (source_id, slot_generation, commit_lsn, ingress_transaction_id)
-             VALUES (2, 2, '0/1', 1)",
+            "INSERT INTO shiba_internal.graph_continuation
+             (graph_id, slot_generation, commit_lsn, ingress_transaction_id, graph_digest)
+             SELECT 2, 2, '0/1', 1, graph_digest
+               FROM shiba_internal.graph_definition WHERE graph_id = 2",
             &[],
         )
         .expect("make configured source non-pristine");
@@ -259,7 +271,7 @@ fn catalog_configures_invalidates_and_rotates_without_managing_slots() {
     let rotated = admin
         .query_one(
             "SELECT slot_name::text, slot_generation
-             FROM shiba_internal.source_ingress_config WHERE source_id = 2",
+             FROM shiba_internal.graph_ingress_config WHERE graph_id = 2",
             &[],
         )
         .expect("read retained rotation authority");
@@ -270,7 +282,7 @@ fn catalog_configures_invalidates_and_rotates_without_managing_slots() {
         .query_one(
             "SELECT count(*) FROM information_schema.columns
              WHERE table_schema = 'shiba_internal'
-               AND table_name IN ('source_ingress_config', 'source_ingress_invalidation')
+               AND table_name IN ('graph_ingress_config', 'graph_ingress_invalidation')
                AND column_name IN ('confirmed_flush_lsn', 'restart_lsn', 'active_pid')",
             &[],
         )
@@ -284,7 +296,7 @@ fn catalog_configures_invalidates_and_rotates_without_managing_slots() {
         .expect("assume ordinary role");
     assert!(
         admin
-            .query("SELECT * FROM shiba_internal.source_ingress_config", &[])
+            .query("SELECT * FROM shiba_internal.graph_ingress_config", &[])
             .is_err()
     );
     assert!(configure(&mut admin, 4, active_pub, ACTIVE_SLOT, 1).is_err());

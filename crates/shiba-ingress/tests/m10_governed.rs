@@ -1,17 +1,15 @@
-use std::{num::NonZeroU64, sync::mpsc, thread, time::Duration};
+use std::{sync::mpsc, thread, time::Duration};
 
 use libpq::{Connection, Status};
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_ingress::{AttachOptions, GovernedSourceSession, ReplicationMode, StreamedInput};
-use shiba_operator::OperatorId;
-use shiba_protocol::{SlotGeneration, SourceId};
+use shiba_ingress::{AttachOptions, GovernedGraphSession, ReplicationMode, StreamedInput};
+use shiba_protocol::{GraphId, SlotGeneration};
 use shiba_runtime::{ProcessOutcome, compile_and_register};
 
 #[allow(dead_code)]
 mod support;
 
-use support::{slot_lsn, wait_for_slot_lsn};
+use support::{count_spec, slot_lsn, wait_for_slot_lsn};
 
 const SLOT: &str = "shiba_m10_governed_slot";
 const PUBLICATION: &str = "shiba_m10_governed_pub";
@@ -36,11 +34,11 @@ fn options() -> AttachOptions {
 fn attach(
     apply: &str,
     replication: &str,
-) -> Result<GovernedSourceSession, shiba_ingress::IngressError> {
-    GovernedSourceSession::attach(
+) -> Result<GovernedGraphSession, shiba_ingress::IngressError> {
+    GovernedGraphSession::attach(
         apply,
         replication,
-        SourceId::new(1).expect("source ID"),
+        GraphId::new(1).expect("graph ID"),
         SlotGeneration::new(1).expect("generation"),
         options(),
     )
@@ -79,33 +77,28 @@ fn governed_session_uses_split_roles_and_revalidates_before_empty_ack() {
              GRANT USAGE ON SCHEMA shiba_internal, shiba, source TO {APPLY_ROLE};
              GRANT SELECT, UPDATE ON shiba_internal.source_binding TO {APPLY_ROLE};
              GRANT SELECT ON shiba_internal.source_invalidation,
-                 shiba_internal.source_ingress_config,
-                 shiba_internal.source_ingress_invalidation,
-                 shiba_internal.source_bootstrap,
-                 shiba_internal.operator_definition TO {APPLY_ROLE};
-             GRANT UPDATE ON shiba_internal.source_bootstrap TO {APPLY_ROLE};
+                 shiba_internal.graph_ingress_config,
+                 shiba_internal.graph_ingress_source,
+                 shiba_internal.graph_ingress_invalidation,
+                 shiba_internal.graph_bootstrap TO {APPLY_ROLE};
+             GRANT SELECT, UPDATE ON shiba_internal.graph_definition,
+                 shiba_internal.graph_ingress_config,
+                 shiba_internal.graph_source_member TO {APPLY_ROLE};
+             GRANT UPDATE ON shiba_internal.graph_bootstrap TO {APPLY_ROLE};
              GRANT SELECT, INSERT, UPDATE
-                 ON shiba_internal.source_continuation TO {APPLY_ROLE};
+                 ON shiba_internal.graph_continuation TO {APPLY_ROLE};
              GRANT SELECT, INSERT, UPDATE, DELETE
                  ON shiba_internal.source_row_state TO {APPLY_ROLE};
-             GRANT SELECT, UPDATE ON shiba_internal.operator_state TO {APPLY_ROLE};
+             GRANT SELECT, INSERT, UPDATE, DELETE ON shiba_internal.graph_node_state TO {APPLY_ROLE};
              GRANT USAGE ON SCHEMA shiba TO {APPLY_ROLE};
-             GRANT SELECT, UPDATE ON shiba.operator_result TO {APPLY_ROLE};
+             GRANT SELECT, UPDATE ON shiba.graph_result TO {APPLY_ROLE};
+             GRANT SELECT, INSERT, UPDATE, DELETE ON shiba_internal.graph_result_row TO {APPLY_ROLE};
              GRANT SELECT ON source.events TO {APPLY_ROLE};
              GRANT USAGE ON SCHEMA source TO {RECEIVER_ROLE};
              GRANT SELECT ON source.events TO {RECEIVER_ROLE};"
         ))
         .expect("install governed fixture and split roles");
-    compile_and_register(
-        &mut admin,
-        &OperatorSpecV1 {
-            version: OPERATOR_SPEC_VERSION,
-            operator_id: OperatorId::new(NonZeroU64::new(1).expect("operator ID")),
-            source_id: SourceId::new(1).expect("source ID"),
-            operation: OperatorOperationV1::CountRows,
-        },
-    )
-    .expect("register CountRows");
+    compile_and_register(&mut admin, &count_spec(1)).expect("register CountRows");
     admin
         .query_one(
             "SELECT slot_name FROM pg_create_logical_replication_slot($1, 'pgoutput')",
@@ -121,7 +114,7 @@ fn governed_session_uses_split_roles_and_revalidates_before_empty_ack() {
         .get(0);
     admin
         .execute(
-            "SELECT shiba_internal.configure_source_ingress(1, $1, $2, 1)",
+            "SELECT shiba_internal.configure_graph_ingress(1, $1, $2, 1)",
             &[&publication_oid, &SLOT],
         )
         .expect("configure governed source");
@@ -131,10 +124,10 @@ fn governed_session_uses_split_roles_and_revalidates_before_empty_ack() {
     assert!(attach(&receiver_url, &receiver_url).is_err());
     assert!(attach(&apply_url, &as_role(&replication_url, APPLY_ROLE)).is_err());
     assert!(
-        GovernedSourceSession::attach(
+        GovernedGraphSession::attach(
             &apply_url,
             &receiver_url,
-            SourceId::new(1).expect("source ID"),
+            GraphId::new(1).expect("graph ID"),
             SlotGeneration::new(2).expect("wrong generation"),
             options(),
         )
@@ -216,7 +209,7 @@ fn governed_session_uses_split_roles_and_revalidates_before_empty_ack() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1",
+                "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2",
                 &[]
             )
             .expect("query unchanged CountRows")

@@ -1,9 +1,9 @@
-use std::{num::NonZeroU64, process::Command};
+use std::{num::NonZeroU32, process::Command};
 
 use postgres::Client;
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_operator::OperatorId;
-use shiba_protocol::SourceId;
+use shiba_compiler::{GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
+use shiba_operator::NodeId;
+use shiba_protocol::{GraphId, SourceId};
 use shiba_runtime::compile_and_register;
 
 pub(crate) use crate::pg_support::slot_lsn;
@@ -38,12 +38,26 @@ pub(crate) fn restart_postgres(mode: &str) {
     assert!(started.success(), "pg_ctl restart failed");
 }
 
-pub(crate) fn operator_spec(operator_id: u64, operation: OperatorOperationV1) -> OperatorSpecV1 {
-    OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("operator ID")),
-        source_id: SourceId::new(1).expect("source ID"),
-        operation,
+fn graph_spec() -> GraphSpecV1 {
+    let source_id = SourceId::new(1).expect("source ID");
+    let node = |value| NodeId::new(NonZeroU32::new(value).expect("node ID"));
+    GraphSpecV1 {
+        version: GRAPH_SPEC_VERSION,
+        graph_id: GraphId::new(1).expect("graph ID"),
+        sources: vec![source_id],
+        outputs: vec![
+            GraphOutputSpecV1::CountRows {
+                source_id,
+                aggregate_node_id: node(1),
+                result_node_id: node(2),
+            },
+            GraphOutputSpecV1::SumInt8 {
+                source_id,
+                input_column: "payload".to_owned(),
+                aggregate_node_id: node(3),
+                result_node_id: node(4),
+            },
+        ],
     }
 }
 
@@ -59,18 +73,7 @@ pub(crate) fn install_source(client: &mut Client) -> u32 {
              INSERT INTO source.events VALUES (1, 10), (2, 20), (3, 10);"
         ))
         .expect("install recovery source");
-    compile_and_register(client, &operator_spec(1, OperatorOperationV1::CountRows))
-        .expect("register CountRows");
-    compile_and_register(
-        client,
-        &operator_spec(
-            2,
-            OperatorOperationV1::SumInt8 {
-                input_column: "payload".to_owned(),
-            },
-        ),
-    )
-    .expect("register SumInt8");
+    compile_and_register(client, &graph_spec()).expect("register graph");
     client
         .query_one(
             "SELECT oid FROM pg_publication WHERE pubname = $1",
@@ -83,9 +86,9 @@ pub(crate) fn install_source(client: &mut Client) -> u32 {
 pub(crate) fn states(client: &mut Client) -> Vec<(i64, i64)> {
     client
         .query(
-            "SELECT operator_id, state_payload
-             FROM shiba_internal.operator_state
-             WHERE operator_id IN (1, 2) ORDER BY operator_id",
+            "SELECT node_id, state_payload
+             FROM shiba_internal.graph_node_state
+             WHERE graph_id = 1 AND node_id IN (1, 3) ORDER BY node_id",
             &[],
         )
         .expect("query operator states")
@@ -94,7 +97,7 @@ pub(crate) fn states(client: &mut Client) -> Vec<(i64, i64)> {
             let payload: Vec<u8> = row.get(1);
             (
                 row.get(0),
-                i64::from_be_bytes(payload.try_into().expect("int8 operator state")),
+                i64::from_be_bytes(payload.try_into().expect("int8 node state")),
             )
         })
         .collect()
@@ -116,8 +119,11 @@ pub(crate) fn rows(client: &mut Client) -> Vec<(i64, Option<i64>)> {
 pub(crate) fn checkpoint(client: &mut Client) -> (String, i64, Option<i64>) {
     let row = client
         .query_one(
-            "SELECT phase, last_batch_ordinal, last_source_row_id
-             FROM shiba_internal.source_bootstrap WHERE source_id = 1",
+            "SELECT bootstrap.phase, checkpoint.last_batch_ordinal,
+                    checkpoint.last_source_row_id
+             FROM shiba_internal.graph_bootstrap AS bootstrap
+             JOIN shiba_internal.graph_bootstrap_checkpoint AS checkpoint USING (graph_id)
+             WHERE bootstrap.graph_id = 1 AND checkpoint.source_id = 1",
             &[],
         )
         .expect("query bootstrap checkpoint");

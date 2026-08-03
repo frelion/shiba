@@ -87,6 +87,7 @@ m13_gates=(
 
 m14_gates=(
   test-m14-grouped.sh
+  test-m14-graph-runtime.sh
 )
 
 cd "$root"
@@ -101,7 +102,7 @@ if [[ "$expected" != "$discovered" ]]; then
   exit 1
 fi
 
-logs="$(mktemp -d /tmp/shiba-m13-release.XXXXXX)"
+logs="$(mktemp -d /tmp/shiba-m14-release.XXXXXX)"
 cleanup() {
   local exit_code=$?
   trap - EXIT HUP INT TERM
@@ -191,7 +192,7 @@ echo "==> phase 6/7: M13 generic scalar/keyed operator differential"
 run_m13_matrix pg17-m13 "$pg17"
 run_m13_matrix pg18-m13 "$pg18"
 
-echo "==> phase 7/7: current M14 generic grouped-state differential"
+echo "==> phase 7/7: M14 grouped-state and unified graph Runtime differential"
 run_m14_matrix pg17-m14 "$pg17"
 run_m14_matrix pg18-m14 "$pg18"
 

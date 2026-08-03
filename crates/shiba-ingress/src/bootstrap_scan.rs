@@ -17,6 +17,11 @@ impl BootstrapSession {
     /// the current Apply transaction and leaves the checkpoint retryable.
     pub fn scan_next(&mut self) -> Result<SnapshotProgress, IngressError> {
         self.config.revalidate(&mut self.apply, false)?;
+        if self.current_member >= self.members.len() {
+            complete_bootstrap_scan(&mut self.apply, self.spec.graph_id, self.spec.bootstrap_id)?;
+            return Ok(SnapshotProgress::ScanComplete);
+        }
+        let member = &mut self.members[self.current_member];
         let mut scan = self
             .scanner
             .build_transaction()
@@ -29,7 +34,7 @@ impl BootstrapSession {
         ))?;
         let batch_limit =
             i64::try_from(self.options.batch_rows()).map_err(|_| IngressError::LimitExceeded)?;
-        let rows = scan.query(&self.locator.query, &[&self.last_key, &batch_limit])?;
+        let rows = scan.query(&member.locator.query, &[&member.last_key, &batch_limit])?;
         let snapshot_rows: Vec<SnapshotRow> = rows
             .into_iter()
             .map(|row| SnapshotRow {
@@ -39,21 +44,34 @@ impl BootstrapSession {
             .collect();
         scan.commit()?;
         if snapshot_rows.is_empty() {
-            complete_bootstrap_scan(&mut self.apply, self.spec.source_id, self.spec.bootstrap_id)?;
-            return Ok(SnapshotProgress::ScanComplete);
+            self.current_member += 1;
+            if self.current_member == self.members.len() {
+                complete_bootstrap_scan(
+                    &mut self.apply,
+                    self.spec.graph_id,
+                    self.spec.bootstrap_id,
+                )?;
+                return Ok(SnapshotProgress::ScanComplete);
+            }
+            return self.scan_next();
         }
         let count = snapshot_rows.len();
         let last_key = snapshot_rows
             .last()
             .ok_or(IngressError::InvalidEnvelope("empty snapshot batch"))?
             .source_row_id;
-        let batch_id = BootstrapBatchId::new(self.spec.bootstrap_id, self.next_ordinal)
+        let batch_id = BootstrapBatchId::new(self.spec.bootstrap_id, member.next_ordinal)
             .map_err(|_| IngressError::LimitExceeded)?;
-        let batch = BootstrapBatch::new(self.spec.source_id, batch_id, snapshot_rows)?;
+        let batch = BootstrapBatch::new(
+            self.spec.graph_id,
+            member.source_id,
+            batch_id,
+            snapshot_rows,
+        )?;
         process_bootstrap_batch(&mut self.apply, &batch)?;
-        let ordinal = self.next_ordinal;
-        self.next_ordinal = ordinal.checked_add(1).ok_or(IngressError::LimitExceeded)?;
-        self.last_key = Some(last_key);
+        let ordinal = member.next_ordinal;
+        member.next_ordinal = ordinal.checked_add(1).ok_or(IngressError::LimitExceeded)?;
+        member.last_key = Some(last_key);
         Ok(SnapshotProgress::BatchApplied {
             ordinal,
             rows: count,

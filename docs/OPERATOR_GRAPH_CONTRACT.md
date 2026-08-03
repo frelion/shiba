@@ -5,8 +5,10 @@ keyed-state authority plus KeyBy, GroupedCount and GroupedSumInt8. Runtime uses
 canonical typed keys and set-based state/result persistence; typed NULL remains
 distinct from absent. M14.4 accepts the exact two-source JOIN authority and
 M14.5 implements its pure GraphId/SourcePort Compiler and Operator kernel.
-Runtime, Catalog, PG17/18 cross-schema execution and graph lifecycle remain
-M14.6 work. M14.5 is not M14 completion.
+M14.6 cuts Catalog, Runtime, Ingress, Bootstrap and Rebuild over to that same
+graph authority. Directed PG17.10/PG18.4 graph Runtime evidence is green;
+M14.7 owns the full lifecycle release/performance evidence, so M14.5 alone is
+not M14 completion.
 
 M14 extends the M13 database-free kernel; it does not add a SQL frontend or a
 second Runtime. This contract freezes graph identity, typed deltas, state,
@@ -206,12 +208,12 @@ smaller workload.
 Every implemented expression and node has an independent deterministic
 reference model and fixed-seed randomized differential. Pure JOIN gates cover
 mixed I/U/D, NULL/Absent, corrupt state, exact fan-out bounds and pre-to-final
-semantics. Remaining PostgreSQL JOIN gates cover full-row left/right and same-
-transaction changes, bounded fan-out, rollback, kill, retry, replay, DDL,
-bootstrap, catch-up, rebuild, recovery and least privilege.
-Grouped materializations compare complete rows with independent SQL oracles on
-PG17.10 and PG18.4. Joined materialization comparison remains an unproved M14.6
-gate.
+semantics. PG17.10/PG18.4 directed Runtime gates cover complete joined rows,
+left/right and same-transaction changes, bounded fan-out/retraction, rollback,
+retry, replay and exact PK invalidation. Grouped materializations compare
+complete rows with independent SQL oracles on both versions. Full graph
+bootstrap, catch-up, rebuild, recovery, least privilege and performance remain
+M14.7 release gates.
 
 M14 excludes SQL parsing, outer or three-table joins, windows, DISTINCT,
 Min/Max/Avg, plugins, schedulers and persisted intermediate deltas. M14 does not

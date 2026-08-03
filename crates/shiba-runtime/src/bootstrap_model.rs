@@ -1,4 +1,4 @@
-use shiba_protocol::{BootstrapBatchDigest, BootstrapBatchId, SourceId};
+use shiba_protocol::{BootstrapBatchDigest, BootstrapBatchId, GraphId, SourceId};
 
 use crate::M2Error;
 
@@ -12,6 +12,7 @@ pub struct SnapshotRow {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BootstrapBatch {
+    pub(crate) graph_id: GraphId,
     pub(crate) source_id: SourceId,
     pub(crate) batch_id: BootstrapBatchId,
     pub(crate) rows: Vec<SnapshotRow>,
@@ -24,6 +25,7 @@ impl BootstrapBatch {
     /// # Errors
     /// Rejects empty, oversized, or non-increasing batches.
     pub fn new(
+        graph_id: GraphId,
         source_id: SourceId,
         batch_id: BootstrapBatchId,
         rows: Vec<SnapshotRow>,
@@ -40,8 +42,9 @@ impl BootstrapBatch {
         {
             return Err(M2Error::BootstrapRowsOutOfOrder);
         }
-        let digest = digest_batch(source_id, batch_id, &rows);
+        let digest = digest_batch(graph_id, source_id, batch_id, &rows);
         Ok(Self {
+            graph_id,
             source_id,
             batch_id,
             rows,
@@ -52,6 +55,11 @@ impl BootstrapBatch {
     #[must_use]
     pub const fn source_id(&self) -> SourceId {
         self.source_id
+    }
+
+    #[must_use]
+    pub const fn graph_id(&self) -> GraphId {
+        self.graph_id
     }
 
     #[must_use]
@@ -71,11 +79,13 @@ impl BootstrapBatch {
 }
 
 fn digest_batch(
+    graph_id: GraphId,
     source_id: SourceId,
     batch_id: BootstrapBatchId,
     rows: &[SnapshotRow],
 ) -> BootstrapBatchDigest {
     let mut canonical = Vec::with_capacity(32 + rows.len() * 17);
+    canonical.extend_from_slice(&graph_id.get().to_be_bytes());
     canonical.extend_from_slice(&source_id.get().to_be_bytes());
     canonical.extend_from_slice(&batch_id.bootstrap_id.get().to_be_bytes());
     canonical.extend_from_slice(&batch_id.batch_ordinal().to_be_bytes());
@@ -101,6 +111,7 @@ mod tests {
 
     fn batch(rows: Vec<SnapshotRow>) -> Result<BootstrapBatch, M2Error> {
         BootstrapBatch::new(
+            GraphId::new(1).unwrap(),
             SourceId::new(1).unwrap(),
             BootstrapBatchId::new(BootstrapId::new(2).unwrap(), 3).unwrap(),
             rows,
@@ -156,6 +167,7 @@ mod tests {
         }])
         .unwrap();
         let second = BootstrapBatch::new(
+            GraphId::new(1).unwrap(),
             SourceId::new(1).unwrap(),
             BootstrapBatchId::new(BootstrapId::new(2).unwrap(), 4).unwrap(),
             vec![SnapshotRow {

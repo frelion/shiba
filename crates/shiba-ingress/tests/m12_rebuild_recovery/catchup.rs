@@ -21,7 +21,7 @@ pub(crate) fn prove_catchup_activation_feedback(
             "CREATE FUNCTION public.reject_m12_fence() RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN RAISE EXCEPTION 'm12 fail before fence commit'; END $$;
          CREATE TRIGGER reject_m12_fence BEFORE UPDATE OF phase
-         ON shiba_internal.source_bootstrap FOR EACH ROW
+         ON shiba_internal.graph_bootstrap FOR EACH ROW
          WHEN (NEW.phase = 'catching_up') EXECUTE FUNCTION public.reject_m12_fence();",
         )
         .expect("install pre-fence failure");
@@ -29,7 +29,7 @@ pub(crate) fn prove_catchup_activation_feedback(
         BootstrapCatchupSession::resume(
             database_url,
             replication_url,
-            shiba_protocol::SourceId::new(1).unwrap(),
+            shiba_protocol::GraphId::new(1).unwrap(),
             shiba_protocol::BootstrapId::new(attempt.bootstrap).unwrap(),
             shiba_protocol::SlotGeneration::new(attempt.generation).unwrap(),
             support::options(),
@@ -39,7 +39,7 @@ pub(crate) fn prove_catchup_activation_feedback(
     let fence_state = admin
         .query_one(
             "SELECT phase, catchup_fence_lsn IS NULL
-             FROM shiba_internal.source_bootstrap WHERE source_id=1",
+             FROM shiba_internal.graph_bootstrap WHERE graph_id=1",
             &[],
         )
         .expect("query rolled-back fence");
@@ -47,7 +47,7 @@ pub(crate) fn prove_catchup_activation_feedback(
     assert!(fence_state.get::<_, bool>(1));
     admin
         .batch_execute(
-            "DROP TRIGGER reject_m12_fence ON shiba_internal.source_bootstrap;
+            "DROP TRIGGER reject_m12_fence ON shiba_internal.graph_bootstrap;
          DROP FUNCTION public.reject_m12_fence();",
         )
         .expect("remove pre-fence failure");
@@ -55,7 +55,7 @@ pub(crate) fn prove_catchup_activation_feedback(
     let catchup = BootstrapCatchupSession::resume(
         database_url,
         replication_url,
-        shiba_protocol::SourceId::new(1).unwrap(),
+        shiba_protocol::GraphId::new(1).unwrap(),
         shiba_protocol::BootstrapId::new(attempt.bootstrap).unwrap(),
         shiba_protocol::SlotGeneration::new(attempt.generation).unwrap(),
         support::options(),
@@ -65,7 +65,7 @@ pub(crate) fn prove_catchup_activation_feedback(
     let mut catchup = BootstrapCatchupSession::resume(
         database_url,
         replication_url,
-        shiba_protocol::SourceId::new(1).unwrap(),
+        shiba_protocol::GraphId::new(1).unwrap(),
         shiba_protocol::BootstrapId::new(attempt.bootstrap).unwrap(),
         shiba_protocol::SlotGeneration::new(attempt.generation).unwrap(),
         support::options(),
@@ -78,7 +78,7 @@ pub(crate) fn prove_catchup_activation_feedback(
             "CREATE FUNCTION public.reject_m12_apply() RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN RAISE EXCEPTION 'm12 fail before Apply commit'; END $$;
          CREATE TRIGGER reject_m12_apply BEFORE INSERT
-         ON shiba_internal.source_continuation FOR EACH ROW
+         ON shiba_internal.graph_continuation FOR EACH ROW
          EXECUTE FUNCTION public.reject_m12_apply();",
         )
         .expect("install deterministic pre-Apply failure");
@@ -87,7 +87,7 @@ pub(crate) fn prove_catchup_activation_feedback(
     assert_eq!(support::evidence(admin), before_apply);
     admin
         .batch_execute(
-            "DROP TRIGGER reject_m12_apply ON shiba_internal.source_continuation;
+            "DROP TRIGGER reject_m12_apply ON shiba_internal.graph_continuation;
          DROP FUNCTION public.reject_m12_apply();",
         )
         .expect("remove pre-Apply failure");
@@ -96,7 +96,7 @@ pub(crate) fn prove_catchup_activation_feedback(
     let mut catchup = BootstrapCatchupSession::resume(
         database_url,
         replication_url,
-        shiba_protocol::SourceId::new(1).unwrap(),
+        shiba_protocol::GraphId::new(1).unwrap(),
         shiba_protocol::BootstrapId::new(attempt.bootstrap).unwrap(),
         shiba_protocol::SlotGeneration::new(attempt.generation).unwrap(),
         support::options(),
@@ -105,7 +105,7 @@ pub(crate) fn prove_catchup_activation_feedback(
 
     support::install_receiver_kill_trigger(
         admin,
-        "shiba_internal.source_continuation",
+        "shiba_internal.graph_continuation",
         "AFTER INSERT",
     );
     assert!(
@@ -117,7 +117,7 @@ pub(crate) fn prove_catchup_activation_feedback(
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_continuation WHERE slot_generation=$1",
+                "SELECT count(*) FROM shiba_internal.graph_continuation WHERE slot_generation=$1",
                 &[&i64::try_from(attempt.generation).expect("generation bigint")],
             )
             .unwrap()
@@ -125,12 +125,12 @@ pub(crate) fn prove_catchup_activation_feedback(
         1
     );
     drop(catchup);
-    support::remove_kill_trigger(admin, "shiba_internal.source_continuation");
+    support::remove_kill_trigger(admin, "shiba_internal.graph_continuation");
 
     let mut catchup = BootstrapCatchupSession::resume(
         database_url,
         replication_url,
-        shiba_protocol::SourceId::new(1).unwrap(),
+        shiba_protocol::GraphId::new(1).unwrap(),
         shiba_protocol::BootstrapId::new(attempt.bootstrap).unwrap(),
         shiba_protocol::SlotGeneration::new(attempt.generation).unwrap(),
         support::options(),
@@ -147,7 +147,7 @@ pub(crate) fn prove_catchup_activation_feedback(
             "CREATE FUNCTION public.reject_m12_activation() RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN RAISE EXCEPTION 'm12 fail before activation commit'; END $$;
          CREATE TRIGGER reject_m12_activation BEFORE UPDATE OF phase
-         ON shiba_internal.source_bootstrap FOR EACH ROW
+         ON shiba_internal.graph_bootstrap FOR EACH ROW
          WHEN (NEW.phase = 'active') EXECUTE FUNCTION public.reject_m12_activation();",
         )
         .expect("install pre-activation failure");
@@ -157,7 +157,7 @@ pub(crate) fn prove_catchup_activation_feedback(
     support::assert_building(admin);
     admin
         .batch_execute(
-            "DROP TRIGGER reject_m12_activation ON shiba_internal.source_bootstrap;
+            "DROP TRIGGER reject_m12_activation ON shiba_internal.graph_bootstrap;
          DROP FUNCTION public.reject_m12_activation();",
         )
         .expect("remove pre-activation failure");
@@ -166,7 +166,7 @@ pub(crate) fn prove_catchup_activation_feedback(
     let mut catchup = BootstrapCatchupSession::resume(
         database_url,
         replication_url,
-        shiba_protocol::SourceId::new(1).unwrap(),
+        shiba_protocol::GraphId::new(1).unwrap(),
         shiba_protocol::BootstrapId::new(attempt.bootstrap).unwrap(),
         shiba_protocol::SlotGeneration::new(attempt.generation).unwrap(),
         support::options(),
@@ -175,7 +175,7 @@ pub(crate) fn prove_catchup_activation_feedback(
 
     support::install_receiver_kill_trigger(
         admin,
-        "shiba_internal.source_bootstrap",
+        "shiba_internal.graph_bootstrap",
         "AFTER UPDATE OF phase",
     );
     assert!(
@@ -184,19 +184,19 @@ pub(crate) fn prove_catchup_activation_feedback(
     );
     let activation_lsn: String = admin
         .query_one(
-            "SELECT activation_end_lsn::text FROM shiba_internal.source_bootstrap
-         WHERE source_id=1 AND phase='active'",
+            "SELECT activation_end_lsn::text FROM shiba_internal.graph_bootstrap
+         WHERE graph_id=1 AND phase='active'",
             &[],
         )
         .expect("activation committed")
         .get(0);
     drop(catchup);
-    support::remove_kill_trigger(admin, "shiba_internal.source_bootstrap");
+    support::remove_kill_trigger(admin, "shiba_internal.graph_bootstrap");
 
     let mut active = BootstrapCatchupSession::resume(
         database_url,
         replication_url,
-        shiba_protocol::SourceId::new(1).unwrap(),
+        shiba_protocol::GraphId::new(1).unwrap(),
         shiba_protocol::BootstrapId::new(attempt.bootstrap).unwrap(),
         shiba_protocol::SlotGeneration::new(attempt.generation).unwrap(),
         support::options(),
@@ -214,7 +214,7 @@ pub(crate) fn prove_catchup_activation_feedback(
     let mut exact = BootstrapCatchupSession::resume(
         database_url,
         replication_url,
-        shiba_protocol::SourceId::new(1).unwrap(),
+        shiba_protocol::GraphId::new(1).unwrap(),
         shiba_protocol::BootstrapId::new(attempt.bootstrap).unwrap(),
         shiba_protocol::SlotGeneration::new(attempt.generation).unwrap(),
         support::options(),

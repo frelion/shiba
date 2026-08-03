@@ -17,10 +17,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -76,7 +76,7 @@ fn install_crash_trigger(client: &mut Client) {
              END
              $$;
              CREATE TRIGGER m5_replica_index_crash
-             AFTER INSERT ON shiba_internal.source_continuation
+             AFTER INSERT ON shiba_internal.graph_continuation
              FOR EACH ROW EXECUTE FUNCTION
                  m5_replica_index_test.crash_after_continuation();",
         )
@@ -127,7 +127,8 @@ fn m5_real_replica_index_delete_and_identity_drift() {
     assert_eq!((relation, identity), (relation_id, b'i'));
     assert_eq!((columns, key_flags), (1, 1));
     assert_eq!(insert_wire[insert_at], b'I');
-    let insert = decode_committed_changes(&insert_wire, source).expect("decode index insert");
+    let insert = decode_committed_changes(&insert_wire, &support::singleton_graph(1, source))
+        .expect("decode index insert");
     assert_eq!(
         process(&mut client, &insert).expect("apply index insert"),
         ProcessOutcome::Applied
@@ -143,7 +144,8 @@ fn m5_real_replica_index_delete_and_identity_drift() {
         .expect("commit replica-index delete");
     let delete_wire = CAPTURE.capture(&mut client, "replica-index-delete.pgoutput");
     assert_index_delete(&delete_wire, relation_id);
-    let delete = decode_committed_changes(&delete_wire, source).expect("decode index delete");
+    let delete = decode_committed_changes(&delete_wire, &support::singleton_graph(1, source))
+        .expect("decode index delete");
     install_crash_trigger(&mut client);
     assert!(process(&mut client, &delete).is_err());
     let mut client = Client::connect(&connection, NoTls).expect("reconnect after crash");
@@ -174,6 +176,6 @@ fn m5_real_replica_index_delete_and_identity_drift() {
     assert_eq!((relation, identity), (relation_id, b'd'));
     assert_eq!((columns, key_flags), (1, 1));
     assert_eq!(default_wire[insert_at], b'I');
-    assert!(decode_committed_changes(&default_wire, source).is_err());
+    assert!(decode_committed_changes(&default_wire, &support::singleton_graph(1, source)).is_err());
     assert_eq!(durable_state(&mut client), (0, 0, 0, 2));
 }

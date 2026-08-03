@@ -40,7 +40,7 @@ impl BootstrapSession {
         if scanner_database != database {
             return Err(IngressError::Governance("scanner database differs"));
         }
-        let advisory_key = advisory_key(abandoned.source_id)?;
+        let advisory_key = advisory_key(abandoned.graph_id)?;
         let acquired: bool = apply
             .query_one(
                 "SELECT pg_catalog.pg_try_advisory_lock($1)",
@@ -88,7 +88,7 @@ fn validate_replacement(
 ) -> Result<(), IngressError> {
     validate_spec(abandoned)?;
     validate_spec(replacement)?;
-    if abandoned.source_id != replacement.source_id
+    if abandoned.graph_id != replacement.graph_id
         || abandoned.publication_oid != replacement.publication_oid
         || abandoned.bootstrap_id == replacement.bootstrap_id
         || replacement.slot_generation.get() <= abandoned.slot_generation.get()
@@ -120,7 +120,7 @@ fn reconcile_abandoned(
     spec: &BootstrapSpec,
     replacement: &BootstrapSpec,
 ) -> Result<bool, IngressError> {
-    let source_id = as_bigint(spec.source_id.get())?;
+    let graph_id = as_bigint(spec.graph_id.get())?;
     let bootstrap_id = as_bigint(spec.bootstrap_id.get())?;
     let generation = as_bigint(spec.slot_generation.get())?;
     let publication_oid = i64::from(spec.publication_oid);
@@ -130,16 +130,16 @@ fn reconcile_abandoned(
             "SELECT bootstrap.slot_name::text, bootstrap.slot_generation,
                     bootstrap.phase, config.publication_objid::bigint,
                     database.datname::text
-             FROM shiba_internal.source_bootstrap AS bootstrap
-             JOIN shiba_internal.source_ingress_config AS config
-               ON config.source_id = bootstrap.source_id
+             FROM shiba_internal.graph_bootstrap AS bootstrap
+             JOIN shiba_internal.graph_ingress_config AS config
+               ON config.graph_id = bootstrap.graph_id
               AND config.slot_name = bootstrap.slot_name
               AND config.slot_generation = bootstrap.slot_generation
              JOIN pg_catalog.pg_database AS database
                ON database.oid = config.database_oid
-             WHERE bootstrap.source_id = $1 AND bootstrap.bootstrap_id = $2
+             WHERE bootstrap.graph_id = $1 AND bootstrap.bootstrap_id = $2
              FOR UPDATE OF bootstrap, config",
-            &[&source_id, &bootstrap_id],
+            &[&graph_id, &bootstrap_id],
         )?
         .ok_or(IngressError::Governance("bootstrap attempt is missing"))?;
     if row.get::<_, &str>(0) != spec.slot_name
@@ -161,12 +161,12 @@ fn reconcile_abandoned(
     }
     let m12 = validate_m12_abandoned(&mut transaction, spec, replacement, row.get(2))?;
     if transaction.execute(
-        "UPDATE shiba_internal.source_bootstrap
+        "UPDATE shiba_internal.graph_bootstrap
          SET phase = 'cleanup_pending'
-         WHERE source_id = $1 AND bootstrap_id = $2
+         WHERE graph_id = $1 AND bootstrap_id = $2
            AND slot_name = $3::text::name AND slot_generation = $4
            AND phase IN ('creating', 'scanning', 'cleanup_pending', 'failed')",
-        &[&source_id, &bootstrap_id, &spec.slot_name, &generation],
+        &[&graph_id, &bootstrap_id, &spec.slot_name, &generation],
     )? != 1
     {
         return Err(IngressError::Governance(
@@ -234,18 +234,19 @@ fn replace_catalog_attempt(
     replacement: &BootstrapSpec,
 ) -> Result<(), IngressError> {
     let mut transaction = apply.transaction()?;
-    // Reset the abandoned attempt through the sole generic definition/state
-    // writer before the lifecycle function checks pristine replacement state.
-    // Any later replacement failure rolls this reset back with the attempt.
-    shiba_runtime::recompile_registered_plans(&mut transaction, replacement.source_id)?;
+    shiba_runtime::reset_abandoned_bootstrap_state(
+        &mut transaction,
+        abandoned.graph_id,
+        abandoned.bootstrap_id,
+    )?;
     transaction.query_one(
-        "SELECT shiba_internal.replace_pristine_source_bootstrap(
+        "SELECT shiba_internal.replace_pristine_graph_bootstrap(
              $1, $2, $3::text::name, $4, $5, $6::bigint::oid,
              $7::text::name, $8
          )",
         &[
             &as_bigint(abandoned.bootstrap_id.get())?,
-            &as_bigint(abandoned.source_id.get())?,
+            &as_bigint(abandoned.graph_id.get())?,
             &abandoned.slot_name,
             &as_bigint(abandoned.slot_generation.get())?,
             &as_bigint(replacement.bootstrap_id.get())?,
@@ -260,13 +261,13 @@ fn replace_catalog_attempt(
 
 #[cfg(test)]
 mod tests {
-    use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+    use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
 
     use super::{BootstrapSpec, validate_replacement};
 
     fn spec(source: u64, bootstrap: u64, publication: u32, generation: u64) -> BootstrapSpec {
         BootstrapSpec {
-            source_id: SourceId::new(source).expect("source ID"),
+            graph_id: GraphId::new(source).expect("graph ID"),
             bootstrap_id: BootstrapId::new(bootstrap).expect("bootstrap ID"),
             publication_oid: publication,
             slot_name: format!("slot_{generation}"),

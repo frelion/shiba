@@ -4,7 +4,7 @@ use std::{
 };
 
 use shiba_ingress::{AttachOptions, PreparedRebuild, ReplicationMode};
-use shiba_protocol::{SlotGeneration, SourceId};
+use shiba_protocol::{GraphId, SlotGeneration};
 use shiba_runtime::ProcessOutcome;
 
 use crate::support::{
@@ -26,7 +26,7 @@ pub(crate) fn prove_same_source_exclusion_and_other_source_progress(
             let spec = fixture.spec();
             thread::spawn(move || {
                 barrier.wait();
-                PreparedRebuild::prepare(&apply, &replication, spec, options()).is_ok_and(
+                PreparedRebuild::prepare(&apply, &replication, &spec, options()).is_ok_and(
                     |prepared| {
                         prepared.detach().expect("release winning rebuild owner");
                         true
@@ -66,8 +66,8 @@ pub(crate) fn prove_same_source_exclusion_and_other_source_progress(
         .expect("query source-two SQL oracle");
     let result = admin
         .query(
-            "SELECT value_bigint FROM shiba.operator_result
-             WHERE operator_id IN (4, 5) ORDER BY operator_id",
+            "SELECT value_bigint FROM shiba.graph_result
+             WHERE graph_id = 2 AND result_id IN (2, 4) ORDER BY result_id",
             &[],
         )
         .expect("read independent public result")
@@ -76,10 +76,10 @@ pub(crate) fn prove_same_source_exclusion_and_other_source_progress(
         .collect::<Vec<_>>();
     assert_eq!(result, vec![Some(second.get(0)), Some(second.get(1))]);
     assert!(
-        shiba_ingress::GovernedSourceSession::attach(
+        shiba_ingress::GovernedGraphSession::attach(
             database_url,
             replication_url,
-            SourceId::new(1).expect("source ID"),
+            GraphId::new(1).expect("graph ID"),
             SlotGeneration::new(2).expect("retired generation"),
             AttachOptions::new(
                 ReplicationMode::Committed,

@@ -2,7 +2,7 @@ use std::{process::Command, time::Duration};
 
 use postgres::Client;
 use shiba_ingress::{BootstrapOptions, BootstrapSpec};
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
 
 #[path = "../m12_rebuild_admission/support.rs"]
 #[allow(dead_code, unused_imports)]
@@ -29,7 +29,7 @@ pub(crate) struct Attempt {
 impl Attempt {
     pub(crate) fn spec(self) -> BootstrapSpec {
         BootstrapSpec {
-            source_id: SourceId::new(1).expect("source ID"),
+            graph_id: GraphId::new(1).expect("graph ID"),
             bootstrap_id: BootstrapId::new(self.bootstrap).expect("bootstrap ID"),
             publication_oid: self.publication,
             slot_name: self.slot.to_owned(),
@@ -59,12 +59,12 @@ pub(crate) fn extend_target(client: &mut Client) {
 pub(crate) fn evidence(client: &mut Client) -> Vec<Vec<String>> {
     [
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_binding ORDER BY binding_kind, address_objsubid) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_ingress_config ORDER BY source_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_bootstrap ORDER BY source_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_ingress_config ORDER BY graph_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_bootstrap ORDER BY graph_id) x",
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_row_state ORDER BY source_row_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.operator_state ORDER BY operator_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.operator_result ORDER BY operator_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_continuation ORDER BY slot_generation, commit_lsn) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_node_state ORDER BY graph_id, node_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.graph_result ORDER BY graph_id, result_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_continuation ORDER BY slot_generation, commit_lsn) x",
         "SELECT row_to_json(x)::text FROM (
            SELECT slot_name, slot_type, plugin, database, temporary, active,
                   two_phase, failover, synced, restart_lsn::text, confirmed_flush_lsn::text
@@ -86,7 +86,7 @@ pub(crate) fn assert_building(client: &mut Client) {
     let row = client
         .query_one(
             "SELECT count(*) FILTER (WHERE result_status = 'building' AND value_bigint IS NULL),
-                    count(*) FROM shiba.operator_result",
+                    count(*) FROM shiba.graph_result",
             &[],
         )
         .expect("query rebuilding visibility");
@@ -102,7 +102,7 @@ pub(crate) fn assert_oracle(client: &mut Client) {
         .expect("query SQL oracle");
     let result = client
         .query(
-            "SELECT value_bigint FROM shiba.operator_result ORDER BY operator_id",
+            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )
         .expect("query active results");
@@ -118,7 +118,7 @@ pub(crate) fn assert_oracle(client: &mut Client) {
     let actual = client
         .query(
             "SELECT result_key_bigint, result_value_bigint
-             FROM shiba.operator_result_rows WHERE operator_id = 3 ORDER BY 1",
+             FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 6 ORDER BY 1",
             &[],
         )
         .expect("query recovered ProjectRows")

@@ -1,13 +1,11 @@
-use std::{num::NonZeroU64, time::Duration};
+use std::time::Duration;
 
 use postgres::Client;
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
 use shiba_ingress::{
     BootstrapCatchupProgress, BootstrapOptions, BootstrapSession, BootstrapSpec, SnapshotProgress,
 };
-use shiba_operator::OperatorId;
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
-use shiba_runtime::compile_and_register;
+use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
+use shiba_runtime::{RebuildSourceTarget, compile_and_register, compile_rebuild_graph};
 
 #[path = "../m12_rebuild_admission/support.rs"]
 #[allow(dead_code, unused_imports)]
@@ -16,6 +14,10 @@ mod admission;
 pub(crate) use admission::{
     IdentityCoordinates, RebuildFixture, authority_snapshot, establish_active_source, options,
 };
+
+#[path = "../support/mod.rs"]
+#[allow(dead_code)]
+mod test_support;
 
 pub(crate) const CONTROL_ROLE: &str = "shiba_m12_rebuild_control";
 pub(crate) const RECEIVER_ROLE: &str = "shiba_m12_rebuild_receiver";
@@ -35,7 +37,7 @@ pub(crate) fn as_role(conninfo: &str, role: &str) -> String {
 pub(crate) fn assert_building(client: &mut Client) {
     let rows = client
         .query(
-            "SELECT result_status, value_bigint FROM shiba.operator_result ORDER BY operator_id",
+            "SELECT result_status, value_bigint FROM shiba.graph_result ORDER BY graph_id, result_id",
             &[],
         )
         .expect("query public rebuild visibility");
@@ -45,11 +47,31 @@ pub(crate) fn assert_building(client: &mut Client) {
     }));
 }
 
+pub(crate) fn refresh_target_digest(client: &mut Client, fixture: &mut RebuildFixture) {
+    let mut transaction = client
+        .transaction()
+        .expect("compile refreshed target graph");
+    let artifact = compile_rebuild_graph(
+        &mut transaction,
+        GraphId::new(1).expect("graph ID"),
+        &[RebuildSourceTarget {
+            source_id: shiba_protocol::SourceId::new(1).expect("source ID"),
+            relation_id: fixture.target.relation,
+            identity_index_id: fixture.target.identity_index,
+        }],
+    )
+    .expect("compile refreshed target graph");
+    transaction
+        .rollback()
+        .expect("rollback read-only compilation");
+    fixture.target.graph_digest = artifact.graph_digest;
+}
+
 pub(crate) fn install_second_active_source(
     client: &mut Client,
     database_url: &str,
     replication_url: &str,
-) -> shiba_ingress::GovernedSourceSession {
+) -> shiba_ingress::GovernedGraphSession {
     client
         .batch_execute(&format!(
             "CREATE SCHEMA source_two;
@@ -60,26 +82,9 @@ pub(crate) fn install_second_active_source(
              INSERT INTO source_two.events VALUES (201, 9);"
         ))
         .expect("install independent source");
-    for (operator_id, operation) in [
-        (4, OperatorOperationV1::CountRows),
-        (
-            5,
-            OperatorOperationV1::SumInt8 {
-                input_column: "payload".to_owned(),
-            },
-        ),
-    ] {
-        compile_and_register(
-            client,
-            &OperatorSpecV1 {
-                version: OPERATOR_SPEC_VERSION,
-                operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("operator ID")),
-                source_id: SourceId::new(2).expect("source ID"),
-                operation,
-            },
-        )
-        .expect("register independent source operator");
-    }
+    let mut graph = test_support::count_sum_spec(2);
+    graph.graph_id = GraphId::new(2).expect("graph ID");
+    compile_and_register(client, &graph).expect("register independent graph");
     let publication_oid: u32 = client
         .query_one(
             "SELECT oid FROM pg_catalog.pg_publication WHERE pubname = $1",
@@ -91,7 +96,7 @@ pub(crate) fn install_second_active_source(
         database_url,
         replication_url,
         BootstrapSpec {
-            source_id: SourceId::new(2).expect("source ID"),
+            graph_id: GraphId::new(2).expect("graph ID"),
             bootstrap_id: BootstrapId::new(1).expect("bootstrap ID"),
             publication_oid,
             slot_name: SECOND_SLOT.to_owned(),
@@ -120,27 +125,31 @@ pub(crate) fn grant_rebuild_control(client: &mut Client) {
              GRANT USAGE ON SCHEMA shiba_internal, shiba, source, target TO {CONTROL_ROLE};
              GRANT SELECT, UPDATE ON shiba_internal.source_binding TO {CONTROL_ROLE};
              GRANT SELECT, DELETE ON shiba_internal.source_invalidation TO {CONTROL_ROLE};
-             GRANT SELECT ON shiba_internal.source_ingress_config TO {CONTROL_ROLE};
+             GRANT SELECT, UPDATE ON shiba_internal.graph_ingress_config TO {CONTROL_ROLE};
              GRANT SELECT ON
-                 shiba_internal.source_ingress_invalidation TO {CONTROL_ROLE};
+                 shiba_internal.graph_ingress_invalidation TO {CONTROL_ROLE};
              GRANT SELECT, UPDATE ON
-                 shiba_internal.operator_definition TO {CONTROL_ROLE};
-             GRANT SELECT, UPDATE ON shiba_internal.source_bootstrap TO {CONTROL_ROLE};
-             GRANT SELECT, INSERT, UPDATE ON shiba_internal.source_continuation TO {CONTROL_ROLE};
+                 shiba_internal.graph_definition,
+                 shiba_internal.graph_source_member,
+                 shiba_internal.graph_ingress_source TO {CONTROL_ROLE};
+             GRANT SELECT, UPDATE ON shiba_internal.graph_bootstrap,
+                 shiba_internal.graph_bootstrap_checkpoint TO {CONTROL_ROLE};
+             GRANT SELECT, INSERT, UPDATE ON shiba_internal.graph_continuation TO {CONTROL_ROLE};
              GRANT SELECT, INSERT, UPDATE, DELETE ON shiba_internal.source_row_state TO {CONTROL_ROLE};
-             GRANT SELECT, UPDATE ON shiba_internal.operator_state TO {CONTROL_ROLE};
+             GRANT SELECT, INSERT, UPDATE, DELETE ON shiba_internal.graph_node_state TO {CONTROL_ROLE};
              GRANT SELECT, INSERT, UPDATE, DELETE
-                 ON shiba_internal.operator_result_row TO {CONTROL_ROLE};
-             GRANT SELECT, UPDATE ON shiba.operator_result TO {CONTROL_ROLE};
+                 ON shiba_internal.graph_result_row TO {CONTROL_ROLE};
+             GRANT SELECT, UPDATE ON shiba.graph_result TO {CONTROL_ROLE};
              GRANT SELECT ON source.events, target.events TO {CONTROL_ROLE};
-             GRANT EXECUTE ON FUNCTION shiba_internal.prepare_source_rebuild(
-                 bigint, bigint, oid, oid, oid, name, bigint,
-                 bigint, regclass, regclass, oid, name, bigint
+             GRANT EXECUTE ON FUNCTION shiba_internal.prepare_graph_rebuild(
+                 bigint, bytea, bigint, oid[], oid[], oid, name, bigint,
+                 bigint, bigint[], oid[], oid[], oid, name, bigint,
+                 bytea, bytea, bytea, bigint[], text[], boolean[], boolean[]
              ) TO {CONTROL_ROLE};
              GRANT USAGE ON SCHEMA target TO {RECEIVER_ROLE};
              GRANT SELECT ON target.events TO {RECEIVER_ROLE};
              GRANT USAGE ON SCHEMA shiba TO {READER_ROLE};
-             GRANT SELECT ON shiba.operator_result, shiba.operator_result_rows TO {READER_ROLE};"
+             GRANT SELECT ON shiba.graph_result, shiba.graph_result_rows TO {READER_ROLE};"
         ))
         .expect("grant only rebuild execution capabilities");
 }

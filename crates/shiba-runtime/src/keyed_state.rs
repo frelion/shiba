@@ -1,131 +1,179 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use postgres::Transaction;
+use postgres::{Row, Transaction};
 use shiba_operator::{
-    CompiledPlan, DeltaBatch, StateDelta, StateKey, StateMutation, StateSnapshot, TypedValue,
-    state_read_set,
+    MultiInputBatch, OperatorGraph, StateDelta, StateKey, StateMutation, StatePartition,
+    StateSnapshot, TypedValue, graph_state_read_set,
 };
 
 use crate::M2Error;
 
+const MAX_GRAPH_STATE_ENTRIES: usize = 100_000;
+
 type Coordinate = (i64, i32, Vec<u8>, Vec<u8>);
+type PartitionCoordinate = (i64, i32, Vec<u8>);
 type CoordinateArrays = (Vec<i64>, Vec<i32>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
 pub(crate) struct LockedState {
     pub(crate) snapshot: StateSnapshot,
-    requested: BTreeMap<Coordinate, bool>,
+    present: BTreeSet<Coordinate>,
+    exact: BTreeSet<Coordinate>,
+    partitions: BTreeSet<PartitionCoordinate>,
 }
 
 pub(crate) fn load(
     transaction: &mut Transaction<'_>,
-    operator_id: i64,
-    plan: &CompiledPlan,
-    batch: &DeltaBatch,
+    graph_id: i64,
+    graph: &OperatorGraph,
+    batch: &MultiInputBatch,
 ) -> Result<LockedState, M2Error> {
-    let read_set = state_read_set(plan, batch)?;
-    let mut requested = read_set
+    let read_set = graph_state_read_set(graph, batch)?;
+    let exact = read_set
+        .keys
+        .iter()
+        .map(coordinate)
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let partitions = read_set
+        .partitions
+        .iter()
+        .map(partition_coordinate)
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let rows = query_rows(transaction, graph_id, &exact, &partitions)?;
+    if rows.len() > MAX_GRAPH_STATE_ENTRIES {
+        return Err(M2Error::TransactionLimitExceeded);
+    }
+
+    let requested_keys: BTreeMap<Coordinate, StateKey> = read_set
         .keys
         .iter()
         .cloned()
-        .enumerate()
-        .map(|(index, key)| Ok((coordinate(&key)?, index, key)))
-        .collect::<Result<Vec<_>, M2Error>>()?;
-    requested.sort_by(|left, right| left.0.cmp(&right.0));
-    if requested.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err(M2Error::InvalidOperatorDefinition);
+        .map(|key| Ok((coordinate(&key)?, key)))
+        .collect::<Result<_, M2Error>>()?;
+    let requested_partitions: BTreeMap<PartitionCoordinate, StatePartition> = read_set
+        .partitions
+        .iter()
+        .cloned()
+        .map(|partition| Ok((partition_coordinate(&partition)?, partition)))
+        .collect::<Result<_, M2Error>>()?;
+    let mut entries = Vec::with_capacity(rows.len().saturating_add(exact.len()));
+    let mut present = BTreeSet::new();
+    for row in rows {
+        let coordinate = (row.get(0), row.get(1), row.get(2), row.get(3));
+        let key = requested_keys.get(&coordinate).cloned().or_else(|| {
+            let partition_coordinate = (coordinate.0, coordinate.1, coordinate.2.clone());
+            requested_partitions
+                .get(&partition_coordinate)
+                .and_then(|partition| state_key(partition, &coordinate.3).ok())
+        });
+        let key = key.ok_or(M2Error::InvalidOperatorDefinition)?;
+        if !present.insert(coordinate) {
+            return Err(M2Error::InvalidOperatorDefinition);
+        }
+        entries.push(shiba_operator::StateEntry {
+            key,
+            state: Some(shiba_operator::EncodedOperatorState {
+                codec_version: u32::try_from(row.get::<_, i32>(4))
+                    .map_err(|_| M2Error::InvalidOperatorDefinition)?,
+                payload: row.get(5),
+            }),
+        });
     }
-    let node_ids: Vec<i64> = requested.iter().map(|entry| entry.0.0).collect();
-    let namespaces: Vec<i32> = requested.iter().map(|entry| entry.0.1).collect();
-    let partitions: Vec<Vec<u8>> = requested.iter().map(|entry| entry.0.2.clone()).collect();
-    let items: Vec<Vec<u8>> = requested.iter().map(|entry| entry.0.3.clone()).collect();
-    let mut states = BTreeMap::<usize, _>::new();
-    if !requested.is_empty() {
-        for row in transaction.query(
-            "SELECT request.ordinality::bigint, state.codec_version, state.state_payload
-             FROM unnest($2::bigint[], $3::integer[], $4::bytea[], $5::bytea[])
-                  WITH ORDINALITY AS request(
-                      node_id, namespace, partition_key_payload,
-                      item_key_payload, ordinality)
-             JOIN shiba_internal.operator_node_state AS state
-               ON state.operator_id = $1
-              AND state.node_id = request.node_id
-              AND state.namespace = request.namespace
-              AND state.partition_key_payload = request.partition_key_payload
-              AND state.item_key_payload = request.item_key_payload
-             ORDER BY request.node_id, request.namespace,
-                      request.partition_key_payload, request.item_key_payload
-             FOR UPDATE OF state",
-            &[&operator_id, &node_ids, &namespaces, &partitions, &items],
-        )? {
-            let ordinal = usize::try_from(row.get::<_, i64>(0))
-                .ok()
-                .and_then(|value| value.checked_sub(1))
-                .filter(|value| *value < requested.len())
-                .ok_or(M2Error::InvalidOperatorDefinition)?;
-            let original_index = requested[ordinal].1;
-            let codec_version = u32::try_from(row.get::<_, i32>(1))
-                .map_err(|_| M2Error::InvalidOperatorDefinition)?;
-            if states
-                .insert(
-                    original_index,
-                    shiba_operator::EncodedOperatorState {
-                        codec_version,
-                        payload: row.get(2),
-                    },
-                )
-                .is_some()
-            {
-                return Err(M2Error::InvalidOperatorDefinition);
-            }
+    for (coordinate, key) in requested_keys {
+        if !present.contains(&coordinate) {
+            entries.push(shiba_operator::StateEntry { key, state: None });
         }
     }
-    let requested_presence = requested
-        .iter()
-        .map(|(coordinate, index, _)| (coordinate.clone(), states.contains_key(index)))
-        .collect();
-    let entries = read_set
-        .keys
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, key)| shiba_operator::StateEntry {
-            key,
-            state: states.remove(&index),
-        })
-        .collect();
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
     let snapshot =
         StateSnapshot::new(&read_set, entries).map_err(|_| M2Error::InvalidOperatorDefinition)?;
     Ok(LockedState {
         snapshot,
-        requested: requested_presence,
+        present,
+        exact,
+        partitions,
     })
+}
+
+fn query_rows(
+    transaction: &mut Transaction<'_>,
+    graph_id: i64,
+    exact: &BTreeSet<Coordinate>,
+    partitions: &BTreeSet<PartitionCoordinate>,
+) -> Result<Vec<Row>, M2Error> {
+    let (exact_nodes, exact_namespaces, exact_partitions, exact_items) =
+        coordinate_arrays(&exact.iter().cloned().collect::<Vec<_>>());
+    let partition_nodes: Vec<i64> = partitions.iter().map(|value| value.0).collect();
+    let partition_namespaces: Vec<i32> = partitions.iter().map(|value| value.1).collect();
+    let partition_payloads: Vec<Vec<u8>> = partitions.iter().map(|value| value.2.clone()).collect();
+    let limit = i64::try_from(MAX_GRAPH_STATE_ENTRIES + 1)
+        .map_err(|_| M2Error::InvalidOperatorDefinition)?;
+    Ok(transaction.query(
+        "WITH exact AS (
+             SELECT * FROM unnest($2::bigint[], $3::integer[], $4::bytea[], $5::bytea[])
+               AS value(node_id, namespace, partition_key_payload, item_key_payload)
+         ), partitions AS (
+             SELECT * FROM unnest($6::bigint[], $7::integer[], $8::bytea[])
+               AS value(node_id, namespace, partition_key_payload)
+         )
+         SELECT state.node_id, state.namespace, state.partition_key_payload,
+                state.item_key_payload, state.codec_version, state.state_payload
+         FROM shiba_internal.graph_node_state AS state
+         WHERE state.graph_id = $1 AND (
+             EXISTS (SELECT 1 FROM exact WHERE exact.node_id = state.node_id
+                 AND exact.namespace = state.namespace
+                 AND exact.partition_key_payload = state.partition_key_payload
+                 AND exact.item_key_payload = state.item_key_payload)
+             OR EXISTS (SELECT 1 FROM partitions
+                 WHERE partitions.node_id = state.node_id
+                   AND partitions.namespace = state.namespace
+                   AND partitions.partition_key_payload = state.partition_key_payload))
+         ORDER BY state.node_id, state.namespace,
+                  state.partition_key_payload, state.item_key_payload
+         LIMIT $9 FOR UPDATE OF state",
+        &[
+            &graph_id,
+            &exact_nodes,
+            &exact_namespaces,
+            &exact_partitions,
+            &exact_items,
+            &partition_nodes,
+            &partition_namespaces,
+            &partition_payloads,
+            &limit,
+        ],
+    )?)
 }
 
 pub(crate) fn persist(
     transaction: &mut Transaction<'_>,
-    operator_id: i64,
+    graph_id: i64,
     locked: &LockedState,
     deltas: Vec<StateDelta>,
 ) -> Result<(), M2Error> {
+    if deltas.len() > MAX_GRAPH_STATE_ENTRIES {
+        return Err(M2Error::TransactionLimitExceeded);
+    }
     let mut ordered = deltas
         .into_iter()
         .map(|delta| Ok((coordinate(&delta.key)?, delta)))
         .collect::<Result<Vec<_>, M2Error>>()?;
     ordered.sort_by(|left, right| left.0.cmp(&right.0));
     if ordered.windows(2).any(|pair| pair[0].0 == pair[1].0)
-        || ordered
-            .iter()
-            .any(|(coordinate, _)| !locked.requested.contains_key(coordinate))
+        || ordered.iter().any(|(coordinate, _)| {
+            !locked.exact.contains(coordinate)
+                && !locked
+                    .partitions
+                    .contains(&(coordinate.0, coordinate.1, coordinate.2.clone()))
+        })
     {
         return Err(M2Error::InvalidOperatorDefinition);
     }
-
     let mut deletes = Vec::new();
     let mut upserts = Vec::new();
     for (coordinate, delta) in ordered {
         match delta.mutation {
             StateMutation::Delete => {
-                if locked.requested.get(&coordinate) != Some(&true) {
+                if !locked.present.contains(&coordinate) {
                     return Err(M2Error::InvalidOperatorDefinition);
                 }
                 deletes.push(coordinate);
@@ -133,36 +181,45 @@ pub(crate) fn persist(
             StateMutation::Upsert { state } => upserts.push((coordinate, state)),
         }
     }
-    delete_states(transaction, operator_id, &deletes)?;
-    upsert_states(transaction, operator_id, &upserts)
+    delete_states(transaction, graph_id, &deletes)?;
+    upsert_states(transaction, graph_id, &upserts)
 }
 
-pub(crate) fn clear(transaction: &mut Transaction<'_>, operator_id: i64) -> Result<(), M2Error> {
-    transaction.execute(
-        "DELETE FROM shiba_internal.operator_node_state WHERE operator_id = $1",
-        &[&operator_id],
-    )?;
-    Ok(())
+fn state_key(partition: &StatePartition, item: &[u8]) -> Result<StateKey, M2Error> {
+    let item_key = if item == b"null" {
+        None
+    } else {
+        Some(
+            TypedValue::from_canonical_json(item)
+                .map_err(|_| M2Error::InvalidOperatorDefinition)?,
+        )
+    };
+    Ok(StateKey {
+        node_id: partition.node_id,
+        namespace: partition.namespace,
+        partition_key: partition.partition_key.clone(),
+        item_key,
+    })
 }
 
 fn delete_states(
     transaction: &mut Transaction<'_>,
-    operator_id: i64,
+    graph_id: i64,
     states: &[Coordinate],
 ) -> Result<(), M2Error> {
     if states.is_empty() {
         return Ok(());
     }
-    let (node_ids, namespaces, partitions, items) = coordinate_arrays(states);
+    let (nodes, namespaces, partitions, items) = coordinate_arrays(states);
     let changed = transaction.execute(
-        "DELETE FROM shiba_internal.operator_node_state AS state
+        "DELETE FROM shiba_internal.graph_node_state AS state
          USING unnest($2::bigint[], $3::integer[], $4::bytea[], $5::bytea[])
-               AS input(node_id, namespace, partition_key_payload, item_key_payload)
-         WHERE state.operator_id = $1 AND state.node_id = input.node_id
+           AS input(node_id, namespace, partition_key_payload, item_key_payload)
+         WHERE state.graph_id = $1 AND state.node_id = input.node_id
            AND state.namespace = input.namespace
            AND state.partition_key_payload = input.partition_key_payload
            AND state.item_key_payload = input.item_key_payload",
-        &[&operator_id, &node_ids, &namespaces, &partitions, &items],
+        &[&graph_id, &nodes, &namespaces, &partitions, &items],
     )?;
     if usize::try_from(changed).ok() != Some(states.len()) {
         return Err(M2Error::InvalidOperatorDefinition);
@@ -172,38 +229,33 @@ fn delete_states(
 
 fn upsert_states(
     transaction: &mut Transaction<'_>,
-    operator_id: i64,
+    graph_id: i64,
     states: &[(Coordinate, shiba_operator::EncodedOperatorState)],
 ) -> Result<(), M2Error> {
     if states.is_empty() {
         return Ok(());
     }
     let coordinates: Vec<_> = states.iter().map(|state| state.0.clone()).collect();
-    let (node_ids, namespaces, partitions, items) = coordinate_arrays(&coordinates);
+    let (nodes, namespaces, partitions, items) = coordinate_arrays(&coordinates);
     let codecs = states
         .iter()
-        .map(|state| {
-            i32::try_from(state.1.codec_version).map_err(|_| M2Error::InvalidOperatorDefinition)
-        })
-        .collect::<Result<Vec<_>, M2Error>>()?;
+        .map(|state| i32::try_from(state.1.codec_version))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| M2Error::InvalidOperatorDefinition)?;
     let payloads: Vec<Vec<u8>> = states.iter().map(|state| state.1.payload.clone()).collect();
     let changed = transaction.execute(
-        "INSERT INTO shiba_internal.operator_node_state (
-             operator_id, node_id, namespace, partition_key_payload,
+        "INSERT INTO shiba_internal.graph_node_state (
+             graph_id, node_id, namespace, partition_key_payload,
              item_key_payload, codec_version, state_payload)
-         SELECT $1, input.node_id, input.namespace, input.partition_key_payload,
-                input.item_key_payload, input.codec_version, input.state_payload
-         FROM unnest($2::bigint[], $3::integer[], $4::bytea[], $5::bytea[],
-                     $6::integer[], $7::bytea[])
-              AS input(node_id, namespace, partition_key_payload,
-                       item_key_payload, codec_version, state_payload)
-         ON CONFLICT (operator_id, node_id, namespace,
+         SELECT $1, * FROM unnest($2::bigint[], $3::integer[], $4::bytea[],
+                                  $5::bytea[], $6::integer[], $7::bytea[])
+         ON CONFLICT (graph_id, node_id, namespace,
                       partition_key_payload, item_key_payload)
          DO UPDATE SET codec_version = EXCLUDED.codec_version,
                        state_payload = EXCLUDED.state_payload",
         &[
-            &operator_id,
-            &node_ids,
+            &graph_id,
+            &nodes,
             &namespaces,
             &partitions,
             &items,
@@ -225,6 +277,14 @@ fn coordinate(key: &StateKey) -> Result<Coordinate, M2Error> {
         key.item_key
             .as_ref()
             .map_or_else(|| Ok(b"null".to_vec()), canonical)?,
+    ))
+}
+
+fn partition_coordinate(partition: &StatePartition) -> Result<PartitionCoordinate, M2Error> {
+    Ok((
+        i64::from(partition.node_id.get()),
+        i32::from(partition.namespace),
+        canonical(&partition.partition_key)?,
     ))
 }
 

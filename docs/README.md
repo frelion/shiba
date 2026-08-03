@@ -206,5 +206,12 @@ transaction assembly, graph continuation/ACK, exported snapshot and graph-wide
 rebuild, with an exact effective right PK/UK identity binding. M14.5 implements
 the pure GraphId/ordered-SourcePort Compiler and partition-state INNER JOIN
 kernel, including a 300-step differential and exact 20,000/20,001 fan-out
-gates. Runtime/Catalog, PG17/18 cross-schema live execution, bootstrap/rebuild
-and release evidence remain M14.6; M14 is not complete.
+gates. M14.6 replaces source/operator execution authority with one canonical
+graph definition, ordered one/two-source membership, graph ingress/continuation,
+generic graph state/results and a graph-wide bootstrap/rebuild lifecycle. The
+directed PG17.10/PG18.4 graph Runtime gate proves singleton and cross-schema
+JOIN execution, both-side atomicity, fan-out/retraction, rollback/replay and
+exact effective-identity invalidation. Compiler also admits strict computed
+projection and filtered grouped pipelines without Runtime kind dispatch.
+M14.7 owns the complete bootstrap/rebuild release and performance evidence, so
+M14 is not complete.

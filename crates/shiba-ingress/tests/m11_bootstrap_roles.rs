@@ -78,8 +78,8 @@ fn bootstrap_runs_without_superuser_and_permission_loss_fails_closed() {
 
     admin
         .batch_execute(&format!(
-            "GRANT EXECUTE ON FUNCTION shiba_internal.reserve_source_bootstrap(bigint, bigint, oid, name, bigint) TO {CONTROL_ROLE};
-             GRANT EXECUTE ON FUNCTION shiba_internal.replace_pristine_source_bootstrap(bigint, bigint, name, bigint, bigint, oid, name, bigint) TO {CONTROL_ROLE};"
+            "GRANT EXECUTE ON FUNCTION shiba_internal.reserve_graph_bootstrap(bigint, bigint, oid, name, bigint) TO {CONTROL_ROLE};
+             GRANT EXECUTE ON FUNCTION shiba_internal.replace_pristine_graph_bootstrap(bigint, bigint, name, bigint, bigint, oid, name, bigint) TO {CONTROL_ROLE};"
         ))
         .expect("grant the two revoked bootstrap control functions");
     let swapped = bootstrap_spec(2, 2, swapped_publication_oid, SWAPPED_SLOT);
@@ -94,7 +94,7 @@ fn bootstrap_runs_without_superuser_and_permission_loss_fails_closed() {
         "NOREPLICATION control role cannot own replication transport"
     );
     assert_no_apply(&mut admin, 2, Some("creating"));
-    assert_results(&mut admin, 3, "building", [None, None]);
+    assert_results(&mut admin, 2, "building", [None, None]);
     assert_eq!(
         admin
             .query_one(
@@ -109,14 +109,14 @@ fn bootstrap_runs_without_superuser_and_permission_loss_fails_closed() {
     let mut reader = Client::connect(&reader_url, NoTls).expect("connect result reader");
     assert!(
         reader
-            .query("SELECT * FROM shiba_internal.operator_state", &[])
+            .query("SELECT * FROM shiba_internal.graph_node_state", &[])
             .is_err()
     );
     assert!(reader.query("SELECT * FROM source.events", &[]).is_err());
     assert!(
         reader
             .execute(
-                "UPDATE shiba.operator_result SET value_bigint = 99 WHERE operator_id = 1",
+                "UPDATE shiba.graph_result SET value_bigint = 99 WHERE graph_id = 1 AND result_id = 2",
                 &[],
             )
             .is_err(),
@@ -128,7 +128,8 @@ fn bootstrap_runs_without_superuser_and_permission_loss_fails_closed() {
 
     admin
         .batch_execute(&format!(
-            "REVOKE UPDATE ON shiba_internal.source_bootstrap FROM {CONTROL_ROLE}"
+            "REVOKE UPDATE ON shiba_internal.graph_bootstrap,
+                 shiba_internal.graph_bootstrap_checkpoint FROM {CONTROL_ROLE}"
         ))
         .expect("remove checkpoint UPDATE");
     assert!(
@@ -139,7 +140,8 @@ fn bootstrap_runs_without_superuser_and_permission_loss_fails_closed() {
     assert_results(&mut reader, 1, "building", [None, None]);
     admin
         .batch_execute(&format!(
-            "GRANT UPDATE ON shiba_internal.source_bootstrap TO {CONTROL_ROLE};
+            "GRANT UPDATE ON shiba_internal.graph_bootstrap,
+                 shiba_internal.graph_bootstrap_checkpoint TO {CONTROL_ROLE};
              REVOKE SELECT ON source.events FROM {CONTROL_ROLE}"
         ))
         .expect("exchange UPDATE for missing scanner SELECT");
@@ -153,9 +155,9 @@ fn bootstrap_runs_without_superuser_and_permission_loss_fails_closed() {
             .query_one(
                 "SELECT slot.confirmed_flush_lsn = bootstrap.consistent_point
                  FROM pg_replication_slots AS slot
-                 JOIN shiba_internal.source_bootstrap AS bootstrap
+                 JOIN shiba_internal.graph_bootstrap AS bootstrap
                    ON bootstrap.slot_name = slot.slot_name
-                 WHERE bootstrap.source_id = 1",
+                 WHERE bootstrap.graph_id = 1",
                 &[],
             )
             .expect("verify no unauthorized feedback")
@@ -215,14 +217,14 @@ fn bootstrap_runs_without_superuser_and_permission_loss_fails_closed() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_continuation WHERE source_id = 1",
+                "SELECT count(*) FROM shiba_internal.graph_continuation WHERE graph_id = 1",
                 &[]
             )
             .expect("WAL continuation")
             .get::<_, i64>(0),
         1
     );
-    assert_eq!(admin.query_one("SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1 AND confirmed_flush_lsn >= (SELECT activation_end_lsn FROM shiba_internal.source_bootstrap WHERE source_id = 1)", &[&SLOT]).expect("authorized feedback").get::<_, i64>(0), 1);
+    assert_eq!(admin.query_one("SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1 AND confirmed_flush_lsn >= (SELECT activation_end_lsn FROM shiba_internal.graph_bootstrap WHERE graph_id = 1)", &[&SLOT]).expect("authorized feedback").get::<_, i64>(0), 1);
     catchup
         .into_live()
         .expect("least-privilege live handoff")

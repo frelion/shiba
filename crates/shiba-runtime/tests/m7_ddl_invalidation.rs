@@ -17,10 +17,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -138,7 +138,8 @@ fn m7_exact_object_address_invalidation_and_rollback() {
         .batch_execute("INSERT INTO source_m7.events VALUES (1101)")
         .expect("commit source row after rolled-back DDL");
     let first_wire = CAPTURE.capture(&mut client, "after-rollback.pgoutput");
-    let first = decode_committed_changes(&first_wire, source).expect("decode first transaction");
+    let first = decode_committed_changes(&first_wire, &support::singleton_graph(1, source))
+        .expect("decode first transaction");
     assert_eq!(
         process(&mut client, &first).expect("apply after rolled-back DDL"),
         ProcessOutcome::Applied
@@ -164,7 +165,8 @@ fn m7_exact_object_address_invalidation_and_rollback() {
     assert_eq!(invalidation_count(&mut client), 1);
 
     let renamed_wire = CAPTURE.capture(&mut client, "after-commit.pgoutput");
-    let renamed = decode_committed_changes(&renamed_wire, source).expect("decode renamed source");
+    let renamed = decode_committed_changes(&renamed_wire, &support::singleton_graph(1, source))
+        .expect("decode renamed source");
     assert!(matches!(
         process(&mut client, &renamed),
         Err(M2Error::SourceInvalidated)

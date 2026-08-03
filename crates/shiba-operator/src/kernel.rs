@@ -1,10 +1,9 @@
-use crate::{
-    CompiledPlan, DeltaBatch, EncodedOperatorState, KeyedMutation, OperatorTransition,
-    OutputContract, OutputDelta, PlanImplementation, ResultDelta, ResultMutation, TypedRow,
-    TypedValue, ValueType, apply_graph,
-    plan::{PlanError, STATE_CODEC_VERSION},
-};
 use core::fmt;
+
+use crate::{
+    DeltaBatch, GraphEffectOrigin, GraphTransition, MultiInputBatch, OperatorGraph, ResultDelta,
+    StateReadSet, StateSnapshot,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelError {
@@ -21,253 +20,118 @@ pub enum KernelError {
 }
 
 impl fmt::Display for KernelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "operator kernel rejected transition: {self:?}")
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "operator kernel rejected transition: {self:?}")
     }
 }
 
 impl std::error::Error for KernelError {}
 
-impl From<PlanError> for KernelError {
-    fn from(_: PlanError) -> Self {
-        Self::InvalidPlan
-    }
-}
-
-/// Creates the deterministic state required by a validated plan.
+/// Returns the exact generic state keys and partitions needed by one graph batch.
 ///
 /// # Errors
 ///
-/// Rejects invalid plans or unsupported codecs.
-pub fn initial_state(plan: &CompiledPlan) -> Result<EncodedOperatorState, KernelError> {
-    plan.validate()?;
-    let payload = match plan.implementation {
-        PlanImplementation::CountRows | PlanImplementation::SumInt8 { .. } => {
-            0_i64.to_be_bytes().to_vec()
-        }
-        PlanImplementation::Graph { .. } => Vec::new(),
-    };
-    Ok(EncodedOperatorState {
-        codec_version: STATE_CODEC_VERSION,
-        payload,
-    })
+/// Rejects graph, origin, layout, type, state-key, or bound violations.
+pub fn graph_state_read_set(
+    graph: &OperatorGraph,
+    batch: &MultiInputBatch,
+) -> Result<StateReadSet, KernelError> {
+    graph.validate().map_err(|_| KernelError::InvalidGraph)?;
+    if graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, crate::OperatorNodeKind::InnerJoin { .. }))
+    {
+        return crate::join::state_read_set(graph, batch)?.ok_or(KernelError::InvalidGraph);
+    }
+    let input = singleton_batch(graph, batch)?;
+    let scalar = crate::scalar::state_read_set(graph)?;
+    let grouped = crate::grouped::state_read_set(graph, input)?;
+    let mut keys = scalar.keys;
+    keys.extend(grouped.keys);
+    StateReadSet::canonical(keys).map_err(|_| KernelError::InvalidState)
 }
 
-/// Produces the empty terminal output for a newly registered plan.
+/// Applies one canonical graph against its exact generic state snapshot.
 ///
 /// # Errors
 ///
-/// Rejects a corrupt plan/state or a graph without one supported terminal.
-pub fn initial_transition(
-    plan: &CompiledPlan,
-    state: &EncodedOperatorState,
-) -> Result<OperatorTransition, KernelError> {
-    let current = decode_state(plan, state)?;
-    match &plan.implementation {
-        PlanImplementation::CountRows | PlanImplementation::SumInt8 { .. } => {
-            scalar_transition(plan, current)
-        }
-        PlanImplementation::Graph { graph } => {
-            graph.validate().map_err(|_| KernelError::InvalidGraph)?;
-            if !matches!(plan.output_contract, OutputContract::KeyedRows { .. }) {
-                return Err(KernelError::OutputContractMismatch);
-            }
-            Ok(OperatorTransition {
-                next_state: state.clone(),
-                state_deltas: Vec::new(),
-                output_delta: OutputDelta::KeyedMutations {
-                    mutations: Vec::new(),
-                },
-            })
-        }
-    }
-}
-
-/// Strictly validates and decodes state for reference and sink validation.
-///
-/// # Errors
-///
-/// Rejects corrupt plans, versions, lengths, or unexpected project state.
-pub fn decode_state(plan: &CompiledPlan, state: &EncodedOperatorState) -> Result<i64, KernelError> {
-    plan.validate()?;
-    if state.codec_version != STATE_CODEC_VERSION {
-        return Err(KernelError::InvalidState);
-    }
-    match plan.implementation {
-        PlanImplementation::CountRows | PlanImplementation::SumInt8 { .. } => state
-            .payload
-            .as_slice()
-            .try_into()
-            .map(i64::from_be_bytes)
-            .map_err(|_| KernelError::InvalidState),
-        PlanImplementation::Graph { .. } if state.payload.is_empty() => Ok(0),
-        PlanImplementation::Graph { .. } => Err(KernelError::InvalidState),
-    }
-}
-
-/// Computes one deterministic transition without database access.
-///
-/// # Errors
-///
-/// Fails closed for invalid plan/state/input, arithmetic, contract or bounds.
-pub fn apply_plan(
-    plan: &CompiledPlan,
-    scalar_state: &EncodedOperatorState,
-    keyed: &crate::StateSnapshot,
-    batch: &DeltaBatch,
-) -> Result<OperatorTransition, KernelError> {
-    let current = decode_state(plan, scalar_state)?;
-    if let Some(transition) = crate::grouped::apply(plan, scalar_state, keyed, batch)? {
+/// Rejects corrupt graph/state, invalid input, arithmetic, output amplification,
+/// duplicate result/state identities, or any nondeterministic transition shape.
+pub fn apply_graph_plan(
+    graph: &OperatorGraph,
+    snapshot: &StateSnapshot,
+    batch: &MultiInputBatch,
+) -> Result<GraphTransition, KernelError> {
+    graph.validate().map_err(|_| KernelError::InvalidGraph)?;
+    let read_set = graph_state_read_set(graph, batch)?;
+    snapshot
+        .validate_exact(&read_set)
+        .map_err(|_| KernelError::InvalidState)?;
+    if let Some(transition) = crate::join::apply(graph, snapshot, batch)? {
         return Ok(transition);
     }
-    if !keyed.entries.is_empty() {
-        return Err(KernelError::InvalidState);
-    }
-    match &plan.implementation {
-        PlanImplementation::CountRows => scalar_transition(plan, apply_count(current, batch)?),
-        PlanImplementation::SumInt8 { input_slot, .. } => {
-            scalar_transition(plan, apply_sum(current, batch, *input_slot)?)
-        }
-        PlanImplementation::Graph { graph } => graph_transition(plan, graph, batch),
-    }
-}
-
-/// Returns the exact, sorted operator-owned keyed state required by one batch.
-///
-/// # Errors
-///
-/// Rejects plan, graph, row-layout, typed-key, or bound violations.
-pub fn state_read_set(
-    plan: &CompiledPlan,
-    batch: &DeltaBatch,
-) -> Result<crate::StateReadSet, KernelError> {
-    crate::grouped::state_read_set(plan, batch)
-}
-
-/// Returns the exact keyed/partition reads for one canonical multi-source graph.
-/// Computes the exact grouped-state keys and partitions needed by one graph batch.
-///
-/// # Errors
-///
-/// Rejects graph, origin, layout, type, or input-bound violations.
-pub fn graph_state_read_set(
-    graph: &crate::OperatorGraph,
-    batch: &crate::MultiInputBatch,
-) -> Result<crate::StateReadSet, KernelError> {
-    crate::join::state_read_set(graph, batch)?.ok_or(KernelError::InvalidGraph)
-}
-
-/// Applies one canonical multi-source graph without database access.
-/// Applies one validated graph batch against its exact state snapshot.
-///
-/// # Errors
-///
-/// Rejects corrupt graph/state, invalid input, output amplification, or an
-/// invalid deterministic transition.
-pub fn apply_graph_plan(
-    graph: &crate::OperatorGraph,
-    state: &EncodedOperatorState,
-    snapshot: &crate::StateSnapshot,
-    batch: &crate::MultiInputBatch,
-) -> Result<OperatorTransition, KernelError> {
-    crate::join::apply(graph, state, snapshot, batch)?.ok_or(KernelError::InvalidGraph)
-}
-
-fn scalar_transition(plan: &CompiledPlan, value: i64) -> Result<OperatorTransition, KernelError> {
-    if plan.output_contract
-        != (OutputContract::Scalar {
-            value_type: crate::ValueType::Int8,
-        })
+    let input = singleton_batch(graph, batch)?;
+    let mut transition = crate::apply_graph(graph, input).map_err(|_| KernelError::InvalidGraph)?;
+    let (scalar_state, scalar_results) = crate::scalar::apply(graph, snapshot, input)?;
+    transition.state_deltas.extend(scalar_state);
+    transition.results.extend(scalar_results);
+    let grouped = crate::grouped::apply(graph, snapshot, input)?;
+    transition.state_deltas.extend(grouped.state_deltas);
+    transition.results.extend(grouped.results);
+    transition
+        .state_deltas
+        .sort_by(|left, right| left.key.cmp(&right.key));
+    transition.results.sort_by_key(result_node_id);
+    if transition
+        .state_deltas
+        .windows(2)
+        .any(|pair| pair[0].key == pair[1].key)
+        || transition
+            .results
+            .windows(2)
+            .any(|pair| result_node_id(&pair[0]) == result_node_id(&pair[1]))
     {
-        return Err(KernelError::OutputContractMismatch);
-    }
-    Ok(OperatorTransition {
-        next_state: EncodedOperatorState {
-            codec_version: STATE_CODEC_VERSION,
-            payload: value.to_be_bytes().to_vec(),
-        },
-        state_deltas: Vec::new(),
-        output_delta: OutputDelta::ScalarReplacement {
-            value: TypedValue::Int8(value),
-        },
-    })
-}
-
-fn apply_count(mut value: i64, batch: &DeltaBatch) -> Result<i64, KernelError> {
-    if value < 0 {
-        return Err(KernelError::NegativeCount);
-    }
-    for effect in &batch.rows {
-        match (&effect.before, &effect.after) {
-            (None, Some(_)) => value = value.checked_add(1).ok_or(KernelError::Overflow)?,
-            (Some(_), None) => {
-                value = value.checked_sub(1).ok_or(KernelError::Underflow)?;
-                if value < 0 {
-                    return Err(KernelError::Underflow);
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(value)
-}
-
-fn apply_sum(mut value: i64, batch: &DeltaBatch, input_slot: u16) -> Result<i64, KernelError> {
-    for effect in &batch.rows {
-        if let Some(before) = &effect.before {
-            value = value
-                .checked_sub(contribution(before, input_slot)?)
-                .ok_or(KernelError::Overflow)?;
-        }
-        if let Some(after) = &effect.after {
-            value = value
-                .checked_add(contribution(after, input_slot)?)
-                .ok_or(KernelError::Overflow)?;
-        }
-    }
-    Ok(value)
-}
-
-fn contribution(row: &TypedRow, input_slot: u16) -> Result<i64, KernelError> {
-    match row.values.get(usize::from(input_slot)) {
-        Some(TypedValue::Null(ValueType::Int8)) => Ok(0),
-        Some(TypedValue::Int8(value)) => Ok(*value),
-        Some(TypedValue::Absent) | None => Err(KernelError::AbsentInput),
-        _ => Err(KernelError::WrongType),
-    }
-}
-
-fn graph_transition(
-    plan: &CompiledPlan,
-    graph: &crate::OperatorGraph,
-    batch: &DeltaBatch,
-) -> Result<OperatorTransition, KernelError> {
-    let transition = apply_graph(graph, batch).map_err(|_| KernelError::InvalidGraph)?;
-    if transition.results.len() != 1 {
         return Err(KernelError::InvalidTransition);
     }
-    let result = transition
-        .results
-        .into_iter()
-        .next()
-        .expect("length checked");
-    let ResultDelta::Keyed { mutations, .. } = result;
-    let mutations = mutations
-        .into_iter()
-        .map(|mutation| match mutation {
-            ResultMutation::Delete { key } => KeyedMutation::Delete { key },
-            ResultMutation::Upsert { key, value } => KeyedMutation::Upsert { key, value },
-        })
-        .collect();
-    if !matches!(plan.output_contract, OutputContract::KeyedRows { .. }) {
-        return Err(KernelError::OutputContractMismatch);
+    Ok(transition)
+}
+
+fn singleton_batch<'a>(
+    graph: &OperatorGraph,
+    batch: &'a MultiInputBatch,
+) -> Result<&'a DeltaBatch, KernelError> {
+    if graph.sources.len() != 1
+        || batch.sources.len() != 1
+        || batch.sources[0].source_id != graph.sources[0].source_id
+    {
+        return Err(KernelError::InvalidGraph);
     }
-    Ok(OperatorTransition {
-        next_state: EncodedOperatorState {
-            codec_version: crate::plan::STATE_CODEC_VERSION,
-            payload: Vec::new(),
-        },
-        state_deltas: Vec::new(),
-        output_delta: OutputDelta::KeyedMutations { mutations },
-    })
+    let source = &batch.sources[0];
+    let valid_origin = match (batch.origin, source.delta.origin) {
+        (GraphEffectOrigin::Wal(graph_tx), crate::EffectOrigin::Wal(source_tx)) => {
+            graph_tx.graph_id == graph.graph_id
+                && source_tx.source_id == source.source_id
+                && graph_tx.slot_generation == source_tx.slot_generation
+                && graph_tx.commit_lsn == source_tx.commit_lsn
+                && graph_tx.ingress_transaction_id == source_tx.ingress_transaction_id
+        }
+        (
+            GraphEffectOrigin::Bootstrap(graph_batch),
+            crate::EffectOrigin::Bootstrap(source_batch),
+        ) => graph_batch == source_batch,
+        _ => false,
+    };
+    let layout = crate::source_typed_layout(source.source_id, &graph.sources[0].layout)
+        .map_err(|_| KernelError::InvalidGraph)?;
+    if !valid_origin || source.delta.layout_identity != layout.identity {
+        return Err(KernelError::InvalidGraph);
+    }
+    Ok(&source.delta)
+}
+
+fn result_node_id(result: &ResultDelta) -> crate::NodeId {
+    match result {
+        ResultDelta::Scalar { node_id, .. } | ResultDelta::Keyed { node_id, .. } => *node_id,
+    }
 }

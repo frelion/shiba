@@ -1,5 +1,5 @@
 use crate::{
-    GovernedSourceSession, IngressError, ReplicationMode,
+    GovernedGraphSession, IngressError, ReplicationMode,
     bootstrap_catchup::BootstrapCatchupSession, governed::AttachOptions,
 };
 
@@ -9,7 +9,7 @@ impl BootstrapCatchupSession {
     /// # Errors
     /// Fails if activation has not durably committed or advisory ownership was
     /// lost before the normal receiver reattaches.
-    pub fn into_live(self) -> Result<GovernedSourceSession, IngressError> {
+    pub fn into_live(self) -> Result<GovernedGraphSession, IngressError> {
         if !self.active {
             return Err(IngressError::Governance("bootstrap is not active"));
         }
@@ -35,10 +35,10 @@ impl BootstrapCatchupSession {
         }
         drop(apply);
         drop(permit);
-        GovernedSourceSession::attach(
+        GovernedGraphSession::attach(
             &apply_conninfo,
             &replication_conninfo,
-            spec.source_id,
+            spec.graph_id,
             spec.slot_generation,
             AttachOptions::new(ReplicationMode::Committed, options.statement_timeout())?,
         )

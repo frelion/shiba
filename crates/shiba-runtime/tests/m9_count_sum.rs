@@ -1,13 +1,6 @@
-use std::num::NonZeroU64;
-
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_operator::OperatorId;
 use shiba_protocol::{SlotGeneration, SourceId};
-use shiba_runtime::{
-    M2Error, PgoutputSource, ProcessOutcome, compile_and_register, decode_committed_changes,
-    process,
-};
+use shiba_runtime::{M2Error, PgoutputSource, ProcessOutcome, decode_committed_changes, process};
 
 mod support;
 
@@ -20,26 +13,17 @@ const CAPTURE: PgoutputCapture = PgoutputCapture {
     publication: "shiba_m9_count_sum_pub",
 };
 
-fn spec(operator_id: u64, operation: OperatorOperationV1) -> OperatorSpecV1 {
-    OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("non-zero operator")),
-        source_id: SourceId::new(1).expect("non-zero source"),
-        operation,
-    }
-}
-
 fn capture(
     client: &mut Client,
     source: PgoutputSource,
     sql: &str,
     name: &str,
-) -> shiba_runtime::SourceTransaction {
+) -> shiba_runtime::GraphTransaction {
     client
         .batch_execute(sql)
         .expect("commit source transaction");
     let wire = CAPTURE.capture(client, name);
-    decode_committed_changes(&wire, source)
+    decode_committed_changes(&wire, &support::singleton_graph(1, source))
         .unwrap_or_else(|error| panic!("decode {name}: {error:?}"))
 }
 
@@ -47,23 +31,30 @@ fn values(client: &mut Client) -> (i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 2),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1002),
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query results and continuation");
     let public = (row.get(0), row.get(1), row.get(2));
     let private = client
         .query(
-            "SELECT state_payload FROM shiba_internal.operator_state ORDER BY operator_id",
+            "SELECT state.state_payload
+             FROM shiba.graph_result AS result
+             LEFT JOIN shiba_internal.graph_node_state AS state
+               ON state.graph_id = result.graph_id
+              AND state.node_id = result.result_id - 1000
+              AND state.namespace = 0
+             WHERE result.graph_id = 1 ORDER BY result.result_id",
             &[],
         )
         .expect("query private states")
         .into_iter()
         .map(|row| {
-            let payload: Vec<u8> = row.get(0);
-            i64::from_be_bytes(payload.try_into().expect("int8 operator state"))
+            row.get::<_, Option<Vec<u8>>>(0).map_or(0, |payload| {
+                i64::from_be_bytes(payload.try_into().expect("int8 operator state"))
+            })
         })
         .collect::<Vec<_>>();
     assert_eq!(private, vec![public.0, public.1]);
@@ -90,14 +81,14 @@ fn install_crash_after_count(client: &mut Client) {
              CREATE FUNCTION m9_count_sum_test.crash_after_count()
              RETURNS trigger LANGUAGE plpgsql AS $$
              BEGIN
-                 IF NEW.operator_id = 1 THEN
+                 IF NEW.result_id = 1001 THEN
                      PERFORM pg_terminate_backend(pg_backend_pid());
                  END IF;
                  RETURN NEW;
              END
              $$;
              CREATE TRIGGER m9_crash_after_count
-             AFTER UPDATE ON shiba.operator_result
+             AFTER UPDATE ON shiba.graph_result
              FOR EACH ROW EXECUTE FUNCTION m9_count_sum_test.crash_after_count();",
         )
         .expect("install crash after first operator result");
@@ -113,7 +104,7 @@ fn install_replay_trap(client: &mut Client) {
              END
              $$;
              CREATE TRIGGER m9_reject_operator_replay
-             BEFORE UPDATE ON shiba_internal.operator_state
+             BEFORE UPDATE ON shiba_internal.graph_node_state
              FOR EACH ROW EXECUTE FUNCTION m9_count_sum_test.reject_operator_replay();",
         )
         .expect("install exact replay operator trap");
@@ -134,18 +125,7 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
              SELECT shiba_internal.register_source(1, 'source.events'::regclass);",
         )
         .expect("install source and binding");
-    compile_and_register(&mut client, &spec(1, OperatorOperationV1::CountRows))
-        .expect("register CountRows");
-    compile_and_register(
-        &mut client,
-        &spec(
-            2,
-            OperatorOperationV1::SumInt8 {
-                input_column: "payload".to_owned(),
-            },
-        ),
-    )
-    .expect("register SumInt8");
+    support::register_count_sum_graph(&mut client, 1);
     let relation_oid = client
         .query_one("SELECT 'source.events'::regclass::oid::bigint", &[])
         .expect("read relation oid")
@@ -156,6 +136,7 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
         u32::try_from(relation_oid).expect("oid fits u32"),
     );
     CAPTURE.create_slot();
+    support::configure_graph_ingress(&mut client, 1, CAPTURE.publication, CAPTURE.slot);
 
     let _unapplied = capture(
         &mut client,
@@ -231,11 +212,11 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
     );
     client
         .batch_execute(
-            "UPDATE shiba_internal.operator_state
+            "UPDATE shiba_internal.graph_node_state
                 SET state_payload = decode('7fffffffffffffff', 'hex')
-               WHERE operator_id = 2;
-             UPDATE shiba.operator_result SET value_bigint = 9223372036854775807
-               WHERE operator_id = 2;",
+               WHERE graph_id = 1 AND node_id = 2 AND namespace = 0;
+             UPDATE shiba.graph_result SET value_bigint = 9223372036854775807
+               WHERE graph_id = 1 AND result_id = 1002;",
         )
         .expect("inject sum overflow boundary");
     assert!(matches!(
@@ -246,10 +227,11 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
     assert_eq!(rows(&mut client), vec![(1, None)]);
     client
         .batch_execute(
-            "UPDATE shiba_internal.operator_state
+            "UPDATE shiba_internal.graph_node_state
                 SET state_payload = decode('0000000000000000', 'hex')
-              WHERE operator_id = 2;
-             UPDATE shiba.operator_result SET value_bigint = 0 WHERE operator_id = 2;",
+              WHERE graph_id = 1 AND node_id = 2 AND namespace = 0;
+             UPDATE shiba.graph_result SET value_bigint = 0
+              WHERE graph_id = 1 AND result_id = 1002;",
         )
         .expect("remove overflow injection");
     assert_eq!(

@@ -19,10 +19,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -92,7 +92,8 @@ fn m5_relation_oid_survives_rename_and_rejects_same_name_recreation() {
         .expect("commit original-name insert");
     let first_wire = CAPTURE.capture(&mut client, "original-name.pgoutput");
     assert_eq!(wire_relation_id(&first_wire), original_oid);
-    let first = decode_committed_changes(&first_wire, source).expect("decode original insert");
+    let first = decode_committed_changes(&first_wire, &support::singleton_graph(1, source))
+        .expect("decode original insert");
     assert_eq!(
         process(&mut client, &first).expect("apply original insert"),
         ProcessOutcome::Applied
@@ -118,7 +119,8 @@ fn m5_relation_oid_survives_rename_and_rejects_same_name_recreation() {
     );
     let renamed_wire = CAPTURE.capture(&mut client, "renamed.pgoutput");
     assert_eq!(wire_relation_id(&renamed_wire), original_oid);
-    let renamed = decode_committed_changes(&renamed_wire, source).expect("decode renamed insert");
+    let renamed = decode_committed_changes(&renamed_wire, &support::singleton_graph(1, source))
+        .expect("decode renamed insert");
     assert!(matches!(
         process(&mut client, &renamed),
         Err(M2Error::SourceInvalidated)
@@ -141,7 +143,7 @@ fn m5_relation_oid_survives_rename_and_rejects_same_name_recreation() {
     let recreated_wire = CAPTURE.capture(&mut client, "recreated.pgoutput");
     assert_eq!(wire_relation_id(&recreated_wire), recreated_oid);
     assert!(matches!(
-        decode_committed_changes(&recreated_wire, source),
+        decode_committed_changes(&recreated_wire, &support::singleton_graph(1, source)),
         Err(PgoutputError::RelationMismatch)
     ));
     assert_eq!(durable_state(&mut client), (1, 1, 1, 1));
@@ -151,7 +153,10 @@ fn m5_relation_oid_survives_rename_and_rejects_same_name_recreation() {
         SlotGeneration::new(1).expect("non-zero generation"),
         recreated_oid,
     );
-    let _ = decode_committed_changes(&recreated_wire, recreated_source)
-        .expect("same wire is valid for the recreated OID");
+    let _ = decode_committed_changes(
+        &recreated_wire,
+        &support::singleton_graph(1, recreated_source),
+    )
+    .expect("same wire is valid for the recreated OID");
     assert_eq!(durable_state(&mut client), (1, 1, 1, 1));
 }

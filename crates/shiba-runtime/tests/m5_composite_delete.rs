@@ -17,10 +17,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -75,7 +75,7 @@ fn install_crash_trigger(client: &mut Client) {
              END
              $$;
              CREATE TRIGGER m5_composite_delete_crash
-             AFTER INSERT ON shiba_internal.source_continuation
+             AFTER INSERT ON shiba_internal.graph_continuation
              FOR EACH ROW EXECUTE FUNCTION
                  m5_composite_delete_test.crash_after_continuation();",
         )
@@ -94,7 +94,8 @@ fn prove_missing_pair(client: &mut Client, source: PgoutputSource) {
         )
         .expect("commit missing composite delete");
     let wire = CAPTURE.capture(client, "missing-delete.pgoutput");
-    let missing = decode_committed_changes(&wire, source).expect("decode missing composite delete");
+    let missing = decode_committed_changes(&wire, &support::singleton_graph(1, source))
+        .expect("decode missing composite delete");
     assert!(matches!(
         process(client, &missing),
         Err(M2Error::MissingSourceRow)
@@ -146,7 +147,8 @@ fn m5_real_composite_delete_crash_retry_replay_and_missing_row() {
         )
         .expect("commit composite inserts");
     let insert_wire = CAPTURE.capture(&mut client, "composite-insert.pgoutput");
-    let insert = decode_committed_changes(&insert_wire, source).expect("decode composite inserts");
+    let insert = decode_committed_changes(&insert_wire, &support::singleton_graph(1, source))
+        .expect("decode composite inserts");
     assert_eq!(
         process(&mut client, &insert).expect("apply composite inserts"),
         ProcessOutcome::Applied
@@ -163,10 +165,11 @@ fn m5_real_composite_delete_crash_retry_replay_and_missing_row() {
     let second_tag = second_delete_key_tag(&delete_wire);
     let mut corrupt = delete_wire.clone();
     corrupt[second_tag] = b'n';
-    assert!(decode_committed_changes(&corrupt, source).is_err());
+    assert!(decode_committed_changes(&corrupt, &support::singleton_graph(1, source)).is_err());
     assert_eq!(durable_state(&mut client), (2, 2, 2, 1));
 
-    let delete = decode_committed_changes(&delete_wire, source).expect("decode composite delete");
+    let delete = decode_committed_changes(&delete_wire, &support::singleton_graph(1, source))
+        .expect("decode composite delete");
     install_crash_trigger(&mut client);
     assert!(process(&mut client, &delete).is_err());
     let mut client = Client::connect(&connection, NoTls).expect("reconnect after crash");

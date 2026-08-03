@@ -1,5 +1,6 @@
 use postgres::Client;
 use shiba_ingress::{BootstrapSession, SnapshotProgress};
+use shiba_operator::TypedValue;
 use shiba_protocol::{BootstrapBatchId, SourceId};
 use shiba_runtime::{
     BootstrapBatch, BootstrapProcessOutcome, SnapshotRow, process_bootstrap_batch,
@@ -134,20 +135,30 @@ pub(crate) fn prove_snapshot_restarts(
 
     admin
         .execute(
-            "UPDATE shiba_internal.operator_state SET state_payload = $1 WHERE operator_id = 2",
-            &[&(i64::MAX - 50).to_be_bytes().as_slice()],
+            "INSERT INTO shiba_internal.graph_node_state (
+                 graph_id,node_id,namespace,partition_key_payload,
+                 item_key_payload,codec_version,state_payload
+             ) VALUES (1,3,0,$1,$2,1,$3)",
+            &[
+                &TypedValue::Bool(true)
+                    .to_canonical_json()
+                    .expect("canonical scalar partition"),
+                &b"null".as_slice(),
+                &(i64::MAX - 50).to_be_bytes().as_slice(),
+            ],
         )
         .expect("inject first-batch operator rollback");
     assert!(bootstrap.scan_next().is_err());
     admin
         .execute(
-            "UPDATE shiba_internal.operator_state
-             SET state_payload = decode('0000000000000000', 'hex') WHERE operator_id = 2",
-            &[],
+            "UPDATE shiba_internal.graph_node_state SET state_payload = $1
+             WHERE graph_id = 1 AND node_id = 3",
+            &[&0_i64.to_be_bytes().as_slice()],
         )
         .expect("restore failed batch state");
     assert_batch(&mut bootstrap, 1);
     let exact = BootstrapBatch::new(
+        shiba_protocol::GraphId::new(1).unwrap(),
         SourceId::new(1).unwrap(),
         BootstrapBatchId::new(shiba_protocol::BootstrapId::new(7).unwrap(), 1).unwrap(),
         vec![
@@ -187,10 +198,12 @@ fn assert_reset(client: &mut Client) {
     support::assert_building(client);
     let row = client
         .query_one(
-            "SELECT last_batch_ordinal,
+            "SELECT checkpoint.last_batch_ordinal,
                 (SELECT count(*) FROM shiba_internal.source_row_state WHERE source_id=1),
-                (SELECT count(*) FROM shiba_internal.source_continuation WHERE source_id=1)
-         FROM shiba_internal.source_bootstrap WHERE source_id=1",
+                (SELECT count(*) FROM shiba_internal.graph_continuation WHERE graph_id=1)
+         FROM shiba_internal.graph_bootstrap AS bootstrap
+         JOIN shiba_internal.graph_bootstrap_checkpoint AS checkpoint USING (graph_id)
+         WHERE bootstrap.graph_id=1 AND checkpoint.source_id=1",
             &[],
         )
         .expect("prove fresh attempt reset");

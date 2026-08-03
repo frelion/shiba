@@ -1,12 +1,10 @@
-use std::{num::NonZeroU64, time::Duration};
+use std::time::Duration;
 
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
 use shiba_ingress::{
     BootstrapCatchupProgress, BootstrapOptions, BootstrapSession, BootstrapSpec, SnapshotProgress,
 };
-use shiba_operator::OperatorId;
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
 use shiba_runtime::{ProcessOutcome, compile_and_register};
 
 pub(crate) const OLD_SLOT: &str = "shiba_m12_contract_old";
@@ -19,18 +17,30 @@ pub(crate) fn required(name: &str) -> String {
         .unwrap_or_else(|_| panic!("scripts/test-m12-rebuild-contract.sh must set {name}"))
 }
 
-fn operator_spec(operator_id: u64, operation: OperatorOperationV1) -> OperatorSpecV1 {
-    OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("operator ID")),
-        source_id: SourceId::new(1).expect("source ID"),
-        operation,
-    }
-}
+#[path = "../support/mod.rs"]
+#[allow(dead_code)]
+mod test_support;
+use test_support::count_sum_project_spec;
 
 pub(crate) fn establish_active_source(
     database_url: &str,
     replication_url: &str,
+) -> (Client, BootstrapSpec) {
+    establish_active_source_with_graph(database_url, replication_url, true)
+}
+
+#[allow(dead_code)]
+pub(crate) fn establish_active_scalar_source(
+    database_url: &str,
+    replication_url: &str,
+) -> (Client, BootstrapSpec) {
+    establish_active_source_with_graph(database_url, replication_url, false)
+}
+
+fn establish_active_source_with_graph(
+    database_url: &str,
+    replication_url: &str,
+    include_project: bool,
 ) -> (Client, BootstrapSpec) {
     let mut admin = Client::connect(database_url, NoTls).expect("connect admin database");
     admin
@@ -44,32 +54,12 @@ pub(crate) fn establish_active_source(
              INSERT INTO source.events VALUES (1, 10), (2, NULL), (3, 30);"
         ))
         .expect("install nonempty source");
-    compile_and_register(
-        &mut admin,
-        &operator_spec(1, OperatorOperationV1::CountRows),
-    )
-    .expect("register CountRows");
-    compile_and_register(
-        &mut admin,
-        &operator_spec(
-            2,
-            OperatorOperationV1::SumInt8 {
-                input_column: "payload".to_owned(),
-            },
-        ),
-    )
-    .expect("register SumInt8");
-    compile_and_register(
-        &mut admin,
-        &operator_spec(
-            3,
-            OperatorOperationV1::MaterializedProject {
-                key_column: "id".to_owned(),
-                value_column: "payload".to_owned(),
-            },
-        ),
-    )
-    .expect("register ProjectRows");
+    let graph = if include_project {
+        count_sum_project_spec(1)
+    } else {
+        test_support::count_sum_spec(1)
+    };
+    compile_and_register(&mut admin, &graph).expect("register graph");
     let publication_oid = admin
         .query_one(
             "SELECT oid FROM pg_catalog.pg_publication WHERE pubname = $1",
@@ -78,7 +68,7 @@ pub(crate) fn establish_active_source(
         .expect("read publication OID")
         .get(0);
     let spec = BootstrapSpec {
-        source_id: SourceId::new(1).expect("source ID"),
+        graph_id: GraphId::new(1).expect("graph ID"),
         bootstrap_id: BootstrapId::new(1).expect("bootstrap ID"),
         publication_oid,
         slot_name: OLD_SLOT.to_owned(),
@@ -127,12 +117,12 @@ pub(crate) fn establish_active_source(
 pub(crate) fn shiba_authority_snapshot(client: &mut Client) -> Vec<Vec<String>> {
     [
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_binding ORDER BY address_objsubid) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_ingress_config ORDER BY source_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_bootstrap ORDER BY source_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_ingress_config ORDER BY graph_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_bootstrap ORDER BY graph_id) x",
         "SELECT row_to_json(x)::text FROM (SELECT source_id, source_row_id, source_row_sub_id, payload_int8, payload_text FROM shiba_internal.source_row_state ORDER BY source_row_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.operator_state ORDER BY operator_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.operator_result ORDER BY operator_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT source_id, slot_generation, commit_lsn::text, ingress_transaction_id FROM shiba_internal.source_continuation ORDER BY slot_generation, commit_lsn) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_node_state ORDER BY graph_id, node_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.graph_result ORDER BY graph_id, result_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT graph_id, slot_generation, commit_lsn::text, ingress_transaction_id FROM shiba_internal.graph_continuation ORDER BY slot_generation, commit_lsn) x",
     ]
     .into_iter()
     .map(|query| {

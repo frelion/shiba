@@ -1,6 +1,41 @@
 # Transaction and recovery contract
 
-M13.3 preserves this recovery boundary while replacing operator internals. One
+## M14.6 graph transaction and recovery boundary
+
+One PostgreSQL transaction is now the unit of graph computation. Runtime locks
+the graph/generation, probes the exact `graph_continuation`, locks all member
+bindings by SourceId and current rows by source/key, locks required node state
+by node/state key, constructs one transaction-local multi-input batch, computes
+the canonical graph, persists generic state/result deltas, writes the graph
+continuation last and commits. A transaction that changes both join inputs is
+never split into two Apply transactions or two progress decisions.
+
+Any decoder, plan/state codec, arithmetic, bound, sink, constraint,
+serialization or backend failure rolls back every member's row mutation, all
+node state, all scalar/keyed terminal results and the graph continuation. Retry
+starts at the complete PostgreSQL transaction boundary. Exact replay is proved
+only by the graph/slot-generation continuation. ACK remains post-commit and can
+never be authorized by a per-member position.
+
+Bootstrap/rebuild recover one `graph_bootstrap` lifecycle, one exported snapshot
+and one slot/fence. Per-member scan checkpoints are subordinate progress only;
+activation is graph-wide and atomically publishes every result. Intermediate
+DeltaBatch values are never durable recovery state. The source/operator names
+in the M2--M13 chronology below are historical evidence superseded by this
+single graph authority, not compatibility interfaces. Directed M14.6 crash,
+rollback and replay tests are green on PG17.10/18.4: a same-database transaction
+changing both JOIN members commits once, injected keyed-sink failure restores
+all member rows/results/continuation, and retry then applies once. Replacement
+of the exact right identity index rejects a pending transaction before writes.
+M14.7 owns the complete receiver/bootstrap/rebuild crash and release matrix.
+
+Keyed recovery compares canonical typed key and value payloads, not only their
+convenience bigint/NULL projections. This closes the failure where a projected
+SQL value could look correct while the durable codec payload drifted. Result
+contracts come from the graph terminals; Runtime uses their shape/nullability
+metadata generically and never reconstructs a concrete operator kind.
+
+M13.3 preserved the prior recovery boundary while replacing operator internals. One
 EffectBatch and all opaque state/typed scalar/keyed transitions remain inside
 the processor transaction; continuation is still last and ACK still requires
 durable Apply or exact replay. A codec, plan, arithmetic, output-bound or keyed

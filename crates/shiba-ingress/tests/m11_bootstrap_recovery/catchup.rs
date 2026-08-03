@@ -1,6 +1,6 @@
 use postgres::{Client, NoTls};
 use shiba_ingress::{BootstrapCatchupProgress, BootstrapCatchupSession, BootstrapOptions};
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
 
 use crate::recovery_support::{
     SLOT, checkpoint, install_receiver_kill_trigger, remove_receiver_kill_trigger,
@@ -14,7 +14,7 @@ use crate::recovery_support::{
 pub(crate) fn prove_feedback_and_cutover_recovery(
     database_url: &str,
     replication_url: &str,
-    source_id: SourceId,
+    graph_id: GraphId,
     bootstrap_id: BootstrapId,
     generation: SlotGeneration,
     options: BootstrapOptions,
@@ -24,7 +24,7 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
     let mut catchup = BootstrapCatchupSession::resume(
         database_url,
         replication_url,
-        source_id,
+        graph_id,
         bootstrap_id,
         generation,
         options,
@@ -33,18 +33,18 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
     assert_eq!(checkpoint(&mut admin).0, "catching_up");
     install_receiver_kill_trigger(
         &mut admin,
-        "shiba_internal.source_continuation",
+        "shiba_internal.graph_continuation",
         "AFTER INSERT",
     );
     assert!(
         catchup.catch_up_next().is_err(),
         "feedback transport must fail after durable Apply"
     );
-    assert_eq!(states(&mut admin), vec![(1, 4), (2, 50)]);
+    assert_eq!(states(&mut admin), vec![(1, 4), (3, 50)]);
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_continuation",
+                "SELECT count(*) FROM shiba_internal.graph_continuation",
                 &[]
             )
             .expect("query continuation after failed feedback")
@@ -53,12 +53,12 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
     );
     assert_eq!(checkpoint(&mut admin).0, "catching_up");
     drop(catchup);
-    remove_receiver_kill_trigger(&mut admin, "shiba_internal.source_continuation");
+    remove_receiver_kill_trigger(&mut admin, "shiba_internal.graph_continuation");
 
     let mut catchup = BootstrapCatchupSession::resume(
         database_url,
         replication_url,
-        source_id,
+        graph_id,
         bootstrap_id,
         generation,
         options,
@@ -68,11 +68,11 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
         catchup.catch_up_next().expect("ack exact Apply replay"),
         BootstrapCatchupProgress::TransactionApplied
     );
-    assert_eq!(states(&mut admin), vec![(1, 4), (2, 50)]);
+    assert_eq!(states(&mut admin), vec![(1, 4), (3, 50)]);
     assert_eq!(
         admin
             .query_one(
-                "SELECT count(*) FROM shiba_internal.source_continuation",
+                "SELECT count(*) FROM shiba_internal.graph_continuation",
                 &[]
             )
             .expect("query replay continuation")
@@ -82,7 +82,7 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
 
     install_receiver_kill_trigger(
         &mut admin,
-        "shiba_internal.source_bootstrap",
+        "shiba_internal.graph_bootstrap",
         "AFTER UPDATE OF phase",
     );
     assert!(
@@ -91,8 +91,8 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
     );
     let activation_end: String = admin
         .query_one(
-            "SELECT activation_end_lsn::text FROM shiba_internal.source_bootstrap
-             WHERE source_id = 1 AND phase = 'active'",
+            "SELECT activation_end_lsn::text FROM shiba_internal.graph_bootstrap
+             WHERE graph_id = 1 AND phase = 'active'",
             &[],
         )
         .expect("activation committed before feedback failure")
@@ -100,8 +100,8 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
     assert_eq!(
         admin
             .query(
-                "SELECT operator_id, result_status, value_bigint
-                 FROM shiba.operator_result ORDER BY operator_id",
+                "SELECT result_id, result_status, value_bigint
+                 FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
                 &[],
             )
             .expect("query active results")
@@ -112,15 +112,15 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
                 row.get::<_, i64>(2)
             ))
             .collect::<Vec<_>>(),
-        vec![(1, "active".to_owned(), 4), (2, "active".to_owned(), 50)]
+        vec![(2, "active".to_owned(), 4), (4, "active".to_owned(), 50)]
     );
     drop(catchup);
-    remove_receiver_kill_trigger(&mut admin, "shiba_internal.source_bootstrap");
+    remove_receiver_kill_trigger(&mut admin, "shiba_internal.graph_bootstrap");
 
     let mut resumed = BootstrapCatchupSession::resume(
         database_url,
         replication_url,
-        source_id,
+        graph_id,
         bootstrap_id,
         generation,
         options,
@@ -139,7 +139,7 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
     let mut resumed = BootstrapCatchupSession::resume(
         database_url,
         replication_url,
-        source_id,
+        graph_id,
         bootstrap_id,
         generation,
         options,

@@ -2,7 +2,7 @@ use postgres::{Client, NoTls};
 use shiba_operator::KernelError;
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{
-    M2Error, PgoutputSource, ProcessOutcome, SourceTransaction, decode_committed_changes, process,
+    GraphTransaction, M2Error, PgoutputSource, ProcessOutcome, decode_committed_changes, process,
 };
 
 mod support;
@@ -20,10 +20,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -62,7 +62,7 @@ fn install_crash_trigger(client: &mut Client) {
              END
              $$;
              CREATE TRIGGER m4_delete_crash
-             AFTER INSERT ON shiba_internal.source_continuation
+             AFTER INSERT ON shiba_internal.graph_continuation
              FOR EACH ROW EXECUTE FUNCTION m4_delete_test.crash_after_continuation();",
         )
         .expect("install continuation crash point");
@@ -79,13 +79,14 @@ fn assert_apply_row(client: &mut Client, row_id: i64) {
     assert_eq!(count, 1);
 }
 
-fn prove_count_underflow(client: &mut Client, delete: &SourceTransaction) {
+fn prove_count_underflow(client: &mut Client, delete: &GraphTransaction) {
     client
         .batch_execute(
-            "UPDATE shiba_internal.operator_state
-                 SET state_payload = decode('0000000000000000', 'hex') WHERE operator_id = 1;
-             UPDATE shiba.operator_result
-                 SET value_bigint = 0 WHERE operator_id = 1;",
+            "UPDATE shiba_internal.graph_node_state
+                 SET state_payload = decode('0000000000000000', 'hex')
+                 WHERE graph_id = 1 AND node_id = 1 AND namespace = 0;
+             UPDATE shiba.graph_result
+                 SET value_bigint = 0 WHERE graph_id = 1 AND result_id = 1001;",
         )
         .expect("install count underflow precondition");
     assert!(matches!(
@@ -96,10 +97,11 @@ fn prove_count_underflow(client: &mut Client, delete: &SourceTransaction) {
     assert_apply_row(client, 401);
     client
         .batch_execute(
-            "UPDATE shiba_internal.operator_state
-                 SET state_payload = decode('0000000000000002', 'hex') WHERE operator_id = 1;
-             UPDATE shiba.operator_result
-                 SET value_bigint = 2 WHERE operator_id = 1;",
+            "UPDATE shiba_internal.graph_node_state
+                 SET state_payload = decode('0000000000000002', 'hex')
+                 WHERE graph_id = 1 AND node_id = 1 AND namespace = 0;
+             UPDATE shiba.graph_result
+                 SET value_bigint = 2 WHERE graph_id = 1 AND result_id = 1001;",
         )
         .expect("restore count after underflow proof");
 }
@@ -113,7 +115,8 @@ fn prove_missing_row(client: &mut Client, source: PgoutputSource) {
         .batch_execute("DELETE FROM source_m4_delete.events WHERE id = 499")
         .expect("commit delete whose Apply row is missing");
     let wire = CAPTURE.capture(client, "missing-delete.pgoutput");
-    let missing = decode_committed_changes(&wire, source).expect("decode missing-row delete");
+    let missing = decode_committed_changes(&wire, &support::singleton_graph(1, source))
+        .expect("decode missing-row delete");
     assert!(process(client, &missing).is_err());
     assert_eq!(durable_state(client), (1, 1, 1, 2));
     assert_apply_row(client, 402);
@@ -155,7 +158,8 @@ fn m4_real_pgoutput_delete_replay_decode_failure_and_crash() {
         .batch_execute("INSERT INTO source_m4_delete.events VALUES (401), (402)")
         .expect("commit source insert");
     let insert_wire = CAPTURE.capture(&mut client, "insert.pgoutput");
-    let insert = decode_committed_changes(&insert_wire, source).expect("decode insert");
+    let insert = decode_committed_changes(&insert_wire, &support::singleton_graph(1, source))
+        .expect("decode insert");
     assert_eq!(
         process(&mut client, &insert).expect("apply insert"),
         ProcessOutcome::Applied
@@ -170,16 +174,20 @@ fn m4_real_pgoutput_delete_replay_decode_failure_and_crash() {
     let key_tag = delete_key_tag(&bad_delete);
     assert_eq!(bad_delete[key_tag], b't');
     bad_delete[key_tag] = b'n';
-    assert!(decode_committed_changes(&bad_delete, source).is_err());
+    assert!(decode_committed_changes(&bad_delete, &support::singleton_graph(1, source)).is_err());
     assert_eq!(durable_state(&mut client), (2, 2, 2, 1));
 
-    let delete = decode_committed_changes(&delete_wire, source).expect("decode delete");
+    let delete = decode_committed_changes(&delete_wire, &support::singleton_graph(1, source))
+        .expect("decode delete");
     let wrong_relation = PgoutputSource::new(
         SourceId::new(1).expect("non-zero source"),
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id.checked_add(1).expect("different relation OID"),
     );
-    assert!(decode_committed_changes(&delete_wire, wrong_relation).is_err());
+    assert!(
+        decode_committed_changes(&delete_wire, &support::singleton_graph(1, wrong_relation))
+            .is_err()
+    );
     assert_eq!(durable_state(&mut client), (2, 2, 2, 1));
 
     prove_count_underflow(&mut client, &delete);

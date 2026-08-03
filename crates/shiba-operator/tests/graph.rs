@@ -1,13 +1,13 @@
-use core::num::{NonZeroU32, NonZeroU64};
+use core::num::NonZeroU32;
 use std::collections::BTreeMap;
 
 use shiba_operator::{
     ColumnBinding, DeltaBatch, EffectOrigin, Expression, GraphError, NodeId, NodeInput,
-    ObjectAddress, OperatorGraph, OperatorId, OperatorNode, OperatorNodeKind, OutputContract,
-    ResultDelta, ResultMutation, RowDelta, TypedLayout, TypedRow, TypedValue, ValueType,
+    ObjectAddress, OperatorGraph, OperatorNode, OperatorNodeKind, OutputContract, ResultDelta,
+    ResultMutation, RowDelta, SourcePort, TypedLayout, TypedRow, TypedValue, ValueType,
     apply_graph, source_typed_layout,
 };
-use shiba_protocol::{BootstrapBatchId, BootstrapId, SourceId};
+use shiba_protocol::{BootstrapBatchId, BootstrapId, GraphId, SourceId};
 
 fn node(value: u32) -> NodeId {
     NodeId::new(NonZeroU32::new(value).unwrap())
@@ -33,9 +33,10 @@ fn row(layout: &TypedLayout, key: i64, value: TypedValue) -> TypedRow {
 }
 
 fn graph(predicate: Expression, compute: bool) -> OperatorGraph {
+    let source_id = SourceId::new(1).unwrap();
     let mut nodes = vec![OperatorNode {
         node_id: node(1),
-        input: NodeInput::Source,
+        input: NodeInput::SourcePort(source_id),
         state_contract: None,
         kind: OperatorNodeKind::Filter { predicate },
     }];
@@ -82,9 +83,16 @@ fn graph(predicate: Expression, compute: bool) -> OperatorGraph {
         },
     });
     OperatorGraph::build(
-        OperatorId::new(NonZeroU64::new(3).unwrap()),
-        SourceId::new(1).unwrap(),
-        vec![binding(1), binding(2)],
+        GraphId::new(3).unwrap(),
+        vec![SourcePort {
+            source_id,
+            layout: vec![binding(1), binding(2)],
+            identity_index: Some(ObjectAddress {
+                class_id: 1_259,
+                object_id: 17_000,
+                sub_id: 0,
+            }),
+        }],
         nodes,
     )
     .unwrap()
@@ -253,7 +261,9 @@ fn fixed_seed_project_differential_matches_keyed_reference_model() {
             },
         )
         .unwrap();
-        let ResultDelta::Keyed { mutations, .. } = &transition.results[0];
+        let ResultDelta::Keyed { mutations, .. } = &transition.results[0] else {
+            panic!("expected keyed terminal")
+        };
         for mutation in mutations {
             match mutation {
                 ResultMutation::Delete {

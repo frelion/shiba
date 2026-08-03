@@ -17,10 +17,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -120,7 +120,8 @@ fn m7_replica_identity_index_rollback_commit_and_isolation() {
         .batch_execute("INSERT INTO source_m7_index.events VALUES (1401)")
         .expect("commit first source transaction");
     let first_wire = CAPTURE.capture(&mut client, "first.pgoutput");
-    let first = decode_committed_changes(&first_wire, source).expect("decode first row");
+    let first = decode_committed_changes(&first_wire, &support::singleton_graph(1, source))
+        .expect("decode first row");
     assert_eq!(
         process(&mut client, &first).expect("apply first row"),
         ProcessOutcome::Applied
@@ -131,7 +132,8 @@ fn m7_replica_identity_index_rollback_commit_and_isolation() {
         .batch_execute("INSERT INTO source_m7_index.events VALUES (1402)")
         .expect("commit rollback-pending transaction");
     let second_wire = CAPTURE.capture(&mut client, "before-rollback.pgoutput");
-    let second = decode_committed_changes(&second_wire, source).expect("decode second row");
+    let second = decode_committed_changes(&second_wire, &support::singleton_graph(1, source))
+        .expect("decode second row");
     client
         .batch_execute(
             "BEGIN;
@@ -155,7 +157,8 @@ fn m7_replica_identity_index_rollback_commit_and_isolation() {
         .batch_execute("INSERT INTO source_m7_index.events VALUES (1403)")
         .expect("commit invalidation-pending transaction");
     let third_wire = CAPTURE.capture(&mut client, "before-commit.pgoutput");
-    let third = decode_committed_changes(&third_wire, source).expect("decode third row");
+    let third = decode_committed_changes(&third_wire, &support::singleton_graph(1, source))
+        .expect("decode third row");
     client
         .batch_execute(
             "ALTER INDEX source_m7_index.events_identity_key

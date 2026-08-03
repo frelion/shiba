@@ -1,9 +1,9 @@
-use std::num::NonZeroU64;
+use std::num::NonZeroU32;
 
 use postgres::{Client, NoTls};
-use shiba_compiler::{CompilerError, OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
-use shiba_operator::{CompiledPlan, OperatorId, OutputContract, PlanImplementation};
-use shiba_protocol::SourceId;
+use shiba_compiler::{CompilerError, GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1};
+use shiba_operator::{NodeId, ObjectAddress, OperatorGraph, OperatorNodeKind};
+use shiba_protocol::{GraphId, SourceId};
 use shiba_runtime::{M2Error, RegistrationError, compile_and_register};
 
 mod support;
@@ -17,12 +17,29 @@ const ENVIRONMENT: PgoutputCapture = PgoutputCapture {
     publication: "unused_m9_registration_publication",
 };
 
-fn spec(operator_id: u64, source_id: u64, operation: OperatorOperationV1) -> OperatorSpecV1 {
-    OperatorSpecV1 {
-        version: OPERATOR_SPEC_VERSION,
-        operator_id: OperatorId::new(NonZeroU64::new(operator_id).expect("non-zero operator id")),
-        source_id: SourceId::new(source_id).expect("non-zero source id"),
-        operation,
+fn node(value: u32) -> NodeId {
+    NodeId::new(NonZeroU32::new(value).expect("node ID"))
+}
+
+fn spec(graph_id: u64, source_id: u64, input_column: &str) -> GraphSpecV1 {
+    let source_id = SourceId::new(source_id).expect("source ID");
+    GraphSpecV1 {
+        version: GRAPH_SPEC_VERSION,
+        graph_id: GraphId::new(graph_id).expect("graph ID"),
+        sources: vec![source_id],
+        outputs: vec![
+            GraphOutputSpecV1::CountRows {
+                source_id,
+                aggregate_node_id: node(1),
+                result_node_id: node(101),
+            },
+            GraphOutputSpecV1::SumInt8 {
+                source_id,
+                input_column: input_column.into(),
+                aggregate_node_id: node(2),
+                result_node_id: node(102),
+            },
+        ],
     }
 }
 
@@ -30,62 +47,61 @@ fn authority_counts(client: &mut Client) -> (i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT count(*) FROM shiba_internal.operator_definition),
-                (SELECT count(*) FROM shiba_internal.operator_state),
-                (SELECT count(*) FROM shiba.operator_result)",
+                (SELECT count(*) FROM shiba_internal.graph_definition),
+                (SELECT count(*) FROM shiba_internal.graph_source_member),
+                (SELECT count(*) FROM shiba.graph_result)",
             &[],
         )
-        .expect("query operator authority counts");
+        .expect("query graph authority counts");
     (row.get(0), row.get(1), row.get(2))
 }
 
-fn assert_definition(client: &mut Client, operator_id: i64, expected_shape: &str) -> CompiledPlan {
+fn durable_graph(client: &mut Client) -> OperatorGraph {
     let row = client
         .query_one(
-            "SELECT source_id, compiler_version, plan_format_version,
-                    plan_payload, plan_digest, state_codec_version,
-                    output_shape, encode(state.state_payload, 'hex')
-             FROM shiba_internal.operator_definition AS definition
-             JOIN shiba_internal.operator_state AS state USING (operator_id)
-             WHERE definition.operator_id = $1",
-            &[&operator_id],
+            "SELECT graph_format_version, graph_payload, graph_digest
+             FROM shiba_internal.graph_definition WHERE graph_id = 1",
+            &[],
         )
-        .expect("query generic operator definition");
-    assert_eq!(row.get::<_, i64>(0), 1);
-    assert_eq!(row.get::<_, i32>(1), 1);
-    assert_eq!(row.get::<_, i32>(2), 1);
-    assert_eq!(row.get::<_, i32>(5), 1);
-    assert_eq!(row.get::<_, &str>(6), expected_shape);
-    assert_eq!(row.get::<_, &str>(7), "0000000000000000");
-    let payload: Vec<u8> = row.get(3);
-    let digest: Vec<u8> = row.get(4);
-    CompiledPlan::from_canonical_payload(&payload, digest.try_into().expect("32-byte plan digest"))
-        .expect("decode durable canonical plan")
+        .expect("query durable graph definition");
+    assert_eq!(row.get::<_, i32>(0), 1);
+    let payload: Vec<u8> = row.get(1);
+    let digest: Vec<u8> = row.get(2);
+    OperatorGraph::from_canonical_payload(
+        &payload,
+        digest.try_into().expect("32-byte graph digest"),
+    )
+    .expect("decode durable canonical graph")
 }
 
-fn assert_sum_definition(client: &mut Client, plan: &CompiledPlan) {
+fn assert_sum_binding(client: &mut Client, graph: &OperatorGraph) {
     let row = client
         .query_one(
             "SELECT 'pg_class'::regclass::oid::bigint,
-                    'source_m9.events'::regclass::oid::bigint,
-                    attnum
+                    'source_m9.events'::regclass::oid::bigint, attnum
              FROM pg_catalog.pg_attribute
-             WHERE attrelid = 'source_m9.events'::regclass
-               AND attname = 'payload'",
+             WHERE attrelid = 'source_m9.events'::regclass AND attname = 'payload'",
             &[],
         )
         .expect("query live SumInt8 ObjectAddress");
-    let expected = (
-        u32::try_from(row.get::<_, i64>(0)).expect("class oid"),
-        u32::try_from(row.get::<_, i64>(1)).expect("relation oid"),
-        row.get::<_, i16>(2).into(),
+    let expected = ObjectAddress {
+        class_id: u32::try_from(row.get::<_, i64>(0)).expect("class oid"),
+        object_id: u32::try_from(row.get::<_, i64>(1)).expect("relation oid"),
+        sub_id: i32::from(row.get::<_, i16>(2)),
+    };
+    let source = graph.sources.first().expect("source port");
+    assert!(
+        source
+            .layout
+            .iter()
+            .any(|column| column.address == expected)
     );
-    match plan.implementation {
-        PlanImplementation::SumInt8 { input, .. } => {
-            assert_eq!((input.class_id, input.object_id, input.sub_id), expected);
-        }
-        _ => panic!("expected SumInt8 plan"),
-    }
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, OperatorNodeKind::SumInt8 { .. }))
+    );
 }
 
 fn install_result_failure(client: &mut Client) {
@@ -94,12 +110,8 @@ fn install_result_failure(client: &mut Client) {
             "CREATE SCHEMA m9_registration_test;
              CREATE FUNCTION m9_registration_test.fail_result()
              RETURNS trigger LANGUAGE plpgsql AS $$
-             BEGIN
-                 RAISE EXCEPTION 'injected result registration failure';
-             END
-             $$;
-             CREATE TRIGGER m9_fail_result
-             BEFORE INSERT ON shiba.operator_result
+             BEGIN RAISE EXCEPTION 'injected result registration failure'; END $$;
+             CREATE TRIGGER m9_fail_result BEFORE INSERT ON shiba.graph_result
              FOR EACH ROW EXECUTE FUNCTION m9_registration_test.fail_result();",
         )
         .expect("install result registration failure");
@@ -107,45 +119,23 @@ fn install_result_failure(client: &mut Client) {
 
 fn prove_failures_leave_no_partial_rows(client: &mut Client) {
     let before = authority_counts(client);
-    let missing_source = spec(10, 2, OperatorOperationV1::CountRows);
     assert!(matches!(
-        compile_and_register(client, &missing_source),
+        compile_and_register(client, &spec(2, 2, "payload")),
         Err(RegistrationError::Runtime(M2Error::SourceBindingMissing))
     ));
     assert_eq!(authority_counts(client), before);
-
-    let missing_column = spec(
-        11,
-        1,
-        OperatorOperationV1::SumInt8 {
-            input_column: "missing".to_owned(),
-        },
-    );
     assert!(matches!(
-        compile_and_register(client, &missing_column),
-        Err(RegistrationError::Compiler(CompilerError::MissingColumn(column)))
-            if column == "missing"
+        compile_and_register(client, &spec(2, 1, "missing")),
+        Err(RegistrationError::Compiler(CompilerError::MissingColumn(column))) if column == "missing"
     ));
     assert_eq!(authority_counts(client), before);
-
-    let wrong_type = spec(
-        12,
-        1,
-        OperatorOperationV1::SumInt8 {
-            input_column: "label".to_owned(),
-        },
-    );
     assert!(matches!(
-        compile_and_register(client, &wrong_type),
-        Err(RegistrationError::Compiler(CompilerError::WrongColumnType {
-            column, type_oid: 25
-        })) if column == "label"
+        compile_and_register(client, &spec(2, 1, "label")),
+        Err(RegistrationError::Compiler(CompilerError::WrongColumnType { column, type_oid: 25 })) if column == "label"
     ));
     assert_eq!(authority_counts(client), before);
-
-    let duplicate = spec(1, 1, OperatorOperationV1::CountRows);
     assert!(matches!(
-        compile_and_register(client, &duplicate),
+        compile_and_register(client, &spec(1, 1, "payload")),
         Err(RegistrationError::Runtime(M2Error::Postgres(_)))
     ));
     assert_eq!(authority_counts(client), before);
@@ -155,90 +145,71 @@ fn prove_permissions(client: &mut Client) {
     client
         .batch_execute("CREATE ROLE m9_reader; SET ROLE m9_reader")
         .expect("enter ordinary role");
-    let visible: i64 = client
-        .query_one("SELECT count(*) FROM shiba.operator_result", &[])
-        .expect("ordinary role reads results")
-        .get(0);
-    assert_eq!(visible, 2);
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) FROM shiba.graph_result", &[])
+            .expect("ordinary role reads results")
+            .get::<_, i64>(0),
+        2
+    );
     assert!(
         client
-            .execute("UPDATE shiba.operator_result SET value_bigint = 9", &[])
+            .execute("UPDATE shiba.graph_result SET value_bigint = 9", &[])
             .is_err()
     );
     assert!(
         client
-            .query("SELECT * FROM shiba_internal.operator_definition", &[])
+            .query("SELECT * FROM shiba_internal.graph_definition", &[])
             .is_err()
     );
     client.batch_execute("RESET ROLE").expect("restore owner");
-    assert_eq!(authority_counts(client), (2, 2, 2));
+    assert_eq!(authority_counts(client), (1, 1, 2));
 }
 
 #[test]
 #[ignore = "requires the isolated PostgreSQL cluster from scripts/test-m9-registration.sh"]
-fn m9_live_compile_and_registration_are_atomic_and_private() {
-    let connection = ENVIRONMENT.required("DATABASE_URL");
-    let mut client = Client::connect(&connection, NoTls).expect("connect to temporary PostgreSQL");
+fn m9_live_graph_compile_and_registration_are_atomic_and_private() {
+    let mut client = Client::connect(&ENVIRONMENT.required("DATABASE_URL"), NoTls)
+        .expect("connect to temporary PostgreSQL");
     client
         .batch_execute(
             "CREATE EXTENSION shiba_catalog;
              CREATE SCHEMA source_m9;
-             CREATE TABLE source_m9.events (
-                 id bigint PRIMARY KEY, payload bigint, label text
-             );
-             SELECT shiba_internal.register_source(
-                 1, 'source_m9.events'::regclass);",
+             CREATE TABLE source_m9.events (id bigint PRIMARY KEY, payload bigint, label text);
+             SELECT shiba_internal.register_source(1, 'source_m9.events'::regclass);",
         )
         .expect("install and bind live source");
-    let old_tables = client
-        .query_one(
-            "SELECT to_regclass('shiba_internal.count_state') IS NULL,
-                    to_regclass('shiba.count_result') IS NULL",
-            &[],
-        )
-        .expect("query removed count authorities");
-    assert!(old_tables.get::<_, bool>(0));
-    assert!(old_tables.get::<_, bool>(1));
+    for removed in [
+        "shiba_internal.count_state",
+        "shiba.count_result",
+        "shiba_internal.operator_definition",
+        "shiba_internal.operator_state",
+        "shiba.operator_result",
+    ] {
+        assert!(
+            client
+                .query_one("SELECT to_regclass($1) IS NULL", &[&removed])
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+    }
 
     install_result_failure(&mut client);
-    let count = spec(1, 1, OperatorOperationV1::CountRows);
+    let declaration = spec(1, 1, "payload");
     assert!(matches!(
-        compile_and_register(&mut client, &count),
+        compile_and_register(&mut client, &declaration),
         Err(RegistrationError::Runtime(M2Error::Postgres(_)))
     ));
     assert_eq!(authority_counts(&mut client), (0, 0, 0));
     client
         .batch_execute("DROP SCHEMA m9_registration_test CASCADE")
-        .expect("remove registration failure");
-    let compiled_count = compile_and_register(&mut client, &count).expect("register CountRows");
-    assert!(matches!(
-        compiled_count.implementation,
-        PlanImplementation::CountRows
-    ));
-    assert_eq!(authority_counts(&mut client), (1, 1, 1));
-    let durable_count = assert_definition(&mut client, 1, "scalar");
-    assert_eq!(durable_count, compiled_count);
-    assert!(matches!(
-        durable_count.output_contract,
-        OutputContract::Scalar { .. }
-    ));
+        .unwrap();
 
-    let sum = spec(
-        2,
-        1,
-        OperatorOperationV1::SumInt8 {
-            input_column: "payload".to_owned(),
-        },
-    );
-    let compiled_sum = compile_and_register(&mut client, &sum).expect("register live SumInt8");
-    assert!(matches!(
-        compiled_sum.implementation,
-        PlanImplementation::SumInt8 { .. }
-    ));
-    assert_eq!(authority_counts(&mut client), (2, 2, 2));
-    let durable_sum = assert_definition(&mut client, 2, "scalar");
-    assert_eq!(durable_sum, compiled_sum);
-    assert_sum_definition(&mut client, &durable_sum);
+    let compiled = compile_and_register(&mut client, &declaration).expect("register graph");
+    assert_eq!(authority_counts(&mut client), (1, 1, 2));
+    let durable = durable_graph(&mut client);
+    assert_eq!(durable, compiled);
+    assert_sum_binding(&mut client, &durable);
     prove_failures_leave_no_partial_rows(&mut client);
     prove_permissions(&mut client);
 }

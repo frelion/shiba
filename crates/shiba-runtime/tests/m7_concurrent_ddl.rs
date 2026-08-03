@@ -6,7 +6,7 @@ use std::{
 use postgres::{Client, NoTls};
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{
-    M2Error, PgoutputSource, ProcessOutcome, SourceTransaction, decode_committed_changes, process,
+    GraphTransaction, M2Error, PgoutputSource, ProcessOutcome, decode_committed_changes, process,
 };
 
 mod support;
@@ -25,10 +25,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -113,7 +113,7 @@ fn install_apply_blocker(client: &mut Client) {
 
 fn spawn_apply(
     connection: String,
-    input: SourceTransaction,
+    input: GraphTransaction,
 ) -> thread::JoinHandle<Result<(), String>> {
     thread::Builder::new()
         .name("m7-apply".to_owned())
@@ -177,12 +177,14 @@ fn m7_concurrent_apply_then_ddl_has_one_lock_order() {
         .batch_execute("INSERT INTO source_m7_concurrent.events VALUES (1501)")
         .expect("commit first pending source transaction");
     let first_wire = CAPTURE.capture(&mut client, "first-pending.pgoutput");
-    let first = decode_committed_changes(&first_wire, source).expect("decode first pending row");
+    let first = decode_committed_changes(&first_wire, &support::singleton_graph(1, source))
+        .expect("decode first pending row");
     client
         .batch_execute("INSERT INTO source_m7_concurrent.events VALUES (1502)")
         .expect("commit second pending source transaction");
     let second_wire = CAPTURE.capture(&mut client, "second-pending.pgoutput");
-    let second = decode_committed_changes(&second_wire, source).expect("decode second pending row");
+    let second = decode_committed_changes(&second_wire, &support::singleton_graph(1, source))
+        .expect("decode second pending row");
 
     install_apply_blocker(&mut client);
     client

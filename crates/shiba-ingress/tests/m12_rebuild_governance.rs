@@ -1,3 +1,5 @@
+#![allow(clippy::duplicate_mod)]
+
 use postgres::{Client, NoTls};
 
 #[path = "m12_rebuild_governance/competition.rs"]

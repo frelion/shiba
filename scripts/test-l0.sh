@@ -88,6 +88,8 @@ runtime_files = sorted(pathlib.Path("crates/shiba-runtime/src").glob("*.rs"))
 line_counts = {path: len(path.read_text().splitlines()) for path in runtime_files}
 runtime_total = sum(line_counts.values())
 component_files = {
+    "protocol": sorted(pathlib.Path("crates/shiba-protocol/src").glob("*.rs")),
+    "catalog": sorted(pathlib.Path("crates/shiba-catalog/src").glob("*.rs")),
     "operator": sorted(pathlib.Path("crates/shiba-operator/src").glob("*.rs")),
     "compiler": sorted(pathlib.Path("crates/shiba-compiler/src").glob("*.rs")),
     "ingress": sorted(pathlib.Path("crates/shiba-ingress/src").glob("*.rs")),
@@ -123,7 +125,8 @@ if production_failures:
         + ", ".join(production_failures)
     )
 
-for component, files in component_files.items():
+for component in ("operator", "compiler", "ingress"):
+    files = component_files[component]
     total = sum(all_production_counts[path] for path in files)
     if total > limits[f"{component}_soft"]:
         print(
@@ -204,6 +207,7 @@ scripts = [
         "m12-rebuild-governance",
         "m12-rebuild-performance",
         "m13-operator-kernel",
+        "m14-grouped", "m14-graph-runtime",
     )
 ]
 for path in scripts:
@@ -214,7 +218,8 @@ for path in scripts:
         raise SystemExit(f"{path} duplicates shared PostgreSQL cluster mechanics")
 PY
 
-# M11.1 freezes the exported-snapshot boundary before bootstrap production code.
+# The M11 exported-snapshot proof remains binding after M14.6 moves lifecycle
+# and compute progress from one source to one graph.
 python3 - <<'PY'
 import pathlib
 
@@ -227,9 +232,9 @@ contract = contract_path.read_text().lower()
 required = (
     "export_snapshot", "consistent_point", "snapshot_name",
     "set transaction snapshot", "repeatable read", "bootstrapid",
-    "bootstrapbatchid", "effectorigin", "source_bootstrap", "source_row_state",
+    "bootstrapbatchid", "effectorigin", "graph_bootstrap", "source_row_state",
     "bootstrapfence", "building", "unavailable",
-    "three connections", "scan_complete", "source_continuation",
+    "three connections", "scan_complete", "graph_continuation",
 )
 missing = [term for term in required if term not in contract]
 if missing:
@@ -244,8 +249,8 @@ for milestone in ("M11.1", "M11.2", "M11.3", "M11.4", "M11.5"):
         raise SystemExit(f"REUSE_MANIFEST must record {milestone} evidence")
 PY
 
-# M12.1 freezes the forward-only offline rebuild contract before production
-# admission code exists. One source_bootstrap row remains the sole lifecycle.
+# The M12 forward-only rebuild proof remains binding after graph-wide lifecycle
+# cutover. One graph_bootstrap row remains the sole graph lifecycle authority.
 python3 - <<'PY'
 import pathlib
 
@@ -257,7 +262,7 @@ if not contract_path.is_file() or not adr_path.is_file():
 contract = contract_path.read_text().lower()
 required = (
     "building authority", "active authority", "destructive prepare",
-    "source_bootstrap", "exact old", "forward-only", "building/null",
+    "graph_bootstrap", "exact old", "forward-only", "building/null",
     "old continuation", "old generation", "slot-birth", "threat model",
     "`replication` credential", "same-name", "activation",
 )
@@ -273,8 +278,8 @@ if "M12.1" not in manifest or "test-m12-rebuild-contract.sh" not in manifest:
     raise SystemExit("REUSE_MANIFEST must record the M12.1 failure-first evidence")
 PY
 
-# M12.2 admits one exact active authority into the same forward-only lifecycle.
-# Slot retirement and target-slot creation remain outside this slice.
+# M12.2 admission now operates on the one graph lifecycle/config authority.
+# Slot retirement and target-slot creation remain non-transactional operations.
 python3 - <<'PY'
 import pathlib
 
@@ -289,10 +294,12 @@ sql = "\n".join(
 )
 for required in (
     "rebuild_prepared", "retired_bootstrap_id", "retired_slot_name",
-    "retired_slot_generation", "prepare_source_rebuild",
-    "result_status = 'building'", "value_bigint = null",
-    "shiba_internal.source_ingress_bound_source",
-    "shiba_internal.source_bootstrap_exact_ingress",
+    "retired_slot_generation", "prepare_graph_rebuild",
+    "insert into shiba.graph_result", "'building', null, null",
+    "shiba_internal.graph_definition",
+    "shiba_internal.graph_ingress_config",
+    "shiba_internal.graph_bootstrap",
+    "shiba_internal.graph_continuation",
 ):
     if required not in sql:
         raise SystemExit(f"M12.2 admission SQL is missing: {required}")
@@ -305,7 +312,7 @@ if "M12.2" not in manifest or "test-m12-rebuild-admission.sh" not in manifest:
 PY
 
 if rg -n -i \
-  'create table[^;]*(source_rebuild|rebuild_(intent|log|state)|wal_spool|effect_log)|create table[^;]*candidate_(binding|config)|source_continuation_v2' \
+  'create table[^;]*(source_rebuild|rebuild_(intent|log|state)|wal_spool|effect_log)|create table[^;]*candidate_(binding|config)|(source|graph)_continuation_v2' \
   sql/v2; then
   echo "parallel rebuild authority, spool, or second continuation found" >&2
   exit 1
@@ -477,6 +484,8 @@ if "M14.4 accepted two-source JOIN authority" not in reuse_manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks M14.4 contract evidence")
 if "M14.5 pure multi-input INNER JOIN kernel" not in reuse_manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks M14.5 pure-kernel evidence")
+if "M14.6 unified graph production cutover" not in reuse_manifest:
+    raise SystemExit("REUSE_MANIFEST.md lacks M14.6 graph-cutover evidence")
 PY
 
 if rg -n \
@@ -484,6 +493,33 @@ if rg -n \
   crates/shiba-operator/src crates/shiba-compiler/src \
   crates/shiba-runtime/src crates/shiba-ingress/src sql/v2; then
   echo "M14.2 forbidden ProjectRows production path remains" >&2
+  exit 1
+fi
+
+if rg -n \
+  '\bCompiledPlan\b|\bPlanImplementation\b|\bOperatorSpecV1\b|\bOperatorOperationV1\b' \
+  crates/shiba-operator/src crates/shiba-compiler/src \
+  crates/shiba-runtime/src crates/shiba-ingress/src sql/v2; then
+  echo "M14.6 singular operator-plan production API remains" >&2
+  exit 1
+fi
+
+if rg -n 'OperatorGraph::build' crates/shiba-runtime/src crates/shiba-ingress/src sql/v2; then
+  echo "M14 graph construction leaked outside pure Compiler/Operator" >&2
+  exit 1
+fi
+
+if rg -n -i \
+  '\b(operator_definition|operator_state|operator_node_state|operator_result|operator_result_row|source_continuation|source_ingress_config|source_ingress_invalidation|source_bootstrap)\b' \
+  crates/shiba-runtime/src crates/shiba-ingress/src sql/v2; then
+  echo "M14.6 superseded source/operator execution authority remains" >&2
+  exit 1
+fi
+
+if rg -n \
+  '\b(CountRows|SumInt8|ProjectRows|GroupedCount|GroupedSumInt8|InnerJoin|GraphOutputSpecV1)\b|operator_kind' \
+  crates/shiba-runtime/src crates/shiba-ingress/src sql/v2; then
+  echo "M14 concrete operator kind leaked outside Operator/Compiler" >&2
   exit 1
 fi
 
@@ -506,7 +542,10 @@ import pathlib
 
 identity = pathlib.Path("crates/shiba-protocol/src/identity.rs").read_text()
 graph = pathlib.Path("crates/shiba-operator/src/graph.rs").read_text()
-compiler = pathlib.Path("crates/shiba-compiler/src/join.rs").read_text()
+kernel = pathlib.Path("crates/shiba-operator/src/kernel.rs").read_text()
+compiler = "\n".join(
+    path.read_text() for path in pathlib.Path("crates/shiba-compiler/src").glob("*.rs")
+)
 for marker in ("id_type!(GraphId", "pub struct GraphTransactionId"):
     if marker not in identity:
         raise SystemExit(f"M14.5 graph identity lacks marker: {marker}")
@@ -515,27 +554,47 @@ for marker in (
     "pub sources: Vec<SourcePort>",
     "SourcePort(SourceId)",
     "pub struct MultiInputBatch",
+    "pub enum ResultDelta",
+    "pub struct GraphTransition",
 ):
     if marker not in graph:
         raise SystemExit(f"M14.5 canonical graph lacks marker: {marker}")
-for marker in ("effective_replica_identity", "Result<OperatorGraph, CompilerError>"):
+for marker in ("pub fn graph_state_read_set", "pub fn apply_graph_plan"):
+    if marker not in kernel:
+        raise SystemExit(f"M14.6 graph kernel lacks marker: {marker}")
+for marker in (
+    "pub struct GraphSpecV1", "pub fn compile_graph",
+    "effective_replica_identity", "Result<OperatorGraph, CompilerError>",
+):
     if marker not in compiler:
-        raise SystemExit(f"M14.5 JOIN compiler lacks marker: {marker}")
+        raise SystemExit(f"M14 graph compiler lacks marker: {marker}")
 PY
 
 python3 - <<'PY'
 import pathlib
 
-schema = pathlib.Path("sql/v2/018_operator_keyed_state.sql").read_text()
-for marker in (
-    "CREATE TABLE shiba_internal.operator_node_state",
-    "operator_node_state_primary PRIMARY KEY",
-    "CREATE TABLE shiba_internal.operator_result_row",
-    "operator_result_row_primary PRIMARY KEY (operator_id, key_payload)",
-    "REVOKE ALL ON TABLE shiba_internal.operator_node_state FROM PUBLIC",
-):
+schema = "\n".join(
+    path.read_text() for path in sorted(pathlib.Path("sql/v2").glob("*.sql"))
+)
+required = (
+    "CREATE TABLE shiba_internal.graph_definition",
+    "CREATE TABLE shiba_internal.graph_source_member",
+    "CONSTRAINT graph_source_member_one_graph UNIQUE (source_id)",
+    "CREATE TABLE shiba_internal.graph_ingress_config",
+    "CREATE TABLE shiba_internal.graph_ingress_source",
+    "CREATE TABLE shiba_internal.graph_ingress_invalidation",
+    "CREATE TABLE shiba_internal.graph_continuation",
+    "CREATE TABLE shiba_internal.graph_bootstrap",
+    "CREATE TABLE shiba_internal.graph_bootstrap_checkpoint",
+    "CREATE TABLE shiba_internal.graph_node_state",
+    "CREATE TABLE shiba.graph_result",
+    "CREATE TABLE shiba_internal.graph_result_row",
+    "CREATE VIEW shiba.graph_result_rows",
+    "REVOKE ALL ON TABLE shiba_internal.graph_node_state FROM PUBLIC",
+)
+for marker in required:
     if marker not in schema:
-        raise SystemExit(f"M14.3 keyed-state authority lacks marker: {marker}")
+        raise SystemExit(f"M14.6 graph authority lacks marker: {marker}")
 PY
 
 echo "L0 passed for PostgreSQL $pg_major ($pg_config)"

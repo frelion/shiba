@@ -17,10 +17,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -66,17 +66,13 @@ fn install_crash_trigger(client: &mut Client) {
              END
              $$;
              CREATE TRIGGER m4_update_crash
-             AFTER INSERT ON shiba_internal.source_continuation
+             AFTER INSERT ON shiba_internal.graph_continuation
              FOR EACH ROW EXECUTE FUNCTION m4_update_test.crash_after_continuation();",
         )
         .expect("install continuation crash point");
 }
 
-#[test]
-#[ignore = "requires the isolated logical PostgreSQL cluster from scripts/test-m4-update.sh"]
-fn m4_real_pgoutput_update_replay_decode_failure_and_crash() {
-    let connection = CAPTURE.required("DATABASE_URL");
-    let mut client = Client::connect(&connection, NoTls).expect("connect to temporary PostgreSQL");
+fn install_source(client: &mut Client) -> PgoutputSource {
     client
         .batch_execute(
             "CREATE EXTENSION shiba_catalog;
@@ -104,14 +100,24 @@ fn m4_real_pgoutput_update_replay_decode_failure_and_crash() {
         SlotGeneration::new(1).expect("non-zero generation"),
         relation_id,
     );
-    register_source(&mut client, "source_m4_update.events");
+    register_source(client, "source_m4_update.events");
     CAPTURE.create_slot();
+    source
+}
+
+#[test]
+#[ignore = "requires the isolated logical PostgreSQL cluster from scripts/test-m4-update.sh"]
+fn m4_real_pgoutput_update_replay_decode_failure_and_crash() {
+    let connection = CAPTURE.required("DATABASE_URL");
+    let mut client = Client::connect(&connection, NoTls).expect("connect to temporary PostgreSQL");
+    let source = install_source(&mut client);
 
     client
         .batch_execute("INSERT INTO source_m4_update.events VALUES (301, 10)")
         .expect("commit source insert");
     let insert_wire = CAPTURE.capture(&mut client, "insert.pgoutput");
-    let insert = decode_committed_changes(&insert_wire, source).expect("decode insert");
+    let insert = decode_committed_changes(&insert_wire, &support::singleton_graph(1, source))
+        .expect("decode insert");
     assert_eq!(
         process(&mut client, &insert).expect("apply insert"),
         ProcessOutcome::Applied
@@ -127,11 +133,12 @@ fn m4_real_pgoutput_update_replay_decode_failure_and_crash() {
     let key_tag = update_key_tag(&bad_update);
     assert_eq!(bad_update[key_tag], b't');
     bad_update[key_tag] = b'n';
-    assert!(decode_committed_changes(&bad_update, source).is_err());
+    assert!(decode_committed_changes(&bad_update, &support::singleton_graph(1, source)).is_err());
     assert_eq!(durable_state(&mut client), (1, 1, 1, 1));
     assert_eq!(payload(&mut client), (true, Some(10)));
 
-    let update = decode_committed_changes(&update_wire, source).expect("decode update");
+    let update = decode_committed_changes(&update_wire, &support::singleton_graph(1, source))
+        .expect("decode update");
     install_crash_trigger(&mut client);
     assert!(process(&mut client, &update).is_err());
     let mut client = Client::connect(&connection, NoTls).expect("reconnect after crash");
@@ -158,8 +165,8 @@ fn m4_real_pgoutput_update_replay_decode_failure_and_crash() {
         .batch_execute("UPDATE source_m4_update.events SET payload = 77 WHERE id = 301")
         .expect("commit non-null source update");
     let non_null_wire = CAPTURE.capture(&mut client, "non-null-update.pgoutput");
-    let non_null =
-        decode_committed_changes(&non_null_wire, source).expect("decode text payload update");
+    let non_null = decode_committed_changes(&non_null_wire, &support::singleton_graph(1, source))
+        .expect("decode text payload update");
     assert_eq!(
         process(&mut client, &non_null).expect("apply non-null update"),
         ProcessOutcome::Applied
@@ -175,8 +182,8 @@ fn m4_real_pgoutput_update_replay_decode_failure_and_crash() {
         .batch_execute("UPDATE source_m4_update.events SET payload = 2 WHERE id = 302")
         .expect("commit update whose Apply row is missing");
     let missing_wire = CAPTURE.capture(&mut client, "missing-update.pgoutput");
-    let missing =
-        decode_committed_changes(&missing_wire, source).expect("decode missing-row update");
+    let missing = decode_committed_changes(&missing_wire, &support::singleton_graph(1, source))
+        .expect("decode missing-row update");
     assert!(process(&mut client, &missing).is_err());
     assert_eq!(durable_state(&mut client), (1, 1, 1, 3));
     assert_eq!(payload(&mut client), (true, Some(77)));

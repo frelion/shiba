@@ -19,39 +19,39 @@ pub(crate) fn prepare_catchup(
     phase: &str,
 ) -> Result<(GovernedConfig, String, u64, bool), IngressError> {
     config.revalidate(apply, false)?;
-    let source_id = as_bigint(spec.source_id.get())?;
+    let graph_id = as_bigint(spec.graph_id.get())?;
     let bootstrap_id = as_bigint(spec.bootstrap_id.get())?;
     let fence_token: String = apply
         .query_one(
-            "SELECT fence_token::text FROM shiba_internal.source_bootstrap
-             WHERE source_id = $1 AND bootstrap_id = $2",
-            &[&source_id, &bootstrap_id],
+            "SELECT fence_token::text FROM shiba_internal.graph_bootstrap
+             WHERE graph_id = $1 AND bootstrap_id = $2",
+            &[&graph_id, &bootstrap_id],
         )?
         .get(0);
     let content = format!(
         "{}:{}:{fence_token}",
-        spec.source_id.get(),
+        spec.graph_id.get(),
         spec.bootstrap_id.get()
     );
     if phase == "scan_complete" {
-        emit_fence_and_enter_catchup(apply, source_id, bootstrap_id, &content)?;
+        emit_fence_and_enter_catchup(apply, graph_id, bootstrap_id, &content)?;
     } else if !matches!(phase, "catching_up" | "active") {
         return Err(IngressError::Governance("bootstrap scan is not complete"));
     }
     let (fresh, confirmed_lsn) =
-        GovernedConfig::load(apply, spec.source_id, spec.slot_generation, false)?;
+        GovernedConfig::load(apply, spec.graph_id, spec.slot_generation, false)?;
     if fresh != config {
         return Err(IngressError::Governance("source configuration drifted"));
     }
     config = fresh;
     let active =
-        phase == "active" && confirmed_lsn >= activation_end_lsn(apply, source_id, bootstrap_id)?;
+        phase == "active" && confirmed_lsn >= activation_end_lsn(apply, graph_id, bootstrap_id)?;
     Ok((config, content, confirmed_lsn, active))
 }
 
 fn emit_fence_and_enter_catchup(
     apply: &mut Client,
-    source_id: i64,
+    graph_id: i64,
     bootstrap_id: i64,
     content: &str,
 ) -> Result<(), IngressError> {
@@ -66,10 +66,10 @@ fn emit_fence_and_enter_catchup(
         .map_err(|_| IngressError::InvalidEnvelope("invalid fence LSN"))?;
     if marker.is_zero()
         || transaction.execute(
-            "UPDATE shiba_internal.source_bootstrap
+            "UPDATE shiba_internal.graph_bootstrap
              SET phase = 'catching_up', catchup_fence_lsn = $1::text::pg_lsn
-             WHERE source_id = $2 AND bootstrap_id = $3 AND phase = 'scan_complete'",
-            &[&marker_lsn, &source_id, &bootstrap_id],
+             WHERE graph_id = $2 AND bootstrap_id = $3 AND phase = 'scan_complete'",
+            &[&marker_lsn, &graph_id, &bootstrap_id],
         )? != 1
     {
         return Err(IngressError::Governance(
@@ -82,15 +82,15 @@ fn emit_fence_and_enter_catchup(
 
 fn activation_end_lsn(
     apply: &mut Client,
-    source_id: i64,
+    graph_id: i64,
     bootstrap_id: i64,
 ) -> Result<u64, IngressError> {
     let value: String = apply
         .query_one(
             "SELECT activation_end_lsn::text
-             FROM shiba_internal.source_bootstrap
-             WHERE source_id = $1 AND bootstrap_id = $2 AND phase = 'active'",
-            &[&source_id, &bootstrap_id],
+             FROM shiba_internal.graph_bootstrap
+             WHERE graph_id = $1 AND bootstrap_id = $2 AND phase = 'active'",
+            &[&graph_id, &bootstrap_id],
         )?
         .get(0);
     let lsn = PostgresLsn::from_str(&value)

@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use postgres::Transaction;
 use shiba_operator::{
     ColumnBinding, DeltaBatch, EffectOrigin, ObjectAddress, RowDelta, TypedLayout, TypedRow,
@@ -11,12 +9,6 @@ use crate::{M2Error, SourcePayload};
 
 pub(crate) struct SourceLayout {
     typed: TypedLayout,
-    bindings: HashSet<ObjectAddress>,
-}
-
-pub(crate) struct SourceBatch {
-    pub(crate) delta: DeltaBatch,
-    pub(crate) bindings: HashSet<ObjectAddress>,
 }
 
 impl SourceLayout {
@@ -69,8 +61,7 @@ impl SourceLayout {
         }
         let typed = source_typed_layout(source_identity, &columns)
             .map_err(|_| M2Error::InvalidSourceRowState)?;
-        let bindings = columns.into_iter().map(|column| column.address).collect();
-        Ok(Self { typed, bindings })
+        Ok(Self { typed })
     }
 
     pub(crate) fn row(
@@ -102,14 +93,11 @@ impl SourceLayout {
         TypedRow::new(&self.typed, values).map_err(|_| M2Error::InvalidSourceRowState)
     }
 
-    pub(crate) fn batch(self, origin: EffectOrigin, rows: Vec<RowDelta>) -> SourceBatch {
-        SourceBatch {
-            delta: DeltaBatch {
-                origin,
-                layout_identity: self.typed.identity,
-                rows,
-            },
-            bindings: self.bindings,
+    pub(crate) fn batch(self, origin: EffectOrigin, rows: Vec<RowDelta>) -> DeltaBatch {
+        DeltaBatch {
+            origin,
+            layout_identity: self.typed.identity,
+            rows,
         }
     }
 }

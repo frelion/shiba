@@ -18,6 +18,7 @@ mod kernel;
 mod materialize;
 mod model;
 mod plan;
+mod scalar;
 mod state;
 mod typed;
 
@@ -29,18 +30,9 @@ pub use graph::{
 };
 pub use graph_eval::apply_graph;
 pub use graph_validation::source_typed_layout;
-pub use kernel::{
-    KernelError, apply_graph_plan, apply_plan, decode_state, graph_state_read_set, initial_state,
-    initial_transition, state_read_set,
-};
-pub use model::{
-    EffectOrigin, EncodedOperatorState, KeyedMutation, ObjectAddress, OperatorId,
-    OperatorTransition, OutputDelta,
-};
-pub use plan::{
-    CompiledPlan, InputBinding, InputRole, OutputContract, PlanError, PlanImplementation,
-    StateContract,
-};
+pub use kernel::{KernelError, apply_graph_plan, graph_state_read_set};
+pub use model::{EffectOrigin, EncodedOperatorState, ObjectAddress};
+pub use plan::{OutputContract, StateContract};
 pub use state::{
     StateDelta, StateEntry, StateError, StateKey, StateMutation, StatePartition, StateReadSet,
     StateSnapshot,

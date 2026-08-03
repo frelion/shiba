@@ -17,10 +17,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -101,7 +101,8 @@ fn m4_replica_identity_full_delete_stops_before_apply() {
     let (identity, columns, key_flags, insert_at) = relation_metadata(&insert_wire);
     assert_eq!((identity, columns, key_flags), (b'd', 1, 1));
     assert_eq!(insert_wire[insert_at], b'I');
-    let insert = decode_committed_changes(&insert_wire, source).expect("decode default insert");
+    let insert = decode_committed_changes(&insert_wire, &support::singleton_graph(1, source))
+        .expect("decode default insert");
     assert_eq!(
         process(&mut client, &insert).expect("apply default insert"),
         ProcessOutcome::Applied
@@ -121,6 +122,6 @@ fn m4_replica_identity_full_delete_stops_before_apply() {
         .expect("commit full-identity delete");
     let delete_wire = CAPTURE.capture(&mut client, "full-delete.pgoutput");
     assert_full_delete_shape(&delete_wire);
-    assert!(decode_committed_changes(&delete_wire, source).is_err());
+    assert!(decode_committed_changes(&delete_wire, &support::singleton_graph(1, source)).is_err());
     assert_eq!(durable_state(&mut client), (1, 1, 1, 1));
 }

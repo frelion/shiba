@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::{
     DeltaBatch, GraphError, NodeId, ResultDelta, ResultMutation, TypedLayout, TypedRow, TypedValue,
-    ValueType, plan::MAX_KEYED_MUTATIONS,
+    ValueType, graph::MAX_NODE_DELTA_ROWS,
 };
 
 pub(crate) fn materialize(
@@ -19,7 +19,7 @@ pub(crate) fn materialize(
         .len()
         .checked_mul(2)
         .ok_or(GraphError::OutputLimit)?
-        .min(MAX_KEYED_MUTATIONS);
+        .min(MAX_NODE_DELTA_ROWS);
     let mut keys = BTreeSet::new();
     let mut mutations = Vec::with_capacity(capacity);
     for delta in &batch.rows {
@@ -79,7 +79,7 @@ fn push_mutation(
     mutations: &mut Vec<ResultMutation>,
     mutation: ResultMutation,
 ) -> Result<(), GraphError> {
-    if mutations.len() == MAX_KEYED_MUTATIONS {
+    if mutations.len() == MAX_NODE_DELTA_ROWS {
         return Err(GraphError::OutputLimit);
     }
     mutations.push(mutation);

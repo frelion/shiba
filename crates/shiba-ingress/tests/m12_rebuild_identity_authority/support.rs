@@ -2,13 +2,14 @@ use std::time::Duration;
 
 use postgres::Client;
 use shiba_ingress::{BootstrapOptions, PreparedRebuild, RebuildIdentity, RebuildSpec};
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+use shiba_protocol::{BootstrapId, GraphId, SlotGeneration, SourceId};
+use shiba_runtime::{RebuildSourceTarget, compile_rebuild_graph};
 
 #[path = "../m12_rebuild_admission/support.rs"]
 #[allow(dead_code, unused_imports)]
 mod admission;
 
-pub(crate) use admission::{OLD_SLOT, RebuildFixture, TARGET_SLOT, establish_active_source};
+pub(crate) use admission::{RebuildFixture, TARGET_SLOT, establish_active_source};
 
 pub(crate) const SECOND_SLOT: &str = "shiba_m12_identity_next";
 pub(crate) const SECOND_PUBLICATION: &str = "shiba_m12_identity_next_pub";
@@ -32,7 +33,7 @@ pub(crate) fn resume(
     PreparedRebuild::resume_prepared(
         database_url,
         replication_url,
-        SourceId::new(1).expect("source ID"),
+        GraphId::new(1).expect("graph ID"),
         BootstrapId::new(bootstrap).expect("bootstrap ID"),
         SlotGeneration::new(generation).expect("slot generation"),
         options(),
@@ -101,14 +102,16 @@ pub(crate) fn assert_exact_identity(client: &mut Client, relation_oid: u32, inde
 pub(crate) fn assert_prepared_closed(client: &mut Client, target_slot: &str) {
     let row = client
         .query_one(
-            "SELECT phase,
-                    last_batch_ordinal = 0
-                    AND last_source_row_id IS NULL
-                    AND last_batch_digest IS NULL
-                    AND consistent_point IS NULL
+            "SELECT bootstrap.phase,
+                    checkpoint.last_batch_ordinal = 0
+                    AND checkpoint.last_source_row_id IS NULL
+                    AND checkpoint.last_batch_digest IS NULL
+                    AND bootstrap.consistent_point IS NULL
                     AND catchup_fence_lsn IS NULL
                     AND activation_end_lsn IS NULL
-             FROM shiba_internal.source_bootstrap WHERE source_id = 1",
+             FROM shiba_internal.graph_bootstrap AS bootstrap
+             JOIN shiba_internal.graph_bootstrap_checkpoint AS checkpoint USING (graph_id)
+             WHERE bootstrap.graph_id = 1 AND checkpoint.source_id = 1",
             &[],
         )
         .expect("read prepared lifecycle");
@@ -121,15 +124,9 @@ pub(crate) fn assert_prepared_closed(client: &mut Client, target_slot: &str) {
         .query_one(
             "SELECT
                 (SELECT count(*) FROM shiba_internal.source_row_state WHERE source_id = 1),
-                (SELECT count(*) FROM shiba_internal.source_continuation WHERE source_id = 1),
-                (SELECT count(*)
-                 FROM shiba_internal.operator_state AS state
-                 JOIN shiba_internal.operator_definition AS definition USING (operator_id)
-                 WHERE (definition.output_shape = 'scalar'
-                        AND state.state_payload <> decode('0000000000000000', 'hex'))
-                    OR (definition.output_shape = 'keyed'
-                        AND pg_catalog.octet_length(state.state_payload) <> 0)),
-                (SELECT count(*) FROM shiba.operator_result
+                (SELECT count(*) FROM shiba_internal.graph_continuation WHERE graph_id = 1),
+                (SELECT count(*) FROM shiba_internal.graph_node_state WHERE graph_id = 1),
+                (SELECT count(*) FROM shiba.graph_result
                  WHERE result_status <> 'building' OR value_bigint IS NOT NULL),
                 (SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1)",
             &[&target_slot],
@@ -144,11 +141,11 @@ pub(crate) fn prepared_snapshot(client: &mut Client, target_slot: &str) -> Vec<S
     let mut snapshot = Vec::new();
     for query in [
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_binding ORDER BY binding_kind, address_objsubid) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_bootstrap WHERE source_id = 1) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_ingress_config WHERE source_id = 1) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.operator_state ORDER BY operator_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.operator_result ORDER BY operator_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_continuation ORDER BY commit_lsn) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_bootstrap WHERE graph_id = 1) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_ingress_config WHERE graph_id = 1) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_node_state ORDER BY graph_id, node_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.graph_result ORDER BY graph_id, result_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_continuation ORDER BY commit_lsn) x",
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_invalidation ORDER BY source_id) x",
     ] {
         snapshot.extend(
@@ -172,63 +169,28 @@ pub(crate) fn prepared_snapshot(client: &mut Client, target_slot: &str) -> Vec<S
 }
 
 pub(crate) fn activate_prepared_fixture(client: &mut Client, prepared: PreparedRebuild) {
-    prepared
-        .detach()
-        .expect("release prepared worker before test-owned activation fixture");
-    client
-        .execute(
-            "SELECT pg_catalog.pg_drop_replication_slot($1)",
-            &[&OLD_SLOT],
-        )
-        .expect("retire exact old test slot");
-    let lsn: String = client
-        .query_one(
-            "SELECT lsn::text
-             FROM pg_catalog.pg_create_logical_replication_slot($1, 'pgoutput')",
-            &[&TARGET_SLOT],
-        )
-        .expect("create exact target fixture slot at a real nonzero LSN")
-        .get(0);
-    client
-        .execute(
-            "UPDATE shiba_internal.source_bootstrap
-             SET phase = 'active', consistent_point = $1::text::pg_lsn,
-                 catchup_fence_lsn = $1::text::pg_lsn,
-                 activation_end_lsn = $1::text::pg_lsn
-             WHERE source_id = 1 AND bootstrap_id = 2
-               AND slot_name = $2::text::name AND slot_generation = 3
-               AND phase = 'rebuild_prepared'",
-            &[&lsn, &TARGET_SLOT],
-        )
-        .expect("promote the same durable target identity for CAS-only fixture");
-    client
-        .batch_execute(&format!(
-            "INSERT INTO shiba_internal.source_row_state
-                (source_id, source_row_id, source_row_sub_id,
-                 payload_present, payload_int8, payload_text)
-             VALUES
-                (1, 10, NULL, true, 100, NULL),
-                (1, 11, NULL, true, NULL, NULL);
-             UPDATE shiba_internal.operator_state
-             SET state_payload = CASE operator_id
-                 WHEN 1 THEN decode('0000000000000002', 'hex')
-                 ELSE decode('0000000000000064', 'hex') END
-             WHERE operator_id IN (1, 2);
-             UPDATE shiba.operator_result
-             SET result_status = 'active',
-                 value_bigint = CASE operator_id WHEN 1 THEN 2 ELSE 100 END
-             WHERE operator_id IN (1, 2);
-             UPDATE shiba.operator_result
-             SET result_status = 'active', value_bigint = NULL
-             WHERE operator_id = 3;
-             INSERT INTO shiba_internal.operator_result_row
-                 (operator_id, result_key_bigint, result_value_bigint)
-             VALUES (3, 10, 100), (3, 11, NULL);
-             INSERT INTO shiba_internal.source_continuation
-                 (source_id, slot_generation, commit_lsn, ingress_transaction_id)
-             VALUES (1, 3, '{lsn}'::pg_lsn, 1);"
-        ))
-        .expect("install non-pristine active state for second old-identity CAS");
+    let mut bootstrap = prepared
+        .into_bootstrap()
+        .expect("enter exact target bootstrap");
+    while bootstrap.scan_next().expect("scan target")
+        != shiba_ingress::SnapshotProgress::ScanComplete
+    {}
+    let mut catchup = bootstrap.into_catchup().expect("enter target catch-up");
+    assert_eq!(
+        catchup.catch_up_next().expect("activate target"),
+        shiba_ingress::BootstrapCatchupProgress::Active
+    );
+    drop(catchup);
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM shiba_internal.source_row_state WHERE source_id = 1",
+                &[]
+            )
+            .expect("target rows")
+            .get::<_, i64>(0),
+        2
+    );
 }
 
 pub(crate) fn install_second_target(client: &mut Client, fixture: &RebuildFixture) -> RebuildSpec {
@@ -250,20 +212,45 @@ pub(crate) fn install_second_target(client: &mut Client, fixture: &RebuildFixtur
         )
         .expect("read second publication OID")
         .get(0);
+    let target_digest = {
+        let mut transaction = client.transaction().expect("compile second target");
+        let artifact = compile_rebuild_graph(
+            &mut transaction,
+            GraphId::new(1).expect("graph ID"),
+            &[RebuildSourceTarget {
+                source_id: SourceId::new(1).expect("source ID"),
+                relation_id: relation,
+                identity_index_id: index,
+            }],
+        )
+        .expect("compile second target graph");
+        transaction
+            .rollback()
+            .expect("rollback read-only compilation");
+        artifact.graph_digest
+    };
     RebuildSpec {
-        source_id: SourceId::new(1).expect("source ID"),
+        graph_id: GraphId::new(1).expect("graph ID"),
         expected: RebuildIdentity {
             bootstrap_id: BootstrapId::new(2).expect("old bootstrap ID"),
-            relation_oid: fixture.target.relation,
-            identity_index_oid: fixture.target.identity_index,
+            graph_digest: fixture.target.graph_digest,
+            members: vec![shiba_ingress::RebuildMemberIdentity {
+                source_id: SourceId::new(1).expect("source ID"),
+                relation_oid: fixture.target.relation,
+                identity_index_oid: fixture.target.identity_index,
+            }],
             publication_oid: fixture.target.publication,
             slot_name: TARGET_SLOT.to_owned(),
             slot_generation: SlotGeneration::new(3).expect("old generation"),
         },
         target: RebuildIdentity {
             bootstrap_id: BootstrapId::new(3).expect("new bootstrap ID"),
-            relation_oid: relation,
-            identity_index_oid: index,
+            graph_digest: target_digest,
+            members: vec![shiba_ingress::RebuildMemberIdentity {
+                source_id: SourceId::new(1).expect("source ID"),
+                relation_oid: relation,
+                identity_index_oid: index,
+            }],
             publication_oid: publication,
             slot_name: SECOND_SLOT.to_owned(),
             slot_generation: SlotGeneration::new(4).expect("new generation"),

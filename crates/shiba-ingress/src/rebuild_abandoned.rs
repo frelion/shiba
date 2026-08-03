@@ -16,13 +16,13 @@ pub(crate) fn validate_m12_abandoned(
     replacement: &BootstrapSpec,
     phase: &str,
 ) -> Result<bool, IngressError> {
-    let source_id = as_bigint(abandoned.source_id.get())?;
+    let graph_id = as_bigint(abandoned.graph_id.get())?;
     let marker = transaction.query_one(
         "SELECT retired_bootstrap_id, retired_slot_name::text,
                     retired_slot_generation
-             FROM shiba_internal.source_bootstrap
-             WHERE source_id = $1 AND bootstrap_id = $2",
-        &[&source_id, &as_bigint(abandoned.bootstrap_id.get())?],
+             FROM shiba_internal.graph_bootstrap
+             WHERE graph_id = $1 AND bootstrap_id = $2",
+        &[&graph_id, &as_bigint(abandoned.bootstrap_id.get())?],
     )?;
     let retired_bootstrap: Option<i64> = marker.get(0);
     let retired_slot: Option<String> = marker.get(1);
@@ -50,7 +50,7 @@ pub(crate) fn validate_m12_abandoned(
     }
     let (authority, durable_phase) = load_rebuild_authority(
         transaction,
-        abandoned.source_id,
+        abandoned.graph_id,
         abandoned.bootstrap_id,
         abandoned.slot_generation,
     )?;

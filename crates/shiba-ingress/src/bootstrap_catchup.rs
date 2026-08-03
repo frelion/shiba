@@ -10,7 +10,7 @@ use crate::{
     tokens::BootstrapInput,
 };
 use postgres::Client;
-use shiba_protocol::{BootstrapId, SlotGeneration, SourceId};
+use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapCatchupProgress {
@@ -75,7 +75,7 @@ impl BootstrapCatchupSession {
     pub fn resume(
         apply_conninfo: &str,
         replication_conninfo: &str,
-        source_id: SourceId,
+        graph_id: GraphId,
         bootstrap_id: BootstrapId,
         slot_generation: SlotGeneration,
         options: BootstrapOptions,
@@ -85,7 +85,7 @@ impl BootstrapCatchupSession {
         if database != replication_database(replication_conninfo)? {
             return Err(IngressError::Governance("connection databases differ"));
         }
-        let advisory_key = advisory_key(source_id)?;
+        let advisory_key = advisory_key(graph_id)?;
         let acquired: bool = apply
             .query_one(
                 "SELECT pg_catalog.pg_try_advisory_lock($1)",
@@ -94,22 +94,22 @@ impl BootstrapCatchupSession {
             .get(0);
         if !acquired {
             return Err(IngressError::Governance(
-                "source already has an active session",
+                "graph already has an active session",
             ));
         }
-        let source_key = as_bigint(source_id.get())?;
+        let graph_key = as_bigint(graph_id.get())?;
         let bootstrap_key = as_bigint(bootstrap_id.get())?;
         let row = apply
             .query_opt(
                 "SELECT bootstrap.slot_name::text, bootstrap.slot_generation,
                         bootstrap.phase, config.publication_objid::bigint
-                 FROM shiba_internal.source_bootstrap AS bootstrap
-                 JOIN shiba_internal.source_ingress_config AS config
-                   ON config.source_id = bootstrap.source_id
+                 FROM shiba_internal.graph_bootstrap AS bootstrap
+                 JOIN shiba_internal.graph_ingress_config AS config
+                   ON config.graph_id = bootstrap.graph_id
                   AND config.slot_name = bootstrap.slot_name
                   AND config.slot_generation = bootstrap.slot_generation
-                 WHERE bootstrap.source_id = $1 AND bootstrap.bootstrap_id = $2",
-                &[&source_key, &bootstrap_key],
+                 WHERE bootstrap.graph_id = $1 AND bootstrap.bootstrap_id = $2",
+                &[&graph_key, &bootstrap_key],
             )?
             .ok_or(IngressError::Governance("bootstrap attempt is missing"))?;
         if row.get::<_, i64>(1) != as_bigint(slot_generation.get())? {
@@ -122,14 +122,14 @@ impl BootstrapCatchupSession {
             ));
         }
         let spec = BootstrapSpec {
-            source_id,
+            graph_id,
             bootstrap_id,
             publication_oid: u32::try_from(row.get::<_, i64>(3))
                 .map_err(|_| IngressError::Governance("publication OID is invalid"))?,
             slot_name: row.get(0),
             slot_generation,
         };
-        let (config, _) = GovernedConfig::load(&mut apply, source_id, slot_generation, false)?;
+        let (config, _) = GovernedConfig::load(&mut apply, graph_id, slot_generation, false)?;
         let (config, expected_content, start_lsn, active) =
             prepare_catchup(&mut apply, config, &spec, phase)?;
         Self::connect(
@@ -213,8 +213,8 @@ impl BootstrapCatchupSession {
             .take()
             .ok_or(IngressError::Governance("bootstrap receiver is detached"))?;
         let outcome = receiver.receive_bootstrap_one(
-            self.config.source,
-            self.spec.source_id,
+            &self.config.graph,
+            self.spec.graph_id,
             self.spec.bootstrap_id,
             &self.expected_content,
             &self.shutdown,

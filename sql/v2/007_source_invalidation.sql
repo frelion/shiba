@@ -1,5 +1,5 @@
--- M7 binds each admitted source to one exact PostgreSQL ObjectAddress set.
--- Binding creation and DDL invalidation remain separate facts with one writer each.
+-- Source ObjectAddresses remain source facts. Ordered graph membership is the
+-- sole association from those facts to one singleton or two-source graph.
 
 CREATE TABLE shiba_internal.source_binding (
     source_id bigint NOT NULL CHECK (source_id > 0),
@@ -15,6 +15,9 @@ CREATE TABLE shiba_internal.source_binding (
     PRIMARY KEY (source_id, address_classid, address_objid, address_objsubid),
     CONSTRAINT source_binding_address_unique UNIQUE (
         address_classid, address_objid, address_objsubid
+    ),
+    CONSTRAINT source_binding_source_kind_sub_unique UNIQUE (
+        source_id, binding_kind, address_objsubid
     )
 );
 
@@ -30,96 +33,97 @@ CREATE TABLE shiba_internal.source_invalidation (
     )
 );
 
-REVOKE ALL ON TABLE shiba_internal.source_binding FROM PUBLIC;
-REVOKE ALL ON TABLE shiba_internal.source_invalidation FROM PUBLIC;
+CREATE TABLE shiba_internal.graph_source_member (
+    graph_id bigint NOT NULL CHECK (graph_id > 0),
+    source_id bigint NOT NULL CHECK (source_id > 0),
+    input_ordinal smallint NOT NULL CHECK (input_ordinal IN (0, 1)),
+    graph_digest bytea NOT NULL CHECK (pg_catalog.octet_length(graph_digest) = 32),
+    relation_binding_kind text NOT NULL DEFAULT 'relation'
+        CHECK (relation_binding_kind = 'relation'),
+    relation_binding_objsubid integer NOT NULL DEFAULT 0
+        CHECK (relation_binding_objsubid = 0),
+    CONSTRAINT graph_source_member_primary PRIMARY KEY (graph_id, source_id),
+    CONSTRAINT graph_source_member_ordinal UNIQUE (graph_id, input_ordinal),
+    CONSTRAINT graph_source_member_one_graph UNIQUE (source_id),
+    CONSTRAINT graph_source_member_exact_graph FOREIGN KEY (graph_id, graph_digest)
+        REFERENCES shiba_internal.graph_definition (graph_id, graph_digest)
+        DEFERRABLE INITIALLY IMMEDIATE,
+    CONSTRAINT graph_source_member_exact_relation FOREIGN KEY (
+        source_id, relation_binding_kind, relation_binding_objsubid
+    ) REFERENCES shiba_internal.source_binding (
+        source_id, binding_kind, address_objsubid
+    ) DEFERRABLE INITIALLY IMMEDIATE
+);
 
-CREATE FUNCTION shiba_internal.register_source(
-    requested_source_id bigint,
-    requested_relation regclass
-)
-RETURNS void
-LANGUAGE plpgsql
-VOLATILE
-SECURITY DEFINER
+CREATE FUNCTION shiba_internal.validate_graph_member_cardinality()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $function$
+DECLARE checked_graph bigint := COALESCE(NEW.graph_id, OLD.graph_id);
+DECLARE expected smallint;
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_catalog.pg_class
-        WHERE oid = requested_relation AND relkind = 'r'
-    ) THEN
+    SELECT source_count INTO expected FROM shiba_internal.graph_definition
+    WHERE graph_id = checked_graph;
+    IF FOUND AND (
+        (SELECT count(*) FROM shiba_internal.graph_source_member
+         WHERE graph_id = checked_graph) <> expected
+        OR (SELECT array_agg(input_ordinal ORDER BY input_ordinal)
+            FROM shiba_internal.graph_source_member WHERE graph_id = checked_graph)
+           <> CASE expected WHEN 1 THEN ARRAY[0::smallint]
+                            ELSE ARRAY[0::smallint, 1::smallint] END
+    ) THEN RAISE EXCEPTION 'graph source membership is incomplete'; END IF;
+    RETURN NULL;
+END
+$function$;
+
+CREATE CONSTRAINT TRIGGER shiba_graph_member_cardinality
+AFTER INSERT OR UPDATE OR DELETE ON shiba_internal.graph_source_member
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+EXECUTE FUNCTION shiba_internal.validate_graph_member_cardinality();
+
+CREATE CONSTRAINT TRIGGER shiba_graph_definition_cardinality
+AFTER INSERT OR UPDATE ON shiba_internal.graph_definition
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+EXECUTE FUNCTION shiba_internal.validate_graph_member_cardinality();
+
+REVOKE ALL ON TABLE shiba_internal.source_binding FROM PUBLIC;
+REVOKE ALL ON TABLE shiba_internal.source_invalidation FROM PUBLIC;
+REVOKE ALL ON TABLE shiba_internal.graph_source_member FROM PUBLIC;
+REVOKE ALL ON FUNCTION shiba_internal.validate_graph_member_cardinality() FROM PUBLIC;
+
+CREATE FUNCTION shiba_internal.register_source(
+    requested_source_id bigint, requested_relation regclass
+) RETURNS void LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $function$
+DECLARE effective_identity_indexes oid[];
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class
+                   WHERE oid = requested_relation AND relkind = 'r') THEN
         RAISE EXCEPTION 'source relation must be an ordinary table';
     END IF;
-
-    INSERT INTO shiba_internal.source_binding (
-        source_id, binding_kind,
-        address_classid, address_objid, address_objsubid
-    )
-    SELECT requested_source_id, 'relation',
-           'pg_class'::regclass, requested_relation, 0
-    UNION ALL
-    SELECT requested_source_id, 'column',
-           'pg_class'::regclass, requested_relation,
-           attribute.attnum::integer
-    FROM pg_catalog.pg_attribute AS attribute
-    WHERE attribute.attrelid = requested_relation
-      AND attribute.attnum > 0
-      AND NOT attribute.attisdropped
-    UNION ALL
-    SELECT requested_source_id, 'identity_index',
-           'pg_class'::regclass, identity.indexrelid, 0
-    FROM pg_catalog.pg_index AS identity
-    WHERE identity.indrelid = requested_relation
-      AND identity.indisreplident;
+    SELECT pg_catalog.array_agg(identity.indexrelid ORDER BY identity.indexrelid)
+      INTO effective_identity_indexes
+      FROM pg_catalog.pg_class AS relation
+      JOIN pg_catalog.pg_index AS identity ON identity.indrelid = relation.oid
+      WHERE relation.oid = requested_relation
+        AND ((relation.relreplident = 'd' AND identity.indisprimary)
+             OR (relation.relreplident = 'i' AND identity.indisreplident))
+        AND identity.indisunique AND identity.indisvalid AND identity.indisready
+        AND identity.indexprs IS NULL AND identity.indpred IS NULL;
+    IF pg_catalog.cardinality(effective_identity_indexes) IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'source relation requires exactly one effective identity index';
+    END IF;
+    INSERT INTO shiba_internal.source_binding
+        (source_id, binding_kind, address_classid, address_objid, address_objsubid)
+    SELECT requested_source_id, 'relation', 'pg_class'::regclass, requested_relation, 0
+    UNION ALL SELECT requested_source_id, 'column', 'pg_class'::regclass,
+        requested_relation, attribute.attnum::integer
+      FROM pg_catalog.pg_attribute AS attribute
+      WHERE attribute.attrelid = requested_relation AND attribute.attnum > 0
+        AND NOT attribute.attisdropped
+    UNION ALL SELECT requested_source_id, 'identity_index', 'pg_class'::regclass,
+        effective_identity_indexes[1], 0;
 END
 $function$;
 
 REVOKE ALL ON FUNCTION shiba_internal.register_source(bigint, regclass) FROM PUBLIC;
-
-CREATE FUNCTION shiba_internal.invalidate_source_object()
-RETURNS event_trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-AS $function$
-BEGIN
-    IF TG_EVENT = 'ddl_command_end' THEN
-        INSERT INTO shiba_internal.source_invalidation (
-            source_id, address_classid, address_objid, address_objsubid
-        )
-        SELECT binding.source_id, command.classid, command.objid, command.objsubid
-        FROM pg_catalog.pg_event_trigger_ddl_commands() AS command
-        JOIN shiba_internal.source_binding AS binding
-          ON (binding.address_classid, binding.address_objid, binding.address_objsubid)
-           = (command.classid, command.objid, command.objsubid)
-        WHERE NOT command.in_extension
-        ON CONFLICT (source_id) DO NOTHING;
-    ELSIF TG_EVENT = 'sql_drop' THEN
-        INSERT INTO shiba_internal.source_invalidation (
-            source_id, address_classid, address_objid, address_objsubid
-        )
-        SELECT binding.source_id, dropped.classid, dropped.objid, dropped.objsubid
-        FROM pg_catalog.pg_event_trigger_dropped_objects() AS dropped
-        JOIN shiba_internal.source_binding AS binding
-          ON (binding.address_classid, binding.address_objid, binding.address_objsubid)
-           = (dropped.classid, dropped.objid, dropped.objsubid)
-        WHERE NOT dropped.is_temporary
-        ON CONFLICT (source_id) DO NOTHING;
-    ELSE
-        RAISE EXCEPTION 'unsupported source invalidation event %', TG_EVENT;
-    END IF;
-END
-$function$;
-
-CREATE EVENT TRIGGER shiba_source_ddl_command_end
-    ON ddl_command_end
-    EXECUTE FUNCTION shiba_internal.invalidate_source_object();
-
-CREATE EVENT TRIGGER shiba_source_sql_drop
-    ON sql_drop
-    EXECUTE FUNCTION shiba_internal.invalidate_source_object();
-
-COMMENT ON TABLE shiba_internal.source_binding IS
-    'Immutable source relation, column, and identity-index ObjectAddress authority';
-COMMENT ON TABLE shiba_internal.source_invalidation IS
-    'Exact ObjectAddress invalidation facts written in the owning DDL transaction';

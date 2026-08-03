@@ -1,25 +1,27 @@
 # Architecture boundary
 
-M14.1 freezes the next database-free execution boundary in
+M14.6 cuts the production lifecycle over to the graph boundary frozen in
 [OPERATOR_GRAPH_CONTRACT.md](OPERATOR_GRAPH_CONTRACT.md): one canonical typed
 graph owns its exact source membership, nodes, edges, terminal outputs and hard
-bounds. Runtime will schedule canonical topology and persist generic deltas;
-only the Operator crate may dispatch concrete node implementations. The M14.6
-cutover replaces, rather than mirrors, the flat plan set and source-scoped
-continuation. ADR 0005 fixes one slot/generation and one transaction authority
-for both sides of the admitted two-source INNER JOIN.
+bounds. Runtime schedules canonical topology and persists generic deltas; only
+the Operator crate may dispatch concrete node implementations. The cutover
+replaces, rather than mirrors, the flat plan set and source-scoped continuation.
+One `graph_definition`, ordered `graph_source_member` set, ingress configuration,
+slot generation and `graph_continuation` own both single-input and admitted
+two-input execution. ADR 0005 fixes one slot/generation and one transaction
+authority for both sides of the admitted two-source INNER JOIN.
 
 M14.2 implements the first stateless vertical slice. Compiler binds the full
 ordered source layout and exact expression slots; Source Apply/Bootstrap create
 one typed DeltaBatch; Filter, Compute, Project and Materialize execute purely;
 Runtime loads and persists plans/state/results generically. The old ProjectRows
 implementation is removed rather than adapted. M14.3 adds KeyBy, GroupedCount
-and GroupedSumInt8 over the sole private `operator_node_state` authority.
-Runtime loads and persists canonical typed keyed state/results set-wise in the
-same transaction as Source Apply and continuation. Two-input Join, graph-wide
-lifecycle and the full M14 release/performance matrix remain later work.
+and GroupedSumInt8; M14.6 moves their state into the sole private
+`graph_node_state` authority. Runtime loads and persists canonical typed keyed
+state/results set-wise in the same transaction as every member's Source Apply
+and graph continuation.
 
-M14.4 accepts, but has not implemented, the graph-wide two-source authority in
+M14.4 accepted the graph-wide two-source authority in
 [JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md) and
 [ADR 0006](adr/0006-m14-two-source-join-authority.md). Exactly
 two explicit SourceIds share one database/publication/slot/generation, one
@@ -34,8 +36,31 @@ M14.5 implements the database-free half: a nonzero `GraphId` owns ordered
 right port binds the exact effective replica-identity index. Compiler emits one
 canonical multi-input plan; the kernel uses generic partition state and
 computes mixed batches from pre-state to final-state with bounded normalized
-output. Runtime, Catalog, cross-schema PG17/18 live execution, bootstrap and
-rebuild remain M14.6 work.
+output. M14.6 installs that graph as the sole Catalog/Runtime/lifecycle
+authority: a single-input source is a one-member graph and the join is a
+two-member graph, with no second Runtime or compatibility path. Directed
+PG17.10/PG18.4 graph Runtime gates prove one- and two-member registration,
+same-transaction two-side Apply, right fan-out/retraction, key changes, rollback,
+exact replay and effective-identity invalidation. The final release/performance
+matrix remains M14.7.
+
+The graph-wide durable authorities are `graph_definition`, ordered
+`graph_source_member`, `graph_ingress_config`/`graph_ingress_source`,
+`graph_ingress_invalidation`, `graph_continuation`, `graph_bootstrap` with
+subordinate per-member `graph_bootstrap_checkpoint`, `graph_node_state`, and
+the `shiba.graph_result` header plus private keyed rows exposed by
+`shiba.graph_result_rows`. The source facts `source_binding`,
+`source_invalidation`, and `source_row_state` remain SourceId-owned. Superseded
+operator/source execution tables are absent; there is no alias, dual write,
+migration adapter, persisted DeltaBatch, or per-source progress.
+
+Every member durably binds its effective replica identity: the default primary
+key when `relreplident='d'`, or the exact unique replica-identity index when
+`relreplident='i'`. Registration rejects a relation without exactly one
+admitted effective index. Runtime validates the same ObjectAddress before
+Apply, and replacement invalidates the complete graph. Compiler also supplies
+strict `ComputedProject` and filtered grouped pipelines while Runtime consumes
+only graph topology and result contracts, never concrete node kinds.
 
 M13.1 froze the generic execution successor to the M9 aggregate-shaped API;
 M13.2 supplied its pure kernel, and M13.3 made that kernel the sole Runtime and

@@ -39,10 +39,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1),
-                (SELECT state_payload FROM shiba_internal.operator_state WHERE operator_id = 1),
+                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 1001),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
-                (SELECT count(*) FROM shiba_internal.source_continuation)",
+                (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
         .expect("query durable state");
@@ -63,21 +63,21 @@ fn exact_input_limit_is_parsed_and_one_more_byte_is_rejected() {
         1,
     );
     assert!(matches!(
-        decode_committed_changes(&input, source),
+        decode_committed_changes(&input, &support::singleton_graph(1, source)),
         Err(PgoutputError::MessageOrder)
     ));
     assert!(matches!(
-        decode_streamed_changes(&input, source),
+        decode_streamed_changes(&input, &support::singleton_graph(1, source)),
         Err(PgoutputError::MessageOrder)
     ));
 
     input.push(0);
     assert!(matches!(
-        decode_committed_changes(&input, source),
+        decode_committed_changes(&input, &support::singleton_graph(1, source)),
         Err(PgoutputError::LimitExceeded)
     ));
     assert!(matches!(
-        decode_streamed_changes(&input, source),
+        decode_streamed_changes(&input, &support::singleton_graph(1, source)),
         Err(PgoutputError::LimitExceeded)
     ));
 }
@@ -107,7 +107,8 @@ fn m8_committed_decode_admits_limit_and_rejects_next_change() {
         )
         .expect("commit transaction at change limit");
     let admitted_wire = CAPTURE.capture(&mut client, "admitted.pgoutput");
-    let admitted = decode_committed_changes(&admitted_wire, source).expect("decode 10,000 changes");
+    let admitted = decode_committed_changes(&admitted_wire, &support::singleton_graph(1, source))
+        .expect("decode 10,000 changes");
     assert_eq!(admitted.changes.len(), 10_000);
     assert_eq!(
         process(&mut client, &admitted).expect("apply admitted transaction"),
@@ -127,7 +128,7 @@ fn m8_committed_decode_admits_limit_and_rejects_next_change() {
         .expect("commit transaction above change limit");
     let rejected_wire = CAPTURE.capture(&mut client, "rejected.pgoutput");
     assert!(matches!(
-        decode_committed_changes(&rejected_wire, source),
+        decode_committed_changes(&rejected_wire, &support::singleton_graph(1, source)),
         Err(PgoutputError::LimitExceeded)
     ));
     assert_eq!(durable_state(&mut client), (10_000, 10_000, 10_000, 1));

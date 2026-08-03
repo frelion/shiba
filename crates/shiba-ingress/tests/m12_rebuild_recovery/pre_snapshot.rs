@@ -18,7 +18,7 @@ pub(crate) fn prove_windows(
     let mut invalid = fixture.spec();
     invalid.target.slot_generation = shiba_protocol::SlotGeneration::new(5).unwrap();
     assert!(
-        PreparedRebuild::prepare(database_url, replication_url, invalid, support::options())
+        PreparedRebuild::prepare(database_url, replication_url, &invalid, support::options())
             .is_err()
     );
     assert_eq!(
@@ -33,7 +33,7 @@ pub(crate) fn prove_windows(
     PreparedRebuild::prepare(
         database_url,
         replication_url,
-        fixture.spec(),
+        &fixture.spec(),
         support::options(),
     )
     .expect("commit rebuild intent")
@@ -52,7 +52,7 @@ pub(crate) fn prove_windows(
             PreparedRebuild::resume_prepared(
                 &apply,
                 &replication,
-                shiba_protocol::SourceId::new(1).unwrap(),
+                shiba_protocol::GraphId::new(1).unwrap(),
                 shiba_protocol::BootstrapId::new(2).unwrap(),
                 shiba_protocol::SlotGeneration::new(3).unwrap(),
                 support::options(),
@@ -89,7 +89,7 @@ pub(crate) fn prove_slot_windows(
     let foreign_target = PreparedRebuild::resume_prepared(
         database_url,
         replication_url,
-        shiba_protocol::SourceId::new(1).unwrap(),
+        shiba_protocol::GraphId::new(1).unwrap(),
         shiba_protocol::BootstrapId::new(2).unwrap(),
         shiba_protocol::SlotGeneration::new(3).unwrap(),
         support::options(),
@@ -115,7 +115,7 @@ pub(crate) fn prove_slot_windows(
     let foreign_old = PreparedRebuild::resume_prepared(
         database_url,
         replication_url,
-        shiba_protocol::SourceId::new(1).unwrap(),
+        shiba_protocol::GraphId::new(1).unwrap(),
         shiba_protocol::BootstrapId::new(2).unwrap(),
         shiba_protocol::SlotGeneration::new(3).unwrap(),
         support::options(),
@@ -137,14 +137,14 @@ pub(crate) fn prove_slot_windows(
             "CREATE FUNCTION public.stop_after_old_drop() RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN RAISE EXCEPTION 'm12 stop after old drop'; END $$;
          CREATE TRIGGER stop_after_old_drop BEFORE UPDATE OF phase
-         ON shiba_internal.source_bootstrap FOR EACH ROW
+         ON shiba_internal.graph_bootstrap FOR EACH ROW
          EXECUTE FUNCTION public.stop_after_old_drop();",
         )
         .expect("install old-drop barrier");
     let old_drop = PreparedRebuild::resume_prepared(
         database_url,
         replication_url,
-        shiba_protocol::SourceId::new(1).unwrap(),
+        shiba_protocol::GraphId::new(1).unwrap(),
         shiba_protocol::BootstrapId::new(2).unwrap(),
         shiba_protocol::SlotGeneration::new(3).unwrap(),
         support::options(),
@@ -153,7 +153,7 @@ pub(crate) fn prove_slot_windows(
     assert!(old_drop.into_bootstrap().is_err());
     admin
         .batch_execute(
-            "DROP TRIGGER stop_after_old_drop ON shiba_internal.source_bootstrap;
+            "DROP TRIGGER stop_after_old_drop ON shiba_internal.graph_bootstrap;
          DROP FUNCTION public.stop_after_old_drop();",
         )
         .expect("remove old-drop barrier");
@@ -173,13 +173,13 @@ pub(crate) fn prove_slot_windows(
         "CREATE FUNCTION public.stop_before_target_slot() RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN EXECUTE 'ALTER ROLE shiba_m12_recovery_replication NOREPLICATION'; RETURN NEW; END $$;
          CREATE TRIGGER stop_before_target_slot AFTER UPDATE OF phase
-         ON shiba_internal.source_bootstrap FOR EACH ROW
+         ON shiba_internal.graph_bootstrap FOR EACH ROW
          WHEN (NEW.phase = 'creating') EXECUTE FUNCTION public.stop_before_target_slot();"
     ).expect("install creating-before-slot barrier");
     let creating = PreparedRebuild::resume_prepared(
         database_url,
         replication_url,
-        shiba_protocol::SourceId::new(1).unwrap(),
+        shiba_protocol::GraphId::new(1).unwrap(),
         shiba_protocol::BootstrapId::new(2).unwrap(),
         shiba_protocol::SlotGeneration::new(3).unwrap(),
         support::options(),
@@ -189,13 +189,13 @@ pub(crate) fn prove_slot_windows(
     admin
         .batch_execute(
             "ALTER ROLE shiba_m12_recovery_replication REPLICATION;
-         DROP TRIGGER stop_before_target_slot ON shiba_internal.source_bootstrap;
+         DROP TRIGGER stop_before_target_slot ON shiba_internal.graph_bootstrap;
          DROP FUNCTION public.stop_before_target_slot();",
         )
         .expect("restore replication capability");
     let phase: String = admin
         .query_one(
-            "SELECT phase FROM shiba_internal.source_bootstrap WHERE source_id=1",
+            "SELECT phase FROM shiba_internal.graph_bootstrap WHERE graph_id=1",
             &[],
         )
         .unwrap()
@@ -206,7 +206,7 @@ pub(crate) fn prove_slot_windows(
     let publication_value: i64 = admin
         .query_one(
             "SELECT publication_objid::bigint
-             FROM shiba_internal.source_ingress_config WHERE source_id=1",
+             FROM shiba_internal.graph_ingress_config WHERE graph_id=1",
             &[],
         )
         .unwrap()

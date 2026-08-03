@@ -1,21 +1,16 @@
-use std::{
-    num::NonZeroU64,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use postgres::{Client, NoTls};
-use shiba_compiler::{OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1};
 use shiba_ingress::{
-    AttachOptions, CONNECTIONS_PER_SOURCE, GovernedSourceSession, IngressError, ReplicationMode,
+    AttachOptions, CONNECTIONS_PER_GRAPH, GovernedGraphSession, IngressError, ReplicationMode,
 };
-use shiba_operator::OperatorId;
-use shiba_protocol::{SlotGeneration, SourceId};
+use shiba_protocol::{GraphId, SlotGeneration};
 use shiba_runtime::{ProcessOutcome, compile_and_register};
 
 #[allow(dead_code)]
 mod support;
 
-use support::{slot_lsn, wait_for_slot_lsn};
+use support::{count_spec, slot_lsn, wait_for_slot_lsn};
 
 const SLOT: &str = "shiba_m10_performance_slot";
 const PUBLICATION: &str = "shiba_m10_performance_pub";
@@ -38,11 +33,11 @@ fn required(name: &str) -> String {
         .unwrap_or_else(|_| panic!("scripts/test-m10-performance-ingress.sh must set {name}"))
 }
 
-fn attach(database_url: &str, replication_url: &str) -> GovernedSourceSession {
-    GovernedSourceSession::attach(
+fn attach(database_url: &str, replication_url: &str) -> GovernedGraphSession {
+    GovernedGraphSession::attach(
         database_url,
         replication_url,
-        SourceId::new(1).expect("source ID"),
+        GraphId::new(1).expect("graph ID"),
         SlotGeneration::new(1).expect("slot generation"),
         AttachOptions::new(ReplicationMode::Committed, Duration::from_secs(5))
             .expect("attach options"),
@@ -73,16 +68,7 @@ fn install_fixture(client: &mut Client) {
              SELECT shiba_internal.register_source(1, 'source.events'::regclass);"
         ))
         .expect("install performance source");
-    compile_and_register(
-        client,
-        &OperatorSpecV1 {
-            version: OPERATOR_SPEC_VERSION,
-            operator_id: OperatorId::new(NonZeroU64::new(1).expect("operator ID")),
-            source_id: SourceId::new(1).expect("source ID"),
-            operation: OperatorOperationV1::CountRows,
-        },
-    )
-    .expect("register CountRows");
+    compile_and_register(client, &count_spec(1)).expect("register CountRows");
     client
         .query_one(
             "SELECT slot_name FROM pg_create_logical_replication_slot($1, 'pgoutput')",
@@ -98,7 +84,7 @@ fn install_fixture(client: &mut Client) {
         .get(0);
     client
         .execute(
-            "SELECT shiba_internal.configure_source_ingress(1, $1, $2, 1)",
+            "SELECT shiba_internal.configure_graph_ingress(1, $1, $2, 1)",
             &[&publication_oid, &SLOT],
         )
         .expect("configure governed ingress");
@@ -107,7 +93,7 @@ fn install_fixture(client: &mut Client) {
 fn count_rows(client: &mut Client) -> i64 {
     client
         .query_one(
-            "SELECT value_bigint FROM shiba.operator_result WHERE operator_id = 1",
+            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2",
             &[],
         )
         .expect("read CountRows result")
@@ -126,7 +112,7 @@ fn governed_committed_ingress_has_bounded_latency_throughput_and_backpressure() 
     let mut admin = Client::connect(&database_url, NoTls).expect("connect admin database");
     install_fixture(&mut admin);
 
-    assert_eq!(CONNECTIONS_PER_SOURCE, 2);
+    assert_eq!(CONNECTIONS_PER_GRAPH, 2);
     let initial_lsn = slot_lsn(&mut admin, SLOT);
     let mut session = attach(&database_url, &replication_url);
     let apply_connections: i64 = admin
@@ -223,7 +209,7 @@ fn governed_committed_ingress_has_bounded_latency_throughput_and_backpressure() 
              END
              $$;
              CREATE TRIGGER m10_slow_apply BEFORE UPDATE
-             ON shiba_internal.operator_state FOR EACH ROW
+             ON shiba_internal.graph_node_state FOR EACH ROW
              EXECUTE FUNCTION m10_performance_test.slow_apply();",
         )
         .expect("install slow Apply fixture");
@@ -270,6 +256,6 @@ fn governed_committed_ingress_has_bounded_latency_throughput_and_backpressure() 
     assert_eq!(count_rows(&mut admin), 11_002);
 
     eprintln!(
-        "M10 performance measured source_commit_to_apply_e2e_10000={e2e_elapsed:?} replay={replay_elapsed:?} precommitted_backlog_service={sustained_elapsed:?} throughput={throughput:.2}tx/s service_p50={p50:?} service_p95={p95:?} service_p99={p99:?} backpressure_reject={rejected_elapsed:?} slow_apply={slow_elapsed:?}; frozen Rust bounds assembly_bytes={MAX_RUST_ASSEMBLY_BYTES} decoded_changes={MAX_DECODED_CHANGES} connections_per_source={CONNECTIONS_PER_SOURCE}"
+        "M10 performance measured source_commit_to_apply_e2e_10000={e2e_elapsed:?} replay={replay_elapsed:?} precommitted_backlog_service={sustained_elapsed:?} throughput={throughput:.2}tx/s service_p50={p50:?} service_p95={p95:?} service_p99={p99:?} backpressure_reject={rejected_elapsed:?} slow_apply={slow_elapsed:?}; frozen Rust bounds assembly_bytes={MAX_RUST_ASSEMBLY_BYTES} decoded_changes={MAX_DECODED_CHANGES} connections_per_source={CONNECTIONS_PER_GRAPH}"
     );
 }

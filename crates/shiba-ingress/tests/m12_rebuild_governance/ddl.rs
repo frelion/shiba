@@ -1,9 +1,8 @@
 use shiba_ingress::PreparedRebuild;
-use shiba_operator::{CompiledPlan, PlanImplementation};
 
 use crate::support::{
     IdentityCoordinates, RebuildFixture, assert_building, authority_snapshot,
-    establish_active_source, options,
+    establish_active_source, options, refresh_target_digest,
 };
 
 pub(crate) fn prove_relation_replacement_is_not_adopted(database_url: &str, replication_url: &str) {
@@ -18,7 +17,8 @@ pub(crate) fn prove_relation_replacement_is_not_adopted(database_url: &str, repl
         )
         .expect("replace target relation with same name and SQL shape");
     assert!(
-        PreparedRebuild::prepare(database_url, replication_url, fixture.spec(), options()).is_err(),
+        PreparedRebuild::prepare(database_url, replication_url, &fixture.spec(), options())
+            .is_err(),
         "a same-name relation replacement cannot satisfy the approved ObjectAddress"
     );
     assert_eq!(authority_snapshot(&mut admin), before);
@@ -39,7 +39,8 @@ pub(crate) fn prove_publication_drift_requires_explicit_new_admission(
         )
         .expect("replace publication with the same name");
     assert!(
-        PreparedRebuild::prepare(database_url, replication_url, fixture.spec(), options()).is_err(),
+        PreparedRebuild::prepare(database_url, replication_url, &fixture.spec(), options())
+            .is_err(),
         "a same-name publication replacement cannot be adopted by an old OID request"
     );
     assert_eq!(authority_snapshot(&mut admin), before);
@@ -53,7 +54,7 @@ pub(crate) fn prove_publication_drift_requires_explicit_new_admission(
         .get(0);
     let fixture = fixture_with_publication(fixture, publication_oid);
     let prepared =
-        PreparedRebuild::prepare(database_url, replication_url, fixture.spec(), options())
+        PreparedRebuild::prepare(database_url, replication_url, &fixture.spec(), options())
             .expect("explicitly approved replacement publication may prepare");
     admin
         .batch_execute(
@@ -77,7 +78,8 @@ pub(crate) fn prove_identity_shape_and_operator_plan(database_url: &str, replica
         .batch_execute("ALTER TABLE target.events REPLICA IDENTITY FULL")
         .expect("change target replica identity shape");
     assert!(
-        PreparedRebuild::prepare(database_url, replication_url, fixture.spec(), options()).is_err(),
+        PreparedRebuild::prepare(database_url, replication_url, &fixture.spec(), options())
+            .is_err(),
         "non-default replica identity must fail before destructive prepare"
     );
     assert_eq!(authority_snapshot(&mut admin), before);
@@ -89,7 +91,8 @@ pub(crate) fn prove_identity_shape_and_operator_plan(database_url: &str, replica
         .batch_execute("ALTER TABLE target.events ALTER COLUMN payload TYPE text")
         .expect("change target payload shape");
     assert!(
-        PreparedRebuild::prepare(database_url, replication_url, fixture.spec(), options()).is_err(),
+        PreparedRebuild::prepare(database_url, replication_url, &fixture.spec(), options())
+            .is_err(),
         "column type drift must fail before destructive prepare"
     );
     assert_eq!(authority_snapshot(&mut admin), before);
@@ -107,7 +110,8 @@ pub(crate) fn prove_identity_shape_and_operator_plan(database_url: &str, replica
         .get(0);
     assert_ne!(replacement_identity, fixture.target.identity_index);
     assert!(
-        PreparedRebuild::prepare(database_url, replication_url, fixture.spec(), options()).is_err(),
+        PreparedRebuild::prepare(database_url, replication_url, &fixture.spec(), options())
+            .is_err(),
         "same-name primary-key replacement must not satisfy a stale target OID"
     );
     assert_eq!(authority_snapshot(&mut admin), before);
@@ -116,6 +120,7 @@ pub(crate) fn prove_identity_shape_and_operator_plan(database_url: &str, replica
         identity_index: replacement_identity,
         ..fixture.target
     };
+    refresh_target_digest(&mut admin, &mut fixture);
     admin
         .batch_execute(
             "ALTER TABLE target.events RENAME TO events_renamed;
@@ -124,7 +129,7 @@ pub(crate) fn prove_identity_shape_and_operator_plan(database_url: &str, replica
         )
         .expect("apply ObjectAddress-stable and unrelated target DDL");
     let prepared =
-        PreparedRebuild::prepare(database_url, replication_url, fixture.spec(), options())
+        PreparedRebuild::prepare(database_url, replication_url, &fixture.spec(), options())
             .expect("exact durable identities survive rename and ignore unrelated index DDL");
     assert_building(&mut admin);
     let binding: i64 = admin
@@ -136,27 +141,24 @@ pub(crate) fn prove_identity_shape_and_operator_plan(database_url: &str, replica
         .expect("read durable target identity index")
         .get(0);
     assert_eq!(binding, i64::from(replacement_identity));
-    let sum_binding = admin
+    let graph_authority = admin
         .query_one(
-            "SELECT plan_payload, plan_digest FROM shiba_internal.operator_definition
-             WHERE operator_id = 2",
+            "SELECT graph_payload, graph_digest FROM shiba_internal.graph_definition
+             WHERE graph_id = 1",
             &[],
         )
         .expect("read compiled SumInt8 target binding");
-    let payload: Vec<u8> = sum_binding.get(0);
-    let digest: Vec<u8> = sum_binding.get(1);
-    let plan = CompiledPlan::from_canonical_payload(
+    let payload: Vec<u8> = graph_authority.get(0);
+    let digest: Vec<u8> = graph_authority.get(1);
+    let graph = shiba_operator::OperatorGraph::from_canonical_payload(
         &payload,
-        digest.try_into().expect("32-byte plan digest"),
+        digest.try_into().expect("32-byte graph digest"),
     )
-    .expect("decode durable target SumInt8 plan");
-    match plan.implementation {
-        PlanImplementation::SumInt8 { input, .. } => {
-            assert_eq!(input.object_id, fixture.target.relation);
-            assert_eq!(input.sub_id, 2);
-        }
-        _ => panic!("operator 2 must remain SumInt8"),
-    }
+    .expect("decode durable target graph");
+    assert_eq!(
+        graph.sources[0].layout[0].address.object_id,
+        fixture.target.relation
+    );
     prepared.detach().expect("release prepared rebuild owner");
 }
 

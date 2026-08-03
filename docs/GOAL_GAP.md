@@ -1,22 +1,49 @@
 # V2 goal gap entering M14
 
+## M14.6 production cutover status
+
+The production schema and execution/lifecycle code have been cut over to the
+same canonical `OperatorGraph` proved purely in M14.5. Single-source execution
+is a one-member graph; the admitted JOIN is a two-member graph. Both use one
+graph ingress configuration/publication/slot/generation, one graph transaction,
+one `graph_continuation`, generic node state/results, one exported-snapshot
+bootstrap and graph-wide rebuild. Ordered member checkpoints are subordinate to
+that one bootstrap lifecycle.
+
+The old per-operator and per-source execution authorities are removed rather
+than adapted. Runtime, Ingress, Bootstrap and Rebuild consume graph identity and
+contracts only; they do not know CountRows, SumInt8, Filter, grouped nodes,
+Join, Materialize, fixed node IDs or node counts. Intermediate DeltaBatch values
+remain transaction-local.
+
+The directed M14.6 Runtime gate is green on PG17.10/PG18.4. It proves
+cross-schema keyed results, an atomic transaction changing both sides, right
+fan-out/retraction, join-key changes, rollback/retry/exact replay and exact
+right-PK replacement invalidation. Source registration durably binds either a
+default PK or explicit replica-identity index and rejects a relation with none.
+Strict Compiler tests cover ComputedProject and filtered grouped Count/Sum
+pipelines; Runtime consumes only generic result contracts.
+
+M14.7 must still close the full receiver/bootstrap/rebuild, least-privilege,
+release and performance matrix; M14 is not yet complete.
+
 ## M14.5 pure JOIN kernel status
 
 M14.4 freezes the two-source JOIN authority. M14.5 implements its pure
 Compiler/Operator half: GraphId, ordered SourcePorts, exact effective right
 replica-identity binding, generic partition state and pre-to-final multi-input
 evaluation. The 300-step relational differential, 20,000/20,001 fan-out bound
-and `O(n^2)` to `O(n log n)` affected-row correction are proved. M14.6 must
-supply Runtime/Catalog and PostgreSQL integration. Exactly two sources share
+and `O(n^2)` to `O(n log n)` affected-row correction are proved. M14.6 supplies
+the Runtime/Catalog/lifecycle cutover and directed PostgreSQL Runtime evidence.
+Exactly two sources share
 one database/publication/slot/generation, graph continuation and ACK,
 exported-snapshot bootstrap and graph-wide rebuild. Admission binds exact
 relation/column ObjectAddresses and the exact right PK/UK index. See
 [JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md) and
 [ADR 0006](adr/0006-m14-two-source-join-authority.md).
 
-Still unproved are the JOIN Catalog/Runtime path, graph lifecycle schema cutover,
-same-transaction two-side SQL differential, right-side fan-out, crash/replay,
-DDL, least-privilege bootstrap/rebuild and frozen PG17/18 performance matrix.
+Still unproved are the complete graph bootstrap/rebuild/least-privilege matrix
+and frozen PG17/18 release/performance matrix.
 No per-source continuation, second Runtime, persisted DeltaBatch or adapter is
 accepted as a way to close those gaps.
 
@@ -56,14 +83,14 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source/publication authority, canonical compiled plans/digests, opaque scalar/keyed node state, generic scalar/keyed results, sole `source_row_state`, one bootstrap lifecycle, complete M12 evidence | Graph-scoped two-source lifecycle authority is accepted but unimplemented |
-| Compiler | Strict IR to ObjectAddress-bound scalar, stateless, grouped and pure two-source JOIN plans | JOIN Catalog/lifecycle integration, SQL frontend and broader plan language |
+| Catalog | Version, source facts/effective identity, sole canonical graph plan/membership, graph ingress/continuation/bootstrap, generic graph node state/results, sole `source_row_state`, directed M14.6 evidence | M14.7 full lifecycle/release matrix |
+| Compiler | Strict IR to one ObjectAddress-bound single/two-source graph | Directed PostgreSQL graph evidence, SQL frontend and broader plan language |
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
-| Source Apply | Current-row authority plus transaction-local before/after effects, including the narrow key-changing update needed by ProjectRows | Broader row shapes and identities |
-| EffectStream | Non-durable transaction-local EffectBatch | Persisted effects intentionally absent |
-| Runtime | Generic plan/state decode, ordered kernel dispatch and atomic scalar/keyed persistence through live/bootstrap/rebuild | Graph-scoped two-source transaction/lifecycle remains unimplemented |
-| Operator | Database-free stateless/grouped nodes and bounded two-source INNER JOIN on one kernel | PostgreSQL JOIN integration and broader operator families remain unproved |
-| Result Sink | Generic visibility header, scalar bigint arm and active-only nullable keyed rows | Non-bigint result types |
+| Source Apply | SourceId-tagged current rows plus transaction-local before/after effects for every graph member | Broader row shapes and identities |
+| EffectStream | Non-durable transaction-local DeltaBatch/MultiInputBatch | Persisted effects intentionally absent |
+| Runtime | Generic graph decode/topology, ordered multi-input dispatch and atomic scalar/keyed persistence; directed two-input PostgreSQL rollback/replay evidence | M14.7 complete bootstrap/rebuild/recovery/performance matrix |
+| Operator | Database-free stateless/grouped/computed nodes and bounded two-source INNER JOIN on one kernel | Broader operator families remain unproved |
+| Result Sink | Graph-terminal visibility headers, scalar bigint arm and active-only nullable keyed rows | Non-bigint result types |
 
 M13.2 implemented the pure generic plan/state/transition contract. M13.3 made it
 the sole Catalog/Runtime path and proved CountRows, SumInt8 and ProjectRows

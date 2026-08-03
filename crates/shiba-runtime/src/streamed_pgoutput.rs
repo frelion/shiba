@@ -1,37 +1,36 @@
-use shiba_protocol::{IngressTransactionId, InputSequence, PostgresLsn, SourceTransactionId};
+use shiba_protocol::{GraphTransactionId, IngressTransactionId, InputSequence, PostgresLsn};
 
 use crate::{
-    PgoutputError, PgoutputRelationState, SourceInsert, SourcePayload, SourceTransaction,
+    GraphSourceChange, GraphTransaction, PgoutputError, PgoutputGraph, PgoutputRelationState,
+    SourceChange, SourceInsert, SourceUpdate, SourceUpdatePayload,
     pgoutput::{check_input_limit, decode_relation},
-    pgoutput_source::{PgoutputSource, SourceShape},
-    pgoutput_tuple::{DecodedChange, decode_insert},
+    pgoutput_tuple::{DecodedChange, decode_delete, decode_insert, decode_update},
     pgoutput_wire::Cursor,
     transaction::MAX_TRANSACTION_CHANGES,
 };
 
-/// # Errors
-/// Rejects input that is not one complete admitted protocol-v2 streamed transaction.
-pub fn decode_streamed_changes(
-    input: &[u8],
-    source: PgoutputSource,
-) -> Result<SourceTransaction, PgoutputError> {
-    decode_streamed_changes_in_session(input, source, &mut PgoutputRelationState::new())
-}
-
-/// Decodes a streamed transaction with connection-local relation validation state.
+/// Decodes one complete protocol-v2 graph transaction.
 ///
 /// # Errors
-/// Rejects a change before the first exact relation descriptor on the session.
+/// Rejects partial, mixed-XID, unknown-relation, malformed, or oversized input.
+pub fn decode_streamed_changes(
+    input: &[u8],
+    graph: &PgoutputGraph,
+) -> Result<GraphTransaction, PgoutputError> {
+    decode_streamed_changes_in_session(input, graph, &mut PgoutputRelationState::new())
+}
+
+/// Decodes protocol-v2 using the bounded connection-local relation proof.
+///
+/// # Errors
+/// Every changed relation must have an exact descriptor in this or an earlier transaction.
 pub fn decode_streamed_changes_in_session(
     input: &[u8],
-    source: PgoutputSource,
+    graph: &PgoutputGraph,
     relation_state: &mut PgoutputRelationState,
-) -> Result<SourceTransaction, PgoutputError> {
+) -> Result<GraphTransaction, PgoutputError> {
     check_input_limit(input)?;
-    if source.shape != SourceShape::KeyOnly {
-        return Err(PgoutputError::RelationShape);
-    }
-
+    relation_state.begin(graph)?;
     let mut cursor = Cursor::new(input);
     if cursor.byte()? != b'S' {
         return Err(PgoutputError::MessageOrder);
@@ -40,37 +39,40 @@ pub fn decode_streamed_changes_in_session(
     if xid == 0 || cursor.byte()? != 1 {
         return Err(PgoutputError::InvalidIdentity);
     }
-
-    let mut relation_seen = relation_state.validated_for(source)?;
-    let mut relation_in_transaction = false;
-    let mut row_ids = Vec::new();
+    let mut values = Vec::new();
+    let mut relation_updates = Vec::new();
     loop {
         loop {
-            match cursor.byte()? {
+            let tag = cursor.byte()?;
+            match tag {
                 b'R' => {
                     require_xid(&mut cursor, xid)?;
+                    let source = graph.source_for_relation(peek_u32(&cursor)?)?;
                     decode_relation(&mut cursor, source)?;
-                    relation_seen = true;
-                    relation_in_transaction = true;
+                    relation_updates.push(source);
                 }
-                b'I' if relation_seen => {
-                    if row_ids.len() >= MAX_TRANSACTION_CHANGES {
+                b'I' | b'U' | b'D' => {
+                    if values.len() >= MAX_TRANSACTION_CHANGES {
                         return Err(PgoutputError::LimitExceeded);
                     }
                     require_xid(&mut cursor, xid)?;
-                    match decode_insert(&mut cursor, source)? {
-                        DecodedChange::RowInsert(row_id, SourcePayload::Absent) => {
-                            row_ids.push(row_id);
-                        }
-                        _ => return Err(PgoutputError::TupleShape),
+                    let source = graph.source_for_relation(peek_u32(&cursor)?)?;
+                    if !relation_state.validated_for(source) && !relation_updates.contains(&source)
+                    {
+                        return Err(PgoutputError::MessageOrder);
                     }
+                    let value = match tag {
+                        b'I' => decode_insert(&mut cursor, source)?,
+                        b'U' => decode_update(&mut cursor, source)?,
+                        b'D' => decode_delete(&mut cursor, source)?,
+                        _ => unreachable!(),
+                    };
+                    values.push((source, value));
                 }
-                b'I' => return Err(PgoutputError::MessageOrder),
                 b'E' => break,
                 other => return Err(PgoutputError::UnknownMessage(other)),
             }
         }
-
         match cursor.byte()? {
             b'S' => {
                 require_xid(&mut cursor, xid)?;
@@ -78,11 +80,11 @@ pub fn decode_streamed_changes_in_session(
                     return Err(PgoutputError::MessageOrder);
                 }
             }
-            b'c' => break,
+            b'c' if !values.is_empty() => break,
+            b'c' => return Err(PgoutputError::MessageOrder),
             other => return Err(PgoutputError::UnknownMessage(other)),
         }
     }
-
     require_xid(&mut cursor, xid)?;
     let flags = cursor.byte()?;
     let commit_lsn = cursor.u64()?;
@@ -94,32 +96,56 @@ pub fn decode_streamed_changes_in_session(
     if !cursor.finished() {
         return Err(PgoutputError::InvalidIdentity);
     }
-
-    let identity = SourceTransactionId::new(
-        source.source_id,
-        source.slot_generation,
+    let identity = GraphTransactionId::new(
+        graph.graph_id,
+        graph.slot_generation,
         PostgresLsn::from_u64(commit_lsn),
         IngressTransactionId::new(u64::from(xid)).map_err(|_| PgoutputError::InvalidIdentity)?,
     )
     .map_err(|_| PgoutputError::InvalidIdentity)?;
-    let inserts = row_ids
+    let changes = values
         .into_iter()
         .enumerate()
-        .map(|(index, row_id)| {
+        .map(|(index, (source, row))| {
             let sequence = u64::try_from(index)
                 .ok()
                 .and_then(|value| value.checked_add(1))
                 .and_then(|value| InputSequence::new(value).ok())
                 .ok_or(PgoutputError::InvalidIdentity)?;
-            Ok(SourceInsert::new(sequence, row_id))
+            Ok(GraphSourceChange {
+                source_id: source.source_id,
+                change: decoded_change(sequence, row),
+            })
         })
         .collect::<Result<Vec<_>, PgoutputError>>()?;
     let transaction =
-        SourceTransaction::new(identity, inserts).map_err(|_| PgoutputError::TupleValue)?;
-    if relation_in_transaction {
+        GraphTransaction::new(identity, changes).map_err(|_| PgoutputError::TupleValue)?;
+    for source in relation_updates {
         relation_state.mark_validated(source);
     }
     Ok(transaction)
+}
+
+fn decoded_change(sequence: InputSequence, row: DecodedChange) -> SourceChange {
+    match row {
+        DecodedChange::EmptyInsert => SourceChange::Insert(SourceInsert::empty(sequence)),
+        DecodedChange::RowInsert(id, payload) => {
+            SourceChange::Insert(SourceInsert::with_payload(sequence, id, payload))
+        }
+        DecodedChange::CompositeInsert(a, b) => {
+            SourceChange::Insert(SourceInsert::composite(sequence, a, b))
+        }
+        DecodedChange::Update(old, new, payload) => SourceChange::Update(match payload {
+            SourceUpdatePayload::Int8(value) => SourceUpdate::key_change(sequence, old, new, value),
+            SourceUpdatePayload::UnchangedText => SourceUpdate::unchanged_text(sequence, new),
+            SourceUpdatePayload::Text(value) => SourceUpdate::text(sequence, new, value),
+        }),
+        DecodedChange::Delete(source_row_id, source_row_sub_id) => SourceChange::Delete {
+            input_sequence: sequence,
+            source_row_id,
+            source_row_sub_id,
+        },
+    }
 }
 
 fn require_xid(cursor: &mut Cursor<'_>, expected: u32) -> Result<(), PgoutputError> {
@@ -127,4 +153,8 @@ fn require_xid(cursor: &mut Cursor<'_>, expected: u32) -> Result<(), PgoutputErr
         return Err(PgoutputError::InvalidIdentity);
     }
     Ok(())
+}
+fn peek_u32(cursor: &Cursor<'_>) -> Result<u32, PgoutputError> {
+    let mut copy = *cursor;
+    copy.u32()
 }

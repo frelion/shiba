@@ -23,13 +23,15 @@ pub(crate) fn validate_graph(graph: &CanonicalGraph) -> Result<(), GraphError> {
             .sources
             .windows(2)
             .any(|pair| pair[0].source_id >= pair[1].source_id)
-        || graph.sources.len() == 2
-            && graph
-                .sources
+        || graph
+            .sources
+            .iter()
+            .any(|source| source.identity_index.is_none())
+        || graph.sources.iter().enumerate().any(|(index, source)| {
+            graph.sources[index + 1..]
                 .iter()
-                .filter(|source| source.identity_index.is_some())
-                .count()
-                != 1
+                .any(|other| other.identity_index == source.identity_index)
+        })
     {
         return Err(GraphError::InvalidTopology);
     }
@@ -47,7 +49,7 @@ pub(crate) fn validate_graph(graph: &CanonicalGraph) -> Result<(), GraphError> {
         .iter()
         .filter_map(|node| match node.input {
             NodeInput::Node(id) => Some(id),
-            NodeInput::Source | NodeInput::SourcePort(_) => None,
+            NodeInput::SourcePort(_) => None,
         })
         .collect::<BTreeSet<_>>();
     if graph.nodes.iter().any(|node| {
@@ -105,55 +107,21 @@ fn validate_join_topology(graph: &CanonicalGraph) -> Result<(), GraphError> {
 }
 
 fn validate_stateful_topology(graph: &CanonicalGraph) -> Result<(), GraphError> {
-    let aggregates = graph
-        .nodes
-        .iter()
-        .filter(|node| {
-            matches!(
-                node.kind,
-                OperatorNodeKind::GroupedCount { .. } | OperatorNodeKind::GroupedSumInt8 { .. }
-            )
-        })
-        .collect::<Vec<_>>();
-    if aggregates.is_empty() {
-        return Ok(());
-    }
-    if aggregates.len() != 1 {
-        return Err(GraphError::InvalidTopology);
-    }
-    let aggregate = aggregates[0];
-    let aggregate_index = graph
-        .nodes
-        .iter()
-        .position(|node| node.node_id == aggregate.node_id)
-        .ok_or(GraphError::InvalidTopology)?;
-    if aggregate_index == 0 || aggregate_index + 2 != graph.nodes.len() {
-        return Err(GraphError::InvalidTopology);
-    }
-    let key_by = &graph.nodes[aggregate_index - 1];
-    let materialize = &graph.nodes[aggregate_index + 1];
-    if !matches!(key_by.kind, OperatorNodeKind::KeyBy { .. })
-        || aggregate.input != NodeInput::Node(key_by.node_id)
-        || !matches!(materialize.kind, OperatorNodeKind::Materialize { .. })
-        || materialize.input != NodeInput::Node(aggregate.node_id)
-    {
-        return Err(GraphError::InvalidTopology);
-    }
-    for (index, node) in graph.nodes[..aggregate_index].iter().enumerate() {
-        let expected_input = if index == 0 {
-            NodeInput::Source
-        } else {
-            NodeInput::Node(graph.nodes[index - 1].node_id)
+    for aggregate in &graph.nodes {
+        let valid_input = match aggregate.kind {
+            OperatorNodeKind::CountRows | OperatorNodeKind::SumInt8 { .. } => {
+                matches!(aggregate.input, NodeInput::SourcePort(_))
+            }
+            OperatorNodeKind::GroupedCount { .. } | OperatorNodeKind::GroupedSumInt8 { .. } => {
+                matches!(aggregate.input, NodeInput::Node(id) if graph.nodes.iter().any(|node| node.node_id == id && matches!(node.kind, OperatorNodeKind::KeyBy { .. })))
+            }
+            _ => continue,
         };
-        if node.input != expected_input
-            || !matches!(
-                node.kind,
-                OperatorNodeKind::Filter { .. }
-                    | OperatorNodeKind::Project { .. }
-                    | OperatorNodeKind::Compute { .. }
-                    | OperatorNodeKind::KeyBy { .. }
-            )
-        {
+        let materialized = graph.nodes.iter().any(|node| {
+            node.input == NodeInput::Node(aggregate.node_id)
+                && matches!(node.kind, OperatorNodeKind::Materialize { .. })
+        });
+        if !valid_input || !materialized {
             return Err(GraphError::InvalidTopology);
         }
     }
@@ -165,6 +133,13 @@ pub(crate) fn layout_graph(
 ) -> Result<(TypedLayout, BTreeMap<NodeId, TypedLayout>), GraphError> {
     let primary = graph.sources.first().ok_or(GraphError::InvalidTopology)?;
     let source = source_typed_layout(primary.source_id, &primary.layout)?;
+    let source_layouts = graph
+        .sources
+        .iter()
+        .map(|port| {
+            source_typed_layout(port.source_id, &port.layout).map(|layout| (port.source_id, layout))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     let mut layouts = BTreeMap::new();
     let mut previous = None;
     for node in &graph.nodes {
@@ -174,7 +149,9 @@ pub(crate) fn layout_graph(
         previous = Some(node.node_id);
         let stateful = matches!(
             node.kind,
-            OperatorNodeKind::GroupedCount { .. }
+            OperatorNodeKind::CountRows
+                | OperatorNodeKind::SumInt8 { .. }
+                | OperatorNodeKind::GroupedCount { .. }
                 | OperatorNodeKind::GroupedSumInt8 { .. }
                 | OperatorNodeKind::InnerJoin { .. }
         );
@@ -186,13 +163,9 @@ pub(crate) fn layout_graph(
             return Err(GraphError::InvalidStateContract);
         }
         let input = match node.input {
-            NodeInput::Source => &source,
-            NodeInput::SourcePort(source_id)
-                if graph.sources.iter().any(|port| port.source_id == source_id) =>
-            {
-                &source
-            }
-            NodeInput::SourcePort(_) => return Err(GraphError::InvalidTopology),
+            NodeInput::SourcePort(source_id) => source_layouts
+                .get(&source_id)
+                .ok_or(GraphError::InvalidTopology)?,
             NodeInput::Node(id) => layouts.get(&id).ok_or(GraphError::InvalidTopology)?,
         };
         let node_types = if let OperatorNodeKind::InnerJoin {
@@ -251,6 +224,20 @@ fn node_output_types(
     input: &TypedLayout,
 ) -> Result<Option<Vec<ValueType>>, GraphError> {
     Ok(match &node.kind {
+        OperatorNodeKind::CountRows => {
+            if node.state_contract.is_none() {
+                return Err(GraphError::InvalidStateContract);
+            }
+            Some(vec![ValueType::Int8])
+        }
+        OperatorNodeKind::SumInt8 { input_slot } => {
+            if node.state_contract.is_none()
+                || input.value_types.get(usize::from(*input_slot)) != Some(&ValueType::Int8)
+            {
+                return Err(GraphError::WrongType);
+            }
+            Some(vec![ValueType::Int8])
+        }
         OperatorNodeKind::Filter { predicate } if predicate.validate(input)? == ValueType::Bool => {
             Some(input.value_types.clone())
         }
@@ -298,18 +285,22 @@ fn node_output_types(
             value_slot,
             output,
         } => {
-            if input.value_types.get(usize::from(*key_slot)) != Some(&ValueType::Int8)
-                || input.value_types.get(usize::from(*value_slot)) != Some(&ValueType::Int8)
-                || !matches!(
-                    output,
-                    OutputContract::KeyedRows {
-                        key_type: ValueType::Int8,
-                        key_nullable: _,
-                        value_type: ValueType::Int8,
-                        nullable: _
-                    }
-                )
-            {
+            let valid = match output {
+                OutputContract::Scalar {
+                    value_type: ValueType::Int8,
+                } => input.value_types.get(usize::from(*value_slot)) == Some(&ValueType::Int8),
+                OutputContract::KeyedRows {
+                    key_type: ValueType::Int8,
+                    key_nullable: _,
+                    value_type: ValueType::Int8,
+                    nullable: _,
+                } => {
+                    input.value_types.get(usize::from(*key_slot)) == Some(&ValueType::Int8)
+                        && input.value_types.get(usize::from(*value_slot)) == Some(&ValueType::Int8)
+                }
+                _ => false,
+            };
+            if !valid {
                 return Err(GraphError::WrongType);
             }
             None
