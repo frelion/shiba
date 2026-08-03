@@ -1,5 +1,14 @@
 # Transaction and recovery contract
 
+M13 preserves this recovery boundary while replacing operator internals. One
+EffectBatch and all opaque state/typed scalar/keyed transitions remain inside
+the processor transaction; continuation is still last and ACK still requires
+durable Apply or exact replay. A codec, plan, arithmetic, output-bound or keyed
+sink failure aborts source rows, every operator state/result and continuation.
+Rebuild recovery reads only the target plan-set digest installed at destructive
+prepare; it cannot reconstruct plans by concrete kind, fixed ID or column
+position.
+
 ## Proven transaction owners
 
 PostgreSQL's `CREATE EXTENSION` transaction still owns installation: either the

@@ -1,5 +1,27 @@
 # Catalog contract
 
+## M13 generic operator authority (frozen, pending M13.3 cutover)
+
+M13 replaces the aggregate-specific layout rather than migrating or mirroring
+it. The sole definition authority will contain the strict declaration,
+canonical compiled-plan payload, format version, digest, state contract and
+output contract. Ordered exact ObjectAddress input bindings are children of
+that same definition and are written only by `compile_and_register`; they are
+not a second plan authority. Concrete operator names are not SQL constraints.
+
+Runtime remains the only state/result writer. State is an opaque versioned
+payload. Results have a generic visibility/header plus either one typed scalar
+payload or operator-owned keyed rows. Public scalar/keyed surfaces expose only
+active results. Registration and rebuild initialization call the same generic
+Runtime writer; Catalog SQL must not infer a concrete zero, patch an input by
+kind, or reset state independently.
+
+At M12 destructive prepare, the registration/compiler writer installs the
+complete target plan set and digest in the same transaction that makes the
+target the sole building authority. Recovery validates that durable set;
+activation only publishes the same set. There is no candidate table,
+compatibility view, dual write or recovery-time kind reconstruction.
+
 ## Installation authority
 
 The catalog extension installs one constrained row containing catalog and

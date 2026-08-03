@@ -158,6 +158,11 @@ switch. M12.2--M12.6 implement and prove that production rebuild path on
 PG17.10/PG18.4, including recovery, governance, least privilege, bounded
 million-row performance, and the complete release matrix.
 
+M13.1 freezes the next replacement boundary: a canonical compiled plan, opaque
+state codec, typed scalar/keyed transition and generic Result Sink. Concrete
+operator dispatch is confined to the database-free Operator crate. Runtime,
+Ingress, Bootstrap and Rebuild will consume only an ordered durable plan set.
+
 **Not proved.** M10 production receiver/restart and slot lifecycle are proved, but
 persisted partial-stream recovery is intentionally absent, as are
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
@@ -168,7 +173,7 @@ change, production transport scheduling/backpressure or transport memory,
 multi-source contention/tail latency, sustained throughput, or heap evidence;
 the M12 production rebuild lifecycle, SQL frontend, non-aggregate operators, external
 effect, compatibility path, alias, fallback,
-or dual write.
+or dual write. M13 has frozen but not yet implemented the non-aggregate kernel.
 
 Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),
 [catalog contract](CATALOG_CONTRACT.md), the
@@ -183,4 +188,6 @@ Ingress work must also follow the
 [pgoutput contract](PGOUTPUT_CONTRACT.md).
 Nullable tuple work is bounded by the [tuple contract](TUPLE_CONTRACT.md).
 Compiler, EffectBatch, Operator, and sink work must follow the
-[operator contract](OPERATOR_CONTRACT.md).
+[operator contract](OPERATOR_CONTRACT.md) and the
+[M13 Operator Kernel contract](OPERATOR_KERNEL_CONTRACT.md). The design
+decision is recorded in [ADR 0004](adr/0004-m13-generic-operator-kernel.md).

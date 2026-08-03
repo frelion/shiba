@@ -1,5 +1,7 @@
 # V2 goal gap after M12
 
+## M13.1 contract status
+
 M1–M9 are the reference correctness kernel, not a complete Shiba V2. They
 prove the transaction and recovery semantics that later architecture must
 preserve while replacing the fixed count path with explicit compiler,
@@ -16,6 +18,10 @@ operator, effect, and sink contracts.
 | Runtime | Replay/recovery plus ordered registered-operator execution integrated with M10 ingress | Broader operators and production orchestration |
 | Operator | Database-free CountRows/SumInt8 contract; both integrated atomically | Add non-aggregate kinds |
 | Result Sink | Operator-keyed private state and public result | Non-bigint result shapes |
+
+M13.1 has frozen, but not yet implemented, the generic plan/state/transition
+and scalar/keyed sink contract. M13 is not complete until CountRows, SumInt8
+and ProjectRows use that sole path through live ingress, bootstrap and rebuild.
 
 ## Proven reference boundary
 

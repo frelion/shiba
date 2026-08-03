@@ -1,5 +1,12 @@
 # Architecture boundary
 
+M13.1 freezes the generic execution successor to the M9 aggregate-shaped API.
+See [OPERATOR_KERNEL_CONTRACT.md](OPERATOR_KERNEL_CONTRACT.md): concrete plan
+dispatch is confined to `shiba-operator`; Runtime owns the PostgreSQL
+transaction and generic sink only; Ingress/Bootstrap/Rebuild consume an ordered
+durable plan set without kind, ID or cardinality assumptions. M13.2--M13.4 must
+replace the old path atomically rather than preserve an adapter.
+
 ## Direction
 
 The intended dependency line is:

@@ -1,5 +1,20 @@
 # Testing strategy
 
+## M13 frozen gates
+
+M13.1 records the pre-change five-run medians in
+`OPERATOR_KERNEL_CONTRACT.md`. PG17/PG18 Apply medians are 768.727625 and
+770.174125 ms, so the unchanged-scenario 15% regression ceilings are
+884.036769 and 885.700244 ms. Existing absolute decode, Apply, replay,
+bootstrap, ingress, rebuild, RSS and retained-WAL limits remain in force.
+
+M13.2 adds pure codec/model/randomized gates. M13.3 adds full scalar/keyed SQL
+differential and transaction rollback. M13.4 re-runs M10--M12 with zero
+operator-kind/fixed-ID knowledge outside compiler/operator tests. M13.5 enrolls
+all new scripts in the one-click PG17.10/PG18.4 release matrix and runs the
+forbidden-specialization scan. ProjectRows must compare every key and nullable
+value with an independent SQL oracle; a count or digest alone is insufficient.
+
 ## Milestone gates
 
 Run from `/Users/zzhang/Documents/Shiba-v2-cleanroom`:
