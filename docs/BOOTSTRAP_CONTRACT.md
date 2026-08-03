@@ -266,5 +266,24 @@ Activation only promotes that same target authority from building to active
 and publishes its complete private state. There is no candidate binding,
 second bootstrap implementation, parallel generation, birth marker, alias or
 fallback. The full closed transition and residual physical-slot risk are in
-[the M12 rebuild contract](REBUILD_CONTRACT.md). M12.1 documents and tests the
-contract only; production rebuild is not yet proved.
+[the M12 rebuild contract](REBUILD_CONTRACT.md). M12.1 freezes the contract;
+M12.2 proves the exact admission/retirement transaction, but a production
+snapshot-to-live rebuild is not yet proved.
+
+## M12.2 handoff into the bootstrap lifecycle
+
+M12.2 reuses the sole `source_bootstrap` row and adds the closed
+`rebuild_prepared` state. A successful prepare has already installed the target
+BootstrapId, binding, publication, slot name and generation as the only catalog
+authority, while preserving the exact retired old BootstrapId/slot/generation
+for forward reconciliation. Public results are `building/NULL`, old current
+rows and continuation are absent, operator private state is zero, and old
+invalidations are retired in the same Apply transaction.
+
+No exported snapshot exists at this phase. The old inactive physical slot is
+still present and the named target physical slot is absent. M12.3 must first
+reconcile those exact slot coordinates, then invoke the existing M11
+reservation/exported-snapshot scanner and its bounded batches. It may not reset
+to the old authority or synthesize snapshot/WAL identity. The target identity-
+index OID is validated explicitly but does not add a bootstrap checkpoint or
+source-binding row.

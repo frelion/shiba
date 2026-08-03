@@ -1,6 +1,23 @@
 use crate::{IngressError, feedback::FeedbackState, tokens::EmptyCommitted};
 
 #[test]
+fn applied_and_aborted_feedback_require_exact_receiver_authorization() {
+    let mut feedback = FeedbackState::new(10);
+    feedback.mark_applied(20, 7);
+    assert!(feedback.require_applied(20, 8).is_err());
+    feedback
+        .require_applied(20, 7)
+        .expect("exact applied token");
+    feedback.complete(20);
+
+    feedback.mark_aborted(30, 7);
+    assert!(feedback.require_aborted(30, 8).is_err());
+    feedback
+        .require_aborted(30, 7)
+        .expect("exact aborted token");
+}
+
+#[test]
 fn empty_feedback_requires_exact_receiver_authorization() {
     let mut feedback = FeedbackState::new(10);
     feedback.mark_empty(20, 7);

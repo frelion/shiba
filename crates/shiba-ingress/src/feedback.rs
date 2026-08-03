@@ -2,9 +2,9 @@ use crate::IngressError;
 
 #[derive(Clone, Copy)]
 enum PendingFeedback {
-    Applied(u64),
+    Applied { lsn: u64, authorization: u64 },
     Empty { lsn: u64, authorization: u64 },
-    Aborted(u64),
+    Aborted { lsn: u64, authorization: u64 },
     Fence { lsn: u64, authorization: u64 },
 }
 
@@ -30,9 +30,9 @@ impl FeedbackState {
     pub(crate) const fn pending_lsn(&self) -> Option<u64> {
         match self.pending {
             Some(
-                PendingFeedback::Applied(lsn)
+                PendingFeedback::Applied { lsn, .. }
                 | PendingFeedback::Empty { lsn, .. }
-                | PendingFeedback::Aborted(lsn)
+                | PendingFeedback::Aborted { lsn, .. }
                 | PendingFeedback::Fence { lsn, .. },
             ) => Some(lsn),
             None => None,
@@ -43,26 +43,30 @@ impl FeedbackState {
         self.pending.is_some()
     }
 
-    pub(crate) fn mark_applied(&mut self, lsn: u64) {
-        self.pending = Some(PendingFeedback::Applied(lsn));
+    pub(crate) fn mark_applied(&mut self, lsn: u64, authorization: u64) {
+        self.pending = Some(PendingFeedback::Applied { lsn, authorization });
     }
 
     pub(crate) fn mark_empty(&mut self, lsn: u64, authorization: u64) {
         self.pending = Some(PendingFeedback::Empty { lsn, authorization });
     }
 
-    pub(crate) fn mark_aborted(&mut self, lsn: u64) {
-        self.pending = Some(PendingFeedback::Aborted(lsn));
+    pub(crate) fn mark_aborted(&mut self, lsn: u64, authorization: u64) {
+        self.pending = Some(PendingFeedback::Aborted { lsn, authorization });
     }
 
     pub(crate) fn mark_fence(&mut self, lsn: u64, authorization: u64) {
         self.pending = Some(PendingFeedback::Fence { lsn, authorization });
     }
 
-    pub(crate) fn require_applied(&self, lsn: u64) -> Result<(), IngressError> {
-        matches!(self.pending, Some(PendingFeedback::Applied(value)) if value == lsn)
-            .then_some(())
-            .ok_or(IngressError::FeedbackMismatch)
+    pub(crate) fn require_applied(&self, lsn: u64, authorization: u64) -> Result<(), IngressError> {
+        matches!(
+            self.pending,
+            Some(PendingFeedback::Applied { lsn: value, authorization: expected })
+                if value == lsn && expected == authorization
+        )
+        .then_some(())
+        .ok_or(IngressError::FeedbackMismatch)
     }
 
     pub(crate) fn require_empty(&self, lsn: u64, authorization: u64) -> Result<(), IngressError> {
@@ -75,10 +79,14 @@ impl FeedbackState {
         .ok_or(IngressError::FeedbackMismatch)
     }
 
-    pub(crate) fn require_aborted(&self, lsn: u64) -> Result<(), IngressError> {
-        matches!(self.pending, Some(PendingFeedback::Aborted(value)) if value == lsn)
-            .then_some(())
-            .ok_or(IngressError::FeedbackMismatch)
+    pub(crate) fn require_aborted(&self, lsn: u64, authorization: u64) -> Result<(), IngressError> {
+        matches!(
+            self.pending,
+            Some(PendingFeedback::Aborted { lsn: value, authorization: expected })
+                if value == lsn && expected == authorization
+        )
+        .then_some(())
+        .ok_or(IngressError::FeedbackMismatch)
     }
 
     pub(crate) fn require_fence(&self, lsn: u64, authorization: u64) -> Result<(), IngressError> {

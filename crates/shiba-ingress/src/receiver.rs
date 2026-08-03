@@ -6,7 +6,7 @@ use shiba_runtime::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
-static NEXT_EMPTY_AUTHORIZATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_RECEIVER_AUTHORIZATION: AtomicU64 = AtomicU64::new(1);
 
 use crate::{
     CommittedAssembler, IngressError, ReplicationMode, ReplicationTransport, ShutdownHandle,
@@ -29,7 +29,7 @@ pub(crate) struct SourceReceiver {
     pub(super) transport: ReplicationTransport,
     pub(super) assembly: Assembly,
     pub(super) feedback: FeedbackState,
-    empty_authorization: u64,
+    authorization: u64,
     relation_state: PgoutputRelationState,
     outstanding_lsn: Option<u64>,
     failed: bool,
@@ -68,7 +68,7 @@ impl SourceReceiver {
         last_acknowledged_lsn: u64,
         messages: bool,
     ) -> Result<Self, IngressError> {
-        let empty_authorization = NEXT_EMPTY_AUTHORIZATION
+        let authorization = NEXT_RECEIVER_AUTHORIZATION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
@@ -83,7 +83,7 @@ impl SourceReceiver {
             transport,
             assembly,
             feedback: FeedbackState::new(last_acknowledged_lsn),
-            empty_authorization,
+            authorization,
             relation_state: PgoutputRelationState::new(),
             outstanding_lsn: None,
             failed: false,
@@ -109,14 +109,13 @@ impl SourceReceiver {
                 if fence.end_lsn != assembled.end_lsn {
                     return Err(IngressError::FeedbackMismatch);
                 }
-                self.feedback
-                    .mark_fence(fence.end_lsn, self.empty_authorization);
+                self.feedback.mark_fence(fence.end_lsn, self.authorization);
                 return Ok(BootstrapInput::Fence(BootstrapFence::new(
                     source_id,
                     bootstrap_id,
                     fence.message_lsn,
                     fence.end_lsn,
-                    self.empty_authorization,
+                    self.authorization,
                 )));
             }
             let transaction = decode_committed_changes_in_session(
@@ -200,7 +199,10 @@ impl SourceReceiver {
         if self.failed {
             return Err(IngressError::ReceiverFailed);
         }
-        if self.outstanding_lsn != Some(input.end_lsn()) || self.feedback.has_pending() {
+        if self.outstanding_lsn != Some(input.end_lsn())
+            || input.authorization() != self.authorization
+            || self.feedback.has_pending()
+        {
             return Err(IngressError::FeedbackMismatch);
         }
         let outcome = match process(apply, input.raw_transaction()) {
@@ -211,8 +213,13 @@ impl SourceReceiver {
             }
         };
         self.outstanding_lsn = None;
-        self.feedback.mark_applied(input.end_lsn());
-        Ok(DurableTransaction::new(outcome, input.end_lsn()))
+        self.feedback
+            .mark_applied(input.end_lsn(), self.authorization);
+        Ok(DurableTransaction::new(
+            outcome,
+            input.end_lsn(),
+            self.authorization,
+        ))
     }
 
     /// Acknowledges one exact durably applied transaction.
@@ -226,7 +233,8 @@ impl SourceReceiver {
         if self.outstanding_lsn.is_some() {
             return Err(IngressError::FeedbackMismatch);
         }
-        self.feedback.require_applied(token.end_lsn())?;
+        self.feedback
+            .require_applied(token.end_lsn(), token.authorization())?;
         self.send_ack(token.end_lsn())
     }
 
@@ -241,7 +249,8 @@ impl SourceReceiver {
         if self.outstanding_lsn.is_some() {
             return Err(IngressError::FeedbackMismatch);
         }
-        self.feedback.require_aborted(token.acknowledgment_lsn())?;
+        self.feedback
+            .require_aborted(token.acknowledgment_lsn(), token.authorization())?;
         self.send_ack(token.acknowledgment_lsn())
     }
 
@@ -306,19 +315,21 @@ impl SourceReceiver {
                 end_lsn,
                 segment_count,
             } => {
-                self.feedback.mark_empty(end_lsn, self.empty_authorization);
+                self.feedback.mark_empty(end_lsn, self.authorization);
                 Ok(StreamedInput::EmptyCommitted(EmptyCommitted::new(
                     xid,
                     commit_lsn,
                     end_lsn,
                     segment_count,
-                    self.empty_authorization,
+                    self.authorization,
                 )))
             }
             StreamTerminal::Aborted { acknowledgment_lsn } => {
-                self.feedback.mark_aborted(acknowledgment_lsn);
+                self.feedback
+                    .mark_aborted(acknowledgment_lsn, self.authorization);
                 Ok(StreamedInput::Aborted(AbortedTransaction::new(
                     acknowledgment_lsn,
+                    self.authorization,
                 )))
             }
         }
@@ -326,7 +337,7 @@ impl SourceReceiver {
 
     fn set_outstanding(&mut self, transaction: SourceTransaction, end_lsn: u64) -> ReceivedInput {
         self.outstanding_lsn = Some(end_lsn);
-        ReceivedInput::new(transaction, end_lsn)
+        ReceivedInput::new(transaction, end_lsn, self.authorization)
     }
 
     fn send_ack(&mut self, lsn: u64) -> Result<(), IngressError> {

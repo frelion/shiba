@@ -8,7 +8,7 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap checkpoint/lifecycle, and PG17/18-proved exact pre-scan replacement writer | M12.1 freezes non-pristine rebuild authority; production M12.2--M12.6 remain |
+| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap lifecycle, and PG17/18-proved exact M12.2 active-source destructive admission | M12.3 slot/snapshot progression, crash/DDL/role matrix and final release gate remain |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
 | Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
@@ -28,7 +28,7 @@ has been removed.
 
 ## Still unproved
 
-Non-pristine source binding rebuild, SQL frontend, non-aggregate operators,
+Completed active-source rebuild data flow, SQL frontend, non-aggregate operators,
 non-bigint result shapes, cross-host sustained soak, empirical heap peak, and
 contention tail latency remain outside the proved boundary.
 
@@ -59,8 +59,15 @@ M11 is complete at its pristine nullable-int8 CountRows/SumInt8 scope. V2 is
 not complete. M12.1 freezes an offline rebuild: target identity becomes sole
 building authority at destructive prepare, old computation is retired, and
 activation promotes the same authority. It adds no candidate or parallel path.
-The production transaction, rebuild data path, recovery/DDL/role matrix and
-performance remain M12.2--M12.6 work.
+M12.2 now proves the production admission transaction: all preflight failures
+preserve old active authority, exact-old CAS installs target as the sole
+`rebuild_prepared` building authority, results become `building/NULL`, old
+rows/continuation/invalidations retire and private state resets to zero. The
+old inactive slot remains and the target slot is absent for forward recovery.
+The identity-index OID is an explicit CAS coordinate, not another binding row,
+and receiver-local token capability prevents a foreign old receiver from
+authorizing Apply/ACK. The snapshot-to-live data path, full recovery/DDL/role
+matrix and performance remain M12.3--M12.6 work.
 
 M10.3 deliberately does not add persisted partial-stream recovery: partial
 stream bytes are volatile and PostgreSQL's replication slot replays them after

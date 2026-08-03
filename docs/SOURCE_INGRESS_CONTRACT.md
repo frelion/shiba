@@ -406,5 +406,33 @@ name, lifecycle or generation mismatch. It never adopts or repairs a slot by
 name. PostgreSQL cannot reveal a same-name/same-shape replacement performed by
 a superuser or holder of the trusted `REPLICATION` credential. Credential
 exclusivity and no external slot DDL are deployment prerequisites, not a
-per-slot ACL proof. M12.1 defines these rules; production ingress enforcement
-is pending M12.2--M12.6.
+per-slot ACL proof. M12.1 defines these rules; M12.2 now enforces the admission
+and destructive catalog boundary, while M12.3--M12.6 retain the slot/data-path
+and recovery obligations.
+
+## M12.2 rebuild admission ingress
+
+`PreparedRebuild::prepare` accepts only explicit old and target BootstrapId,
+relation OID, identity-index OID, publication OID, slot name and generation,
+plus the exact CountRows/SumInt8 plan. It acquires normal per-source ownership,
+keeps the old slot inactive, validates replication/apply database agreement,
+and performs relation, publication, replica-identity, operator, permission and
+target-slot preflight before destructive SQL. It never guesses an object from
+its name, adopts a slot, or creates a candidate config.
+
+On commit the target config is the only ingress config but is not execution
+eligible: phase `rebuild_prepared` forbids ordinary M10 attach/receive/Apply/
+ACK. The old inactive slot remains for the M12.3 retirement step; the target
+slot is still absent. M11 scanner and Runtime can later resolve only the target
+authority. The default bigint primary-key index OID travels as an exact CAS
+coordinate even though the durable binding set remains relation plus two
+columns.
+
+All received terminal tokens also include a private authorization minted by
+their receiver instance. Apply and feedback reject a stale/foreign receiver's
+token before it can exploit an equal LSN. This is volatile capability checking,
+not a stored cursor, generation, continuation or slot identity; catalog
+lifecycle/generation validation remains mandatory. PG17.10 and PG18.4 pass the
+real active-source admission gate. M12.3 must still retire the exact old slot,
+create the exact new slot with `EXPORT_SNAPSHOT`, and drive the existing M11/
+M10 path.

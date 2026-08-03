@@ -275,6 +275,37 @@ if "M12.1" not in manifest or "test-m12-rebuild-contract.sh" not in manifest:
     raise SystemExit("REUSE_MANIFEST must record the M12.1 failure-first evidence")
 PY
 
+# M12.2 admits one exact active authority into the same forward-only lifecycle.
+# Slot retirement and target-slot creation remain outside this slice.
+python3 - <<'PY'
+import pathlib
+
+sql = "\n".join(
+    pathlib.Path(path).read_text().lower()
+    for path in (
+        "sql/v2/014_source_rebuild.sql",
+        "sql/v2/015_source_rebuild_preflight.sql",
+        "sql/v2/016_source_rebuild_current.sql",
+        "sql/v2/017_source_rebuild_prepare.sql",
+    )
+)
+for required in (
+    "rebuild_prepared", "retired_bootstrap_id", "retired_slot_name",
+    "retired_slot_generation", "prepare_source_rebuild",
+    "result_status = 'building'", "value_bigint = null",
+    "shiba_internal.source_ingress_bound_source",
+    "shiba_internal.source_bootstrap_exact_ingress",
+):
+    if required not in sql:
+        raise SystemExit(f"M12.2 admission SQL is missing: {required}")
+if "create table" in sql:
+    raise SystemExit("M12.2 must reuse the existing lifecycle and authority tables")
+
+manifest = pathlib.Path("docs/contracts/REUSE_MANIFEST.md").read_text()
+if "M12.2" not in manifest or "test-m12-rebuild-admission.sh" not in manifest:
+    raise SystemExit("REUSE_MANIFEST must record the M12.2 PG17/18 admission evidence")
+PY
+
 if rg -n -i \
   'create table[^;]*(source_rebuild|rebuild_(intent|log|state)|wal_spool|effect_log)|create table[^;]*candidate_(binding|config)|source_continuation_v2' \
   sql/v2; then

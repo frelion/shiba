@@ -79,6 +79,30 @@
     requires = ["source_bootstrap_reservation"]
 );
 
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/014_source_rebuild.sql",
+    name = "source_rebuild",
+    requires = ["source_bootstrap_replacement"]
+);
+
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/015_source_rebuild_preflight.sql",
+    name = "source_rebuild_preflight",
+    requires = ["source_rebuild"]
+);
+
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/016_source_rebuild_current.sql",
+    name = "source_rebuild_current",
+    requires = ["source_rebuild_preflight"]
+);
+
+::pgrx::extension_sql_file!(
+    "../../../sql/v2/017_source_rebuild_prepare.sql",
+    name = "source_rebuild_prepare",
+    requires = ["source_rebuild_current"]
+);
+
 #[cfg(test)]
 mod tests {
     const CATALOG_SQL: &str = include_str!("../../../sql/v2/001_catalog_identity.sql");
@@ -98,6 +122,10 @@ mod tests {
         include_str!("../../../sql/v2/012_source_bootstrap_reservation.sql");
     const M11_REPLACEMENT_SQL: &str =
         include_str!("../../../sql/v2/013_source_bootstrap_replacement.sql");
+    const M12_REBUILD_SQL: &str = include_str!("../../../sql/v2/014_source_rebuild.sql");
+    const M12_TARGET_SQL: &str = include_str!("../../../sql/v2/015_source_rebuild_preflight.sql");
+    const M12_CURRENT_SQL: &str = include_str!("../../../sql/v2/016_source_rebuild_current.sql");
+    const M12_PREPARE_SQL: &str = include_str!("../../../sql/v2/017_source_rebuild_prepare.sql");
 
     fn normalized_sql() -> String {
         CATALOG_SQL.to_ascii_lowercase()
@@ -494,5 +522,83 @@ mod tests {
                 "forbidden recovery authority: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn m12_reuses_one_bootstrap_authority_with_schema_level_generation_cas() {
+        let sql = M12_REBUILD_SQL.to_ascii_lowercase();
+        assert_eq!(sql.matches("create table ").count(), 0);
+        for required in [
+            "'rebuild_prepared'",
+            "retired_bootstrap_id bigint",
+            "retired_slot_name name",
+            "retired_slot_generation bigint",
+            "bootstrap_id <> retired_bootstrap_id",
+            "slot_name <> retired_slot_name",
+            "slot_generation = retired_slot_generation + 1",
+            "deferrable initially immediate",
+        ] {
+            assert!(sql.contains(required), "missing rebuild schema: {required}");
+        }
+        for forbidden in ["create table", "slot_birth", "candidate", "fallback"] {
+            assert!(
+                !sql.contains(forbidden),
+                "forbidden rebuild authority: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn m12_prepare_is_preflighted_exact_and_destructive_only_after_cas() {
+        let target = M12_TARGET_SQL.to_ascii_lowercase();
+        let current = M12_CURRENT_SQL.to_ascii_lowercase();
+        let prepare = M12_PREPARE_SQL.to_ascii_lowercase();
+        for required in [
+            "has_table_privilege",
+            "relation.relreplident = 'd'",
+            "identity.indisprimary and identity.indisunique",
+            "target rebuild slot must be absent",
+            "publication.pubinsert and publication.pubupdate",
+            "not publication.pubtruncate",
+            "return next",
+        ] {
+            assert!(
+                target.contains(required),
+                "missing target preflight: {required}"
+            );
+        }
+        assert!(!current.contains("current_validation."));
+        for required in [
+            "bootstrap.phase = 'active'",
+            "target_generation <> expected_old_generation + 1",
+            "'-9223372036854775808'::bigint + requested_source_id",
+            "not slot.active and not slot.two_phase",
+            "not slot.failover and not slot.synced",
+            "stale source binding identity",
+            "old_identity.indisprimary and old_identity.indisunique",
+            "stale operator plan identity",
+            "return next",
+        ] {
+            assert!(current.contains(required), "missing old CAS: {required}");
+        }
+        for required in [
+            "set constraints shiba_internal.source_ingress_bound_source",
+            "shiba_internal.source_bootstrap_exact_ingress deferred",
+            "delete from shiba_internal.source_continuation",
+            "delete from shiba_internal.source_row_state",
+            "delete from shiba_internal.source_binding",
+            "set result_status = 'building', value_bigint = null",
+            "phase = 'rebuild_prepared'",
+            "retired_bootstrap_id = expected_old_bootstrap_id",
+        ] {
+            assert!(
+                prepare.contains(required),
+                "missing prepare mutation: {required}"
+            );
+        }
+        assert!(!format!("{target}{current}{prepare}").contains("pg_drop_replication_slot"));
+        assert!(
+            !format!("{target}{current}{prepare}").contains("pg_create_logical_replication_slot")
+        );
     }
 }

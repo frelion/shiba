@@ -369,4 +369,36 @@ a trusted control-plane capability, and an identical privileged external slot
 replacement is an explicit residual risk outside the M12 correctness threat
 model. See [the rebuild contract](REBUILD_CONTRACT.md) and
 [ADR 0003](adr/0003-m12-offline-rebuild.md). M12.1 freezes this architecture;
-M12.2--M12.6 have not yet implemented or proved it.
+M12.2 now proves the destructive admission boundary; M12.3--M12.6 have not
+yet proved snapshot-to-live recovery, the full crash/DDL/role matrix, or
+performance.
+
+## M12.2 destructive admission architecture
+
+`PreparedRebuild::prepare` owns the admission orchestration. It takes the same
+per-source advisory ownership as live/bootstrap work, opens a short Apply
+transaction, locks and resolves the explicitly supplied target relation, and
+invokes the sole catalog writer with exact old and target coordinates. All
+target shape, publication, permission and slot-name checks precede mutation.
+Any failure therefore leaves the old active binding/config/generation, public
+result, rows, state, continuation and invalidations unchanged.
+
+The writer's commit changes the existing authority in place: target
+binding/config/generation and BootstrapId are the only catalog identity,
+`source_bootstrap.phase` is `rebuild_prepared`, results are `building/NULL`,
+current rows and continuation are gone, private operator states are zero, and
+old-generation invalidations are retired. The old inactive physical slot is
+deliberately retained and the target slot remains absent; their ordered,
+recoverable transport cleanup/creation belongs to M12.3. The default single-
+column bigint primary-key index OID is an explicit admission/CAS coordinate,
+not another durable binding row: `source_binding` remains exactly relation plus
+the two live columns.
+
+Receiver terminal capabilities now carry an unforgeable, process-local
+receiver authorization. A token from an old or foreign receiver fails even if
+its LSN happens to match; durable generation/lifecycle checks remain the
+catalog defense. This is no cursor authority and creates no durable state.
+PG17.10 and PG18.4 pass `scripts/test-m12-rebuild-admission.sh`, including
+invalid shape/permission/stale identity/active or preoccupied slot/foreign
+binding/mixed-plan rollback, single-winner concurrency and the exact successful
+building state.

@@ -237,5 +237,36 @@ same-name/same-shape replacement. This is a documented deployment assumption
 and residual risk, not a database-enforced invariant. M12 adds no slot-birth
 marker, parallel candidate authority, alias, fallback or dual write.
 
-M12.1 is a contract and failure-first-test slice. The SQL writer and production
-state transitions are not accepted until M12.2 and later PG17/18 gates.
+M12.1 is the frozen contract. M12.2 accepts the destructive writer and
+production admission transition on PG17.10 and PG18.4; later data-path and
+recovery claims still require M12.3--M12.6.
+
+## M12.2 admitted rebuild state
+
+The existing `source_bootstrap` row is still the sole lifecycle authority.
+M12.2 adds `rebuild_prepared` plus the exact retired BootstrapId/slot/generation
+coordinates needed for the next forward recovery action; it adds no candidate
+table or second checkpoint. The sole SECURITY DEFINER prepare writer first
+validates and locks the exact active bootstrap, ingress config, relation,
+publication, operators, states and results. It also verifies the target's
+ordinary two-column nullable-bigint shape, single-column bigint primary-key
+replica identity, exact single-table publication semantics, caller `SELECT`
+permission and absent target slot. Permission is checked for `session_user`,
+not the definer identity.
+
+After exact-old CAS succeeds, one transaction replaces the old relation and
+two column binding rows with the target relation and two columns, installs the
+target publication/slot/generation, rebinds SumInt8 to target column sub-ID 2,
+deletes current rows and the WAL continuation, resets both operator states to
+zero, clears old source/ingress invalidations, publishes `building/NULL`, and
+marks the same lifecycle `rebuild_prepared`. The identity-index OID is an
+explicit old/target validation and CAS coordinate, not a fourth
+`source_binding` row; the durable binding set remains relation plus two
+columns. Deferred exact-ingress constraints permit this one atomic replacement
+without exposing an intermediate authority.
+
+The old inactive physical slot still exists and the target physical slot does
+not. Catalog SQL neither drops nor creates either slot. PG17.10/PG18.4 prove
+that every failed preflight/CAS leaves an exact authority snapshot unchanged,
+two concurrent preparations have one winner, and success exposes only the
+state above. Snapshot creation, slot retirement and forward resume are M12.3.

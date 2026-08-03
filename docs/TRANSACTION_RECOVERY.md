@@ -471,5 +471,29 @@ No second continuation or durable effect log participates.
 PostgreSQL 17/18 cannot distinguish an identical slot replacement by a trusted
 privileged actor. The `REPLICATION` credential is a control-plane capability,
 and its compromise or external slot DDL is outside this correctness model. M12
-does not claim database ACL enforcement or add a slot-birth marker. M12.1 has
-not yet proved the production crash matrix; that begins in M12.2.
+does not claim database ACL enforcement or add a slot-birth marker. M12.2 now
+proves the admission transaction and rollback boundary; instruction-level slot,
+snapshot, catch-up and activation recovery remains M12.3--M12.4.
+
+## M12.2 prepare rollback and forward state
+
+PG17.10 and PG18.4 prove that invalid target shape or permission, stale old
+BootstrapId/generation, active old slot, occupied target slot, foreign target
+binding, mixed operator identity, and losing concurrent preparation all fail
+before the destructive commit. Exact snapshots of binding/config/bootstrap,
+rows, states/results, continuation and invalidations remain unchanged.
+
+The successful commit is one transaction: target identity becomes sole
+`rebuild_prepared` authority; results become `building/NULL`; current rows and
+continuation are deleted; private states reset to zero; and obsolete source and
+ingress invalidations are cleared. The old inactive slot remains and the target
+slot is absent, so a crash at this point is unambiguously forward-recoverable
+without pretending slot DDL was transactional. M12.3 owns their exact cleanup/
+creation sequence.
+
+Old/foreign receiver tokens are additionally rejected by a receiver-local
+authorization capability even when their terminal LSN equals a current value.
+The capability is memory-only and cannot replace durable lifecycle/generation
+validation. The admission gate does not yet prove kill points after old-slot
+drop, new-slot creation, snapshot loss, scan/catch-up, activation or feedback;
+those remain M12.3--M12.4.

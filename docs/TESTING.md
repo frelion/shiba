@@ -500,3 +500,32 @@ M12.1 runs Markdown/static contract checks plus fmt, workspace check/tests and
 clippy. It does not count as proof of destructive prepare, snapshot-to-live
 rebuild, crash/DDL/concurrency/role matrix or performance; each belongs to its
 subsequent independently green milestone.
+
+## M12.2 rebuild admission gate
+
+Run `scripts/test-m12-rebuild-admission.sh` independently with the absolute
+PG17 and PG18 `pg_config` paths. PG17.10 and PG18.4 are green. The gate begins
+with a real active, non-pristine M11/M10 source and snapshots every old
+authority. Invalid nullable-int8 shape, missing caller `SELECT`, stale
+BootstrapId/generation, active old slot, occupied target slot, foreign target
+binding and mixed operator plan must fail with byte-for-byte-equivalent catalog
+state. Two concurrent exact requests produce one winner.
+
+The winning request must expose exactly one target relation plus two column
+bindings, target ingress config/generation and `rebuild_prepared` lifecycle;
+the primary-key identity-index OID is checked as an explicit CAS coordinate but
+is not inserted as another binding. It must also prove `building/NULL`, empty
+current-row and continuation state, zero private operator values, retired old
+invalidations, an unchanged inactive old physical slot, and an absent target
+physical slot. A foreign old-receiver token with a matching LSN is rejected by
+the new receiver-local capability check.
+
+Failure-first development also caught and corrected four concrete assumptions:
+the initial test incorrectly expected a custom identity binding rather than the
+existing relation-plus-two-columns set; SECURITY DEFINER permission validation
+had to use `session_user`; PostgreSQL `bigint` values had to retain their exact
+64-bit type at the Rust boundary; and PL/pgSQL block-label plus deferred-
+constraint references required explicit qualification. These are clean-room
+runtime failures, not legacy evidence. M12.2 does not prove old-slot cleanup,
+new exported snapshot, snapshot-to-live differential, crash recovery, DDL/
+least-privilege breadth or performance.
