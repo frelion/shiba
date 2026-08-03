@@ -21,6 +21,21 @@ pub fn compile_graph(
     descriptors: &[SourceDescriptor],
     indexes: &[IdentityIndexDescriptor],
 ) -> Result<OperatorGraph, CompilerError> {
+    let indexes = indexes.iter().cloned().map(Some).collect::<Vec<_>>();
+    compile_graph_with_optional_identities(spec, descriptors, &indexes)
+}
+
+/// Compiles a graph whose only identity-free shape is the previously proven
+/// singleton zero-column `CountRows` source.
+///
+/// # Errors
+///
+/// Rejects every other missing, extra, or invalid source identity.
+pub fn compile_graph_with_optional_identities(
+    spec: &GraphSpecV1,
+    descriptors: &[SourceDescriptor],
+    indexes: &[Option<IdentityIndexDescriptor>],
+) -> Result<OperatorGraph, CompilerError> {
     let canonical_spec = spec
         .to_canonical_json()
         .ok()
@@ -41,13 +56,30 @@ pub fn compile_graph(
     }
     let mut sources = descriptors
         .iter()
-        .map(|source| {
-            identity_for(source, indexes).and_then(|index| source_port(source, Some(index.address)))
+        .zip(indexes)
+        .map(|(source, index)| {
+            let identity = index
+                .as_ref()
+                .map(|index| identity_for(source, std::slice::from_ref(index)))
+                .transpose()?
+                .map(|index| index.address);
+            source_port(source, identity)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let exact_indexes = indexes
+        .iter()
+        .filter_map(Option::as_ref)
+        .cloned()
+        .collect::<Vec<_>>();
     let mut nodes = Vec::new();
     for output in &spec.outputs {
-        compile_output(output, descriptors, indexes, &mut sources, &mut nodes)?;
+        compile_output(
+            output,
+            descriptors,
+            &exact_indexes,
+            &mut sources,
+            &mut nodes,
+        )?;
     }
     nodes.sort_by_key(|node| node.node_id);
     OperatorGraph::build(spec.graph_id, sources, nodes).map_err(|_| CompilerError::GraphEncoding)

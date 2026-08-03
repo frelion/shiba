@@ -66,7 +66,7 @@ fn identity_descriptor(
                 index.indexprs IS NOT NULL,index.indpred IS NOT NULL,
                 (index.indisreplident OR
                  (relation.relreplident='d' AND index.indisprimary)),
-                (index.indkey::smallint[])[0]::integer
+                (index.indkey::smallint[])[0]::integer,index.indnkeyatts
          FROM shiba_internal.source_binding AS binding JOIN pg_catalog.pg_index AS index
            ON index.indexrelid=binding.address_objid
          JOIN pg_catalog.pg_class AS relation ON relation.oid=index.indrelid
@@ -82,6 +82,7 @@ fn identity_descriptor(
         address: address_at(&row, 0)?,
         relation,
         key_column,
+        key_arity: u16::try_from(row.get::<_, i16>(10)).map_err(|_| M2Error::SourceInvalidated)?,
         unique: row.get(3),
         valid: row.get(4),
         ready: row.get(5),
@@ -131,7 +132,7 @@ pub(super) fn target_descriptor(
                 index.indexprs IS NOT NULL,index.indpred IS NOT NULL,
                 (index.indisreplident OR
                  (relation.relreplident='d' AND index.indisprimary)),
-                (index.indkey::smallint[])[0]::integer
+                (index.indkey::smallint[])[0]::integer,index.indnkeyatts
          FROM pg_catalog.pg_index AS index
          JOIN pg_catalog.pg_class AS relation ON relation.oid=index.indrelid
          WHERE index.indexrelid=$1 AND index.indrelid=$2",
@@ -157,6 +158,8 @@ pub(super) fn target_descriptor(
             },
             relation,
             key_column,
+            key_arity: u16::try_from(row.get::<_, i16>(7))
+                .map_err(|_| M2Error::SourceInvalidated)?,
             unique: row.get(0),
             valid: row.get(1),
             ready: row.get(2),

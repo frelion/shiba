@@ -35,6 +35,7 @@ pub(crate) fn compile_join(
         || right_id.nullable
         || index.relation != right.relation
         || index.key_column != right_id.address
+        || index.key_arity != 1
         || !index.unique
         || !index.valid
         || !index.ready

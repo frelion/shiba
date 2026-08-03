@@ -1,5 +1,36 @@
 # Testing strategy
 
+## M14.7 release evidence
+
+`scripts/release-matrix.sh` passed all 51 enrolled scripts on PostgreSQL 17.10
+and PostgreSQL 18.4: 102 successful PostgreSQL invocations. Enrollment remains
+exact, so an unlisted `test-*.sh` fails before the database matrix begins. The
+matrix includes graph stateless/grouped/JOIN correctness, transaction rollback,
+retry/replay, DDL identity, ingress/ACK, one-snapshot bootstrap, catch-up,
+rebuild/recovery, concurrency, least privilege and all M1--M13 regressions.
+
+The frozen same-scene five-run M13 Apply comparison reports PG17 median
+771.019625 ms versus 782.302750 ms baseline (-1.44%) and PG18 median
+821.920250 ms versus 787.157125 ms baseline (+4.42%). Both remain below the
+fixed M14 ceilings of 899.648163/905.230694 ms.
+
+The million-row M12 rebuild regression reports PG17 total 7.588033917 s,
+RSS +6,224 KiB and retained WAL 252,905,752 bytes; PG18 total 7.703419083 s,
+RSS +6,272 KiB and retained WAL 252,938,872 bytes. Both stay below the unchanged
+268,435,456-byte retained-WAL limit and preserve the prior time/RSS thresholds.
+No workload, assertion or threshold was relaxed after observation.
+
+Failure-first static/directed gates additionally freeze three boundaries:
+
+- only a zero-column singleton CountRows layout may omit identity;
+- composite identities remain admitted for proven one-member graphs, while the
+  JOIN right side is exactly one non-null bigint PK/UK effective identity;
+- after graph/generation locking, exact replay is probed before current
+  eligibility/invalidation, while all new work still fails on invalidation.
+
+M14 is complete at the declared Operator Graph scope. This matrix does not
+claim complete V2.
+
 ## M14.6 graph lifecycle cutover gates
 
 The production cutover under test has one canonical `OperatorGraph`, ordered
@@ -33,8 +64,8 @@ the rebuild writer's 22nd value-nullability parameter, member-trigger COALESCE
 syntax, and old-versus-post-prepare invalidation semantics; each now fails
 closed at its owning boundary.
 
-M14.7 separately owns full receiver/bootstrap/rebuild enrollment, regression,
-performance and release evidence, including the frozen M8--M13 thresholds.
+M14.7 closes full receiver/bootstrap/rebuild enrollment, regression,
+performance and release evidence while preserving the frozen M8--M13 thresholds.
 
 ## M14.5 pure two-source JOIN gates
 
@@ -44,8 +75,8 @@ partition state and pre-to-final mixed-input semantics. A fixed-seed 300-step
 relational differential is green. Fan-out 20,000 succeeds and 20,001 fails;
 ordered affected-row indexes correct the initial `O(n^2)` scan to `O(n log n)`.
 M14.6 supplies Runtime/Catalog persistence and the graph lifecycle cutover; its
-directed PG17/18 graph Runtime evidence is green. Full bootstrap/rebuild and
-release evidence belongs to M14.7; M14 is not complete.
+directed PG17/18 graph Runtime evidence is green. M14.7 closes full
+bootstrap/rebuild and release evidence.
 
 ## Directed M14.6 PostgreSQL JOIN gates
 
@@ -64,14 +95,14 @@ portion passes independently on PG17.10 and PG18.4:
 - relation/index drift fails closed by exact bound identity, including
   same-shape right-index replacement.
 
-M14.7 retains the complete one-snapshot bootstrap, graph rebuild/recovery,
+M14.7 re-proves the complete one-snapshot bootstrap, graph rebuild/recovery,
 split-role, publication/column drift, performance and release portions of the
 matrix; those are not inferred from this directed Runtime test.
 
 The runner statically rejects a per-source continuation, second
 Runtime, persisted DeltaBatch/EffectStream, adapter, fallback or dual write.
-These static M14.6 requirements are current evidence; full release enrollment
-is M14.7.
+These static M14.6 requirements are current evidence and remain enrolled in the
+M14.7 release matrix.
 
 ## M14.3 generic grouped-state gates
 

@@ -458,7 +458,7 @@ for marker in (
     "One durable graph authority",
     "Pure two-input INNER JOIN boundary",
     "graph/generation ownership mutex",
-    "PG17/PG18 Apply medians are 782.302750/787.157125 ms",
+    "782.302750/787.157125 ms and M14 stop lines",
 ):
     if marker not in graph_contract:
         raise SystemExit(f"M14 graph contract lacks frozen marker: {marker}")
@@ -486,6 +486,23 @@ if "M14.5 pure multi-input INNER JOIN kernel" not in reuse_manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks M14.5 pure-kernel evidence")
 if "M14.6 unified graph production cutover" not in reuse_manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks M14.6 graph-cutover evidence")
+if "M14.7 full graph release closure" not in reuse_manifest:
+    raise SystemExit("REUSE_MANIFEST.md lacks M14.7 release evidence")
+
+current_docs = (
+    "docs/README.md",
+    "docs/ARCHITECTURE.md",
+    "docs/CATALOG_CONTRACT.md",
+    "docs/SOURCE_INGRESS_CONTRACT.md",
+    "docs/TRANSACTION_RECOVERY.md",
+    "docs/TESTING.md",
+    "docs/GOAL_GAP.md",
+)
+for path in current_docs:
+    text = pathlib.Path(path).read_text()
+    for stale in ("M14 is not complete", "M14.7 remains unproved"):
+        if stale in text:
+            raise SystemExit(f"{path} retains stale M14 status: {stale}")
 PY
 
 if rg -n \

@@ -38,7 +38,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
         .expect("query durable state");
     (
         row.get(0),
-        support::decode_scalar_state(&row.get::<_, Vec<u8>>(1)),
+        support::decode_optional_scalar_state(row.get::<_, Option<Vec<u8>>>(1).as_deref()),
         row.get(2),
         row.get(3),
     )
@@ -143,6 +143,7 @@ fn m5_real_incompressible_toast_update_crash_retry_and_replay() {
     );
     register_source(&mut client, "source_m5_incompressible.events");
     CAPTURE.create_slot();
+    support::configure_graph_ingress(&mut client, 1, CAPTURE.publication, CAPTURE.slot);
 
     let first_payload = high_entropy_payload(0x4d59_5df4_d0f3_3173);
     let second_payload = high_entropy_payload(0x8b8b_8b8b_1357_9bdf);

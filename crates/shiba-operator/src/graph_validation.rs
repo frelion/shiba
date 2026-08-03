@@ -23,16 +23,26 @@ pub(crate) fn validate_graph(graph: &CanonicalGraph) -> Result<(), GraphError> {
             .sources
             .windows(2)
             .any(|pair| pair[0].source_id >= pair[1].source_id)
-        || graph
-            .sources
-            .iter()
-            .any(|source| source.identity_index.is_none())
         || graph.sources.iter().enumerate().any(|(index, source)| {
-            graph.sources[index + 1..]
-                .iter()
-                .any(|other| other.identity_index == source.identity_index)
+            source.identity_index.is_some()
+                && graph.sources[index + 1..]
+                    .iter()
+                    .any(|other| other.identity_index == source.identity_index)
         })
     {
+        return Err(GraphError::InvalidTopology);
+    }
+    if graph.sources.iter().any(|source| {
+        source.identity_index.is_none() && (graph.sources.len() != 1 || !source.layout.is_empty())
+    }) || graph.sources.iter().any(|source| {
+        source.identity_index.is_none()
+            && graph.nodes.iter().any(|node| {
+                !matches!(
+                    node.kind,
+                    OperatorNodeKind::CountRows | OperatorNodeKind::Materialize { .. }
+                )
+            })
+    }) {
         return Err(GraphError::InvalidTopology);
     }
     let (_, layouts) = layout_graph(graph)?;

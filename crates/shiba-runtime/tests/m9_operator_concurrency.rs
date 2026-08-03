@@ -196,7 +196,7 @@ fn results(client: &mut Client) -> Vec<(i64, i64, i64)> {
             (
                 row.get(0),
                 row.get(1),
-                support::decode_scalar_state(&row.get::<_, Vec<u8>>(2)),
+                support::decode_optional_scalar_state(row.get::<_, Option<Vec<u8>>>(2).as_deref()),
             )
         })
         .collect()

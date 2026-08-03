@@ -41,7 +41,6 @@ fn process_in_transaction(
     let commit_lsn = identity.commit_lsn.to_string();
 
     let graph = operator_execution::load_locked_graph(transaction, graph_id, generation)?;
-    source_preflight::validate_execution_authority(transaction, graph_id, generation)?;
     if exact_replay(
         transaction,
         graph_id,
@@ -52,6 +51,7 @@ fn process_in_transaction(
     )? {
         return Ok(ProcessOutcome::AlreadyApplied);
     }
+    source_preflight::validate_execution_authority(transaction, graph_id, generation)?;
     reject_out_of_order(transaction, graph_id, generation, identity.commit_lsn)?;
     source_preflight::validate_sources(transaction, &graph.graph)?;
 

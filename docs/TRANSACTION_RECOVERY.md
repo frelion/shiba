@@ -27,13 +27,21 @@ rollback and replay tests are green on PG17.10/18.4: a same-database transaction
 changing both JOIN members commits once, injected keyed-sink failure restores
 all member rows/results/continuation, and retry then applies once. Replacement
 of the exact right identity index rejects a pending transaction before writes.
-M14.7 owns the complete receiver/bootstrap/rebuild crash and release matrix.
+M14.7 re-proves the complete receiver/bootstrap/rebuild crash and release
+matrix.
 
 Keyed recovery compares canonical typed key and value payloads, not only their
 convenience bigint/NULL projections. This closes the failure where a projected
 SQL value could look correct while the durable codec payload drifted. Result
 contracts come from the graph terminals; Runtime uses their shape/nullability
 metadata generically and never reconstructs a concrete operator kind.
+
+Replay ordering is deliberate: Runtime first owns the graph/generation mutex,
+then probes the exact continuation, then checks live eligibility and current
+invalidation for new work. Thus an already committed transaction remains an
+`AlreadyApplied` no-op even when later DDL invalidates the graph. A different
+transaction cannot use that replay path and fails closed before Source Apply;
+generation drift is never ignored.
 
 M13.3 preserved the prior recovery boundary while replacing operator internals. One
 EffectBatch and all opaque state/typed scalar/keyed transitions remain inside

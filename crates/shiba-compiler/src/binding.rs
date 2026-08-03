@@ -65,6 +65,7 @@ pub(crate) fn identity_for<'a>(
             && index.address.class_id == source.relation.class_id
             && index.address.object_id != 0
             && index.address.sub_id == 0
+            && index.key_arity > 0
             && index.unique
             && index.valid
             && index.ready

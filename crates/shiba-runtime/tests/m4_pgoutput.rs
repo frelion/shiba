@@ -26,7 +26,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
         .expect("query durable state");
     (
         row.get(0),
-        support::decode_scalar_state(&row.get::<_, Vec<u8>>(1)),
+        support::decode_optional_scalar_state(row.get::<_, Option<Vec<u8>>>(1).as_deref()),
         row.get(2),
         row.get(3),
     )
@@ -73,6 +73,7 @@ fn m4_real_pgoutput_nullable_payload_and_bad_key_tag() {
     );
     register_source(&mut client, "source_m4.events");
     CAPTURE.create_slot();
+    support::configure_graph_ingress(&mut client, 1, CAPTURE.publication, CAPTURE.slot);
     client
         .batch_execute("INSERT INTO source_m4.events VALUES (201, NULL), (202, 42)")
         .expect("commit real nullable-payload transaction");
@@ -92,7 +93,7 @@ fn m4_real_pgoutput_nullable_payload_and_bad_key_tag() {
             "CREATE SCHEMA m4_test;
              CREATE FUNCTION m4_test.fail_operator() RETURNS trigger
              LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'M4 failure'; END $$;
-             CREATE TRIGGER m4_fail_operator BEFORE UPDATE
+             CREATE TRIGGER m4_fail_operator BEFORE INSERT OR UPDATE
              ON shiba_internal.graph_node_state FOR EACH ROW
              EXECUTE FUNCTION m4_test.fail_operator();",
         )

@@ -26,7 +26,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
         .expect("query durable state");
     (
         row.get(0),
-        support::decode_scalar_state(&row.get::<_, Vec<u8>>(1)),
+        support::decode_optional_scalar_state(row.get::<_, Option<Vec<u8>>>(1).as_deref()),
         row.get(2),
         row.get(3),
     )
@@ -107,7 +107,7 @@ fn m7_exact_object_address_invalidation_and_rollback() {
         .query_one(
             "SELECT address_classid::bigint, address_objid::bigint, address_objsubid
              FROM shiba_internal.source_binding
-             WHERE source_id = 1 AND address_objsubid = 0",
+             WHERE source_id = 1 AND binding_kind = 'relation' AND address_objsubid = 0",
             &[],
         )
         .expect("query source ObjectAddress");
@@ -133,6 +133,7 @@ fn m7_exact_object_address_invalidation_and_rollback() {
         .expect("roll back source rename");
     assert_eq!(invalidation_count(&mut client), 0);
     CAPTURE.create_slot();
+    support::configure_graph_ingress(&mut client, 1, CAPTURE.publication, CAPTURE.slot);
 
     client
         .batch_execute("INSERT INTO source_m7.events VALUES (1101)")

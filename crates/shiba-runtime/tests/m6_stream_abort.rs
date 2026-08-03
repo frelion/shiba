@@ -61,7 +61,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
         .expect("query durable state");
     (
         row.get(0),
-        support::decode_scalar_state(&row.get::<_, Vec<u8>>(1)),
+        support::decode_optional_scalar_state(row.get::<_, Option<Vec<u8>>>(1).as_deref()),
         row.get(2),
         row.get(3),
     )
@@ -210,6 +210,7 @@ fn m6_real_stream_abort_never_applies_then_slot_commits() {
     );
     register_source(&mut client, "source_m6_abort.events");
     CAPTURE.create_slot();
+    support::configure_graph_ingress(&mut client, 1, CAPTURE.publication, CAPTURE.slot);
 
     let output = CAPTURE.capture_path("streamed-abort.pgoutput");
     let receiver = start_receiver(&mut client, &output);

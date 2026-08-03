@@ -13,7 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use shiba_operator::{NodeId, ObjectAddress};
 use shiba_protocol::{GraphId, SourceId};
 
-pub use graph::compile_graph;
+pub use graph::{compile_graph, compile_graph_with_optional_identities};
 
 pub const GRAPH_SPEC_VERSION: u32 = 1;
 pub const POSTGRES_INT8_TYPE_OID: u32 = 20;
@@ -219,6 +219,7 @@ pub struct IdentityIndexDescriptor {
     pub address: ObjectAddress,
     pub relation: ObjectAddress,
     pub key_column: ObjectAddress,
+    pub key_arity: u16,
     pub unique: bool,
     pub valid: bool,
     pub ready: bool,

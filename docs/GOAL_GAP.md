@@ -1,5 +1,24 @@
 # V2 goal gap entering M14
 
+## M14.7 completion status
+
+M14 is complete at the declared Operator Development boundary. The exact
+release runner passed 51 unique scripts on PostgreSQL 17.10 and PostgreSQL 18.4,
+102 invocations total. It re-proves single/two-source graph Runtime, Filter/
+Project/Compute, grouped Count/Sum, two-table INNER JOIN, generic state/results,
+ACK, bootstrap, rebuild, recovery, DDL, concurrency and least privilege without
+a second Runtime, continuation or persisted intermediate batch.
+
+Five-run same-scene Apply medians are 771.019625 ms on PG17 (-1.44% versus
+782.302750 ms baseline) and 821.920250 ms on PG18 (+4.42% versus 787.157125 ms
+baseline), below 899.648163/905.230694 ms ceilings. Million-row rebuild totals
+are 7.588033917/7.703419083 s, RSS +6,224/+6,272 KiB and retained WAL
+252,905,752/252,938,872 bytes, below 268,435,456 bytes.
+
+M14 completion is not V2 completion. SQL frontend, outer/three-table joins,
+windows, DISTINCT, Min/Max/Avg, broader types/results, plugins, scheduler,
+cross-host failover and long-running production soak remain unproved.
+
 ## M14.6 production cutover status
 
 The production schema and execution/lifecycle code have been cut over to the
@@ -24,8 +43,8 @@ default PK or explicit replica-identity index and rejects a relation with none.
 Strict Compiler tests cover ComputedProject and filtered grouped Count/Sum
 pipelines; Runtime consumes only generic result contracts.
 
-M14.7 must still close the full receiver/bootstrap/rebuild, least-privilege,
-release and performance matrix; M14 is not yet complete.
+M14.7 closes the full receiver/bootstrap/rebuild, least-privilege, release and
+performance matrix.
 
 ## M14.5 pure JOIN kernel status
 
@@ -57,12 +76,12 @@ Runtime performs generic plan/state/result persistence without matching node or
 operator names. The former ProjectRows declaration and execution variant no
 longer exists in production; its behavior is Project followed by Materialize.
 
-M14.3 adds the sole generic keyed node-state authority, KeyBy, GroupedCount and
+M14.3 added the sole generic keyed node-state authority, KeyBy, GroupedCount and
 GroupedSumInt8. PG17.10/PG18.4 full-row SQL differentials prove I/U/D, NULL and
 all-NULL groups, key changes, empty-group deletion, whole-transaction rollback,
-retry and replay with set-based persistence. M14.4--M14.7 still must implement
+retry and replay with set-based persistence. M14.4--M14.7 subsequently added
 two-input Join, graph-wide lifecycle/bootstrap/rebuild and the full release/
-performance matrix. M14.3 is not M14 completion.
+performance matrix. M14.3 alone was not M14 completion.
 
 ## M14.1 contract status
 
@@ -83,12 +102,12 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source facts/effective identity, sole canonical graph plan/membership, graph ingress/continuation/bootstrap, generic graph node state/results, sole `source_row_state`, directed M14.6 evidence | M14.7 full lifecycle/release matrix |
-| Compiler | Strict IR to one ObjectAddress-bound single/two-source graph | Directed PostgreSQL graph evidence, SQL frontend and broader plan language |
+| Catalog | Version, source facts/effective identity, sole canonical graph plan/membership, graph ingress/continuation/bootstrap, generic graph node state/results, sole `source_row_state`, complete M14 evidence | Broader graph shapes/types |
+| Compiler | Strict IR to one ObjectAddress-bound single/two-source graph with complete PG17/18 graph evidence | SQL frontend and broader plan language |
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
 | Source Apply | SourceId-tagged current rows plus transaction-local before/after effects for every graph member | Broader row shapes and identities |
 | EffectStream | Non-durable transaction-local DeltaBatch/MultiInputBatch | Persisted effects intentionally absent |
-| Runtime | Generic graph decode/topology, ordered multi-input dispatch and atomic scalar/keyed persistence; directed two-input PostgreSQL rollback/replay evidence | M14.7 complete bootstrap/rebuild/recovery/performance matrix |
+| Runtime | Generic graph decode/topology, ordered multi-input dispatch and atomic scalar/keyed persistence with complete M14 recovery/performance evidence | Cross-host/daemon/soak boundaries |
 | Operator | Database-free stateless/grouped/computed nodes and bounded two-source INNER JOIN on one kernel | Broader operator families remain unproved |
 | Result Sink | Graph-terminal visibility headers, scalar bigint arm and active-only nullable keyed rows | Non-bigint result types |
 

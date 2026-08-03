@@ -26,7 +26,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
         .expect("query durable state");
     (
         row.get(0),
-        support::decode_scalar_state(&row.get::<_, Vec<u8>>(1)),
+        support::decode_optional_scalar_state(row.get::<_, Option<Vec<u8>>>(1).as_deref()),
         row.get(2),
         row.get(3),
     )
@@ -80,6 +80,7 @@ fn m4_real_pgoutput_composite_keys_and_bad_second_key_tag() {
     );
     register_source(&mut client, "source_m4_composite.events");
     CAPTURE.create_slot();
+    support::configure_graph_ingress(&mut client, 1, CAPTURE.publication, CAPTURE.slot);
     client
         .batch_execute("INSERT INTO source_m4_composite.events VALUES (10, 201), (10, 202)")
         .expect("commit same-first-key composite rows");

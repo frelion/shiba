@@ -110,7 +110,10 @@ BEGIN
              OR (relation.relreplident = 'i' AND identity.indisreplident))
         AND identity.indisunique AND identity.indisvalid AND identity.indisready
         AND identity.indexprs IS NULL AND identity.indpred IS NULL;
-    IF pg_catalog.cardinality(effective_identity_indexes) IS DISTINCT FROM 1 THEN
+    IF pg_catalog.cardinality(effective_identity_indexes) IS DISTINCT FROM 1
+       AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                   WHERE attrelid = requested_relation AND attnum > 0
+                     AND NOT attisdropped) THEN
         RAISE EXCEPTION 'source relation requires exactly one effective identity index';
     END IF;
     INSERT INTO shiba_internal.source_binding
@@ -122,7 +125,8 @@ BEGIN
       WHERE attribute.attrelid = requested_relation AND attribute.attnum > 0
         AND NOT attribute.attisdropped
     UNION ALL SELECT requested_source_id, 'identity_index', 'pg_class'::regclass,
-        effective_identity_indexes[1], 0;
+        effective_identity_indexes[1], 0
+      WHERE pg_catalog.cardinality(effective_identity_indexes) = 1;
 END
 $function$;
 

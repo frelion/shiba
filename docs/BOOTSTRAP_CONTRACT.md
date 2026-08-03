@@ -23,8 +23,8 @@ bootstrap and operator-plan-set terminology below records the M11--M13 evidence
 baseline and is superseded, without an adapter, by this graph lifecycle.
 M14.6 implementation and static gates prove that one- and two-member bootstrap
 load the durable graph and share one lifecycle/snapshot with subordinate member
-checkpoints. The complete PG17.10/PG18.4 bootstrap/catch-up/restart matrix is a
-remaining M14.7 release gate; M14.6 does not claim it here.
+checkpoints. M14.7 re-proves the complete PG17.10/PG18.4
+bootstrap/catch-up/restart matrix as part of the 51-script release gate.
 
 ## M13 generic plan-set handoff (historical baseline)
 

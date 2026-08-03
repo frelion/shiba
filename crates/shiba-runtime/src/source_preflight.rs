@@ -176,7 +176,7 @@ fn validate_identity(
                 index.indisunique AND index.indisvalid AND index.indisready
                 AND (index.indisreplident OR
                      (relation.relreplident = 'd' AND index.indisprimary))
-                AND index.indnkeyatts = 1 AND index.indnatts = 1
+                AND index.indnkeyatts > 0
                 AND index.indexprs IS NULL AND index.indpred IS NULL,
                 (index.indkey::smallint[])[0]::integer
          FROM shiba_internal.source_binding AS binding
@@ -187,6 +187,7 @@ fn validate_identity(
         &[&source_id],
     )?;
     match (port.identity_index, row) {
+        (None, None) if port.layout.is_empty() => Ok(()),
         (Some(expected), Some(row))
             if u32::try_from(row.get::<_, i64>(0)).ok() == Some(expected.class_id)
                 && u32::try_from(row.get::<_, i64>(1)).ok() == Some(expected.object_id)

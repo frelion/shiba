@@ -99,6 +99,10 @@ pub(super) fn decode_scalar_state(payload: &[u8]) -> i64 {
     )
 }
 
+pub(super) fn decode_optional_scalar_state(payload: Option<&[u8]>) -> i64 {
+    payload.map_or(0, decode_scalar_state)
+}
+
 pub(super) fn scalar_state(client: &mut Client, operator_id: i64) -> i64 {
     let payload: Vec<u8> = client
         .query_one(

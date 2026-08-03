@@ -140,9 +140,13 @@ fn compile_current(
         let (descriptor, identity) =
             crate::registration_descriptor::source_descriptor(transaction, *source_id)?;
         descriptors.push(descriptor);
-        indexes.push(identity.ok_or(M2Error::SourceInvalidated)?);
+        indexes.push(identity);
     }
-    Ok(compile_graph(spec, &descriptors, &indexes)?)
+    Ok(shiba_compiler::compile_graph_with_optional_identities(
+        spec,
+        &descriptors,
+        &indexes,
+    )?)
 }
 
 fn insert_graph(

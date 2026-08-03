@@ -7,8 +7,8 @@ distinct from absent. M14.4 accepts the exact two-source JOIN authority and
 M14.5 implements its pure GraphId/SourcePort Compiler and Operator kernel.
 M14.6 cuts Catalog, Runtime, Ingress, Bootstrap and Rebuild over to that same
 graph authority. Directed PG17.10/PG18.4 graph Runtime evidence is green;
-M14.7 owns the full lifecycle release/performance evidence, so M14.5 alone is
-not M14 completion.
+M14.7 closes the full lifecycle release/performance evidence. M14 is complete
+at this contract boundary, not complete V2.
 
 M14 extends the M13 database-free kernel; it does not add a SQL frontend or a
 second Runtime. This contract freezes graph identity, typed deltas, state,
@@ -196,12 +196,12 @@ graph and state payload at most once per transaction, constructs each source
 batch once, loads state by node/partition rather than change-by-node queries,
 and persists keyed mutations in bounded sets rather than per-row round trips.
 
-The green M13 HEAD supplies the unchanged CountRows/SumInt8 comparison:
-PG17/PG18 Apply medians are 782.302750/787.157125 ms. M14 stop lines are
-899.648163/905.230694 ms (+15%). M8--M13 absolute limits remain unchanged;
-especially, M12 retained WAL remains at most 256 MiB (latest evidence
-252,876,464/252,917,880 bytes). A regression does not permit a larger limit or
-smaller workload.
+The frozen M13 CountRows/SumInt8 comparison baselines are
+782.302750/787.157125 ms and M14 stop lines are 899.648163/905.230694 ms
+(+15%). M14.7 five-run medians are 771.019625/821.920250 ms (-1.44%/+4.42%),
+within those lines. M8--M13 absolute limits remain unchanged. The final M12
+regression retains 252,905,752/252,938,872 bytes of WAL, below 268,435,456
+bytes. No larger limit or smaller workload was used.
 
 ## Evidence and exclusions
 
@@ -212,8 +212,8 @@ semantics. PG17.10/PG18.4 directed Runtime gates cover complete joined rows,
 left/right and same-transaction changes, bounded fan-out/retraction, rollback,
 retry, replay and exact PK invalidation. Grouped materializations compare
 complete rows with independent SQL oracles on both versions. Full graph
-bootstrap, catch-up, rebuild, recovery, least privilege and performance remain
-M14.7 release gates.
+bootstrap, catch-up, rebuild, recovery, least privilege and performance are
+re-proved by the M14.7 release matrix.
 
 M14 excludes SQL parsing, outer or three-table joins, windows, DISTINCT,
 Min/Max/Avg, plugins, schedulers and persisted intermediate deltas. M14 does not

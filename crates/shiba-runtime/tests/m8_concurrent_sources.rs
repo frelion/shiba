@@ -190,6 +190,8 @@ fn install_sources(client: &mut Client) -> (PgoutputSource, PgoutputSource) {
     support::register_count_operator(client, 2, 2);
     SOURCE1_CAPTURE.create_slot();
     SOURCE2_CAPTURE.create_slot();
+    support::configure_graph_ingress(client, 1, SOURCE1_CAPTURE.publication, SOURCE1_CAPTURE.slot);
+    support::configure_graph_ingress(client, 2, SOURCE2_CAPTURE.publication, SOURCE2_CAPTURE.slot);
     (source1, source2)
 }
 

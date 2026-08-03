@@ -196,8 +196,8 @@ M14.2 implements typed expressions plus Filter/Compute/Project/Materialize on
 one binding-ordered transaction-local DeltaBatch and removes the production
 ProjectRows execution variant. M14.3 adds the sole generic keyed-state
 authority plus KeyBy, GroupedCount and GroupedSumInt8, proved with complete
-PG17.10/PG18.4 keyed SQL differentials. Join, graph-wide lifecycle and the full
-M14 release/performance matrix remain later stages; M14 is not yet complete.
+PG17.10/PG18.4 keyed SQL differentials. Later slices added Join and the unified
+graph lifecycle; M14.7 closes their release/performance matrix.
 M14.4's accepted two-source authority is documented in
 [JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md) and
 [ADR 0006](adr/0006-m14-two-source-join-authority.md). It
@@ -213,5 +213,9 @@ directed PG17.10/PG18.4 graph Runtime gate proves singleton and cross-schema
 JOIN execution, both-side atomicity, fan-out/retraction, rollback/replay and
 exact effective-identity invalidation. Compiler also admits strict computed
 projection and filtered grouped pipelines without Runtime kind dispatch.
-M14.7 owns the complete bootstrap/rebuild release and performance evidence, so
-M14 is not complete.
+M14.7 re-proves the complete bootstrap/rebuild lifecycle and all earlier gates:
+51 unique scripts, 102 successful PG17.10/PG18.4 invocations. Five-run
+same-scene Apply medians are 771.019625/821.920250 ms, below the frozen
+899.648163/905.230694 ms ceilings. M14 is complete; this does not claim a SQL
+frontend, outer/three-table joins, windows, additional aggregates, plugins,
+scheduler, or complete V2.

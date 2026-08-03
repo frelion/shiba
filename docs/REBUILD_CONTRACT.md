@@ -24,8 +24,8 @@ them with `graph_definition`, ordered `graph_source_member`,
 member checkpoints, `graph_node_state` and graph results, without alias or
 dual write. M14.6 implementation/static gates prove that rebuild accepts and
 installs a complete canonical graph/result-contract set rather than named
-operators. The complete PG17.10/PG18.4 graph rebuild/recovery/performance matrix
-remains M14.7 release evidence.
+operators. M14.7 re-proves the complete PG17.10/PG18.4 graph
+rebuild/recovery/performance matrix.
 
 An invalidation on the old active generation is allowed as an explicit reason
 to request rebuild; requiring the invalid old authority to pass ordinary live

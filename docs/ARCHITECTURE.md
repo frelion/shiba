@@ -41,8 +41,8 @@ authority: a single-input source is a one-member graph and the join is a
 two-member graph, with no second Runtime or compatibility path. Directed
 PG17.10/PG18.4 graph Runtime gates prove one- and two-member registration,
 same-transaction two-side Apply, right fan-out/retraction, key changes, rollback,
-exact replay and effective-identity invalidation. The final release/performance
-matrix remains M14.7.
+exact replay and effective-identity invalidation. M14.7 closes the final
+release/performance matrix.
 
 The graph-wide durable authorities are `graph_definition`, ordered
 `graph_source_member`, `graph_ingress_config`/`graph_ingress_source`,
@@ -61,6 +61,16 @@ admitted effective index. Runtime validates the same ObjectAddress before
 Apply, and replacement invalidates the complete graph. Compiler also supplies
 strict `ComputedProject` and filtered grouped pipelines while Runtime consumes
 only graph topology and result contracts, never concrete node kinds.
+
+Identity admission retains earlier row-shape boundaries without a second
+Runtime. A zero-column one-member CountRows graph may omit identity only because
+its layout has no addressable row key. Proven composite identities remain
+admitted for their one-member shape. The M14 INNER JOIN right member is
+narrower: exactly one non-null bigint default-PK or explicit unique
+replica-identity key. These are explicit graph/source contracts, not fallback.
+
+M14.7 re-proves this architecture through 51 scripts on PG17.10 and PG18.4
+(102 invocations). It completes M14, not V2.
 
 M13.1 froze the generic execution successor to the M9 aggregate-shaped API;
 M13.2 supplied its pure kernel, and M13.3 made that kernel the sole Runtime and

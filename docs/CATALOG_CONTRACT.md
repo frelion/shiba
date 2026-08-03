@@ -41,8 +41,8 @@ The cutover removes `operator_definition`, `operator_state`,
 `source_continuation`, `source_ingress_config`,
 `source_ingress_invalidation`, and `source_bootstrap`. None survives as a view,
 alias, adapter or dual-write target. Catalog and directed graph Runtime tests
-are green on PG17.10/PG18.4; M14.7 owns the full lifecycle release/performance
-evidence.
+are green on PG17.10/PG18.4; M14.7 closes the full lifecycle
+release/performance evidence.
 
 Failure-first integration exposed and fixed four contract defects. Keyed sink
 upserts now persist the canonical typed `value_payload` together with SQL
@@ -54,6 +54,13 @@ Finally, explicit rebuild may admit an already-invalid old authority as the
 reason to move forward, but destructive prepare installs exact target
 identities and any invalidation committed afterward blocks scan, Apply and
 activation.
+
+Identity cardinality is shape-specific and fail closed. A zero-column
+single-member CountRows graph may have no identity binding because it has no
+keyed row layout. Proven composite identities remain valid for their
+single-member source shape. Every nullable-int8 graph member, and specifically
+the JOIN right member, requires its exact effective identity; the JOIN right is
+exactly one non-null bigint PK/UK used as replica identity.
 
 ## M13 generic operator authority (historical, superseded by M14.6)
 

@@ -2,7 +2,7 @@
 
 Status: M14.4 authority accepted; M14.5 pure Compiler/Operator kernel
 implemented; M14.6 production graph authority and directed PG17.10/PG18.4
-Runtime evidence are complete. M14.7 release/performance evidence remains.
+Runtime evidence are complete. M14.7 release/performance evidence is green.
 
 M14.4 admits one narrow relational operation: a bigint equality INNER JOIN
 between exactly two explicitly registered `SourceId` values in the same
@@ -139,4 +139,4 @@ PostgreSQL two-source path: one transaction changes both sides atomically,
 right updates/deletes fan out or retract exactly, both join-key changes are
 handled, exact replay is a no-op, injected sink failure rolls back rows/results/
 continuation, and replacement of the exact right PK identity fails closed.
-Graph bootstrap/rebuild release and performance acceptance remains M14.7.
+M14.7 re-proves graph bootstrap/rebuild release and performance acceptance.

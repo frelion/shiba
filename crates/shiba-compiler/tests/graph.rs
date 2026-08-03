@@ -3,6 +3,7 @@ use core::num::NonZeroU32;
 use shiba_compiler::{
     GRAPH_SPEC_VERSION, GraphOutputSpecV1, GraphSpecV1, IdentityIndexDescriptor,
     SourceColumnDescriptor, SourceDescriptor, compile_graph,
+    compile_graph_with_optional_identities,
 };
 use shiba_operator::{
     DeltaBatch, EffectOrigin, GraphEffectOrigin, MultiInputBatch, NodeId, ObjectAddress,
@@ -46,6 +47,7 @@ fn identity(source: &SourceDescriptor, object: u32) -> IdentityIndexDescriptor {
         address: address(object, 0),
         relation: source.relation,
         key_column: source.columns[0].address,
+        key_arity: 1,
         unique: true,
         valid: true,
         ready: true,
@@ -231,6 +233,31 @@ fn every_source_requires_one_exact_effective_identity() {
             .is_err()
         );
     }
+}
+
+#[test]
+fn only_zero_column_singleton_count_may_omit_identity() {
+    let empty = source(1, 45_000, &[]);
+    let count = GraphSpecV1 {
+        version: 1,
+        graph_id: GraphId::new(45).unwrap(),
+        sources: vec![empty.source_id],
+        outputs: vec![GraphOutputSpecV1::CountRows {
+            source_id: empty.source_id,
+            aggregate_node_id: node(1),
+            result_node_id: node(2),
+        }],
+    };
+    let graph =
+        compile_graph_with_optional_identities(&count, std::slice::from_ref(&empty), &[None])
+            .unwrap();
+    assert_eq!(graph.sources[0].identity_index, None);
+
+    let keyed = source(1, 46_000, &[("id", false)]);
+    assert!(
+        compile_graph_with_optional_identities(&count, &[keyed], &[None]).is_err(),
+        "an identity-free source with any durable column must fail closed"
+    );
 }
 
 #[test]

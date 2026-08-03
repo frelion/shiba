@@ -24,14 +24,21 @@ authorities. There is no compatibility path. The directed M14.6 graph Runtime
 gate is green on PG17.10/PG18.4: one real pgoutput transaction can carry both
 relation changes into one graph Apply; exact replay does not duplicate output,
 sink failure rolls back continuation, and exact identity-index replacement
-invalidates before mutation. M14.7 owns full receiver/bootstrap/rebuild release
-and performance evidence.
+invalidates before mutation. M14.7 re-proves the full receiver/bootstrap/rebuild
+release and performance matrix.
 
 Every `PgoutputSource` must agree with the durable effective identity index for
 its member. Default primary-key and explicit unique replica-identity sources
 are admitted; a relation with no effective identity is rejected without a
 partial binding. This member rule is checked independently of node kind, so
 Ingress never treats the JOIN right side as a special transport source.
+
+After taking the graph/generation lock, Runtime performs the exact replay probe
+before current eligibility/invalidation checks. A durable transaction replay
+therefore converges even if DDL invalidated the graph after the original commit;
+a new transaction still fails eligibility before Source Apply. This ordering
+does not authorize ACK before `Applied`/`AlreadyApplied` and never bypasses the
+generation comparison.
 
 ## M13 lifecycle integration status (historical baseline)
 
