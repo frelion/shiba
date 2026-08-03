@@ -2,21 +2,20 @@
 
 ## M14.7 release evidence
 
-`scripts/release-matrix.sh` passed all 51 enrolled scripts on PostgreSQL 17.10
-and PostgreSQL 18.4: 102 successful PostgreSQL invocations. Enrollment remains
-exact, so an unlisted `test-*.sh` fails before the database matrix begins. The
-matrix includes graph stateless/grouped/JOIN correctness, transaction rollback,
-retry/replay, DDL identity, ingress/ACK, one-snapshot bootstrap, catch-up,
-rebuild/recovery, concurrency, least privilege and all M1--M13 regressions.
+Commit `206f085` records the previous green release matrix: 51 enrolled scripts
+on PostgreSQL 17.10 and PostgreSQL 18.4, or 102 successful invocations. With
+`test-m14-join-lifecycle.sh` enrolled exactly once, the final release runner
+passed 52 scripts and 104 PG invocations. An unlisted `test-*.sh` still fails
+before databases start.
 
 The frozen same-scene five-run M13 Apply comparison reports PG17 median
 771.019625 ms versus 782.302750 ms baseline (-1.44%) and PG18 median
 821.920250 ms versus 787.157125 ms baseline (+4.42%). Both remain below the
 fixed M14 ceilings of 899.648163/905.230694 ms.
 
-The million-row M12 rebuild regression reports PG17 total 7.588033917 s,
-RSS +6,224 KiB and retained WAL 252,905,752 bytes; PG18 total 7.703419083 s,
-RSS +6,272 KiB and retained WAL 252,938,872 bytes. Both stay below the unchanged
+The final million-row M12 rebuild regression reports PG17 total 7.434870458 s,
+RSS +6,256 KiB and retained WAL 252,905,752 bytes; PG18 total 7.151174542 s,
+RSS +6,224 KiB and retained WAL 252,938,872 bytes. Both stay below the unchanged
 268,435,456-byte retained-WAL limit and preserve the prior time/RSS thresholds.
 No workload, assertion or threshold was relaxed after observation.
 
@@ -28,8 +27,33 @@ Failure-first static/directed gates additionally freeze three boundaries:
 - after graph/generation locking, exact replay is probed before current
   eligibility/invalidation, while all new work still fails on invalidation.
 
-M14 is complete at the declared Operator Graph scope. This matrix does not
-claim complete V2.
+M14 is complete at the declared Operator Graph scope. The final release matrix
+retains the 52/104 enrollment result; this does not claim complete V2.
+
+## M14 lifecycle evidence closure
+
+`scripts/test-m14-join-lifecycle.sh` is independently green on PostgreSQL 17.10
+and 18.4. One two-source cross-schema Join graph is registered, then one real
+exported snapshot scans both members while a transaction changing both sources
+accumulates in the same slot. Catch-up applies that WAL, activation publishes
+the complete keyed result, and `GovernedGraphSession` continues live on the
+same graph generation.
+
+The gate then proves explicit feedback and both crash sides. A live graph
+transaction is durably applied and explicitly ACKed to its exact end LSN. A
+second transaction commits in Shiba but the governed session is dropped before
+ACK; restart receives the same transaction as `AlreadyApplied`, leaves graph
+continuation cardinality unchanged, and only then advances
+`confirmed_flush_lsn` to the exact terminal coordinate.
+
+Finally, the non-pristine same-binding graph rebuild moves generation 1 to 2 as
+one unit. A new exported snapshot scans both members, concurrent two-source WAL
+is caught up, activation changes the whole graph generation, and a post-cutover
+live transaction is applied and ACKed on the new slot. Every phase compares all
+keyed Join rows with an independent SQL oracle and checks exact graph
+continuation cardinality/generation. No production code or authority changed;
+mechanical responsibility splits leave every production file below 300 lines
+without changing public APIs, transaction ownership or ACK semantics.
 
 ## M14.6 graph lifecycle cutover gates
 

@@ -27,6 +27,14 @@ sink failure rolls back continuation, and exact identity-index replacement
 invalidates before mutation. M14.7 re-proves the full receiver/bootstrap/rebuild
 release and performance matrix.
 
+The lifecycle closure adds a real two-source governed receiver proof on both PG
+versions. After graph activation, `GovernedGraphSession` applies and explicitly
+ACKs one complete Join transaction. Dropping the session after durable Apply
+but before ACK leaves `confirmed_flush_lsn` old; reattach receives exact replay,
+Runtime returns `AlreadyApplied`, continuation cardinality is unchanged, and
+the explicit ACK advances the slot to the exact terminal end LSN. Generation-2
+live ingress repeats Apply/ACK after whole-graph rebuild.
+
 Every `PgoutputSource` must agree with the durable effective identity index for
 its member. Default primary-key and explicit unique replica-identity sources
 are admitted; a relation with no effective identity is rejected without a

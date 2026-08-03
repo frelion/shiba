@@ -27,6 +27,14 @@ installs a complete canonical graph/result-contract set rather than named
 operators. M14.7 re-proves the complete PG17.10/PG18.4 graph
 rebuild/recovery/performance matrix.
 
+The two-source lifecycle gate additionally starts from a live non-pristine Join
+graph with acknowledged and unacknowledged history, performs a same-binding
+whole-graph generation-1-to-2 rebuild, scans both members through one new
+exported snapshot, catches up a transaction changing both sources, activates
+once, and continues live Apply/ACK on the replacement slot. Full keyed SQL
+oracle, exact generation, continuation cardinality and confirmed-flush checks
+prove that neither member switches independently.
+
 An invalidation on the old active generation is allowed as an explicit reason
 to request rebuild; requiring the invalid old authority to pass ordinary live
 preflight would make forward repair impossible. All target checks still occur

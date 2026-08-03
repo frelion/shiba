@@ -62,6 +62,11 @@ single-member source shape. Every nullable-int8 graph member, and specifically
 the JOIN right member, requires its exact effective identity; the JOIN right is
 exactly one non-null bigint PK/UK used as replica identity.
 
+The M14 lifecycle evidence closure adds no Catalog object or writer. Its real
+PG17.10/PG18.4 path observes the same `graph_bootstrap`, per-member checkpoints,
+`graph_continuation`, graph result/state and generation CAS from initial
+snapshot through live ACK, replay and non-pristine whole-graph rebuild.
+
 ## M13 generic operator authority (historical, superseded by M14.6)
 
 M13.3 replaced the aggregate-specific layout rather than migrating or mirroring

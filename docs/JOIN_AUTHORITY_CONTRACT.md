@@ -140,3 +140,10 @@ right updates/deletes fan out or retract exactly, both join-key changes are
 handled, exact replay is a no-op, injected sink failure rolls back rows/results/
 continuation, and replacement of the exact right PK identity fails closed.
 M14.7 re-proves graph bootstrap/rebuild release and performance acceptance.
+
+`test-m14-join-lifecycle.sh` closes the remaining end-to-end authority evidence
+on PG17.10 and PG18.4: one exported snapshot scans both cross-schema members;
+one slot catches up a transaction changing both; activation, governed live ACK,
+Apply-before-ACK crash/replay and same-binding non-pristine generation rebuild
+are graph-wide. Every phase checks the full keyed SQL oracle, continuation
+cardinality, exact generation and slot feedback coordinate.

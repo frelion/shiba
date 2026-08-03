@@ -1,13 +1,19 @@
-# V2 goal gap entering M14
+# V2 goal gap after M14
 
 ## M14.7 completion status
 
-M14 is complete at the declared Operator Development boundary. The exact
-release runner passed 51 unique scripts on PostgreSQL 17.10 and PostgreSQL 18.4,
-102 invocations total. It re-proves single/two-source graph Runtime, Filter/
-Project/Compute, grouped Count/Sum, two-table INNER JOIN, generic state/results,
-ACK, bootstrap, rebuild, recovery, DDL, concurrency and least privilege without
-a second Runtime, continuation or persisted intermediate batch.
+M14 is complete at the declared Operator Development boundary. Commit
+`206f085` preserves the prior 51-script/102-invocation PG17.10/PG18.4 release
+matrix. The independently green two-version `test-m14-join-lifecycle.sh` closes
+the remaining real lifecycle evidence. The final runner passed 52 unique
+scripts and 104 PostgreSQL invocations.
+
+That gate proves a cross-schema two-source Join through one exported snapshot,
+both-member scan, concurrent two-source WAL catch-up, activation, governed live
+Apply and explicit ACK; durable-Apply/before-ACK session loss converges through
+`AlreadyApplied` and exact feedback. It then rebuilds the same non-pristine
+graph from generation 1 to 2, catches up concurrent WAL, activates once, and
+continues live with a full keyed SQL oracle and exact continuation/slot checks.
 
 Five-run same-scene Apply medians are 771.019625 ms on PG17 (-1.44% versus
 782.302750 ms baseline) and 821.920250 ms on PG18 (+4.42% versus 787.157125 ms
@@ -43,8 +49,8 @@ default PK or explicit replica-identity index and rejects a relation with none.
 Strict Compiler tests cover ComputedProject and filtered grouped Count/Sum
 pipelines; Runtime consumes only generic result contracts.
 
-M14.7 closes the full receiver/bootstrap/rebuild, least-privilege, release and
-performance matrix.
+M14.7 and the lifecycle evidence closure prove receiver/bootstrap/rebuild,
+least-privilege, release and performance behavior without a second authority.
 
 ## M14.5 pure JOIN kernel status
 
@@ -61,10 +67,9 @@ relation/column ObjectAddresses and the exact right PK/UK index. See
 [JOIN_AUTHORITY_CONTRACT.md](JOIN_AUTHORITY_CONTRACT.md) and
 [ADR 0006](adr/0006-m14-two-source-join-authority.md).
 
-Still unproved are the complete graph bootstrap/rebuild/least-privilege matrix
-and frozen PG17/18 release/performance matrix.
-No per-source continuation, second Runtime, persisted DeltaBatch or adapter is
-accepted as a way to close those gaps.
+The complete graph bootstrap/rebuild/least-privilege and frozen performance
+boundaries are proved. No per-source continuation, second Runtime, persisted
+DeltaBatch or adapter was introduced.
 
 ## M14.3 implementation status
 

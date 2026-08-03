@@ -26,6 +26,13 @@ load the durable graph and share one lifecycle/snapshot with subordinate member
 checkpoints. M14.7 re-proves the complete PG17.10/PG18.4
 bootstrap/catch-up/restart matrix as part of the 51-script release gate.
 
+The later `test-m14-join-lifecycle.sh` closes the specifically two-source
+lifecycle gap on both versions: one exported snapshot is imported while both
+members are scanned, a transaction changing both sources accumulates on the one
+slot, catch-up applies it before one activation, and all materialized Join rows
+match an independent SQL oracle. The same procedure is repeated for the
+generation-2 rebuild snapshot.
+
 ## M13 generic plan-set handoff (historical baseline)
 
 M13.3 established the sole generic Runtime entry and scalar/keyed Result Sink.

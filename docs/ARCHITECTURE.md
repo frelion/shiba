@@ -69,8 +69,14 @@ admitted for their one-member shape. The M14 INNER JOIN right member is
 narrower: exactly one non-null bigint default-PK or explicit unique
 replica-identity key. These are explicit graph/source contracts, not fallback.
 
-M14.7 re-proves this architecture through 51 scripts on PG17.10 and PG18.4
-(102 invocations). It completes M14, not V2.
+M14.7 first re-proved this architecture through 51 scripts on PG17.10 and
+PG18.4 (102 invocations, commit `206f085`). The added lifecycle gate then
+executes the two-source graph through one exported snapshot, concurrent WAL
+catch-up, governed live ACK/crash replay and whole-graph generation rebuild on
+both versions. The final 52-script/104-invocation runner passed.
+Mechanical responsibility splits made every production file smaller than 300
+lines without changing an API, authority, lock order or transaction owner.
+M14 is complete, not V2.
 
 M13.1 froze the generic execution successor to the M9 aggregate-shaped API;
 M13.2 supplied its pure kernel, and M13.3 made that kernel the sole Runtime and

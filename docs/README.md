@@ -213,8 +213,11 @@ directed PG17.10/PG18.4 graph Runtime gate proves singleton and cross-schema
 JOIN execution, both-side atomicity, fan-out/retraction, rollback/replay and
 exact effective-identity invalidation. Compiler also admits strict computed
 projection and filtered grouped pipelines without Runtime kind dispatch.
-M14.7 re-proves the complete bootstrap/rebuild lifecycle and all earlier gates:
-51 unique scripts, 102 successful PG17.10/PG18.4 invocations. Five-run
+M14.7's matrix at `206f085` preserved 51 unique scripts and 102 successful
+PG17.10/PG18.4 invocations. The subsequent two-version Join lifecycle gate
+proves one exported snapshot across both sources, catch-up, governed live
+ACK/crash replay and whole-graph generation rebuild. The final matrix passed
+52 scripts and 104 invocations. Five-run
 same-scene Apply medians are 771.019625/821.920250 ms, below the frozen
 899.648163/905.230694 ms ceilings. M14 is complete; this does not claim a SQL
 frontend, outer/three-table joins, windows, additional aggregates, plugins,

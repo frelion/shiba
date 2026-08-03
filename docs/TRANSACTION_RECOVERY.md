@@ -30,6 +30,14 @@ of the exact right identity index rejects a pending transaction before writes.
 M14.7 re-proves the complete receiver/bootstrap/rebuild crash and release
 matrix.
 
+The two-source lifecycle evidence makes the ACK crash window concrete for the
+graph path. After durable Apply and before feedback, dropping the governed
+session preserves the computed result and graph continuation while the slot
+position stays old. Restart obtains `AlreadyApplied` for the exact graph
+transaction, does not add a continuation, and only its explicit ACK advances
+`confirmed_flush_lsn`. The same gate proves generation-1-to-2 rebuild and
+post-cutover live ACK with complete keyed SQL results.
+
 Keyed recovery compares canonical typed key and value payloads, not only their
 convenience bigint/NULL projections. This closes the failure where a projected
 SQL value could look correct while the durable codec payload drifted. Result
