@@ -25,6 +25,7 @@ mod governed;
 mod limits;
 mod publication;
 mod rebuild;
+mod rebuild_handoff;
 mod rebuild_model;
 mod rebuild_resume;
 mod rebuild_validation;

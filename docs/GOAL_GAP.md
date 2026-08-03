@@ -8,7 +8,7 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap lifecycle, M12.2 active-source destructive admission, and PG17/18-proven durable rebuild identity-index authority | M12.3 slot/snapshot progression, crash/DDL/role matrix and final release gate remain |
+| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap lifecycle, M12.2 admission/identity and M12.3 PG17/18 snapshot-to-live activation | M12.4 crash recovery, DDL/role matrix and final release gate remain |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
 | Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
@@ -75,8 +75,12 @@ PG17.10 and PG18.4 independently pass
 catalog-only resume, same-OID rename, unrelated DDL isolation, malformed binding
 rejection, repeated rebuild CAS, and replacement-OID rejection are proved.
 Receiver-local token capability prevents a foreign old receiver from
-authorizing Apply/ACK. The snapshot-to-live data path, full recovery/DDL/role
-matrix and performance remain M12.3--M12.6 work.
+authorizing Apply/ACK. PG17.10 and PG18.4 now pass
+`scripts/test-m12-rebuild-snapshot-live.sh`: generation 2 rebuilds to 3 through
+exact old-slot retirement, real exported snapshot, bounded scan, concurrent WAL
+catch-up, fence, atomic activation and ordinary M10 live ACK without copying old
+continuation or switching identity twice. Full crash recovery, DDL/role matrix
+and performance remain M12.4--M12.6 work.
 
 M10.3 deliberately does not add persisted partial-stream recovery: partial
 stream bytes are volatile and PostgreSQL's replication slot replays them after

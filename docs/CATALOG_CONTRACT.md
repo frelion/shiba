@@ -237,10 +237,10 @@ same-name/same-shape replacement. This is a documented deployment assumption
 and residual risk, not a database-enforced invariant. M12 adds no slot-birth
 marker, parallel candidate authority, alias, fallback or dual write.
 
-M12.1 is the frozen contract. M12.2 established the destructive writer and its
-original production admission transition; the corrected durable index identity
-still awaits final PG17/18 evidence. Data-path and recovery claims require
-M12.3--M12.6.
+M12.1 is the frozen contract. M12.2 establishes the destructive writer and
+durable index identity. M12.3 proves the target authority survives real
+snapshot-to-live activation without another binding/config switch. Crash and
+later lifecycle claims remain M12.4--M12.6.
 
 ## M12.2 admitted rebuild state
 
@@ -280,4 +280,14 @@ snapshot unchanged,
 two concurrent preparations have one winner, and success exposes only the
 state above. The corrected four-row identity gate first exposed invalid
 PL/pgSQL `IF CASE` syntax on PG17, then passed on PG17.10 and PG18.4 after the
-fix. Snapshot creation, slot retirement and forward resume are M12.3.
+fix.
+
+## M12.3 activated rebuild authority
+
+PG17.10 and PG18.4 `scripts/test-m12-rebuild-snapshot-live.sh` prove that the
+same generation-3 exact-four binding/config prepared above remains the sole
+authority through real exported-snapshot scan, WAL catch-up, activation and
+ordinary live Apply/ACK. Activation changes lifecycle and result visibility;
+it does not install binding/config again. The retired generation-2 triple is
+preserved in the active row, and no old continuation is copied into generation
+3. M12.4 still owns crash recovery between these durable transitions.

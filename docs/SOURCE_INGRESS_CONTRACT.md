@@ -438,6 +438,25 @@ not a stored cursor, generation, continuation or slot identity; catalog
 lifecycle/generation validation remains mandatory. The earlier PG17.10/PG18.4
 admission gate predates the identity-authority correction. Its new
 failure-first run exposed invalid unparenthesized PL/pgSQL `IF CASE` syntax on
-PG17; the corrected gate is green on PG17.10 and PG18.4. M12.3 must still retire the exact old slot,
-create the exact new slot with `EXPORT_SNAPSHOT`, and drive the existing M11/
-M10 path.
+PG17; the corrected gate is green on PG17.10 and PG18.4.
+
+## M12.3 rebuild transport handoff
+
+PG17.10 and PG18.4 `scripts/test-m12-rebuild-snapshot-live.sh` prove the exact
+handoff: drop the inactive generation-2 slot, create the absent generation-3
+slot with real `EXPORT_SNAPSHOT`, scan in bounded M11 batches, consume
+snapshot-concurrent INSERT/UPDATE/DELETE through M10, cross the exact fence,
+activate, then process and ACK an ordinary live transaction. Backpressure stays
+synchronous and no WAL spool, queue or second receiver path is added.
+
+An old token and old-generation attach are rejected. Results remain
+`building/NULL` until activation, and feedback derives only from durable WAL
+Apply after the real snapshot boundary. M12.4 still must prove restart behavior
+at every non-transactional slot and handoff crash window.
+
+After locking the sole binding, Runtime validates exact ingress config and
+bootstrap generation before replay or Apply. With a lifecycle row present,
+ordinary WAL is admitted only in `catching_up` or `active`: retired generation
+2 rejects before and after activation, and target generation 3 cannot enter the
+ordinary path during `rebuild_prepared`, `creating`, `scanning`, or
+`scan_complete`.

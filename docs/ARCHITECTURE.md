@@ -369,8 +369,8 @@ a trusted control-plane capability, and an identical privileged external slot
 replacement is an explicit residual risk outside the M12 correctness threat
 model. See [the rebuild contract](REBUILD_CONTRACT.md) and
 [ADR 0003](adr/0003-m12-offline-rebuild.md). M12.1 freezes this architecture;
-M12.2 now proves the destructive admission boundary; M12.3--M12.6 have not
-yet proved snapshot-to-live recovery, the full crash/DDL/role matrix, or
+M12.2 proves destructive admission and durable identity; M12.3 proves the real
+snapshot-to-live path. M12.4--M12.6 still own the full crash/DDL/role matrix and
 performance.
 
 ## M12.2 destructive admission architecture
@@ -411,4 +411,28 @@ binding/mixed-plan rollback, single-winner concurrency and the exact successful
 building state. The follow-on identity-authority gate was failure-first and
 initially exposed invalid unparenthesized PL/pgSQL `IF CASE` syntax on PG17.
 After correction, `scripts/test-m12-rebuild-identity-authority.sh` is green on
-PG17.10 and PG18.4. M12.3 slot retirement and snapshot-to-live remain separate.
+PG17.10 and PG18.4.
+
+## M12.3 snapshot-to-live architecture
+
+PG17.10 and PG18.4 now pass `scripts/test-m12-rebuild-snapshot-live.sh`. A real
+active, non-pristine generation 2 enters prepare as generation 3 with the exact
+four-row target authority. The coordinator drops only the exact inactive old
+slot, creates the named target slot with a real `EXPORT_SNAPSHOT`, and hands
+that snapshot to the existing bounded M11 scanner. Concurrent INSERT, UPDATE
+and DELETE are then consumed from the same slot through M10 catch-up, exact
+fence, activation, ordinary live ingress and durable feedback.
+
+Public results remain `building/NULL` until activation. The old continuation is
+deleted rather than copied, snapshot batches never acquire WAL identity, and
+the target binding/config/generation installed by prepare is not switched a
+second time. The retired identity triple remains durable after activation.
+Old-generation attach and terminal-token authorization fail closed. M12.3 does
+not prove the instruction-level crash matrix; that remains M12.4.
+
+Runtime locks the sole binding before checking ingress config/bootstrap
+generation and before any replay or Apply action. When a bootstrap lifecycle
+exists, ordinary WAL processing is eligible only in `catching_up` or `active`.
+Thus the retired generation rejects both immediately after prepare and after
+activation, while target generation 3 cannot bypass bootstrap during
+`rebuild_prepared`, `creating`, `scanning`, or `scan_complete`.

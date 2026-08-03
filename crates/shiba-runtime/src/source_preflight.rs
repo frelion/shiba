@@ -20,6 +20,55 @@ pub(crate) fn lock_binding(
     Ok(())
 }
 
+pub(crate) fn validate_execution_authority(
+    transaction: &mut Transaction<'_>,
+    source_id: i64,
+    expected_slot_generation: i64,
+) -> Result<(), M2Error> {
+    let authority = transaction.query_one(
+        "SELECT (
+             SELECT config.slot_generation
+             FROM shiba_internal.source_ingress_config AS config
+             WHERE config.source_id = $1
+         ), (
+             SELECT bootstrap.slot_generation
+             FROM shiba_internal.source_bootstrap AS bootstrap
+             WHERE bootstrap.source_id = $1
+         ), (
+             SELECT bootstrap.phase
+             FROM shiba_internal.source_bootstrap AS bootstrap
+             WHERE bootstrap.source_id = $1
+         )",
+        &[&source_id],
+    )?;
+    let configured_generation: Option<i64> = authority.get(0);
+    let bootstrap_generation: Option<i64> = authority.get(1);
+    let bootstrap_phase: Option<&str> = authority.get(2);
+    let Some(configured_generation) = configured_generation else {
+        return if bootstrap_generation.is_none() && bootstrap_phase.is_none() {
+            Ok(())
+        } else {
+            Err(M2Error::SourceInvalidated)
+        };
+    };
+    if configured_generation != expected_slot_generation {
+        return Err(M2Error::SlotGenerationMismatch);
+    }
+    match (bootstrap_generation, bootstrap_phase) {
+        (None, None) => Ok(()),
+        (Some(bootstrap_generation), Some(phase)) => {
+            if bootstrap_generation != expected_slot_generation {
+                return Err(M2Error::SlotGenerationMismatch);
+            }
+            if !matches!(phase, "catching_up" | "active") {
+                return Err(M2Error::InvalidBootstrapPhase);
+            }
+            Ok(())
+        }
+        _ => Err(M2Error::SourceInvalidated),
+    }
+}
+
 pub(crate) fn validate(transaction: &mut Transaction<'_>, source_id: i64) -> Result<(), M2Error> {
     let binding = transaction
         .query_opt(

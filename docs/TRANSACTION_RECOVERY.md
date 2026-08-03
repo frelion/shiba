@@ -505,6 +505,26 @@ authorization capability even when their terminal LSN equals a current value.
 The capability is memory-only and cannot replace durable lifecycle/generation
 validation. The admission gate does not yet prove kill points after old-slot
 drop, new-slot creation, snapshot loss, scan/catch-up, activation or feedback;
-those remain M12.3--M12.4. The corrected cardinality path initially failed on
-PG17 because unparenthesized PL/pgSQL `IF CASE` is invalid. Final PG17/18
-recovery evidence remains pending and is not claimed here.
+those remain M12.4. The corrected cardinality path initially failed on PG17
+because unparenthesized PL/pgSQL `IF CASE` is invalid.
+
+## M12.3 proved forward path, not crash matrix
+
+PG17.10 and PG18.4 `scripts/test-m12-rebuild-snapshot-live.sh` prove the normal
+forward sequence from active non-pristine generation 2 through generation-3
+prepare, exact old-slot retirement, real `EXPORT_SNAPSHOT`, bounded scan,
+snapshot-concurrent INSERT/UPDATE/DELETE catch-up, fence, activation and M10
+live Apply/ACK. Results stay `building/NULL` until activation; the old
+continuation is absent and never relabeled; the retired triple survives active
+cutover; old attach and token authorization reject.
+
+This is not evidence for recovery after a crash between those actions. Slot
+drop, slot creation, consistent-point persistence, scan, catch-up, activation
+and pre-feedback kill windows remain explicitly assigned to M12.4.
+
+Runtime's binding lock precedes exact config/bootstrap generation validation,
+which itself precedes replay and Apply. Ordinary WAL is eligible only when the
+existing lifecycle is `catching_up` or `active`. Consequently a retired worker
+cannot write either immediately after prepare or after activation, and the
+target generation cannot skip the snapshot during `rebuild_prepared`,
+`creating`, `scanning`, or `scan_complete`.

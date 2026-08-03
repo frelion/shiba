@@ -535,6 +535,26 @@ PG18.4. It proves exact-four target persistence, recovery using only durable
 Catalog coordinates, same-OID rename reconciliation, unrelated index isolation,
 binding cardinality/kind/address rejection, a second rebuild whose old CAS comes
 from the durable fourth row, and fail-closed same-shaped primary-key replacement.
-M12.2 does not prove old-slot cleanup,
-new exported snapshot, snapshot-to-live differential, crash recovery, DDL/
-least-privilege breadth or performance.
+M12.2 does not prove old-slot cleanup, new exported snapshot or snapshot-to-live
+differential; those are M12.3 evidence. Crash recovery, DDL/least-privilege
+breadth and performance remain later gates.
+
+## M12.3 snapshot-to-live gate
+
+Run `scripts/test-m12-rebuild-snapshot-live.sh` with the exact PG17 and PG18
+`pg_config` paths. Both PG17.10 and PG18.4 are green. The test starts from a
+real active, non-pristine generation 2 and proves generation 3 has the exact
+four-row identity, drops only the exact inactive old slot, creates the target
+slot with real `EXPORT_SNAPSHOT`, scans in bounded batches, and consumes a
+concurrent INSERT/UPDATE/DELETE transaction before exact-fence activation.
+
+Assertions cover `building/NULL` through activation, SQL-equal rows plus
+CountRows/SumInt8 after catch-up, absence of copied old continuation, retained
+retired triple, rejection of old token and attach, no second binding/config
+switch, and a normal post-cutover M10 live Apply/ACK. This gate is the normal
+forward path only. It must not be cited for M12.4 crash/restart windows.
+
+The gate also probes Runtime eligibility before replay/Apply: retired generation
+2 rejects after prepare and after activation; target generation 3 rejects in
+`rebuild_prepared`, `creating`, `scanning`, and `scan_complete`; only
+`catching_up` and `active` admit ordinary WAL under the locked sole binding.

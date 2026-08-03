@@ -267,8 +267,8 @@ and publishes its complete private state. There is no candidate binding,
 second bootstrap implementation, parallel generation, birth marker, alias or
 fallback. The full closed transition and residual physical-slot risk are in
 [the M12 rebuild contract](REBUILD_CONTRACT.md). M12.1 freezes the contract;
-M12.2 proves the exact admission/retirement transaction, but a production
-snapshot-to-live rebuild is not yet proved.
+M12.2 proves the exact admission/retirement transaction and M12.3 now proves
+the production snapshot-to-live forward path. Crash recovery remains M12.4.
 
 ## M12.2 handoff into the bootstrap lifecycle
 
@@ -292,4 +292,18 @@ three-row shape. The retired BootstrapId/slot/generation triple persists across
 creating, scanning, catch-up, active and recoverable failure phases, so
 recovery does not infer identity from current catalogs. Same-OID rename is the
 only narrow reconciliation; replacement OID fails closed. The corrected gate
-is green on PG17.10 and PG18.4; snapshot-to-live remains M12.3 work.
+is green on PG17.10 and PG18.4.
+
+## M12.3 proved reuse of the bootstrap path
+
+`scripts/test-m12-rebuild-snapshot-live.sh` is green on PG17.10 and PG18.4.
+After prepare, the coordinator retires the exact inactive old slot and obtains
+a real exported snapshot from the new slot. It then calls the existing bounded
+M11 scan, catch-up, fence, activation and live-handoff path. Concurrent
+INSERT/UPDATE/DELETE are supplied only by WAL; no snapshot batch fabricates a
+transaction identity and no old continuation is copied.
+
+The public sink stays `building/NULL` until the activation transaction exposes
+the complete target result. The same target identity remains installed, and
+the retired triple remains after activation. Crash/restart behavior during
+these steps remains M12.4 rather than an M12.3 claim.
