@@ -384,3 +384,27 @@ only reader. The real path reaches live ingress and matches the SQL oracle.
 Role swapping and revoked `EXECUTE`, source `SELECT`, or checkpoint `UPDATE`
 fail before unauthorized Apply or feedback; no production session uses
 superuser or inherited role membership.
+
+## M12.1 rebuild ingress boundary
+
+Rebuild first stops ordinary live ingress under the same per-source ownership
+fence and requires the old physical slot inactive. A failure during side-effect-
+free target preflight leaves that receiver, old authority and result unchanged.
+Once destructive prepare commits, only the target building config/generation
+may be used: old-generation receive, Apply, pending terminal authorization,
+feedback and attach all fail closed.
+
+The target slot must be created explicitly with `pgoutput EXPORT_SNAPSHOT`.
+M11's bounded scanner imports its real snapshot; the same target slot then
+feeds M10 catch-up, exact fence, activation and live handoff. Waiting for any
+of these transport operations holds no Apply transaction or catalog lock. No
+new receiver, decoder, queue, WAL spool or continuation is introduced.
+
+Ingress rejects every observable slot drift: unexpected presence/absence,
+active state, database, plugin/type, temporary/two-phase/failover/synced shape,
+name, lifecycle or generation mismatch. It never adopts or repairs a slot by
+name. PostgreSQL cannot reveal a same-name/same-shape replacement performed by
+a superuser or holder of the trusted `REPLICATION` credential. Credential
+exclusivity and no external slot DDL are deployment prerequisites, not a
+per-slot ACL proof. M12.1 defines these rules; production ingress enforcement
+is pending M12.2--M12.6.

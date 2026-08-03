@@ -210,3 +210,32 @@ source, sequence, and revoked bootstrap-function grants. The transport role has
 public result `SELECT`. Missing `EXECUTE`, source `SELECT`, or checkpoint
 `UPDATE`, and swapped control/transport identities, leave the catalog fail
 closed. PUBLIC gains no privilege and no writer or authority changes.
+
+## M12.1 rebuild authority transition
+
+M12 first extends the existing `source_bootstrap` lifecycle rather than adding
+a candidate table. Before destructive prepare, the exact old binding, ingress
+config, generation and bootstrap remain sole active authority. Target binding,
+publication membership/flags, replica identity, operator plan, permissions and
+slot-name availability are validated without catalog mutation.
+
+Prepare is one exact-old identity/generation CAS transaction. Its commit makes
+the target binding/config/new generation the sole catalog authority and the
+bootstrap lifecycle building; all public operator results become
+`building/NULL`. The same transaction retires old current rows, resets private
+operator state and deletes the old continuation. From that point no old worker,
+transaction or token is eligible to Apply or ACK, and recovery cannot restore
+the old identity. Activation later changes only lifecycle/result visibility for
+that same target authority; it does not install another binding/config.
+
+Slot operations are outside this transaction. Durable lifecycle plus exact
+old/new names, generation and observable `pg_replication_slots` shape govern
+their recovery. Names never authorize adoption. PostgreSQL provides no
+immutable slot incarnation identifier or per-slot ownership privilege; a
+holder of the trusted `REPLICATION` credential can make an undetectable
+same-name/same-shape replacement. This is a documented deployment assumption
+and residual risk, not a database-enforced invariant. M12 adds no slot-birth
+marker, parallel candidate authority, alias, fallback or dual write.
+
+M12.1 is a contract and failure-first-test slice. The SQL writer and production
+state transitions are not accepted until M12.2 and later PG17/18 gates.

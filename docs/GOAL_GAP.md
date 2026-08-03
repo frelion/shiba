@@ -1,4 +1,4 @@
-# V2 goal gap after M11
+# V2 goal gap during M12.1
 
 M1–M9 are the reference correctness kernel, not a complete Shiba V2. They
 prove the transaction and recovery semantics that later architecture must
@@ -8,7 +8,7 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap checkpoint/lifecycle, and PG17/18-proved exact pre-scan replacement writer | M12 non-pristine rebuild lifecycle |
+| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap checkpoint/lifecycle, and PG17/18-proved exact pre-scan replacement writer | M12.1 freezes non-pristine rebuild authority; production M12.2--M12.6 remain |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
 | Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
@@ -56,7 +56,11 @@ remain narrower unproved cases. M11.4 proves one million rows in 100 bounded
 frozen before observation. SQL differential and live handoff are green.
 
 M11 is complete at its pristine nullable-int8 CountRows/SumInt8 scope. V2 is
-not complete, and active/non-pristine rebuild remains untouched M12 scope.
+not complete. M12.1 freezes an offline rebuild: target identity becomes sole
+building authority at destructive prepare, old computation is retired, and
+activation promotes the same authority. It adds no candidate or parallel path.
+The production transaction, rebuild data path, recovery/DDL/role matrix and
+performance remain M12.2--M12.6 work.
 
 M10.3 deliberately does not add persisted partial-stream recovery: partial
 stream bytes are volatile and PostgreSQL's replication slot replays them after
@@ -82,3 +86,10 @@ swapping and missing function, source, or checkpoint privileges fail closed.
 TLS/password policy, cross-host credential rotation, column-level grants, and
 split-role successful abandoned-attempt replacement remain operational gaps,
 not M11 data-correctness gaps.
+
+M12 also records a PostgreSQL boundary: `pg_replication_slots` has no immutable
+slot birth identity or per-slot ACL. All observable drift must fail closed, but
+a same-name/same-shape replacement by a superuser or holder of the trusted
+`REPLICATION` credential cannot be detected and is outside the correctness
+threat model. Credential exclusivity and audit are deployment prerequisites;
+no slot-birth marker is introduced in M12.1.

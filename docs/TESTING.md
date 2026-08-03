@@ -476,3 +476,27 @@ Negative cases swap roles and revoke bootstrap-function `EXECUTE`, source
 continuation, public activation and feedback unchanged. PG17.10 and PG18.4
 pass. TLS/password policy, cross-host credentials, column-level grants, and a
 successful split-role abandoned-attempt replacement are not claimed.
+
+## M12.1 rebuild contract gate
+
+M12.1 is failure-first and must not claim the data path implemented. The
+contract freezes the closed lifecycle, exact-old identity/generation CAS
+model, `active -> building -> active` visibility, forward-only post-prepare
+recovery, old-generation worker/token/Apply/ACK rejection and observable
+physical-slot shape classification. Static checks forbid a candidate
+binding/config, second bootstrap/continuation/decoder, slot-birth marker, alias
+or fallback.
+
+A real M11/M10 active-source gate plus PG17.10/PG18.4 experiment records
+failure-first authority snapshots and all stable
+`pg_replication_slots` identity/shape fields around a same-name logical-slot
+drop/recreate. Equality is evidence that PostgreSQL exposes no immutable birth
+identity, not permission to adopt the replacement. Negative cases for every
+observable mismatch remain mandatory in M12.2 and later gates. Documentation
+must describe the `REPLICATION` credential as a trusted capability and list an
+identical privileged replacement as excluded residual risk.
+
+M12.1 runs Markdown/static contract checks plus fmt, workspace check/tests and
+clippy. It does not count as proof of destructive prepare, snapshot-to-live
+rebuild, crash/DDL/concurrency/role matrix or performance; each belongs to its
+subsequent independently green milestone.

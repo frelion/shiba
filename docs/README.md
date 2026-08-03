@@ -143,17 +143,21 @@ operator 1 before failing operator 2; its audit, source row, both operator
 writes, result writes, and continuation all roll back.
 M9.2 is a bounded aggregate execution proof, not a complete V2 runtime.
 
-M11.1 defines, but does not yet implement, consistent initialization. A new
-logical slot created with `EXPORT_SNAPSHOT` supplies the sole
-`consistent_point`/snapshot boundary. Bounded snapshot batches have separate
-bootstrap identities, never fabricate WAL transactions or continuation, and
-remain publicly unavailable until catch-up and atomic activation. Losing the
-ephemeral snapshot before scan completion resets the hidden pristine attempt;
-active/non-pristine rebuild remains M12.
+M11 completes consistent pristine initialization. A new logical slot created
+with `EXPORT_SNAPSHOT` supplies the sole `consistent_point`/snapshot boundary;
+bounded batches, crash recovery, catch-up, atomic activation, million-row
+boundedness and split least-privilege execution are proved on PG17.10/PG18.4.
+Snapshot batches never fabricate WAL identities or continuation.
 
-**Not proved.** M11 snapshot scanning, checkpoint/cutover implementation,
-crash recovery, PG17/18 differential correctness, and bounded performance are
-not proved. M10 production receiver/restart and slot lifecycle are proved, but
+M12.1 now freezes the contract for an offline, forward-only rebuild of an
+active/non-pristine source. Before destructive prepare the old generation is
+sole active authority. Prepare atomically installs the target as sole building
+authority, hides results as `building/NULL`, and retires old computation.
+Activation promotes that same authority; it does not perform a second binding
+switch. M12.1 is contract/failure-first work only; production rebuild remains
+unimplemented until M12.2--M12.6.
+
+**Not proved.** M10 production receiver/restart and slot lifecycle are proved, but
 persisted partial-stream recovery is intentionally absent, as are
 admission for `D + O` or replica identity `FULL`, key-changing/composite UPDATE,
 UPDATE old tuples, NULL text, binary payloads, TOAST keys, durable source/schema
@@ -161,7 +165,7 @@ binding lifecycle/registration or replica-index drift observation without a
 RELATION message, streamed interleaving/subtransactions, slot-generation
 change, production transport scheduling/backpressure or transport memory,
 multi-source contention/tail latency, sustained throughput, or heap evidence;
-binding rebuild lifecycle, SQL frontend, non-aggregate operators, external
+the M12 production rebuild lifecycle, SQL frontend, non-aggregate operators, external
 effect, compatibility path, alias, fallback,
 or dual write.
 
@@ -171,6 +175,8 @@ Read [architecture](ARCHITECTURE.md), [protocol contract](PROTOCOL_CONTRACT.md),
 [transport ADR](adr/0001-m10-replication-transport.md), and the
 [bootstrap contract](BOOTSTRAP_CONTRACT.md), the
 [bootstrap ADR](adr/0002-m11-consistent-bootstrap.md), and the
+[rebuild contract](REBUILD_CONTRACT.md), the
+[offline rebuild ADR](adr/0003-m12-offline-rebuild.md), and the
 [reuse manifest](contracts/REUSE_MANIFEST.md) before extending the workspace.
 Ingress work must also follow the
 [pgoutput contract](PGOUTPUT_CONTRACT.md).

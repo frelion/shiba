@@ -251,3 +251,20 @@ checkpoint `UPDATE` fail without partial state, continuation, result
 publication, or feedback. Split-role successful `restart_abandoned`,
 TLS/password policy, cross-host credential rotation, and column-level grants
 remain unproved.
+
+## M12 relationship
+
+M12 reuses this scanner, batch identity, catch-up fence, activation and live
+handoff for an active/non-pristine source; it does not weaken M11's pristine
+rules. The target binding/config/new generation becomes the sole building
+authority in one destructive prepare transaction before scanning. Old rows,
+operator state and continuation are retired at that boundary, and old workers
+cannot reuse their identities. A new slot's real exported snapshot supplies the
+new boundary; no old continuation is copied or relabeled.
+
+Activation only promotes that same target authority from building to active
+and publishes its complete private state. There is no candidate binding,
+second bootstrap implementation, parallel generation, birth marker, alias or
+fallback. The full closed transition and residual physical-slot risk are in
+[the M12 rebuild contract](REBUILD_CONTRACT.md). M12.1 documents and tests the
+contract only; production rebuild is not yet proved.

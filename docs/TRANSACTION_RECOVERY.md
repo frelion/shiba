@@ -443,3 +443,33 @@ continuation, activation, or feedback. Restoring the exact grant lets the
 bounded bootstrap proceed; no cleanup authority or fallback is introduced.
 Successful `restart_abandoned` under split roles remains a narrow unproved
 operational case.
+
+## M12.1 forward-only rebuild recovery
+
+Before destructive prepare commits, every error rolls back or precedes all
+mutation: the old active binding/config/generation, rows, operator state/result,
+continuation and slot remain unchanged. Prepare owns one PostgreSQL transaction
+under the source fence and exact-old CAS. Its commit installs the target as sole
+building authority, makes public results `building/NULL`, retires old rows and
+continuation and resets private state. This is the point of no fallback.
+
+Slot drop/create cannot join that transaction. Recovery reads the durable
+lifecycle and exact old/new slot coordinates, compares all PostgreSQL-observable
+shape, and performs only the next phase's explicit action. Unexpected absence,
+presence, active ownership, database/plugin/type/flags, name or generation
+fails closed. A crash after prepare therefore resumes target cleanup,
+reservation, snapshot scan, catch-up or activation; it never reconstructs old
+active state. Old transaction/token/ACK replays fail generation and lifecycle
+validation before mutation or feedback.
+
+Snapshot batches and WAL catch-up retain M11/M10 transaction owners and replay
+rules. Activation atomically publishes complete target results and promotes the
+same authority; a crash before its commit remains building, and a crash after
+commit observes active and uses the existing exact terminal feedback recovery.
+No second continuation or durable effect log participates.
+
+PostgreSQL 17/18 cannot distinguish an identical slot replacement by a trusted
+privileged actor. The `REPLICATION` credential is a control-plane capability,
+and its compromise or external slot DDL is outside this correctness model. M12
+does not claim database ACL enforcement or add a slot-birth marker. M12.1 has
+not yet proved the production crash matrix; that begins in M12.2.

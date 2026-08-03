@@ -342,3 +342,31 @@ production failover and persisted partial-stream recovery, binding rebuild,
 SQL frontend, non-aggregate operators, cross-host sustained soak, empirical
 heap peak, contention tail latency, and recovery workers
 remain.
+
+## M12.1 one-authority rebuild architecture
+
+M12 adopts an offline rebuild rather than parallel old/new computation. Before
+destructive prepare, the old binding/config/generation and complete public
+result remain sole active authority while all target checks are side-effect
+free. Prepare takes the source ownership fence and exact-old CAS, then one
+transaction makes the target binding/config/generation the sole catalog
+authority, records the existing bootstrap lifecycle as building, publishes
+`building/NULL`, and retires old current rows, private operator state and
+continuation. That commit is the forward-only boundary.
+
+Catalog identity and execution eligibility are deliberately distinct after
+prepare: M11 scanner and Runtime resolve the sole target authority, but M10 live
+receive/Apply/ACK remains disabled until activation. Activation promotes that
+same authority and complete results atomically; it never installs a candidate
+or performs another binding/config switch. Existing M11 snapshot scan/catch-up
+and M10 receiver/decoder/Runtime/sink/feedback remain the only data path.
+
+Physical slot create/drop remains PostgreSQL-owned and non-transactional with
+the catalog, so durable lifecycle phases drive exact reconciliation. Every
+observable slot mismatch fails closed. PostgreSQL 17/18 expose neither an
+immutable slot birth identity nor per-slot ACL: the replication credential is
+a trusted control-plane capability, and an identical privileged external slot
+replacement is an explicit residual risk outside the M12 correctness threat
+model. See [the rebuild contract](REBUILD_CONTRACT.md) and
+[ADR 0003](adr/0003-m12-offline-rebuild.md). M12.1 freezes this architecture;
+M12.2--M12.6 have not yet implemented or proved it.

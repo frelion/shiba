@@ -205,6 +205,7 @@ scripts = [
         "m10-performance-ingress", "m10-shutdown-ingress",
         "m11-bootstrap-contract", "m11-bootstrap", "m11-recovery",
         "m11-bootstrap-performance", "m11-bootstrap-roles",
+        "m12-rebuild-contract",
     )
 ]
 for path in scripts:
@@ -244,6 +245,42 @@ for milestone in ("M11.1", "M11.2", "M11.3", "M11.4", "M11.5"):
     if milestone not in manifest:
         raise SystemExit(f"REUSE_MANIFEST must record {milestone} evidence")
 PY
+
+# M12.1 freezes the forward-only offline rebuild contract before production
+# admission code exists. One source_bootstrap row remains the sole lifecycle.
+python3 - <<'PY'
+import pathlib
+
+contract_path = pathlib.Path("docs/REBUILD_CONTRACT.md")
+adr_path = pathlib.Path("docs/adr/0003-m12-offline-rebuild.md")
+if not contract_path.is_file() or not adr_path.is_file():
+    raise SystemExit("M12.1 rebuild contract and ADR must both exist")
+
+contract = contract_path.read_text().lower()
+required = (
+    "building authority", "active authority", "destructive prepare",
+    "source_bootstrap", "exact old", "forward-only", "building/null",
+    "old continuation", "old generation", "slot-birth", "threat model",
+    "`replication` credential", "same-name", "activation",
+)
+missing = [term for term in required if term not in contract]
+if missing:
+    raise SystemExit(f"M12.1 rebuild contract is missing: {missing}")
+
+readme = pathlib.Path("docs/README.md").read_text()
+if "REBUILD_CONTRACT.md" not in readme or "0003-m12-offline-rebuild.md" not in readme:
+    raise SystemExit("docs README must link the M12.1 contract and ADR")
+manifest = pathlib.Path("docs/contracts/REUSE_MANIFEST.md").read_text()
+if "M12.1" not in manifest or "test-m12-rebuild-contract.sh" not in manifest:
+    raise SystemExit("REUSE_MANIFEST must record the M12.1 failure-first evidence")
+PY
+
+if rg -n -i \
+  'create table[^;]*(source_rebuild|rebuild_(intent|log|state)|wal_spool|effect_log)|create table[^;]*candidate_(binding|config)|source_continuation_v2' \
+  sql/v2; then
+  echo "parallel rebuild authority, spool, or second continuation found" >&2
+  exit 1
+fi
 
 # No production SQL may smuggle in an old authority or dynamic workflow.
 if rg -n -i \
