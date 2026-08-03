@@ -1,139 +1,25 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
 use shiba_protocol::SourceId;
 
 use crate::{
     ColumnBinding, Expression, GraphError, NodeId, NodeInput, OperatorNode, OperatorNodeKind,
-    OutputContract, TypedLayout, ValueType,
-    graph::{CanonicalGraph, GRAPH_FORMAT_VERSION, MAX_GRAPH_NODES},
+    OutputContract, TypedLayout, ValueType, graph::CanonicalGraph,
 };
 
 const LAYOUT_DOMAIN: &[u8] = b"shiba.operator.layout.v1\0";
 
 pub(crate) fn validate_graph(graph: &CanonicalGraph) -> Result<(), GraphError> {
-    if graph.format_version != GRAPH_FORMAT_VERSION
-        || graph.nodes.is_empty()
-        || graph.nodes.len() > MAX_GRAPH_NODES
-    {
-        return Err(GraphError::InvalidTopology);
-    }
-    if !(1..=2).contains(&graph.sources.len())
-        || graph
-            .sources
-            .windows(2)
-            .any(|pair| pair[0].source_id >= pair[1].source_id)
-        || graph.sources.iter().enumerate().any(|(index, source)| {
-            source.identity_index.is_some()
-                && graph.sources[index + 1..]
-                    .iter()
-                    .any(|other| other.identity_index == source.identity_index)
-        })
-    {
-        return Err(GraphError::InvalidTopology);
-    }
-    if graph.sources.iter().any(|source| {
-        source.identity_index.is_none() && (graph.sources.len() != 1 || !source.layout.is_empty())
-    }) || graph.sources.iter().any(|source| {
-        source.identity_index.is_none()
-            && graph.nodes.iter().any(|node| {
-                !matches!(
-                    node.kind,
-                    OperatorNodeKind::CountRows | OperatorNodeKind::Materialize { .. }
-                )
-            })
-    }) {
-        return Err(GraphError::InvalidTopology);
-    }
+    crate::graph_topology::validate_topology(graph)?;
     let (_, layouts) = layout_graph(graph)?;
     let materialized = graph
         .nodes
         .iter()
         .filter(|node| matches!(node.kind, OperatorNodeKind::Materialize { .. }))
         .count();
-    if materialized == 0 || layouts.len() + materialized != graph.nodes.len() {
+    if layouts.len() + materialized != graph.nodes.len() {
         return Err(GraphError::MissingResult);
-    }
-    let referenced = graph
-        .nodes
-        .iter()
-        .filter_map(|node| match node.input {
-            NodeInput::Node(id) => Some(id),
-            NodeInput::SourcePort(_) => None,
-        })
-        .collect::<BTreeSet<_>>();
-    if graph.nodes.iter().any(|node| {
-        !matches!(node.kind, OperatorNodeKind::Materialize { .. })
-            && !referenced.contains(&node.node_id)
-    }) {
-        return Err(GraphError::InvalidTopology);
-    }
-    validate_stateful_topology(graph)?;
-    validate_join_topology(graph)?;
-    Ok(())
-}
-
-fn validate_join_topology(graph: &CanonicalGraph) -> Result<(), GraphError> {
-    let joins = graph
-        .nodes
-        .iter()
-        .filter(|node| matches!(node.kind, OperatorNodeKind::InnerJoin { .. }))
-        .collect::<Vec<_>>();
-    if joins.is_empty() {
-        return if graph.sources.len() == 1 {
-            Ok(())
-        } else {
-            Err(GraphError::InvalidTopology)
-        };
-    }
-    if joins.len() != 1 || graph.nodes.len() != 2 {
-        return Err(GraphError::InvalidTopology);
-    }
-    let join = joins[0];
-    let OperatorNodeKind::InnerJoin {
-        left_source_id,
-        right_source_id,
-        ..
-    } = join.kind
-    else {
-        unreachable!()
-    };
-    if !graph
-        .sources
-        .iter()
-        .any(|source| source.source_id == left_source_id)
-        || !graph
-            .sources
-            .iter()
-            .any(|source| source.source_id == right_source_id && source.identity_index.is_some())
-        || left_source_id == right_source_id
-        || join.input != NodeInput::SourcePort(left_source_id)
-        || graph.nodes[1].input != NodeInput::Node(join.node_id)
-        || !matches!(graph.nodes[1].kind, OperatorNodeKind::Materialize { .. })
-    {
-        return Err(GraphError::InvalidTopology);
-    }
-    Ok(())
-}
-
-fn validate_stateful_topology(graph: &CanonicalGraph) -> Result<(), GraphError> {
-    for aggregate in &graph.nodes {
-        let valid_input = match aggregate.kind {
-            OperatorNodeKind::CountRows | OperatorNodeKind::SumInt8 { .. } => {
-                matches!(aggregate.input, NodeInput::SourcePort(_))
-            }
-            OperatorNodeKind::GroupedCount { .. } | OperatorNodeKind::GroupedSumInt8 { .. } => {
-                matches!(aggregate.input, NodeInput::Node(id) if graph.nodes.iter().any(|node| node.node_id == id && matches!(node.kind, OperatorNodeKind::KeyBy { .. })))
-            }
-            _ => continue,
-        };
-        let materialized = graph.nodes.iter().any(|node| {
-            node.input == NodeInput::Node(aggregate.node_id)
-                && matches!(node.kind, OperatorNodeKind::Materialize { .. })
-        });
-        if !valid_input || !materialized {
-            return Err(GraphError::InvalidTopology);
-        }
     }
     Ok(())
 }
@@ -187,31 +73,17 @@ pub(crate) fn layout_graph(
             right_payload_slot,
         } = node.kind
         {
-            let left_port = graph
-                .sources
-                .iter()
-                .find(|port| port.source_id == left_source_id)
-                .ok_or(GraphError::InvalidTopology)?;
-            let input = source_typed_layout(left_port.source_id, &left_port.layout)?;
-            let right_port = graph
-                .sources
-                .iter()
-                .find(|port| port.source_id == right_source_id)
-                .ok_or(GraphError::InvalidTopology)?;
-            let right_layout = source_typed_layout(right_port.source_id, &right_port.layout)?;
-            if input.value_types.get(usize::from(left_id_slot)) != Some(&ValueType::Int8)
-                || input.value_types.get(usize::from(left_key_slot)) != Some(&ValueType::Int8)
-                || right_layout.value_types.get(usize::from(right_id_slot))
-                    != Some(&ValueType::Int8)
-                || right_layout
-                    .value_types
-                    .get(usize::from(right_payload_slot))
-                    != Some(&ValueType::Int8)
-                || right_port.identity_index.is_none()
-            {
-                return Err(GraphError::WrongType);
-            }
-            Some(vec![ValueType::Int8, ValueType::Int8])
+            join_output_types(
+                graph,
+                left_source_id,
+                right_source_id,
+                [
+                    left_id_slot,
+                    left_key_slot,
+                    right_id_slot,
+                    right_payload_slot,
+                ],
+            )?
         } else {
             node_output_types(node, input)?
         };
@@ -227,6 +99,35 @@ pub(crate) fn layout_graph(
         }
     }
     Ok((source, layouts))
+}
+
+fn join_output_types(
+    graph: &CanonicalGraph,
+    left_source_id: SourceId,
+    right_source_id: SourceId,
+    slots: [u16; 4],
+) -> Result<Option<Vec<ValueType>>, GraphError> {
+    let left = graph
+        .sources
+        .iter()
+        .find(|port| port.source_id == left_source_id)
+        .ok_or(GraphError::InvalidTopology)?;
+    let left_layout = source_typed_layout(left.source_id, &left.layout)?;
+    let right = graph
+        .sources
+        .iter()
+        .find(|port| port.source_id == right_source_id)
+        .ok_or(GraphError::InvalidTopology)?;
+    let right_layout = source_typed_layout(right.source_id, &right.layout)?;
+    if left_layout.value_types.get(usize::from(slots[0])) != Some(&ValueType::Int8)
+        || left_layout.value_types.get(usize::from(slots[1])) != Some(&ValueType::Int8)
+        || right_layout.value_types.get(usize::from(slots[2])) != Some(&ValueType::Int8)
+        || right_layout.value_types.get(usize::from(slots[3])) != Some(&ValueType::Int8)
+        || right.identity_index.is_none()
+    {
+        return Err(GraphError::WrongType);
+    }
+    Ok(Some(vec![ValueType::Int8, ValueType::Int8]))
 }
 
 fn node_output_types(

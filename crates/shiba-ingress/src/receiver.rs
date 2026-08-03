@@ -31,8 +31,8 @@ pub(crate) struct SourceReceiver {
     pub(super) feedback: FeedbackState,
     authorization: u64,
     relation_state: PgoutputRelationState,
-    outstanding_lsn: Option<u64>,
-    failed: bool,
+    pub(super) outstanding_lsn: Option<u64>,
+    pub(super) failed: bool,
 }
 
 impl SourceReceiver {
@@ -222,67 +222,6 @@ impl SourceReceiver {
         ))
     }
 
-    /// Acknowledges one exact durably applied transaction.
-    ///
-    /// # Errors
-    /// Rejects the wrong token kind/coordinate or feedback transport failure.
-    pub fn acknowledge(&mut self, token: &DurableTransaction) -> Result<(), IngressError> {
-        if self.failed {
-            return Err(IngressError::ReceiverFailed);
-        }
-        if self.outstanding_lsn.is_some() {
-            return Err(IngressError::FeedbackMismatch);
-        }
-        self.feedback
-            .require_applied(token.end_lsn(), token.authorization())?;
-        self.send_ack(token.end_lsn())
-    }
-
-    /// Acknowledges one exact abort without invoking Runtime.
-    ///
-    /// # Errors
-    /// Rejects the wrong token kind/coordinate or feedback transport failure.
-    pub fn acknowledge_abort(&mut self, token: &AbortedTransaction) -> Result<(), IngressError> {
-        if self.failed {
-            return Err(IngressError::ReceiverFailed);
-        }
-        if self.outstanding_lsn.is_some() {
-            return Err(IngressError::FeedbackMismatch);
-        }
-        self.feedback
-            .require_aborted(token.acknowledgment_lsn(), token.authorization())?;
-        self.send_ack(token.acknowledgment_lsn())
-    }
-
-    /// Acknowledges one exact empty commit without invoking Runtime.
-    ///
-    /// # Errors
-    /// Rejects the wrong token kind/coordinate or feedback transport failure.
-    pub fn acknowledge_empty(&mut self, token: &EmptyCommitted) -> Result<(), IngressError> {
-        if self.failed {
-            return Err(IngressError::ReceiverFailed);
-        }
-        if self.outstanding_lsn.is_some() {
-            return Err(IngressError::FeedbackMismatch);
-        }
-        self.feedback
-            .require_empty(token.end_lsn(), token.authorization())?;
-        self.send_ack(token.end_lsn())
-    }
-
-    pub(crate) fn acknowledge_fence(&mut self, token: &BootstrapFence) -> Result<(), IngressError> {
-        if self.failed || self.outstanding_lsn.is_some() {
-            return Err(if self.failed {
-                IngressError::ReceiverFailed
-            } else {
-                IngressError::FeedbackMismatch
-            });
-        }
-        self.feedback
-            .require_fence(token.end_lsn(), token.authorization())?;
-        self.send_ack(token.end_lsn())
-    }
-
     fn ready(&self) -> Result<(), IngressError> {
         if self.failed {
             return Err(IngressError::ReceiverFailed);
@@ -338,14 +277,5 @@ impl SourceReceiver {
     fn set_outstanding(&mut self, transaction: GraphTransaction, end_lsn: u64) -> ReceivedInput {
         self.outstanding_lsn = Some(end_lsn);
         ReceivedInput::new(transaction, end_lsn, self.authorization)
-    }
-
-    fn send_ack(&mut self, lsn: u64) -> Result<(), IngressError> {
-        if self.failed {
-            return Err(IngressError::ReceiverFailed);
-        }
-        self.transport.send_feedback(lsn)?;
-        self.feedback.complete(lsn);
-        Ok(())
     }
 }

@@ -6,6 +6,8 @@ mod expression;
 mod graph;
 mod graph_budget;
 mod graph_eval;
+mod graph_topology;
+mod graph_transition;
 mod graph_validation;
 mod grouped;
 mod grouped_plan;
@@ -24,11 +26,14 @@ mod typed;
 
 pub use expression::{Expression, ExpressionError};
 pub use graph::{
-    ColumnBinding, DeltaBatch, GraphEffectOrigin, GraphError, GraphTransition, MultiInputBatch,
-    NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind, ResultDelta, ResultMutation,
-    RowDelta, SourceDeltaBatch, SourcePort,
+    ColumnBinding, GraphError, NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind,
+    SourcePort,
 };
 pub use graph_eval::apply_graph;
+pub use graph_transition::{
+    DeltaBatch, GraphEffectOrigin, GraphTransition, MultiInputBatch, ResultDelta, ResultMutation,
+    RowDelta, SourceDeltaBatch,
+};
 pub use graph_validation::source_typed_layout;
 pub use kernel::{KernelError, apply_graph_plan, graph_state_read_set};
 pub use model::{EffectOrigin, EncodedOperatorState, ObjectAddress};

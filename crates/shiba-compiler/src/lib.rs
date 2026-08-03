@@ -5,6 +5,8 @@
 mod binding;
 mod graph;
 mod join_compile;
+mod node_builders;
+mod output_compile;
 mod pipeline;
 
 use core::fmt;

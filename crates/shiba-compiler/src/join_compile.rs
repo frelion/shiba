@@ -65,7 +65,7 @@ pub(crate) fn compile_join(
             right_payload_slot,
         },
     });
-    nodes.push(crate::graph::materialize(
+    nodes.push(crate::node_builders::materialize(
         args.node_ids.1,
         args.node_ids.0,
         OutputContract::KeyedRows {

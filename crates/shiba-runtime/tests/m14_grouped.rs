@@ -114,8 +114,14 @@ fn prove_permissions(client: &mut Client) {
 
 #[test]
 fn grouped_runtime_sql_is_set_based() {
-    let keyed = include_str!("../src/keyed_state.rs");
-    let sink = include_str!("../src/result_sink.rs");
+    let keyed = concat!(
+        include_str!("../src/keyed_state.rs"),
+        include_str!("../src/keyed_state/write.rs")
+    );
+    let sink = concat!(
+        include_str!("../src/result_sink.rs"),
+        include_str!("../src/result_sink/keyed.rs")
+    );
     for required in ["FROM unnest(", "ON CONFLICT (graph_id, node_id, namespace"] {
         assert!(
             keyed.contains(required),

@@ -143,7 +143,7 @@ pub(crate) fn computed_project(
             ],
         },
     });
-    nodes.push(crate::graph::materialize(
+    nodes.push(crate::node_builders::materialize(
         args.node_ids.2,
         args.node_ids.1,
         OutputContract::KeyedRows {
@@ -235,7 +235,7 @@ pub(crate) fn filtered_group(
             },
         ),
     });
-    nodes.push(crate::graph::materialize(
+    nodes.push(crate::node_builders::materialize(
         args.node_ids.4,
         args.node_ids.3,
         OutputContract::KeyedRows {
