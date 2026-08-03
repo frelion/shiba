@@ -1,0 +1,20 @@
+//! Bounded, database-independent SQL declaration frontend.
+
+#![forbid(unsafe_code)]
+
+mod ast;
+mod ast_validate;
+mod bounds;
+mod error;
+mod expression;
+mod lowering;
+mod parser;
+mod relation;
+mod select_lower;
+
+pub use ast::{
+    Aggregate, BinaryOperator, ColumnRef, Identifier, Join, QualifiedRelation, SelectExpression,
+    UnaryOperator, UnboundExpression, UnboundQuery, UnboundSelectItem,
+};
+pub use error::{ErrorClass, ErrorCode, FrontendError, Span};
+pub use parser::parse_sql;

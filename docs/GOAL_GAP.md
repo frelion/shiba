@@ -1,9 +1,10 @@
 # V2 goal gap after M14
 
-## M15.1 SQL frontend contract status
+## M15.1--M15.3 SQL frontend status
 
-The SQL frontend gap is frozen but not yet implemented. A bounded SQL `SELECT`
-subset will normalize to canonical `QuerySpecV1`; a short PostgreSQL binder resolves only
+The bounded SQL `SELECT` parser is now implemented through an ephemeral
+`UnboundQuery`; it does not yet normalize into canonical `QuerySpecV1`. A later
+short PostgreSQL binder must resolve only
 registered SourceIds and exact column ObjectAddresses, then the existing
 Compiler emits the sole executable OperatorGraph. Raw SQL, `sqlparser` AST and
 PostgreSQL server parse/optimizer trees are not authority. Rebuild rebinds the
@@ -13,9 +14,15 @@ effective identity.
 The contract fixes projection/filter/compute/grouped Count/Sum and narrow
 two-source INNER JOIN syntax, explicit rejections, identifiers/aliases,
 three-valued NULL semantics, stable spans/errors, DDL locking and hard bounds.
-`sqlparser` 0.62.0 `PostgreSqlDialect` is the candidate with minimized features.
-Parser, unbound lowering, stable frontend diagnostics and SQL-oracle evidence
-remain unproved.
+M15.3 pins `sqlparser` 0.62.0 with default features disabled and only `std`, so
+the frontend dependency graph has no C-toolchain, PostgreSQL or Runtime
+dependency. Twenty-two pure tests prove the accepted/rejected AST allowlist,
+limits, exact spans, closed snake_case errors, canonical equivalence and
+fail-closed iterative validation. A failure-first case found that admitting a
+4,096-token left-deep tree could overflow during recursive AST drop; the parser
+now applies a conservative structural ceiling before constructing that tree.
+Runtime, Ingress and Operator remain parser-free and all durable authority is
+unchanged.
 
 M15.2 replaced GraphSpec recipes with generic QuerySpec
 nodes/results through compiler version 2, registration and rebuild compilation.
@@ -25,6 +32,11 @@ coordinates and corrupt/old declaration rejection. The complete PG17.10/PG18.4
 release matrix passed 52 scripts and 104 invocations, including registration,
 bootstrap, rebuild, recovery and two-source lifecycle gates. M15.2 is green;
 M15 as a whole is not complete.
+
+Still unproved are the Binder/type checker, SourceId/ObjectAddress resolution,
+`UnboundQuery`-to-QuerySpec lowering, atomic registration, PG17/18 SQL
+differential and DDL/lifecycle races, and the frozen 10,000-query performance
+gate. M15.3 provides no PostgreSQL evidence and is not M15 completion.
 
 ## M14.7 completion status
 

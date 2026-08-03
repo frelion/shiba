@@ -10,18 +10,25 @@ Operator, Ingress, Bootstrap and Rebuild receive no SQL/parser types. Rebuild
 rebinds QuerySpec only against explicit target descriptors and binds that
 generation's effective identity index rather than storing its OID in QuerySpec.
 
-The candidate is `sqlparser` 0.62.0 `PostgreSqlDialect`, with minimized features
-and layered parser/Shiba bounds. Its approximate dialect and locations are input
-evidence, not authority; Shiba owns the allowlist, canonical semantics, stable
-UTF-8 byte spans and error codes. M15.1 changes no production execution path.
+M15.3 implements the pure parser boundary as `shiba-sql-frontend` using exactly
+`sqlparser` 0.62.0 with default features disabled and only its `std` feature.
+The resulting dependency tree has no C-toolchain or database client/runtime
+dependency. Its approximate dialect and locations are input evidence, not
+authority; Shiba owns the explicit AST allowlist, `UnboundQuery`, canonical
+semantics, half-open UTF-8 byte spans, closed snake_case error codes and all
+resource accounting. Runtime, Ingress and Operator do not depend on either the
+frontend crate or `sqlparser`.
 
 M15.2 completes the declaration cutover only: generic
 `QuerySpecV1` nodes/results replace GraphSpec recipes, compiler version 2 stores
 canonical QuerySpec, and registration plus rebuild share `compile_query`.
 OperatorGraph, Runtime state/results, continuation, ACK and lifecycle ownership
 do not change. Pure compiler tests and the 52-script/104-invocation
-PG17.10/PG18.4 release matrix are green. SQL parsing, unbound lowering and
-frontend diagnostics remain later M15 work.
+PG17.10/PG18.4 release matrix are green. M15.3 subsequently adds only the pure
+SQL-to-`UnboundQuery` boundary; it does not change Catalog, Runtime, transaction,
+continuation, rebuild or ACK authority. Binder/type checking, SourceId and
+ObjectAddress resolution, QuerySpec lowering and registration remain later M15
+work.
 
 M14.6 cuts the production lifecycle over to the graph boundary frozen in
 [OPERATOR_GRAPH_CONTRACT.md](OPERATOR_GRAPH_CONTRACT.md): one canonical typed
@@ -453,7 +460,8 @@ backoff policy, allocator/RSS peaks, cross-host soak, admission
 for `D + O` or replica identity `FULL`, composite UPDATE and broader old-tuple
 shapes, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving,
-production failover and persisted partial-stream recovery, SQL frontend,
+production failover and persisted partial-stream recovery, SQL Binder/
+registration and its PostgreSQL lifecycle evidence,
 additional operator families beyond non-aggregate ProjectRows, broader result
 types, cross-host sustained soak, empirical heap peak, contention tail latency,
 and recovery workers
@@ -625,4 +633,5 @@ retirement and activation work, but still may not add a queue, per-row SQL path,
 second authority or parallel generation. M12.6 completes only the
 declared active nullable-`int8` CountRows/SumInt8 rebuild boundary; TLS,
 automatic reconnect supervision, cross-host/failover operation, broader source
-shapes, SQL frontend and broader result/operator shapes remain outside it.
+shapes, SQL Binder/registration and broader result/operator shapes remain
+outside it.

@@ -12,8 +12,10 @@ declaration and compiler path; no compatibility decoder or dual format remains.
 Acceptance evidence is complete: ten pure Compiler tests cover strict
 codec/bounds/digest/topology and generic M14-shape compilation; the full
 PG17.10/PG18.4 release runner passed 52 scripts and 104 invocations, including
-Runtime registration, bootstrap/rebuild/recovery and Join lifecycle. SQL
-parsing and unbound SQL lowering remain later M15 work.
+Runtime registration, bootstrap/rebuild/recovery and Join lifecycle. M15.3 now
+provides a bounded pure SQL-to-`UnboundQuery` parser, but the Binder/type checker
+and `UnboundQuery`-to-QuerySpec lowering remain later M15 work. SQL text and
+UnboundQuery are still ephemeral and are not accepted by Runtime.
 
 ## Authority
 

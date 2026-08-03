@@ -1,0 +1,16 @@
+[package]
+name = "shiba-sql-frontend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+sha2 = "0.10"
+sqlparser = { version = "=0.62.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

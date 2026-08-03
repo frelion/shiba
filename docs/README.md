@@ -228,11 +228,22 @@ M15 SQL frontend work is governed by
 [ADR 0007](adr/0007-m15-sql-frontend.md). M15.1 freezes a narrow bounded
 `SELECT` subset, canonical QuerySpec authority, exact ObjectAddress binding,
 DDL-safe registration/rebuild rebind and stable diagnostics. It selects
-`sqlparser` 0.62.0 `PostgreSqlDialect` only as a parser candidate; no SQL
-frontend production path or new V2 completion claim exists yet.
+`sqlparser` 0.62.0 `PostgreSqlDialect` as the parser candidate. That M15.1
+contract-only slice added no production parser or V2 completion claim.
 
-M15.2 is the completed generic declaration cutover, not the SQL parser slice. It
+M15.2 is the completed generic declaration cutover. It
 replaces GraphSpec recipes with canonical QuerySpec nodes/results in Compiler,
 registration and rebuild while leaving OperatorGraph/Runtime/ACK authority
 unchanged. Ten pure Compiler tests and the full PG17.10/PG18.4 52-script,
-104-invocation release matrix are green. Parser/binder work remains later M15.
+104-invocation release matrix are green.
+
+M15.3 implements the separate, database-independent SQL parser and
+`UnboundQuery` normalization boundary. It pins `sqlparser` 0.62.0 with only
+`std`, enforces the frozen byte/token/AST/expression limits, emits stable
+half-open byte spans and closed snake_case errors, and validates public ASTs
+iteratively before canonical encoding. Twenty-two pure tests plus doc-tests,
+fmt/check/clippy and static dependency-isolation gates are green. It adds no
+parser dependency to Runtime, Ingress or Operator and changes no durable
+authority. Binder/type checking, SourceId/ObjectAddress resolution, QuerySpec
+lowering, registration, PG17/18 SQL differential/lifecycle evidence and the
+frozen 10,000-query performance gate remain unproved; M15 is not complete.

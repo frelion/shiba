@@ -135,12 +135,13 @@ to PostgreSQL execution or another parser.
 
 ## Parser selection
 
-M15.1 freezes `sqlparser` 0.62.0 with `PostgreSqlDialect` as the implementation
-candidate. Default features must be minimized. Its parser recursion limit is
-enabled in addition to, not instead of, Shiba's input/token/AST/expression-depth
-bounds. AST nodes implement `Spanned` and tokens provide `TokenWithSpan`, but
-Shiba must normalize those locations into its own stable half-open UTF-8 byte
-spans. Parser/library locations and messages are not the public error contract.
+M15.3 implements the parser with exactly `sqlparser` 0.62.0
+`PostgreSqlDialect`, default features disabled and only `std`. The resolved
+dependency graph has no C-toolchain, PostgreSQL library or Runtime dependency.
+Its parser recursion limit is enabled in addition to, not instead of, Shiba's
+input/token/AST/expression-depth bounds. Shiba normalizes parser locations into
+its own stable half-open UTF-8 byte spans; parser/library locations and messages
+are not the public error contract.
 
 The candidate must demonstrate that it can:
 
@@ -157,10 +158,9 @@ The candidate must demonstrate that it can:
 
 `PostgreSqlDialect` is an approximation of a PostgreSQL grammar, not PostgreSQL
 server-parser or optimizer authority. Shiba owns the strict AST allowlist and
-rejects every unrecognized construct itself. If the 0.62.0 spike cannot satisfy
-span normalization and bounds, M15 pauses for a narrow architecture decision;
-it does not hand-write PostgreSQL wire/grammar support, shell out to `psql`, or
-add a second permissive parser.
+rejects every unrecognized construct itself. The M15.3 pure evidence proves the
+frozen span normalization and admission bounds without hand-writing PostgreSQL
+wire/grammar support, shelling out to `psql`, or adding a second parser.
 
 ## Binding, registration and DDL races
 
@@ -235,6 +235,14 @@ Limit accounting is checked with overflow-safe arithmetic. Rejection is linear
 in consumed input and never creates Catalog state. No query cache, background
 worker or unbounded diagnostic list is admitted.
 
+M15.3 failure-first testing found that allowing a 4,096-token left-deep input to
+reach parser AST construction could overflow the stack during recursive AST
+destruction even if later lowering rejected it. A conservative 2,048-token
+structural ceiling now rejects that shape before AST construction. Publicly
+constructible UnboundQuery values are validated and canonically encoded with an
+iterative bounded walk; invalid cardinality, source slots, identifiers, depth or
+node counts return stable errors instead of saturating lengths or recursing.
+
 On the frozen same machine, 10,000 representative accepted queries in a release
 build must parse+normalize with median at most 1 ms and p95 at most 5 ms per
 query; one maximum-size admitted input must finish within 20 ms and 4 MiB
@@ -245,13 +253,20 @@ after results are observed.
 
 ## Test matrix
 
-Pure tests cover every accepted/rejected form, quoted/unquoted identifiers,
-aliases, precedence, NULL/three-valued logic, checked arithmetic, strict types,
-canonical equivalence/difference, deterministic NodeIds/digests, stable codes
-and exact spans at every UTF-8 split. Fixed-seed generation and malformed input
-prove no panic, superlinear rescan or limit bypass.
+The 22 M15.3 pure tests cover the frozen parser allowlist and explicit rejection
+families, quoted/unquoted identifiers, aliases, precedence, NULL and arithmetic
+syntax, canonical equivalence/difference and digest golden, stable codes,
+direct exact UTF-8 spans, hard-limit boundaries and malformed/no-panic input.
+They also prove iterative fail-closed canonical validation for public
+UnboundQuery values. Type checking and deterministic QuerySpec NodeIds remain
+Binder/lowering evidence, not parser evidence.
 
-PG17.10 and PG18.4 directed tests prove exact relation/column/index binding,
+This pure evidence does not cover Binder/type checker behavior,
+SourceId/ObjectAddress resolution, QuerySpec lowering or registration. It also
+provides no PG17/18 SQL differential, DDL/lifecycle race or 10,000-query
+performance evidence; those remain later M15 slices.
+
+Later PG17.10 and PG18.4 directed tests must prove exact relation/column/index binding,
 schema qualification, registration rollback, concurrent DDL barriers,
 drop/recreate, invalidation, duplicate GraphId, least privilege, and full SQL
 oracles for projection/filter/compute/grouped Count/Sum and cross-schema Join.
@@ -269,6 +284,7 @@ expressions/functions, implicit casts, durable output naming, SQL result executi
 outer/three-table joins, windows, DISTINCT, Min/Max/Avg, HAVING, subqueries,
 parameters, prepared statements, views, permissions inferred from SQL,
 scheduler, plugins, remote databases or cross-host failover. M15.1 freezes this
-contract. M15.2 completed the generic QuerySpec cutover in
-Compiler/registration/rebuild, but SQL parsing, unbound lowering and their
-PG17/18 evidence remain later work.
+contract. M15.2 completed the generic QuerySpec cutover and M15.3 completed the
+pure SQL-to-UnboundQuery parser. Binder/type checking, QuerySpec lowering,
+registration and their PG17/18/lifecycle/performance evidence remain later
+work.

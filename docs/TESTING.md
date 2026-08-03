@@ -16,6 +16,32 @@ golden/error/span, SQL-oracle, DDL-race, least-privilege and rebuild-rebind
 frontend gates. Live Apply must contain no parser call. M15.1 itself claimed no
 implementation evidence.
 
+## M15.3 pure parser evidence
+
+`shiba-sql-frontend` has 22 pure tests plus doc-tests. They cover the accepted
+single/two-source subset, explicit unsupported families, identifier and alias
+normalization, exact half-open UTF-8 error spans, closed snake_case error codes,
+the 64 KiB/4,096-token/2,048-AST-node/256-expression-node/32-depth bounds,
+canonical golden/metamorphic behavior, and fail-closed validation of manually
+constructed public ASTs. Fixed malformed inputs prove no panic. Failure-first
+testing exposed a 4,096-token left-deep AST whose recursive destruction could
+overflow the stack; a pre-parser structural ceiling now rejects it before AST
+construction, while canonical validation/encoding walks admitted public ASTs
+iteratively.
+
+`cargo fmt --all -- --check`, workspace check, frontend tests, frontend clippy
+with `-D warnings`, `scripts/check-m15-contract.sh` and
+`scripts/check-m15-parser.sh` are the M15.3 gates. The static parser gate proves
+the exact `sqlparser = 0.62.0` pin, disabled default features, production file
+limits, forbidden unsafe and that Runtime/Ingress/Operator remain
+parser-independent. The manifest and resolved dependency-tree audit prove that
+only `std` is enabled and no C-toolchain or PostgreSQL runtime is pulled in. No
+PostgreSQL gate is evidence for this pure slice.
+
+M15.3 does not prove Binder types, SourceId/ObjectAddress lookup, QuerySpec
+lowering, registration rollback, PG17/18 SQL differential, DDL/lifecycle races
+or the 10,000-query performance thresholds. Those remain later M15 gates.
+
 ## M15.2 QuerySpec cutover evidence status
 
 The green cutover deletes complete-query GraphOutputSpec recipes, changes the
@@ -26,7 +52,8 @@ former Count/Sum/Project/Compute/Filter/Grouped/Join shapes. Workspace tests,
 clippy and L0 pass. The complete release runner passed 52 scripts and 104
 PG17.10/PG18.4 invocations, including Runtime registration/results,
 bootstrap/rebuild/recovery and Join lifecycle. SQL parsing and its diagnostics
-remain unproved.
+were not M15.2 evidence; M15.3 subsequently proves the pure parser and
+diagnostic boundary described above, without changing the M15.2 PG evidence.
 
 ## M14.7 release evidence
 
