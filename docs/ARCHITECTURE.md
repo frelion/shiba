@@ -270,7 +270,8 @@ ephemeral snapshot resets the hidden attempt and starts a fresh never-used
 attempt/slot/snapshot. After `scan_complete`, recovery retains that slot and
 resumes M10 catch-up. Scan owns exactly three connections; catch-up/live return
 to M10's two. No WAL spool, queue, second continuation, or durable EffectStream
-is introduced. Active/non-pristine rebuild remains M12.
+is introduced. M12 subsequently proves active/non-pristine rebuild by reusing
+this same path.
 
 The production PG17/18 gate proves batches of two transform baseline private
 state to `3/40`, apply one concurrent INSERT/UPDATE/DELETE WAL transaction to

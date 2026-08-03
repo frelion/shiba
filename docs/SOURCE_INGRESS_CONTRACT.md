@@ -373,9 +373,9 @@ after concurrent UPDATE/DELETE/INSERT and the ordinary M10 live handoff.
 Operators should budget exactly three connections while scanning and two after
 handoff, never expose `building`, and choose recovery by phase: exact
 slot cleanup/replacement only before `scan_complete`; same-slot reattach at or
-after it. M11 is complete at this declared source shape, but indefinite
-concurrent-writer catch-up, tail latency, reconnect supervision, and M12 remain
-outside the evidence.
+after it. M11 is complete at this declared source shape. Indefinite concurrent-
+writer catch-up, tail latency, and reconnect supervision remain outside its
+evidence; M12 subsequently proves active/non-pristine rebuild by reusing it.
 
 M11.5 proves the same ingress under split least privilege on PG17.10 and
 PG18.4: a non-superuser `NOREPLICATION` control/Apply/scanner connection, a

@@ -29,8 +29,9 @@ has been removed.
 ## Still unproved
 
 SQL frontend, non-aggregate operators, non-bigint result shapes, cross-host
-sustained soak, empirical heap peak, contention tail latency, and M12.6 active-
-source rebuild performance/release evidence remain outside the proved boundary.
+sustained soak, empirical heap peak, contention tail latency, automatic
+receiver supervision/reconnect, and broader binding/operator lifecycles remain
+outside the proved boundary.
 
 M11.1 defined the initialization contract. A new slot's
 `EXPORT_SNAPSHOT` result is the sole snapshot/WAL boundary; the snapshot name is
@@ -95,9 +96,10 @@ connection ownership, split least-privilege roles, bounded idle receive
 shutdown, and local latency/throughput/backpressure limits. M10 is complete at
 its declared production-ingress boundary. TLS/disconnect policy, shutdown
 during Apply, reconnect daemon/backoff, allocator/RSS peaks, and cross-host soak
-remain future ingress work. The complete V2 is not finished: non-pristine
-binding rebuild, SQL frontend, broader operators/results, and production
-orchestration remain.
+remain future ingress work. The complete V2 is not finished: SQL frontend,
+broader source/operator/result shapes, automated lifecycle orchestration, and
+production supervision remain. Active/non-pristine rebuild for the declared
+nullable-`int8` CountRows/SumInt8 shape is proved by M12.
 
 M11.5 additionally proves on PG17.10 and PG18.4 that full bootstrap does not
 depend on superuser execution: control/Apply/scanning, replication transport,
@@ -138,8 +140,8 @@ growth. PG17.10/PG18.4 observed scan 4.357951916/4.429333333 s, catch-up
 252,864,952/252,898,072 bytes. The fixed-order runner reports 48 unique scripts
 and 96 successful PG invocations.
 
-Passing that gate will close the declared active nullable-`int8`
-CountRows/SumInt8 rebuild lifecycle, not V2. Remaining product gaps include a
+That green gate closes the declared active nullable-`int8` CountRows/SumInt8
+rebuild lifecycle, not V2. Remaining product gaps include a
 SQL frontend, additional source/operator/result shapes, TLS and credential
 rotation, automatic receiver supervision/reconnect, cross-host and failover
 operation, sustained soak/heap/tail-latency evidence, and defense against a

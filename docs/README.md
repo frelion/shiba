@@ -154,8 +154,9 @@ active/non-pristine source. Before destructive prepare the old generation is
 sole active authority. Prepare atomically installs the target as sole building
 authority, hides results as `building/NULL`, and retires old computation.
 Activation promotes that same authority; it does not perform a second binding
-switch. M12.1 is contract/failure-first work only; production rebuild remains
-unimplemented until M12.2--M12.6.
+switch. M12.2--M12.6 implement and prove that production rebuild path on
+PG17.10/PG18.4, including recovery, governance, least privilege, bounded
+million-row performance, and the complete release matrix.
 
 **Not proved.** M10 production receiver/restart and slot lifecycle are proved, but
 persisted partial-stream recovery is intentionally absent, as are

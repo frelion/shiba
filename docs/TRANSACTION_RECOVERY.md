@@ -433,8 +433,9 @@ exact SQL differential, and live handoff. Scan+Apply take
 3.098397625/3.136067542 s, catch-up+activation 1.320857542/1.329330584 s, and
 Rust RSS grows 3,664/3,664 KiB. These pass the pre-observation 120 s, 10,000 rows/s,
 15 s and 256 MiB limits. M11 is complete at this declared recovery boundary;
-indefinitely sustained writers/tail latency, reconnect supervision, the two
-narrow M11.3 injection gaps above, and M12 active/non-pristine rebuild remain.
+indefinitely sustained writers/tail latency, reconnect supervision, and the two
+narrow M11.3 injection gaps above remain. M12 subsequently proves active/
+non-pristine rebuild for its declared source and operator shape.
 
 M11.5 adds permission-loss recovery evidence on PG17.10 and PG18.4. Missing
 bootstrap-function `EXECUTE`, source `SELECT`, or checkpoint `UPDATE`, and

@@ -401,4 +401,53 @@ for required in ("Protocol JSON/schema", "canonical digest", "PG17/18", "Phase 1
         raise SystemExit(f"REUSE_MANIFEST.md lacks required Phase-1 contract: {required}")
 PY
 
+python3 - <<'PY'
+import pathlib
+
+goal_gap = pathlib.Path("docs/GOAL_GAP.md").read_text()
+required = (
+    "# V2 goal gap after M12",
+    "Active/non-pristine rebuild for the declared",
+    "That green gate closes the declared active",
+    "96 successful PG invocations",
+)
+for marker in required:
+    if marker not in goal_gap:
+        raise SystemExit(f"GOAL_GAP.md lacks completed M12 evidence: {marker}")
+
+stale = (
+    "M12.6 active-source rebuild performance/release evidence remain",
+    "non-pristine binding rebuild",
+    "Passing that gate will close",
+)
+for phrase in stale:
+    if phrase in goal_gap:
+        raise SystemExit(f"GOAL_GAP.md retains stale M12 status: {phrase}")
+
+for path in (
+    "docs/ARCHITECTURE.md",
+    "docs/README.md",
+    "docs/SOURCE_INGRESS_CONTRACT.md",
+    "docs/TRANSACTION_RECOVERY.md",
+):
+    text = pathlib.Path(path).read_text()
+    if "Active/non-pristine rebuild remains M12" in text or \
+            "M12 active/non-pristine rebuild remain" in text or \
+            "production rebuild remains\nunimplemented until M12.2--M12.6" in text:
+        raise SystemExit(f"{path} retains stale pre-M12 completion status")
+
+reuse_manifest = pathlib.Path("docs/contracts/REUSE_MANIFEST.md").read_text()
+for phrase in (
+    "M12.6 performance/release 尚未证明",
+    "M12.6 最终性能和运维矩阵未证明",
+    "M12 generation rebuild CAS 未证明",
+    "active/non-pristine binding rebuild lifecycle 属 M12，尚未证明",
+    "M12 rebuild 未证明",
+    "non-pristine binding rebuild、sustained performance 仍未证明",
+    "M12 active rebuild 未证明",
+):
+    if phrase in reuse_manifest:
+        raise SystemExit(f"REUSE_MANIFEST.md retains stale M12 status: {phrase}")
+PY
+
 echo "L0 passed for PostgreSQL $pg_major ($pg_config)"
