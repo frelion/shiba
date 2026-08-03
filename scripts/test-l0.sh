@@ -558,7 +558,9 @@ python3 - <<'PY'
 import pathlib
 
 identity = pathlib.Path("crates/shiba-protocol/src/identity.rs").read_text()
-graph = pathlib.Path("crates/shiba-operator/src/graph.rs").read_text()
+graph = "\n".join(
+    path.read_text() for path in pathlib.Path("crates/shiba-operator/src").glob("graph*.rs")
+)
 kernel = pathlib.Path("crates/shiba-operator/src/kernel.rs").read_text()
 compiler = "\n".join(
     path.read_text() for path in pathlib.Path("crates/shiba-compiler/src").glob("*.rs")
@@ -575,7 +577,7 @@ for marker in (
     "pub struct GraphTransition",
 ):
     if marker not in graph:
-        raise SystemExit(f"M14.5 canonical graph lacks marker: {marker}")
+        raise SystemExit(f"M14.5 operator graph lacks marker: {marker}")
 for marker in ("pub fn graph_state_read_set", "pub fn apply_graph_plan"):
     if marker not in kernel:
         raise SystemExit(f"M14.6 graph kernel lacks marker: {marker}")
