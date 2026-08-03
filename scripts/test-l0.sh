@@ -459,6 +459,8 @@ if "M14.1 typed Operator SDK and graph contract" not in reuse_manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks M14.1 evidence")
 if "M14.2 typed stateless graph and Materialize" not in reuse_manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks M14.2 evidence")
+if "M14.3 generic grouped state and aggregates" not in reuse_manifest:
+    raise SystemExit("REUSE_MANIFEST.md lacks M14.3 evidence")
 PY
 
 if rg -n \
@@ -468,5 +470,27 @@ if rg -n \
   echo "M14.2 forbidden ProjectRows production path remains" >&2
   exit 1
 fi
+
+if rg -n \
+  'KeyBy|GroupedCount|GroupedSumInt8' \
+  crates/shiba-runtime/src crates/shiba-ingress/src sql/v2; then
+  echo "M14.3 concrete grouped operator dispatch leaked outside operator/compiler" >&2
+  exit 1
+fi
+
+python3 - <<'PY'
+import pathlib
+
+schema = pathlib.Path("sql/v2/018_operator_keyed_state.sql").read_text()
+for marker in (
+    "CREATE TABLE shiba_internal.operator_node_state",
+    "operator_node_state_primary PRIMARY KEY",
+    "CREATE TABLE shiba_internal.operator_result_row",
+    "operator_result_row_primary PRIMARY KEY (operator_id, key_payload)",
+    "REVOKE ALL ON TABLE shiba_internal.operator_node_state FROM PUBLIC",
+):
+    if marker not in schema:
+        raise SystemExit(f"M14.3 keyed-state authority lacks marker: {marker}")
+PY
 
 echo "L0 passed for PostgreSQL $pg_major ($pg_config)"

@@ -1,11 +1,10 @@
 # M14 Operator SDK and graph contract
 
-M14.2 implementation evidence: the typed row/delta codecs, canonical graph,
-strict expressions, Filter/Compute/Project/Materialize evaluator and generic
-Runtime batch/result path are implemented. ProjectRows has been replaced by
-ordinary Project plus Materialize without a compatibility execution variant.
-The graph enforces the frozen row/delta/work-memory bounds before persistence.
-Grouped state, Join and graph-wide lifecycle remain later M14 stages.
+M14.2 implements the typed stateless graph path. M14.3 adds the sole generic
+keyed-state authority plus KeyBy, GroupedCount and GroupedSumInt8. Runtime uses
+canonical typed keys and set-based state/result persistence; typed NULL remains
+distinct from absent. Two-input Join, graph-wide lifecycle and the full M14
+release/performance matrix remain unproved, so M14.3 is not M14 completion.
 
 M14 extends the M13 database-free kernel; it does not add a SQL frontend or a
 second Runtime. This contract freezes graph identity, typed deltas, state,
@@ -84,8 +83,10 @@ empty-state special case or source-row-field shortcut remains.
 
 ## Keyed state and grouping
 
-State is Runtime-opaque and versioned. Generic keyed state is addressed by
-`(graph_id, node_id, namespace, partition_key, item_key)` canonical typed keys.
+State is Runtime-opaque and versioned. In M14.3, generic keyed state is
+addressed by `(operator_id, node_id, namespace, partition_key_payload,
+item_key_payload)` canonical typed keys; `operator_id` remains the current
+graph-plan identity until the later graph-wide authority cutover.
 Runtime loads requested partitions in set-based queries and persists ordered
 mutations in set-based statements; it never interprets a concrete node state.
 `StateReadSet` is computed deterministically from the graph and input deltas

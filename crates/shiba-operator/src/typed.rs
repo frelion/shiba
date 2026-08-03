@@ -40,6 +40,21 @@ impl TypedValue {
         }
     }
 
+    /// Encodes one persistent typed value in its strict canonical JSON form.
+    ///
+    /// # Errors
+    ///
+    /// Rejects `Absent`, oversized text, or serialization failure.
+    pub fn to_canonical_json(&self) -> Result<Vec<u8>, TypedError> {
+        if matches!(self, Self::Absent) {
+            return Err(TypedError::Absent);
+        }
+        if matches!(self, Self::Text(value) if value.len() > MAX_TEXT_BYTES) {
+            return Err(TypedError::TextLimit);
+        }
+        serde_json::to_vec(self).map_err(|_| TypedError::Codec)
+    }
+
     pub(crate) fn validate(&self, expected: ValueType) -> Result<(), TypedError> {
         if matches!(self, Self::Absent) {
             return Ok(());
@@ -130,6 +145,8 @@ impl TypedRow {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypedError {
+    Absent,
+    Codec,
     InvalidLayout,
     LayoutMismatch,
     InvalidSlot,

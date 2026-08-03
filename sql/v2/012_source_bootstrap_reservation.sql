@@ -93,6 +93,11 @@ BEGIN
            FROM shiba_internal.operator_result_row AS result_row
            JOIN shiba_internal.operator_definition AS definition USING (operator_id)
            WHERE definition.source_id = requested_source_id
+       ) OR EXISTS (
+           SELECT 1
+           FROM shiba_internal.operator_node_state AS node_state
+           JOIN shiba_internal.operator_definition AS definition USING (operator_id)
+           WHERE definition.source_id = requested_source_id
        ) THEN
         RAISE EXCEPTION 'bootstrap requires pristine operator state';
     END IF;

@@ -34,6 +34,10 @@ BEGIN
     WHERE source_id = requested_source_id;
     DELETE FROM shiba_internal.source_row_state
     WHERE source_id = requested_source_id;
+    DELETE FROM shiba_internal.operator_node_state AS node_state
+    USING shiba_internal.operator_definition AS definition
+    WHERE node_state.operator_id = definition.operator_id
+      AND definition.source_id = requested_source_id;
     DELETE FROM shiba_internal.source_binding
     WHERE source_id = requested_source_id;
     INSERT INTO shiba_internal.source_binding

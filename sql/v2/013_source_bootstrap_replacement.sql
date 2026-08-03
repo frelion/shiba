@@ -87,6 +87,11 @@ BEGIN
                OR result.output_shape <> definition.output_shape
                OR result.result_status <> 'building'
                OR result.value_bigint IS NOT NULL)
+    ) OR EXISTS (
+        SELECT 1
+        FROM shiba_internal.operator_node_state AS node_state
+        JOIN shiba_internal.operator_definition AS definition USING (operator_id)
+        WHERE definition.source_id = requested_source_id
     ) THEN
         RAISE EXCEPTION 'replacement requires private building results';
     END IF;

@@ -8,6 +8,7 @@ use shiba_operator::{
 };
 use shiba_protocol::SourceId;
 
+use crate::keyed_state;
 use crate::source_batch::SourceBatch;
 use crate::{M2Error, result_sink};
 
@@ -22,8 +23,10 @@ pub(crate) fn apply_all(
         validate_result_status(&row, if publish { "active" } else { "building" })?;
         let (operator_id, plan, state) = decode_operator(&row, source_id)?;
         validate_plan_inputs(&plan, &batch.bindings)?;
-        let transition = apply_plan(&plan, &state, &batch.delta)?;
+        let keyed = keyed_state::load(transaction, operator_id, &plan, &batch.delta)?;
+        let transition = apply_plan(&plan, &state, &keyed.snapshot, &batch.delta)?;
         result_sink::persist_state(transaction, operator_id, &transition.next_state)?;
+        keyed_state::persist(transaction, operator_id, &keyed, transition.state_deltas)?;
         result_sink::persist_output(
             transaction,
             operator_id,
@@ -46,7 +49,11 @@ pub(crate) fn activate_results(
         validate_result_status(&row, "building")?;
         let (operator_id, plan, state) = decode_operator(&row, source_id)?;
         validate_plan_inputs(&plan, &inputs)?;
-        let output = initial_transition(&plan, &state)?.output_delta;
+        let transition = initial_transition(&plan, &state)?;
+        if !transition.state_deltas.is_empty() {
+            return Err(M2Error::InvalidOperatorDefinition);
+        }
+        let output = transition.output_delta;
         match output {
             OutputDelta::ScalarReplacement { value } => {
                 let value = result_sink::scalar_int8(&value)?;
@@ -111,7 +118,8 @@ fn load_locked_operators(
                 definition.plan_format_version, definition.plan_payload,
                 definition.plan_digest, definition.state_codec_version,
                 definition.output_shape, definition.output_value_type,
-                definition.output_key_type, definition.output_value_nullable,
+                definition.output_key_type, definition.output_key_nullable,
+                definition.output_value_nullable,
                 state.codec_version, state.state_payload,
                 result.output_shape, result.result_status
          FROM shiba_internal.operator_definition AS definition
@@ -156,7 +164,7 @@ fn decode_operator(
         .and_then(|value| SourceId::new(value).ok())
         .ok_or(M2Error::InvalidOperatorDefinition)?;
     let definition_codec: i32 = row.get(5);
-    let state_codec: i32 = row.get(10);
+    let state_codec: i32 = row.get(11);
     if row.get::<_, i32>(1) != 1
         || u32::try_from(row.get::<_, i32>(2)).ok() != Some(plan.format_version)
         || plan.operator_id != expected_operator
@@ -173,7 +181,7 @@ fn decode_operator(
         EncodedOperatorState {
             codec_version: u32::try_from(state_codec)
                 .map_err(|_| M2Error::InvalidOperatorDefinition)?,
-            payload: row.get(11),
+            payload: row.get(12),
         },
     ))
 }
@@ -182,8 +190,9 @@ fn metadata_matches(contract: &OutputContract, row: &Row) -> bool {
     let shape: &str = row.get(6);
     let value_type: &str = row.get(7);
     let key_type: Option<&str> = row.get(8);
-    let nullable: bool = row.get(9);
-    let result_shape: &str = row.get(12);
+    let key_nullable: bool = row.get(9);
+    let nullable: bool = row.get(10);
+    let result_shape: &str = row.get(13);
     shape == result_shape
         && match contract {
             OutputContract::Scalar {
@@ -192,15 +201,18 @@ fn metadata_matches(contract: &OutputContract, row: &Row) -> bool {
                 shape == "scalar"
                     && value_type == value_type_name(*plan_value)
                     && key_type.is_none()
+                    && !key_nullable
                     && !nullable
             }
             OutputContract::KeyedRows {
                 key_type: plan_key,
+                key_nullable: plan_key_nullable,
                 value_type: plan_value,
                 nullable: plan_nullable,
             } => {
                 shape == "keyed"
                     && key_type == Some(value_type_name(*plan_key))
+                    && key_nullable == *plan_key_nullable
                     && value_type == value_type_name(*plan_value)
                     && nullable == *plan_nullable
             }
@@ -216,7 +228,7 @@ fn value_type_name(value_type: ValueType) -> &'static str {
 }
 
 fn validate_result_status(row: &Row, expected: &str) -> Result<(), M2Error> {
-    if row.get::<_, &str>(13) == expected {
+    if row.get::<_, &str>(14) == expected {
         Ok(())
     } else {
         Err(M2Error::InvalidOperatorDefinition)

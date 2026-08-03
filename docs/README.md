@@ -194,5 +194,7 @@ M14 operator development follows the
 [ADR 0005](adr/0005-m14-operator-graph.md); it does not introduce a SQL parser.
 M14.2 implements typed expressions plus Filter/Compute/Project/Materialize on
 one binding-ordered transaction-local DeltaBatch and removes the production
-ProjectRows execution variant. Grouping, Join and graph lifecycle remain later
-M14 stages.
+ProjectRows execution variant. M14.3 adds the sole generic keyed-state
+authority plus KeyBy, GroupedCount and GroupedSumInt8, proved with complete
+PG17.10/PG18.4 keyed SQL differentials. Join, graph-wide lifecycle and the full
+M14 release/performance matrix remain later stages; M14 is not yet complete.

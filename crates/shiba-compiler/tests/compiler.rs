@@ -186,6 +186,7 @@ fn project_declaration_compiles_to_canonical_graph_nodes() {
         OperatorNodeKind::Materialize {
             output: OutputContract::KeyedRows {
                 key_type: ValueType::Int8,
+                key_nullable: false,
                 value_type: ValueType::Int8,
                 nullable: true
             },

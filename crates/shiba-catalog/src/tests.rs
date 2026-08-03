@@ -1,5 +1,6 @@
 const CATALOG_SQL: &str = include_str!("../../../sql/v2/001_catalog_identity.sql");
 const M9_AUTHORITY_SQL: &str = include_str!("../../../sql/v2/002_source_apply.sql");
+const M14_KEYED_SQL: &str = include_str!("../../../sql/v2/018_operator_keyed_state.sql");
 const M4_SQL: &str = include_str!("../../../sql/v2/003_nullable_insert.sql");
 const M4_EMPTY_SQL: &str = include_str!("../../../sql/v2/004_empty_insert.sql");
 const M4_COMPOSITE_SQL: &str = include_str!("../../../sql/v2/005_composite_insert.sql");
@@ -10,6 +11,7 @@ const M10_REGISTRATION_SQL: &str =
     include_str!("../../../sql/v2/009_source_ingress_registration.sql");
 const M10_INVALIDATION_SQL: &str =
     include_str!("../../../sql/v2/010_source_ingress_invalidation.sql");
+mod m14_keyed_state;
 fn normalized_sql() -> String {
     CATALOG_SQL.to_ascii_lowercase()
 }
@@ -24,14 +26,13 @@ fn installation_identity_owns_exactly_one_table() {
 #[test]
 fn operator_authority_owns_generic_state_and_two_result_shapes() {
     let sql = M9_AUTHORITY_SQL.to_ascii_lowercase();
-    assert_eq!(sql.matches("create table ").count(), 6);
+    assert_eq!(sql.matches("create table ").count(), 5);
     for table in [
         "shiba_internal.source_row_state",
         "shiba_internal.source_continuation",
         "shiba_internal.operator_definition",
         "shiba_internal.operator_state",
         "shiba.operator_result",
-        "shiba_internal.operator_result_row",
     ] {
         assert!(sql.contains(&format!("create table {table}")));
     }
@@ -41,7 +42,11 @@ fn operator_authority_owns_generic_state_and_two_result_shapes() {
 
 #[test]
 fn operator_authority_has_strict_generic_codecs_and_shapes() {
-    let sql = M9_AUTHORITY_SQL.to_ascii_lowercase();
+    let sql = format!(
+        "{}\n{}",
+        M9_AUTHORITY_SQL.to_ascii_lowercase(),
+        M14_KEYED_SQL.to_ascii_lowercase()
+    );
     for required in [
         "check (compiler_version = 1)",
         "spec_payload bytea not null",
@@ -51,6 +56,7 @@ fn operator_authority_has_strict_generic_codecs_and_shapes() {
         "state_codec_version integer not null",
         "output_shape in ('scalar', 'keyed')",
         "output_value_type = 'int8'",
+        "output_key_nullable boolean not null",
         "unique (operator_id, output_shape)",
         "codec_version integer not null",
         "state_payload bytea not null",
@@ -71,19 +77,24 @@ fn operator_authority_has_strict_generic_codecs_and_shapes() {
             "concrete operator leaked: {forbidden}"
         );
     }
-    assert_eq!(sql.matches("comment on table ").count(), 6);
+    assert_eq!(sql.matches("comment on table ").count(), 7);
     assert!(!sql.contains("create trigger"));
 }
 
 #[test]
 fn m9_operator_permissions_are_private_state_and_public_read_only_result() {
-    let sql = M9_AUTHORITY_SQL.to_ascii_lowercase();
+    let sql = format!(
+        "{}\n{}",
+        M9_AUTHORITY_SQL.to_ascii_lowercase(),
+        M14_KEYED_SQL.to_ascii_lowercase()
+    );
     for table in [
         "source_row_state",
         "source_continuation",
         "operator_definition",
         "operator_state",
         "operator_result_row",
+        "operator_node_state",
     ] {
         assert!(sql.contains(&format!(
             "revoke all on table shiba_internal.{table} from public"

@@ -74,6 +74,7 @@ pub fn initial_transition(
             }
             Ok(OperatorTransition {
                 next_state: state.clone(),
+                state_deltas: Vec::new(),
                 output_delta: OutputDelta::KeyedMutations {
                     mutations: Vec::new(),
                 },
@@ -111,10 +112,17 @@ pub fn decode_state(plan: &CompiledPlan, state: &EncodedOperatorState) -> Result
 /// Fails closed for invalid plan/state/input, arithmetic, contract or bounds.
 pub fn apply_plan(
     plan: &CompiledPlan,
-    state: &EncodedOperatorState,
+    scalar_state: &EncodedOperatorState,
+    keyed: &crate::StateSnapshot,
     batch: &DeltaBatch,
 ) -> Result<OperatorTransition, KernelError> {
-    let current = decode_state(plan, state)?;
+    let current = decode_state(plan, scalar_state)?;
+    if let Some(transition) = crate::grouped::apply(plan, scalar_state, keyed, batch)? {
+        return Ok(transition);
+    }
+    if !keyed.entries.is_empty() {
+        return Err(KernelError::InvalidState);
+    }
     match &plan.implementation {
         PlanImplementation::CountRows => scalar_transition(plan, apply_count(current, batch)?),
         PlanImplementation::SumInt8 { input_slot, .. } => {
@@ -122,6 +130,18 @@ pub fn apply_plan(
         }
         PlanImplementation::Graph { graph } => graph_transition(plan, graph, batch),
     }
+}
+
+/// Returns the exact, sorted operator-owned keyed state required by one batch.
+///
+/// # Errors
+///
+/// Rejects plan, graph, row-layout, typed-key, or bound violations.
+pub fn state_read_set(
+    plan: &CompiledPlan,
+    batch: &DeltaBatch,
+) -> Result<crate::StateReadSet, KernelError> {
+    crate::grouped::state_read_set(plan, batch)
 }
 
 fn scalar_transition(plan: &CompiledPlan, value: i64) -> Result<OperatorTransition, KernelError> {
@@ -137,6 +157,7 @@ fn scalar_transition(plan: &CompiledPlan, value: i64) -> Result<OperatorTransiti
             codec_version: STATE_CODEC_VERSION,
             payload: value.to_be_bytes().to_vec(),
         },
+        state_deltas: Vec::new(),
         output_delta: OutputDelta::ScalarReplacement {
             value: TypedValue::Int8(value),
         },
@@ -193,7 +214,7 @@ fn graph_transition(
     batch: &DeltaBatch,
 ) -> Result<OperatorTransition, KernelError> {
     let transition = apply_graph(graph, batch).map_err(|_| KernelError::InvalidGraph)?;
-    if !transition.states.is_empty() || transition.results.len() != 1 {
+    if transition.results.len() != 1 {
         return Err(KernelError::InvalidTransition);
     }
     let result = transition
@@ -217,6 +238,7 @@ fn graph_transition(
             codec_version: crate::plan::STATE_CODEC_VERSION,
             payload: Vec::new(),
         },
+        state_deltas: Vec::new(),
         output_delta: OutputDelta::KeyedMutations { mutations },
     })
 }

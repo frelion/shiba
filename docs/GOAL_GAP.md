@@ -1,6 +1,6 @@
 # V2 goal gap entering M14
 
-## M14.2 implementation status
+## M14.3 implementation status
 
 Typed values/rows/deltas, strict expressions, Filter, Compute, Project and
 Materialize now run in the database-free kernel. The compiler resolves names
@@ -10,17 +10,21 @@ Runtime performs generic plan/state/result persistence without matching node or
 operator names. The former ProjectRows declaration and execution variant no
 longer exists in production; its behavior is Project followed by Materialize.
 
-M14.3--M14.7 still must add generic grouped state, freeze and implement the
-two-input join authority, unify graph lifecycle, and close the full PG17/18
-release matrix. These are not claimed by M14.2.
+M14.3 adds the sole generic keyed node-state authority, KeyBy, GroupedCount and
+GroupedSumInt8. PG17.10/PG18.4 full-row SQL differentials prove I/U/D, NULL and
+all-NULL groups, key changes, empty-group deletion, whole-transaction rollback,
+retry and replay with set-based persistence. M14.4--M14.7 still must implement
+two-input Join, graph-wide lifecycle/bootstrap/rebuild and the full release/
+performance matrix. M14.3 is not M14 completion.
 
 ## M14.1 contract status
 
 M14.1 freezes one canonical typed OperatorGraph, graph-wide transaction and
 continuation authority, generic keyed state, explicit terminal materialization,
 bounded two-source INNER JOIN, and the SourceId/row/node lock order. M14.2 adds
-the stateless single-input slice. M14.3--M14.7 must add grouped/join nodes, cut over lifecycle authority, and re-prove the
-complete PG17/18 matrix without a second Runtime or continuation.
+the stateless single-input slice and M14.3 adds grouped keyed state. Later M14
+stages must add Join, cut over lifecycle authority, and re-prove the complete
+PG17/18 matrix without a second Runtime or continuation.
 
 ## M13 completion status
 

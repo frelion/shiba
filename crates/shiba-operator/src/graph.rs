@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 use shiba_protocol::SourceId;
 
 use crate::{
-    EffectOrigin, EncodedOperatorState, Expression, ObjectAddress, OperatorId, OutputContract,
-    StateContract, TypedLayout, TypedRow, TypedValue, ValueType,
+    EffectOrigin, Expression, ObjectAddress, OperatorId, OutputContract, StateContract,
+    TypedLayout, TypedRow, TypedValue, ValueType,
 };
 
 pub const GRAPH_FORMAT_VERSION: u32 = 1;
@@ -58,6 +58,16 @@ pub enum OperatorNodeKind {
     },
     Compute {
         expressions: Vec<Expression>,
+    },
+    KeyBy {
+        key: Expression,
+    },
+    GroupedCount {
+        key_slot: u16,
+    },
+    GroupedSumInt8 {
+        key_slot: u16,
+        value_slot: u16,
     },
     Materialize {
         key_slot: u16,
@@ -195,13 +205,6 @@ pub struct DeltaBatch {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StateDelta {
-    pub node_id: NodeId,
-    pub next_state: EncodedOperatorState,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mutation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResultMutation {
     Delete { key: TypedValue },
@@ -219,7 +222,6 @@ pub enum ResultDelta {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphTransition {
-    pub states: Vec<StateDelta>,
     pub results: Vec<ResultDelta>,
 }
 

@@ -83,6 +83,16 @@ impl<'de> Deserialize<'de> for OperatorSpecV1 {
                 reject_blank::<D::Error>(key_column, "materialized_project key_column")?;
                 reject_blank::<D::Error>(value_column, "materialized_project value_column")?;
             }
+            OperatorOperationV1::GroupedCount { key_column } => {
+                reject_blank::<D::Error>(key_column, "grouped_count key_column")?;
+            }
+            OperatorOperationV1::GroupedSumInt8 {
+                key_column,
+                input_column,
+            } => {
+                reject_blank::<D::Error>(key_column, "grouped_sum_int8 key_column")?;
+                reject_blank::<D::Error>(input_column, "grouped_sum_int8 input_column")?;
+            }
         }
         Ok(Self {
             version: raw.version,
@@ -104,6 +114,13 @@ pub enum OperatorOperationV1 {
     MaterializedProject {
         key_column: String,
         value_column: String,
+    },
+    GroupedCount {
+        key_column: String,
+    },
+    GroupedSumInt8 {
+        key_column: String,
+        input_column: String,
     },
 }
 

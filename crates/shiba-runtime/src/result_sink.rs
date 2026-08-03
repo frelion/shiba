@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use postgres::Transaction;
 use shiba_operator::{
     EncodedOperatorState, KeyedMutation, OutputContract, OutputDelta, TypedValue, ValueType,
@@ -39,8 +41,22 @@ pub(super) fn persist_output(
                 update_active_value(transaction, operator_id, scalar_int8(&value)?)?;
             }
         }
-        (OutputContract::KeyedRows { nullable, .. }, OutputDelta::KeyedMutations { mutations }) => {
-            persist_keyed(transaction, operator_id, mutations, effect_count, *nullable)?;
+        (
+            OutputContract::KeyedRows {
+                key_nullable,
+                nullable,
+                ..
+            },
+            OutputDelta::KeyedMutations { mutations },
+        ) => {
+            persist_keyed(
+                transaction,
+                operator_id,
+                mutations,
+                effect_count,
+                *key_nullable,
+                *nullable,
+            )?;
         }
         _ => return Err(M2Error::InvalidOperatorDefinition),
     }
@@ -52,52 +68,96 @@ fn persist_keyed(
     operator_id: i64,
     mutations: Vec<KeyedMutation>,
     effect_count: usize,
+    key_nullable: bool,
     nullable: bool,
 ) -> Result<(), M2Error> {
     if mutations.len() > MAX_KEYED_MUTATIONS || mutations.len() > effect_count.saturating_mul(2) {
         return Err(M2Error::InvalidOperatorDefinition);
     }
-    let mut deletes = Vec::new();
-    let mut keys = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut deletes = Vec::<Vec<u8>>::new();
+    let mut key_payloads = Vec::new();
+    let mut keys = Vec::<Option<i64>>::new();
+    let mut key_nulls = Vec::new();
     let mut values = Vec::new();
+    let mut value_nulls = Vec::new();
     for mutation in mutations {
         match mutation {
-            KeyedMutation::Delete {
-                key: TypedValue::Int8(key),
-            } => deletes.push(key),
-            KeyedMutation::Delete { .. } => return Err(M2Error::InvalidOperatorDefinition),
-            KeyedMutation::Upsert { key, value } => {
-                let TypedValue::Int8(key) = key else {
+            KeyedMutation::Delete { key } => {
+                let (payload, _, _) = result_key(&key, key_nullable)?;
+                if !seen.insert(payload.clone()) {
                     return Err(M2Error::InvalidOperatorDefinition);
-                };
+                }
+                deletes.push(payload);
+            }
+            KeyedMutation::Upsert { key, value } => {
+                let (payload, key, key_is_null) = result_key(&key, key_nullable)?;
+                if !seen.insert(payload.clone()) {
+                    return Err(M2Error::InvalidOperatorDefinition);
+                }
+                key_payloads.push(payload);
                 keys.push(key);
-                values.push(match value {
-                    TypedValue::Null(ValueType::Int8) if nullable => None,
-                    TypedValue::Int8(value) => Some(value),
+                key_nulls.push(key_is_null);
+                let (value, value_is_null) = match value {
+                    TypedValue::Null(ValueType::Int8) if nullable => (None, true),
+                    TypedValue::Int8(value) => (Some(value), false),
                     _ => return Err(M2Error::InvalidOperatorDefinition),
-                });
+                };
+                values.push(value);
+                value_nulls.push(value_is_null);
             }
         }
     }
     if !deletes.is_empty() {
-        transaction.execute(
+        let changed = transaction.execute(
             "DELETE FROM shiba_internal.operator_result_row
-             WHERE operator_id = $1 AND result_key_bigint = ANY($2)",
+             WHERE operator_id = $1 AND key_payload = ANY($2)",
             &[&operator_id, &deletes],
         )?;
+        if usize::try_from(changed).ok() != Some(deletes.len()) {
+            return Err(M2Error::InvalidOperatorDefinition);
+        }
     }
     if !keys.is_empty() {
-        transaction.execute(
+        let changed = transaction.execute(
             "INSERT INTO shiba_internal.operator_result_row
-                 (operator_id, result_key_bigint, result_value_bigint)
-             SELECT $1, input.key, input.value
-             FROM unnest($2::bigint[], $3::bigint[]) AS input(key, value)
-             ON CONFLICT (operator_id, result_key_bigint)
-             DO UPDATE SET result_value_bigint = EXCLUDED.result_value_bigint",
-            &[&operator_id, &keys, &values],
+                 (operator_id, key_payload, result_key_is_null,
+                  result_key_bigint, result_value_is_null, result_value_bigint)
+             SELECT $1, input.key_payload, input.key_is_null,
+                    input.key, input.value_is_null, input.value
+             FROM unnest($2::bytea[], $3::boolean[], $4::bigint[],
+                         $5::boolean[], $6::bigint[])
+                  AS input(key_payload, key_is_null, key, value_is_null, value)
+             ON CONFLICT (operator_id, key_payload)
+             DO UPDATE SET result_key_is_null = EXCLUDED.result_key_is_null,
+                           result_key_bigint = EXCLUDED.result_key_bigint,
+                           result_value_is_null = EXCLUDED.result_value_is_null,
+                           result_value_bigint = EXCLUDED.result_value_bigint",
+            &[
+                &operator_id,
+                &key_payloads,
+                &key_nulls,
+                &keys,
+                &value_nulls,
+                &values,
+            ],
         )?;
+        if usize::try_from(changed).ok() != Some(keys.len()) {
+            return Err(M2Error::InvalidOperatorDefinition);
+        }
     }
     Ok(())
+}
+
+fn result_key(key: &TypedValue, nullable: bool) -> Result<(Vec<u8>, Option<i64>, bool), M2Error> {
+    let payload = key
+        .to_canonical_json()
+        .map_err(|_| M2Error::InvalidOperatorDefinition)?;
+    match key {
+        TypedValue::Int8(value) => Ok((payload, Some(*value), false)),
+        TypedValue::Null(ValueType::Int8) if nullable => Ok((payload, None, true)),
+        _ => Err(M2Error::InvalidOperatorDefinition),
+    }
 }
 
 pub(super) fn scalar_int8(value: &TypedValue) -> Result<i64, M2Error> {

@@ -1,7 +1,7 @@
 //! Database-local catalog and durable authority schema for clean-room V2.
 
 ::pgrx::pg_module_magic!(name, version);
-
+mod keyed_state;
 ::pgrx::extension_sql_file!(
     "../../../sql/v2/001_catalog_identity.sql",
     name = "catalog_identity"
@@ -14,7 +14,7 @@
 ::pgrx::extension_sql_file!(
     "../../../sql/v2/003_nullable_insert.sql",
     name = "nullable_insert",
-    requires = ["source_apply"]
+    requires = ["operator_keyed_state"]
 );
 ::pgrx::extension_sql_file!(
     "../../../sql/v2/004_empty_insert.sql",

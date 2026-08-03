@@ -2,7 +2,7 @@ use core::num::NonZeroU32;
 
 use shiba_operator::{
     ColumnBinding, Expression, NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind,
-    OutputContract, ValueType,
+    OutputContract, StateContract, ValueType,
 };
 
 use crate::{CompilerError, OperatorOperationV1, OperatorSpecV1, SourceDescriptor};
@@ -20,18 +20,6 @@ pub fn compile_graph(
     if spec.source_id != source.source_id {
         return Err(CompilerError::SourceMismatch);
     }
-    let OperatorOperationV1::MaterializedProject {
-        key_column,
-        value_column,
-    } = &spec.operation
-    else {
-        return Err(CompilerError::PlanRequired);
-    };
-    let (key_slot, key) = resolve(source, key_column)?;
-    if key.nullable {
-        return Err(CompilerError::NullableKey(key_column.clone()));
-    }
-    let (value_slot, _) = resolve(source, value_column)?;
     let source_layout = source
         .columns
         .iter()
@@ -52,45 +40,124 @@ pub fn compile_graph(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    OperatorGraph::build(
-        spec.operator_id,
-        spec.source_id,
-        source_layout,
-        vec![
-            OperatorNode {
-                node_id: node_id(1),
-                input: NodeInput::Source,
-                state_contract: None,
-                kind: OperatorNodeKind::Project {
-                    expressions: vec![
-                        Expression::Column {
-                            slot: u16::try_from(key_slot)
-                                .map_err(|_| CompilerError::GraphEncoding)?,
-                        },
-                        Expression::Column {
-                            slot: u16::try_from(value_slot)
-                                .map_err(|_| CompilerError::GraphEncoding)?,
-                        },
-                    ],
-                },
-            },
-            OperatorNode {
-                node_id: node_id(2),
-                input: NodeInput::Node(node_id(1)),
-                state_contract: None,
-                kind: OperatorNodeKind::Materialize {
-                    key_slot: 0,
-                    value_slot: 1,
-                    output: OutputContract::KeyedRows {
-                        key_type: ValueType::Int8,
-                        value_type: ValueType::Int8,
-                        nullable: true,
+    let nodes = match &spec.operation {
+        OperatorOperationV1::MaterializedProject {
+            key_column,
+            value_column,
+        } => {
+            let (key_slot, key) = resolve(source, key_column)?;
+            if key.nullable {
+                return Err(CompilerError::NullableKey(key_column.clone()));
+            }
+            let (value_slot, _) = resolve(source, value_column)?;
+            project_nodes(key_slot, value_slot)?
+        }
+        OperatorOperationV1::GroupedCount { key_column } => {
+            let (key_slot, key) = resolve(source, key_column)?;
+            grouped_nodes(key_slot, key.nullable, None, source_layout.len())?
+        }
+        OperatorOperationV1::GroupedSumInt8 {
+            key_column,
+            input_column,
+        } => {
+            let (key_slot, key) = resolve(source, key_column)?;
+            let (value_slot, _) = resolve(source, input_column)?;
+            grouped_nodes(
+                key_slot,
+                key.nullable,
+                Some(value_slot),
+                source_layout.len(),
+            )?
+        }
+        _ => return Err(CompilerError::PlanRequired),
+    };
+    OperatorGraph::build(spec.operator_id, spec.source_id, source_layout, nodes)
+        .map_err(|_| CompilerError::GraphEncoding)
+}
+
+fn project_nodes(key_slot: usize, value_slot: usize) -> Result<Vec<OperatorNode>, CompilerError> {
+    Ok(vec![
+        OperatorNode {
+            node_id: node_id(1),
+            input: NodeInput::Source,
+            state_contract: None,
+            kind: OperatorNodeKind::Project {
+                expressions: vec![
+                    Expression::Column {
+                        slot: slot(key_slot)?,
                     },
+                    Expression::Column {
+                        slot: slot(value_slot)?,
+                    },
+                ],
+            },
+        },
+        OperatorNode {
+            node_id: node_id(2),
+            input: NodeInput::Node(node_id(1)),
+            state_contract: None,
+            kind: OperatorNodeKind::Materialize {
+                key_slot: 0,
+                value_slot: 1,
+                output: OutputContract::KeyedRows {
+                    key_type: ValueType::Int8,
+                    key_nullable: false,
+                    value_type: ValueType::Int8,
+                    nullable: true,
                 },
             },
-        ],
-    )
-    .map_err(|_| CompilerError::GraphEncoding)
+        },
+    ])
+}
+
+fn grouped_nodes(
+    key_slot: usize,
+    key_nullable: bool,
+    value_slot: Option<usize>,
+    source_width: usize,
+) -> Result<Vec<OperatorNode>, CompilerError> {
+    let key_slot = slot(key_slot)?;
+    let grouped_key_slot = slot(source_width)?;
+    let aggregate = match value_slot {
+        None => OperatorNodeKind::GroupedCount {
+            key_slot: grouped_key_slot,
+        },
+        Some(value_slot) => OperatorNodeKind::GroupedSumInt8 {
+            key_slot: grouped_key_slot,
+            value_slot: slot(value_slot)?,
+        },
+    };
+    Ok(vec![
+        OperatorNode {
+            node_id: node_id(1),
+            input: NodeInput::Source,
+            state_contract: None,
+            kind: OperatorNodeKind::KeyBy {
+                key: Expression::Column { slot: key_slot },
+            },
+        },
+        OperatorNode {
+            node_id: node_id(2),
+            input: NodeInput::Node(node_id(1)),
+            state_contract: Some(StateContract { codec_version: 1 }),
+            kind: aggregate,
+        },
+        OperatorNode {
+            node_id: node_id(3),
+            input: NodeInput::Node(node_id(2)),
+            state_contract: None,
+            kind: OperatorNodeKind::Materialize {
+                key_slot: 0,
+                value_slot: 1,
+                output: OutputContract::KeyedRows {
+                    key_type: ValueType::Int8,
+                    key_nullable,
+                    value_type: ValueType::Int8,
+                    nullable: value_slot.is_some(),
+                },
+            },
+        },
+    ])
 }
 
 fn resolve<'a>(
@@ -119,4 +186,8 @@ fn resolve<'a>(
 
 fn node_id(value: u32) -> NodeId {
     NodeId::new(NonZeroU32::new(value).expect("fixed nonzero node identity"))
+}
+
+fn slot(value: usize) -> Result<u16, CompilerError> {
+    u16::try_from(value).map_err(|_| CompilerError::GraphEncoding)
 }

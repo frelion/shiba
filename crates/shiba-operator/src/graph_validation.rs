@@ -41,6 +41,63 @@ pub(crate) fn validate_graph(graph: &CanonicalGraph) -> Result<(), GraphError> {
     }) {
         return Err(GraphError::InvalidTopology);
     }
+    validate_stateful_topology(graph)?;
+    Ok(())
+}
+
+fn validate_stateful_topology(graph: &CanonicalGraph) -> Result<(), GraphError> {
+    let aggregates = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                OperatorNodeKind::GroupedCount { .. } | OperatorNodeKind::GroupedSumInt8 { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    if aggregates.is_empty() {
+        return Ok(());
+    }
+    if aggregates.len() != 1 {
+        return Err(GraphError::InvalidTopology);
+    }
+    let aggregate = aggregates[0];
+    let aggregate_index = graph
+        .nodes
+        .iter()
+        .position(|node| node.node_id == aggregate.node_id)
+        .ok_or(GraphError::InvalidTopology)?;
+    if aggregate_index == 0 || aggregate_index + 2 != graph.nodes.len() {
+        return Err(GraphError::InvalidTopology);
+    }
+    let key_by = &graph.nodes[aggregate_index - 1];
+    let materialize = &graph.nodes[aggregate_index + 1];
+    if !matches!(key_by.kind, OperatorNodeKind::KeyBy { .. })
+        || aggregate.input != NodeInput::Node(key_by.node_id)
+        || !matches!(materialize.kind, OperatorNodeKind::Materialize { .. })
+        || materialize.input != NodeInput::Node(aggregate.node_id)
+    {
+        return Err(GraphError::InvalidTopology);
+    }
+    for (index, node) in graph.nodes[..aggregate_index].iter().enumerate() {
+        let expected_input = if index == 0 {
+            NodeInput::Source
+        } else {
+            NodeInput::Node(graph.nodes[index - 1].node_id)
+        };
+        if node.input != expected_input
+            || !matches!(
+                node.kind,
+                OperatorNodeKind::Filter { .. }
+                    | OperatorNodeKind::Project { .. }
+                    | OperatorNodeKind::Compute { .. }
+                    | OperatorNodeKind::KeyBy { .. }
+            )
+        {
+            return Err(GraphError::InvalidTopology);
+        }
+    }
     Ok(())
 }
 
@@ -55,9 +112,14 @@ pub(crate) fn layout_graph(
             return Err(GraphError::InvalidTopology);
         }
         previous = Some(node.node_id);
+        let stateful = matches!(
+            node.kind,
+            OperatorNodeKind::GroupedCount { .. } | OperatorNodeKind::GroupedSumInt8 { .. }
+        );
         if node
             .state_contract
             .is_some_and(|contract| contract.codec_version != 1)
+            || (!stateful && node.state_contract.is_some())
         {
             return Err(GraphError::InvalidStateContract);
         }
@@ -94,6 +156,37 @@ fn node_output_types(
             values.extend(expression_types(expressions, input)?);
             Some(values)
         }
+        OperatorNodeKind::KeyBy { key } => {
+            let mut values = input.value_types.clone();
+            values.push(key.validate(input)?);
+            Some(values)
+        }
+        OperatorNodeKind::GroupedCount { key_slot } => {
+            if node.state_contract.is_none() {
+                return Err(GraphError::InvalidStateContract);
+            }
+            let key = *input
+                .value_types
+                .get(usize::from(*key_slot))
+                .ok_or(GraphError::WrongType)?;
+            Some(vec![key, ValueType::Int8])
+        }
+        OperatorNodeKind::GroupedSumInt8 {
+            key_slot,
+            value_slot,
+        } => {
+            if node.state_contract.is_none() {
+                return Err(GraphError::InvalidStateContract);
+            }
+            let key = *input
+                .value_types
+                .get(usize::from(*key_slot))
+                .ok_or(GraphError::WrongType)?;
+            if input.value_types.get(usize::from(*value_slot)) != Some(&ValueType::Int8) {
+                return Err(GraphError::WrongType);
+            }
+            Some(vec![key, ValueType::Int8])
+        }
         OperatorNodeKind::Materialize {
             key_slot,
             value_slot,
@@ -105,8 +198,9 @@ fn node_output_types(
                     output,
                     OutputContract::KeyedRows {
                         key_type: ValueType::Int8,
+                        key_nullable: _,
                         value_type: ValueType::Int8,
-                        nullable: true
+                        nullable: _
                     }
                 )
             {

@@ -47,7 +47,9 @@ pub fn compile_plan(
                 },
             )
         }
-        OperatorOperationV1::MaterializedProject { .. } => {
+        OperatorOperationV1::MaterializedProject { .. }
+        | OperatorOperationV1::GroupedCount { .. }
+        | OperatorOperationV1::GroupedSumInt8 { .. } => {
             let graph = crate::compile_graph(spec, source)?;
             let inputs = graph
                 .source_layout
@@ -62,12 +64,35 @@ pub fn compile_plan(
                     address: binding.address,
                 })
                 .collect();
+            let (key_nullable, nullable) = match &spec.operation {
+                OperatorOperationV1::MaterializedProject { .. } => (false, true),
+                OperatorOperationV1::GroupedCount { key_column } => (
+                    source
+                        .columns
+                        .iter()
+                        .find(|column| column.name == *key_column)
+                        .ok_or_else(|| CompilerError::MissingColumn(key_column.clone()))?
+                        .nullable,
+                    false,
+                ),
+                OperatorOperationV1::GroupedSumInt8 { key_column, .. } => (
+                    source
+                        .columns
+                        .iter()
+                        .find(|column| column.name == *key_column)
+                        .ok_or_else(|| CompilerError::MissingColumn(key_column.clone()))?
+                        .nullable,
+                    true,
+                ),
+                _ => unreachable!("graph operations matched"),
+            };
             (
                 inputs,
                 OutputContract::KeyedRows {
                     key_type: ValueType::Int8,
+                    key_nullable,
                     value_type: ValueType::Int8,
-                    nullable: true,
+                    nullable,
                 },
                 PlanImplementation::Graph { graph },
             )

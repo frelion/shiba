@@ -68,5 +68,6 @@ pub enum OutputDelta {
 #[serde(deny_unknown_fields)]
 pub struct OperatorTransition {
     pub next_state: EncodedOperatorState,
+    pub state_deltas: Vec<crate::StateDelta>,
     pub output_delta: OutputDelta,
 }

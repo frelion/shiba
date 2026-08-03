@@ -1,11 +1,9 @@
 use std::collections::BTreeMap;
 
+use crate::graph_budget::EvaluationBudget;
 use crate::{
     DeltaBatch, GraphError, GraphTransition, NodeId, NodeInput, OperatorGraph, OperatorNodeKind,
-    RowDelta, TypedLayout, TypedRow, TypedValue, ValueType,
-    graph::{
-        MAX_GRAPH_DELTA_ROWS, MAX_GRAPH_WORK_BYTES, MAX_INPUT_DELTA_ROWS, MAX_NODE_DELTA_ROWS,
-    },
+    RowDelta, TypedLayout, TypedRow, TypedValue, ValueType, graph::MAX_INPUT_DELTA_ROWS,
 };
 
 /// Evaluates one bounded typed delta through an immutable stateless graph.
@@ -27,9 +25,8 @@ pub fn apply_graph(
         return Err(GraphError::OutputLimit);
     }
     validate_batch(input, &source_layout)?;
-    let mut work_bytes = batch_bytes(input)?;
+    let mut budget = EvaluationBudget::new(input)?;
     let mut batches = BTreeMap::<NodeId, DeltaBatch>::new();
-    let states = Vec::new();
     let mut results = Vec::new();
     let mut emitted_rows = 0_usize;
     for node in &graph.nodes {
@@ -43,84 +40,92 @@ pub fn apply_graph(
         match &node.kind {
             OperatorNodeKind::Filter { predicate } => {
                 let output = filter_batch(batch, layout, predicate)?;
-                charge_rows(&mut emitted_rows, output.rows.len())?;
-                charge_bytes(&mut work_bytes, batch_bytes(&output)?)?;
+                budget.charge(&output, &mut emitted_rows)?;
                 batches.insert(node.node_id, output);
             }
             OperatorNodeKind::Project { expressions } => {
                 let output_layout = layouts.get(&node.node_id).ok_or(GraphError::Layout)?;
                 let output = map_batch(batch, layout, output_layout, expressions, false)?;
-                charge_rows(&mut emitted_rows, output.rows.len())?;
-                charge_bytes(&mut work_bytes, batch_bytes(&output)?)?;
+                budget.charge(&output, &mut emitted_rows)?;
                 batches.insert(node.node_id, output);
             }
             OperatorNodeKind::Compute { expressions } => {
                 let output_layout = layouts.get(&node.node_id).ok_or(GraphError::Layout)?;
                 let output = map_batch(batch, layout, output_layout, expressions, true)?;
-                charge_rows(&mut emitted_rows, output.rows.len())?;
-                charge_bytes(&mut work_bytes, batch_bytes(&output)?)?;
+                budget.charge(&output, &mut emitted_rows)?;
                 batches.insert(node.node_id, output);
+            }
+            OperatorNodeKind::KeyBy { key } => {
+                let output_layout = layouts.get(&node.node_id).ok_or(GraphError::Layout)?;
+                let output = map_batch(
+                    batch,
+                    layout,
+                    output_layout,
+                    core::slice::from_ref(key),
+                    true,
+                )?;
+                budget.charge(&output, &mut emitted_rows)?;
+                batches.insert(node.node_id, output);
+            }
+            OperatorNodeKind::GroupedCount { .. } | OperatorNodeKind::GroupedSumInt8 { .. } => {
+                return Err(GraphError::InvalidNode);
             }
             OperatorNodeKind::Materialize {
                 key_slot,
                 value_slot,
-                ..
-            } => results.push(crate::materialize::materialize(
-                node.node_id,
-                batch,
-                layout,
-                *key_slot,
-                *value_slot,
-            )?),
-        }
-    }
-    Ok(GraphTransition { states, results })
-}
-
-fn charge_bytes(total: &mut usize, bytes: usize) -> Result<(), GraphError> {
-    *total = total.checked_add(bytes).ok_or(GraphError::OutputLimit)?;
-    if *total > MAX_GRAPH_WORK_BYTES {
-        return Err(GraphError::OutputLimit);
-    }
-    Ok(())
-}
-
-fn batch_bytes(batch: &DeltaBatch) -> Result<usize, GraphError> {
-    let mut bytes = 64_usize;
-    for delta in &batch.rows {
-        for row in [delta.before.as_ref(), delta.after.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            bytes = bytes.checked_add(32).ok_or(GraphError::OutputLimit)?;
-            for value in &row.values {
-                let value_bytes = match value {
-                    TypedValue::Text(text) => 16_usize
-                        .checked_add(text.len())
-                        .ok_or(GraphError::OutputLimit)?,
-                    _ => 16,
+                output,
+            } => {
+                let crate::OutputContract::KeyedRows {
+                    key_nullable,
+                    nullable,
+                    ..
+                } = output
+                else {
+                    return Err(GraphError::WrongType);
                 };
-                bytes = bytes
-                    .checked_add(value_bytes)
-                    .ok_or(GraphError::OutputLimit)?;
+                results.push(crate::materialize::materialize(
+                    node.node_id,
+                    batch,
+                    layout,
+                    *key_slot,
+                    *value_slot,
+                    *key_nullable,
+                    *nullable,
+                )?);
             }
         }
     }
-    if bytes > MAX_GRAPH_WORK_BYTES {
-        return Err(GraphError::OutputLimit);
-    }
-    Ok(bytes)
+    Ok(GraphTransition { results })
 }
 
-fn charge_rows(total: &mut usize, rows: usize) -> Result<(), GraphError> {
-    if rows > MAX_NODE_DELTA_ROWS {
+pub(crate) fn apply_prefix(
+    graph: &OperatorGraph,
+    input: &DeltaBatch,
+    stop_before: NodeId,
+) -> Result<(DeltaBatch, TypedLayout, EvaluationBudget, usize), GraphError> {
+    graph.validate()?;
+    let (source_layout, layouts) = graph.layouts()?;
+    if input.layout_identity != source_layout.identity {
+        return Err(GraphError::Layout);
+    }
+    if input.rows.len() > MAX_INPUT_DELTA_ROWS {
         return Err(GraphError::OutputLimit);
     }
-    *total = total.checked_add(rows).ok_or(GraphError::OutputLimit)?;
-    if *total > MAX_GRAPH_DELTA_ROWS {
-        return Err(GraphError::OutputLimit);
+    validate_batch(input, &source_layout)?;
+    let mut current = input.clone();
+    let mut current_layout = source_layout;
+    let mut budget = EvaluationBudget::new(input)?;
+    let mut emitted_rows = 0;
+    for node in &graph.nodes {
+        if node.node_id == stop_before {
+            return Ok((current, current_layout, budget, emitted_rows));
+        }
+        let output_layout = layouts.get(&node.node_id).ok_or(GraphError::Layout)?;
+        current = transform_node(&node.kind, &current, &current_layout, output_layout)?;
+        budget.charge(&current, &mut emitted_rows)?;
+        current_layout = output_layout.clone();
     }
-    Ok(())
+    Err(GraphError::InvalidTopology)
 }
 
 fn validate_batch(batch: &DeltaBatch, layout: &TypedLayout) -> Result<(), GraphError> {
@@ -137,6 +142,31 @@ fn validate_batch(batch: &DeltaBatch, layout: &TypedLayout) -> Result<(), GraphE
         }
     }
     Ok(())
+}
+
+pub(crate) fn transform_node(
+    kind: &OperatorNodeKind,
+    batch: &DeltaBatch,
+    input_layout: &TypedLayout,
+    output_layout: &TypedLayout,
+) -> Result<DeltaBatch, GraphError> {
+    match kind {
+        OperatorNodeKind::Filter { predicate } => filter_batch(batch, input_layout, predicate),
+        OperatorNodeKind::Project { expressions } => {
+            map_batch(batch, input_layout, output_layout, expressions, false)
+        }
+        OperatorNodeKind::Compute { expressions } => {
+            map_batch(batch, input_layout, output_layout, expressions, true)
+        }
+        OperatorNodeKind::KeyBy { key } => map_batch(
+            batch,
+            input_layout,
+            output_layout,
+            core::slice::from_ref(key),
+            true,
+        ),
+        _ => Err(GraphError::InvalidNode),
+    }
 }
 
 fn filter_batch(

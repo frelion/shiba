@@ -33,6 +33,7 @@ pub enum OutputContract {
     },
     KeyedRows {
         key_type: ValueType,
+        key_nullable: bool,
         value_type: ValueType,
         nullable: bool,
     },
@@ -216,9 +217,14 @@ fn validate_contract(plan: &CanonicalPlan) -> Result<(), PlanError> {
                 && plan.output_contract == scalar
         }
         PlanImplementation::Graph { ref graph } => {
+            let terminal_output = graph.nodes.iter().find_map(|node| match &node.kind {
+                crate::OperatorNodeKind::Materialize { output, .. } => Some(output),
+                _ => None,
+            });
             graph.operator_id == plan.operator_id
                 && graph.source_id == plan.source_id
                 && graph.validate().is_ok()
+                && terminal_output == Some(&plan.output_contract)
                 && plan.inputs
                     == graph
                         .source_layout
@@ -233,14 +239,7 @@ fn validate_contract(plan: &CanonicalPlan) -> Result<(), PlanError> {
                             address: binding.address,
                         })
                         .collect::<Vec<_>>()
-                && matches!(
-                    plan.output_contract,
-                    OutputContract::KeyedRows {
-                        key_type: ValueType::Int8,
-                        value_type: ValueType::Int8,
-                        nullable: true
-                    }
-                )
+                && matches!(plan.output_contract, OutputContract::KeyedRows { .. })
         }
     };
     if valid {

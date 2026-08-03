@@ -1,5 +1,17 @@
 # Testing strategy
 
+## M14.3 generic grouped-state gates
+
+`scripts/test-m14-grouped.sh` is green on PG17.10 and PG18.4. It compares every
+GroupedCount/GroupedSumInt8 keyed row with an independent SQL oracle across
+INSERT/UPDATE/DELETE, NULL and all-NULL groups, key changes, empty-group
+deletion, replay and retry. Injected overflow and corrupt keyed state prove
+source rows, all node state/results and continuation roll back together.
+Permission and static gates prove private node state and set-based load/delete/
+upsert rather than per-row SQL. This directed gate does not prove Join,
+graph-wide bootstrap/rebuild/lifecycle or the final M14 release/performance
+matrix.
+
 ## M14.2 typed stateless graph gates
 
 M14.2 implements the database-free `TypedValue`/`TypedRow`/`DeltaBatch` and

@@ -31,10 +31,12 @@ CREATE TABLE shiba_internal.operator_definition (
     output_shape text NOT NULL CHECK (output_shape IN ('scalar', 'keyed')),
     output_value_type text NOT NULL CHECK (output_value_type = 'int8'),
     output_key_type text,
+    output_key_nullable boolean NOT NULL,
     output_value_nullable boolean NOT NULL,
     CONSTRAINT operator_definition_output_contract CHECK (
         (output_shape = 'scalar'
          AND output_key_type IS NULL
+         AND NOT output_key_nullable
          AND NOT output_value_nullable)
         OR (output_shape = 'keyed'
             AND output_key_type = 'int8')
@@ -77,37 +79,12 @@ CREATE TABLE shiba.operator_result (
     CONSTRAINT operator_result_sink_identity UNIQUE (operator_id, output_shape)
 );
 
-CREATE TABLE shiba_internal.operator_result_row (
-    operator_id bigint NOT NULL,
-    output_shape text NOT NULL DEFAULT 'keyed' CHECK (output_shape = 'keyed'),
-    result_key_bigint bigint NOT NULL,
-    result_value_bigint bigint,
-    CONSTRAINT operator_result_row_primary PRIMARY KEY (
-        operator_id, result_key_bigint
-    ),
-    CONSTRAINT operator_result_row_keyed_definition FOREIGN KEY (
-        operator_id, output_shape
-    ) REFERENCES shiba.operator_result (operator_id, output_shape)
-);
-
-CREATE VIEW shiba.operator_result_rows AS
-SELECT result_row.operator_id,
-       result_row.result_key_bigint,
-       result_row.result_value_bigint
-FROM shiba_internal.operator_result_row AS result_row
-JOIN shiba.operator_result AS result USING (operator_id)
-WHERE result.result_status = 'active'
-  AND result.output_shape = 'keyed';
-
 REVOKE ALL ON TABLE shiba_internal.source_row_state FROM PUBLIC;
 REVOKE ALL ON TABLE shiba_internal.source_continuation FROM PUBLIC;
 REVOKE ALL ON TABLE shiba_internal.operator_definition FROM PUBLIC;
 REVOKE ALL ON TABLE shiba_internal.operator_state FROM PUBLIC;
-REVOKE ALL ON TABLE shiba_internal.operator_result_row FROM PUBLIC;
 REVOKE ALL ON TABLE shiba.operator_result FROM PUBLIC;
-REVOKE ALL ON TABLE shiba.operator_result_rows FROM PUBLIC;
 GRANT SELECT ON TABLE shiba.operator_result TO PUBLIC;
-GRANT SELECT ON TABLE shiba.operator_result_rows TO PUBLIC;
 
 COMMENT ON TABLE shiba_internal.source_row_state IS
     'Sole key-owned current source-row state; WAL and bootstrap causes are not stored here';
@@ -119,7 +96,3 @@ COMMENT ON TABLE shiba_internal.operator_state IS
     'Private opaque versioned state owned only by Runtime';
 COMMENT ON TABLE shiba.operator_result IS
     'Read-only generic result header; building rows expose no partial value';
-COMMENT ON TABLE shiba_internal.operator_result_row IS
-    'Private keyed result sink rows owned only by Runtime';
-COMMENT ON VIEW shiba.operator_result_rows IS
-    'Read-only keyed results for active generic result headers';

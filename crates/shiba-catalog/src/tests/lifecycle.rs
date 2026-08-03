@@ -1,4 +1,5 @@
 const AUTHORITY_SQL: &str = include_str!("../../../../sql/v2/002_source_apply.sql");
+const KEYED_SQL: &str = include_str!("../../../../sql/v2/018_operator_keyed_state.sql");
 const BOOTSTRAP_SQL: &str = include_str!("../../../../sql/v2/011_source_bootstrap.sql");
 const RESERVATION_SQL: &str =
     include_str!("../../../../sql/v2/012_source_bootstrap_reservation.sql");
@@ -42,7 +43,11 @@ fn bootstrap_replaces_wal_causes_with_one_key_owned_row_state() {
 
 #[test]
 fn result_visibility_is_closed_and_never_partial() {
-    let sql = AUTHORITY_SQL.to_ascii_lowercase();
+    let sql = format!(
+        "{}\n{}",
+        AUTHORITY_SQL.to_ascii_lowercase(),
+        KEYED_SQL.to_ascii_lowercase()
+    );
     for required in [
         "result_status text not null default 'active'",
         "result_status in ('building', 'active')",

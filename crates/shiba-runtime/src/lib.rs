@@ -7,6 +7,7 @@ mod bootstrap;
 mod bootstrap_activation;
 mod bootstrap_model;
 mod error;
+mod keyed_state;
 mod operator_execution;
 mod pgoutput;
 mod pgoutput_source;

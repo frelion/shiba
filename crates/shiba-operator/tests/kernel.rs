@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use shiba_operator::{
     ColumnBinding, CompiledPlan, DeltaBatch, EffectOrigin, EncodedOperatorState, InputBinding,
     InputRole, KernelError, ObjectAddress, OperatorId, OutputContract, OutputDelta,
-    PlanImplementation, RowDelta, TypedRow, TypedValue, ValueType, apply_plan, decode_state,
-    initial_state, source_typed_layout,
+    PlanImplementation, RowDelta, StateSnapshot, TypedRow, TypedValue, ValueType, apply_plan,
+    decode_state, initial_state, source_typed_layout,
 };
 use shiba_protocol::{
     IngressTransactionId, PostgresLsn, SlotGeneration, SourceId, SourceTransactionId,
@@ -94,7 +94,7 @@ fn batch(delta: RowDelta) -> DeltaBatch {
 }
 
 fn scalar(plan: &CompiledPlan, state: &EncodedOperatorState, batch: &DeltaBatch) -> i64 {
-    let transition = apply_plan(plan, state, batch).unwrap();
+    let transition = apply_plan(plan, state, &empty_snapshot(), batch).unwrap();
     let OutputDelta::ScalarReplacement {
         value: TypedValue::Int8(value),
     } = transition.output_delta
@@ -102,6 +102,12 @@ fn scalar(plan: &CompiledPlan, state: &EncodedOperatorState, batch: &DeltaBatch)
         panic!("expected int8 scalar")
     };
     value
+}
+
+fn empty_snapshot() -> StateSnapshot {
+    StateSnapshot {
+        entries: Vec::new(),
+    }
 }
 
 #[test]
@@ -124,7 +130,10 @@ fn count_and_sum_use_one_typed_batch_and_checked_state() {
         codec_version: 1,
         payload: i64::MAX.to_be_bytes().to_vec(),
     };
-    assert_eq!(apply_plan(&sum, &max, &input), Err(KernelError::Overflow));
+    assert_eq!(
+        apply_plan(&sum, &max, &empty_snapshot(), &input),
+        Err(KernelError::Overflow)
+    );
 }
 
 #[test]
@@ -156,6 +165,7 @@ fn corrupt_scalar_plan_state_and_absent_input_fail_closed() {
         apply_plan(
             &sum,
             &initial_state(&sum).unwrap(),
+            &empty_snapshot(),
             &batch(RowDelta {
                 before: None,
                 after: Some(absent),
@@ -196,8 +206,12 @@ fn deterministic_random_sequence_matches_count_and_sum_models() {
             before: before.map(|value| row(key, value)),
             after: after.map(|value| row(key, value)),
         });
-        count_state = apply_plan(&count, &count_state, &input).unwrap().next_state;
-        sum_state = apply_plan(&sum, &sum_state, &input).unwrap().next_state;
+        count_state = apply_plan(&count, &count_state, &empty_snapshot(), &input)
+            .unwrap()
+            .next_state;
+        sum_state = apply_plan(&sum, &sum_state, &empty_snapshot(), &input)
+            .unwrap()
+            .next_state;
         match after {
             Some(value) => {
                 rows.insert(key, value);

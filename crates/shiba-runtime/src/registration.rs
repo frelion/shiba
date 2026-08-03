@@ -11,6 +11,7 @@ use shiba_operator::{
 use shiba_protocol::SourceId;
 
 use crate::M2Error;
+use crate::keyed_state;
 use crate::source_preflight;
 use crate::transaction::as_bigint;
 
@@ -128,18 +129,20 @@ fn replace_registered_plan(
     let operator_id = as_bigint("operator_id", plan.operator_id.get())?;
     let state_codec =
         i32::try_from(state.codec_version).map_err(|_| M2Error::InvalidOperatorDefinition)?;
-    let (shape, value_type, key_type, nullable) = output_metadata(&plan.output_contract);
+    let (shape, value_type, key_type, key_nullable, nullable) =
+        output_metadata(&plan.output_contract);
     transaction.execute(
         "DELETE FROM shiba_internal.operator_result_row WHERE operator_id = $1",
         &[&operator_id],
     )?;
+    keyed_state::clear(transaction, operator_id)?;
     let changed = transaction.execute(
         "UPDATE shiba_internal.operator_definition SET
              plan_format_version = $2, plan_payload = $3, plan_digest = $4,
              state_codec_version = $5, output_shape = $6,
              output_value_type = $7, output_key_type = $8,
-             output_value_nullable = $9
-         WHERE operator_id = $1 AND source_id = $10",
+             output_key_nullable = $9, output_value_nullable = $10
+         WHERE operator_id = $1 AND source_id = $11",
         &[
             &operator_id,
             &i32::try_from(plan.format_version).map_err(|_| M2Error::InvalidOperatorDefinition)?,
@@ -149,6 +152,7 @@ fn replace_registered_plan(
             &shape,
             &value_type,
             &key_type,
+            &key_nullable,
             &nullable,
             &as_bigint("source_id", plan.source_id.get())?,
         ],
@@ -162,6 +166,9 @@ fn replace_registered_plan(
         &[&operator_id, &state_codec, &state.payload],
     )? != 1
     {
+        return Err(M2Error::InvalidOperatorDefinition.into());
+    }
+    if !initial.state_deltas.is_empty() {
         return Err(M2Error::InvalidOperatorDefinition.into());
     }
     match initial.output_delta {
@@ -200,13 +207,15 @@ fn register_in_transaction(
     let spec_payload = spec
         .to_canonical_json()
         .map_err(|_| CompilerError::PlanEncoding)?;
-    let (shape, value_type, key_type, nullable) = output_metadata(&plan.output_contract);
+    let (shape, value_type, key_type, key_nullable, nullable) =
+        output_metadata(&plan.output_contract);
     transaction.execute(
         "INSERT INTO shiba_internal.operator_definition (
              operator_id, source_id, compiler_version, spec_payload,
              plan_format_version, plan_payload, plan_digest, state_codec_version,
-             output_shape, output_value_type, output_key_type, output_value_nullable
-         ) VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             output_shape, output_value_type, output_key_type,
+             output_key_nullable, output_value_nullable
+         ) VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         &[
             &operator_id,
             &source_id,
@@ -218,6 +227,7 @@ fn register_in_transaction(
             &shape,
             &value_type,
             &key_type,
+            &key_nullable,
             &nullable,
         ],
     )?;
@@ -226,6 +236,9 @@ fn register_in_transaction(
              (operator_id, codec_version, state_payload) VALUES ($1, $2, $3)",
         &[&operator_id, &state_codec, &state.payload],
     )?;
+    if !initial.state_deltas.is_empty() {
+        return Err(M2Error::InvalidOperatorDefinition.into());
+    }
     let scalar = match initial.output_delta {
         OutputDelta::ScalarReplacement {
             value: TypedValue::Int8(value),
@@ -244,19 +257,21 @@ fn register_in_transaction(
 
 fn output_metadata(
     contract: &OutputContract,
-) -> (&'static str, &'static str, Option<&'static str>, bool) {
+) -> (&'static str, &'static str, Option<&'static str>, bool, bool) {
     match contract {
         OutputContract::Scalar { value_type } => {
-            ("scalar", value_type_name(*value_type), None, false)
+            ("scalar", value_type_name(*value_type), None, false, false)
         }
         OutputContract::KeyedRows {
             key_type,
+            key_nullable,
             value_type,
             nullable,
         } => (
             "keyed",
             value_type_name(*value_type),
             Some(value_type_name(*key_type)),
+            *key_nullable,
             *nullable,
         ),
     }

@@ -75,6 +75,7 @@ fn graph(predicate: Expression, compute: bool) -> OperatorGraph {
             value_slot: 1,
             output: OutputContract::KeyedRows {
                 key_type: ValueType::Int8,
+                key_nullable: false,
                 value_type: ValueType::Int8,
                 nullable: true,
             },
