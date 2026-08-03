@@ -163,7 +163,7 @@ fn verify_prepared_catalog(
          FROM shiba_internal.source_bootstrap AS bootstrap
          JOIN shiba_internal.source_ingress_config AS config USING (source_id)
          WHERE bootstrap.source_id = $1
-         FOR UPDATE OF bootstrap, config",
+         FOR UPDATE OF bootstrap",
             &[
                 &source_id,
                 &target_bootstrap,

@@ -44,6 +44,40 @@ impl ReplicationTransport {
         Ok(Self { connection })
     }
 
+    /// Proves that this credential is a database-scoped replication principal
+    /// for the exact apply database, without creating, dropping, or starting a
+    /// slot. Returns the authenticated session principal for target-table
+    /// privilege validation on the apply connection.
+    pub(crate) fn preflight(&self, expected_database: &str) -> Result<String, IngressError> {
+        let identified = self.connection.exec("IDENTIFY_SYSTEM");
+        if identified.status() != Status::TuplesOk
+            || identified.ntuples() != 1
+            || identified.nfields() != 4
+        {
+            return Err(IngressError::UnexpectedStatus(identified.status()));
+        }
+        let database = result_text(&identified, 0, 3)?;
+        if database != expected_database {
+            return Err(IngressError::Governance(
+                "replication credential database differs from apply database",
+            ));
+        }
+        let principal = self.connection.exec("SHOW session_authorization");
+        if principal.status() != Status::TuplesOk
+            || principal.ntuples() != 1
+            || principal.nfields() != 1
+        {
+            return Err(IngressError::UnexpectedStatus(principal.status()));
+        }
+        let principal = result_text(&principal, 0, 0)?;
+        if principal.is_empty() {
+            return Err(IngressError::Governance(
+                "replication credential principal is empty",
+            ));
+        }
+        Ok(principal)
+    }
+
     /// Starts pgoutput replication for one existing slot and publication.
     ///
     /// # Errors
@@ -196,6 +230,16 @@ impl ReplicationTransport {
             .map_err(IngressError::Libpq)?;
         self.connection.flush().map_err(IngressError::Libpq)
     }
+}
+
+fn result_text(result: &libpq::Result, row: usize, column: usize) -> Result<String, IngressError> {
+    result
+        .value(row, column)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(str::to_owned)
+        .ok_or(IngressError::InvalidEnvelope(
+            "invalid replication command response",
+        ))
 }
 
 pub(crate) fn validate_slot(slot: &str) -> Result<(), IngressError> {

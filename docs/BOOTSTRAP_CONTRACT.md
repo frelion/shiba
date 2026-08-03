@@ -321,3 +321,24 @@ The old active generation never returns and its continuation is never
 relabelled. The same relation/key/payload/identity-index authority is read from
 Catalog; marker-null M11 recovery remains unchanged. Readers stay on
 `building/NULL` until ordinary catch-up and activation complete.
+
+## M12.5 rebuild admission governance
+
+PG17.10 and PG18.4 `scripts/test-m12-rebuild-governance.sh` extend the rebuild
+boundary, not the bootstrap data path. Before destructive prepare, transport
+validates its configured database with `IDENTIFY_SYSTEM`, control validates
+target `SELECT`, and Catalog validates relation/publication/key/payload/
+identity-index/operator-plan ObjectAddresses. The exact primary-index OID is
+held with `AccessShareLock` while `pg_relation_size` reads its shape; names are
+not authority.
+
+The gate proves same-OID rename/unrelated-index isolation, replacement-OID,
+publication, replica-identity/column/plan drift rejection, and committed
+post-prepare invalidation preserving `building/NULL`. Two rebuild workers for
+one source share the existing fence and have one winner; another source retains
+ordinary live progress. The control/Apply/scanner role is
+NOSUPERUSER/NOREPLICATION, transport is separately trusted
+NOSUPERUSER/REPLICATION with target `SELECT`, and reader is public-result-only.
+Missing or exchanged privileges fail closed without partial results or a new
+lifecycle/checkpoint authority. M12.6 performance/release evidence remains
+outstanding.

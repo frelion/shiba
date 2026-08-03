@@ -21,6 +21,7 @@ AS $function$
 BEGIN
     -- relation_size opens the exact regclass under AccessShareLock for this tx.
     PERFORM pg_catalog.pg_relation_size(target_relation);
+    PERFORM pg_catalog.pg_relation_size(target_identity_index);
     IF NOT pg_catalog.has_table_privilege(
         session_user, target_relation, 'SELECT'
     ) THEN

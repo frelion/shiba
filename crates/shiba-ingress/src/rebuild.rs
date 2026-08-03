@@ -10,7 +10,7 @@ use crate::{
     rebuild_model::{PreparedAuthority, RebuildSpec},
     rebuild_resume::load_prepared_authority,
     rebuild_validation::verify_rebuild_target,
-    transport::validate_slot,
+    transport::{ReplicationTransport, validate_slot},
 };
 
 /// Exclusive owner of a durably prepared, forward-only rebuild.
@@ -47,6 +47,20 @@ impl PreparedRebuild {
         if apply_database != replication_database(replication_conninfo)? {
             return Err(IngressError::Governance("connection databases differ"));
         }
+        let replication = ReplicationTransport::connect(replication_conninfo)?;
+        let replication_principal = replication.preflight(&apply_database)?;
+        let receiver_can_read: Option<bool> = apply
+            .query_one(
+                "SELECT pg_catalog.has_table_privilege($1, $2::bigint::oid, 'SELECT')",
+                &[&replication_principal, &i64::from(spec.target.relation_oid)],
+            )?
+            .get(0);
+        if receiver_can_read != Some(true) {
+            return Err(IngressError::Governance(
+                "replication credential lacks SELECT on target relation",
+            ));
+        }
+        drop(replication);
         let advisory_key = advisory_key(spec.source_id)?;
         let acquired: bool = apply
             .query_one(

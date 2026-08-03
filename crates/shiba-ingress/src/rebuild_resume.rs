@@ -128,7 +128,7 @@ pub(crate) fn load_rebuild_authority(
                AND bootstrap.slot_generation = $3
                AND config.slot_name = bootstrap.slot_name
                AND config.slot_generation = bootstrap.slot_generation
-             FOR UPDATE OF bootstrap, config, binding",
+             FOR UPDATE OF bootstrap, binding",
             &[
                 &source_key,
                 &as_bigint(target_bootstrap_id.get())?,
@@ -175,7 +175,7 @@ fn load_operator_ids(
         "SELECT operator_id, operator_kind, input_classid::bigint,
                 input_objid::bigint, input_objsubid
          FROM shiba_internal.operator_definition
-         WHERE source_id = $1 ORDER BY operator_id FOR UPDATE",
+         WHERE source_id = $1 ORDER BY operator_id",
         &[&source_id],
     )?;
     if rows.len() != 2 {

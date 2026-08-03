@@ -546,3 +546,22 @@ mutation. `scan_complete`/`catching_up` resume using their existing checkpoint
 and WAL paths; activation and pre/post-ACK recovery retain M11/M10 atomic
 result and durable-feedback rules. No window creates a second continuation,
 spool, EffectStream, candidate binding or old-generation fallback.
+
+## M12.5 governance failures preserve the forward boundary
+
+The PG17.10/PG18.4 `scripts/test-m12-rebuild-governance.sh` gate makes target
+and credential checks explicit recovery boundaries. Before prepare, failure of
+transport `IDENTIFY_SYSTEM`/database, control target `SELECT`, or exact
+relation/publication/identity-index/replica-identity/column/operator-plan
+validation precedes mutation: the old active authority remains untouched.
+Control has `NOREPLICATION`; separate transport is the trusted `REPLICATION`
+control-plane capability; reader is read-only.
+
+After prepare, durable invalidation or ObjectAddress drift cannot be healed by
+rediscovering a same-named object. It leaves the sole target generation
+`building/NULL`, rejects scan/Apply/ACK eligibility, and recovery continues
+only through the existing forward lifecycle. The identity-index OID is checked
+under `AccessShareLock` with `pg_relation_size`, closing the
+shape-check/replacement race without adding state. The shared source fence gives
+one same-source winner while independent sources remain independent. This is
+not a claim to detect privileged identical slot replacement.

@@ -475,3 +475,21 @@ Runtime validates the one current target binding/config/generation (including
 the durable identity-index OID) at each boundary. Old-generation attach,
 Apply, token authorization and ACK fail closed. Replacement scan work never
 manufactures WAL identity or an ACK position.
+
+## M12.5 governed rebuild ingress
+
+The PG17.10/PG18.4 `scripts/test-m12-rebuild-governance.sh` gate proves that
+ingress does not treat a successful transport connection as target authority.
+Before destructive prepare, the dedicated transport credential completes
+`IDENTIFY_SYSTEM` for the configured database and the control caller has
+target-relation `SELECT`. Control/Apply/scanner is `NOREPLICATION`; only the
+separate transport identity carries the trusted `REPLICATION` capability plus
+target `SELECT`; the reader has no ingress or internal-table capability.
+
+At receive, catch-up and activation boundaries, ingress revalidates one durable
+relation/publication/column/identity-index/plan authority. Publication
+remove/re-add or OID drift, replica-identity/index/column drift and committed
+post-prepare invalidation cannot be repaired by a same name: they stop the
+building generation before Apply or ACK. The common ownership fence permits one
+same-source rebuild/live transition while another source progresses normally.
+M12.6, not this gate, owns final performance and release evidence.

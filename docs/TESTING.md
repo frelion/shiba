@@ -575,3 +575,21 @@ position and SQL oracle after retry. M12 lost snapshots must restart only with
 fresh BootstrapId, distinct slot and exact successor generation; M11 marker-null
 recovery is separately regressed unchanged. This gate is not evidence for M12.5
 DDL/least-privilege or M12.6 million-row performance.
+
+## M12.5 rebuild governance gate
+
+Run `scripts/test-m12-rebuild-governance.sh` on PG17.10 and PG18.4. It starts
+from a real active non-pristine source and covers exact ObjectAddress relation,
+publication, identity-index, replica-identity, column and operator-plan drift;
+same-OID index rename/unrelated-index isolation; publication remove/re-add or
+OID replacement; and invalidation after durable prepare. It asserts that a
+rejected building target never scans, Applies, ACKs or activates.
+
+The gate also covers transport `IDENTIFY_SYSTEM` plus database and control-role
+target `SELECT` preflight, exact-index `AccessShareLock`/`pg_relation_size`
+validation, same-source one-winner ownership and different-source live progress.
+It runs split-role success with `NOREPLICATION` control/Apply/scanner, a
+separate trusted `REPLICATION` transport role with target `SELECT`, and a
+public-result reader; exchanged roles and missing control/source/internal
+privileges fail closed. It is not M12.6 performance, release-matrix, TLS,
+reconnect or privileged-identical-slot-replacement evidence.

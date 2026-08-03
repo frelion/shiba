@@ -370,8 +370,9 @@ replacement is an explicit residual risk outside the M12 correctness threat
 model. See [the rebuild contract](REBUILD_CONTRACT.md) and
 [ADR 0003](adr/0003-m12-offline-rebuild.md). M12.1 freezes this architecture;
 M12.2 proves destructive admission and durable identity; M12.3 proves the real
-snapshot-to-live path. M12.4--M12.6 still own the full crash/DDL/role matrix and
-performance.
+snapshot-to-live path; M12.4 proves forward recovery and M12.5 governs DDL,
+concurrency and roles. M12.6 still owns the million-row/release performance
+matrix.
 
 ## M12.2 destructive admission architecture
 
@@ -453,3 +454,29 @@ paths. The target remains the same exact-four binding—including durable
 identity-index OID—and stays `building/NULL` until ordinary activation. M11
 marker-null recovery keeps its existing semantics; the fresh-slot/exact-successor
 rule is restricted to M12-marked abandoned attempts.
+
+## M12.5 rebuild governance architecture
+
+M12.5 keeps the one-authority rebuild topology while proving its governance
+boundary on PG17.10 and PG18.4 with `scripts/test-m12-rebuild-governance.sh`.
+Before destructive prepare, the transport credential executes
+`IDENTIFY_SYSTEM` and verifies the exact database; the control caller must
+independently have `SELECT` on the approved target relation. These checks have
+no side effect. The control/Apply/scanner role remains `NOREPLICATION`; the
+separate transport role is the narrowly trusted `REPLICATION` control-plane
+capability with target `SELECT`; the reader has only public-result `SELECT`.
+
+The target relation, publication, key/payload columns, primary identity-index
+and SumInt8 plan are compared by durable ObjectAddress. The exact
+identity-index OID is held with `AccessShareLock` while `pg_relation_size`
+checks shape. A same-OID rename is not rejected by name; replacement,
+publication drift, replica-identity/column drift and post-prepare invalidation
+stop the building generation before scan, Apply or activation. Preflight reads
+operator definitions and ingress config without needless row-update locks.
+
+The existing per-source ownership fence serializes live, DDL and rebuild work:
+two rebuilds for one source have one winner, while another source can continue
+ordinary Apply. Permission loss or a swapped role rolls back before prepare, or
+leaves an already prepared target safely `building/NULL`; it never revives the
+retired generation. M12.6 still owns million-row rebuild performance and the
+release matrix.

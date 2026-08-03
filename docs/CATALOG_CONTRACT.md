@@ -240,7 +240,8 @@ marker, parallel candidate authority, alias, fallback or dual write.
 M12.1 is the frozen contract. M12.2 establishes the destructive writer and
 durable index identity. M12.3 proves the target authority survives real
 snapshot-to-live activation without another binding/config switch. Crash and
-later lifecycle claims remain M12.4--M12.6.
+later lifecycle claims are proved by M12.4 recovery and M12.5 governance;
+M12.6 performance/release remains.
 
 ## M12.2 admitted rebuild state
 
@@ -308,3 +309,25 @@ mutation; it cannot select a current primary key. Missing, stale, malformed or
 replacement-OID identity fails closed while results remain `building/NULL`.
 This is forward replacement of an ephemeral snapshot, not a fallback or new
 catalog authority.
+
+## M12.5 target governance and role boundary
+
+`scripts/test-m12-rebuild-governance.sh` is green on PG17.10 and PG18.4. It
+proves that the sole prepare writer rejects relation, publication, primary-key
+identity-index, replica-identity, payload-column and operator-plan drift by
+durable ObjectAddress, not name. The exact identity-index OID is held with
+`AccessShareLock` while `pg_relation_size` verifies it, so a concurrent
+replacement cannot pass an unlocked shape check. An unrelated index change and
+a same-OID rename do not pollute this source; a replacement OID or
+post-prepare invalidation leaves the sole target authority `building/NULL` and
+cannot activate it.
+
+The writer remains the sole lifecycle/config/binding writer. Preflight does not
+take row-update locks on `operator_definition` or ingress config when it only
+reads them. The common source fence gives competing rebuilds one CAS winner
+without turning different sources into a global lock. A non-superuser
+control/Apply/scanner role succeeds with `NOREPLICATION`; separate trusted
+transport has `REPLICATION` plus target `SELECT`; reader remains public-result
+read-only. Missing control function/table/source privileges and role exchanges
+fail closed. A compromised trusted replication credential remains the stated
+residual physical-slot risk.

@@ -8,7 +8,7 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap lifecycle, M12.2 admission/identity and M12.3 PG17/18 snapshot-to-live activation | M12.4 crash recovery, DDL/role matrix and final release gate remain |
+| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap lifecycle, M12.2--M12.5 admission/identity/recovery/governance | M12.6 performance and final release gate remain |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
 | Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
@@ -28,9 +28,9 @@ has been removed.
 
 ## Still unproved
 
-Completed active-source rebuild data flow, SQL frontend, non-aggregate operators,
-non-bigint result shapes, cross-host sustained soak, empirical heap peak, and
-contention tail latency remain outside the proved boundary.
+SQL frontend, non-aggregate operators, non-bigint result shapes, cross-host
+sustained soak, empirical heap peak, contention tail latency, and M12.6 active-
+source rebuild performance/release evidence remain outside the proved boundary.
 
 M11.1 defined the initialization contract. A new slot's
 `EXPORT_SNAPSHOT` result is the sole snapshot/WAL boundary; the snapshot name is
@@ -79,8 +79,8 @@ authorizing Apply/ACK. PG17.10 and PG18.4 now pass
 `scripts/test-m12-rebuild-snapshot-live.sh`: generation 2 rebuilds to 3 through
 exact old-slot retirement, real exported snapshot, bounded scan, concurrent WAL
 catch-up, fence, atomic activation and ordinary M10 live ACK without copying old
-continuation or switching identity twice. Full crash recovery, DDL/role matrix
-and performance remain M12.4--M12.6 work.
+continuation or switching identity twice. M12.4 recovery and M12.5 DDL/role
+governance are recorded below; M12.6 performance/release remains work.
 
 M10.3 deliberately does not add persisted partial-stream recovery: partial
 stream bytes are volatile and PostgreSQL's replication slot replays them after
@@ -119,5 +119,11 @@ M12.4 adds the forward recovery contract, not a second bootstrap: durable
 snapshot is abandoned and replaced with a fresh BootstrapId, distinct slot and
 exact successor generation. It cannot return to generation 2 or reuse its
 continuation. `scripts/test-m12-rebuild-recovery.sh` is the focused PG17.10/
-PG18.4 evidence gate. M12.5 DDL/role matrix and M12.6 performance/release
-remain unfinished.
+PG18.4 evidence gate. M12.5 now adds PG17.10/PG18.4
+`scripts/test-m12-rebuild-governance.sh`: exact relation/publication/primary-
+index/replica-identity/column/operator ObjectAddress governance, post-prepare
+invalidation, same-source one-winner/different-source progress, and split
+least-privilege roles. It also proves side-effect-free transport
+`IDENTIFY_SYSTEM`+database and control target-`SELECT` preflight, exact-index
+`AccessShareLock` validation through `pg_relation_size`, and fail-closed role
+or grant loss. M12.6 performance/release remains unfinished.
