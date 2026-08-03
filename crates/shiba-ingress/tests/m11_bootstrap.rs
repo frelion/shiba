@@ -156,9 +156,9 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         &mut admin,
         &operator_spec(
             3,
-            OperatorOperationV1::ProjectRows {
+            OperatorOperationV1::MaterializedProject {
                 key_column: "id".to_owned(),
-                input_column: "payload".to_owned(),
+                value_column: "payload".to_owned(),
             },
         ),
     )

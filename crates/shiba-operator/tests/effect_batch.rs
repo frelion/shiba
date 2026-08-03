@@ -1,30 +1,20 @@
-use shiba_operator::{EffectBatch, EffectOrigin, RowEffect, RowImage, Value};
-use shiba_protocol::{BootstrapBatchId, BootstrapId};
+use shiba_operator::{DeltaBatch, EffectOrigin};
+use shiba_protocol::{BootstrapBatchId, BootstrapId, SourceId};
 
 #[test]
-fn bootstrap_effect_origin_is_distinct_and_strict() {
-    let batch = EffectBatch {
+fn bootstrap_delta_origin_is_distinct_and_strict() {
+    let batch = DeltaBatch {
         origin: EffectOrigin::Bootstrap(
-            BootstrapBatchId::new(BootstrapId::new(7).unwrap(), 3).unwrap(),
+            BootstrapBatchId::new(BootstrapId::new(9).unwrap(), 2).unwrap(),
         ),
-        effects: vec![RowEffect {
-            before: None,
-            after: Some(RowImage {
-                source_row_id: Some(1),
-                source_row_sub_id: None,
-                payload: Value::Null,
-            }),
-        }],
+        layout_identity: [7; 32],
+        rows: Vec::new(),
     };
-    let encoded = serde_json::to_string(&batch).unwrap();
+    let encoded = serde_json::to_vec(&batch).unwrap();
     assert_eq!(
-        serde_json::from_str::<EffectBatch>(&encoded).unwrap(),
+        serde_json::from_slice::<DeltaBatch>(&encoded).unwrap(),
         batch
     );
-    let mut value = serde_json::to_value(batch).unwrap();
-    value
-        .as_object_mut()
-        .unwrap()
-        .insert("commit_lsn".into(), 1.into());
-    assert!(serde_json::from_value::<EffectBatch>(value).is_err());
+    assert!(!encoded.windows(9).any(|window| window == b"source_id"));
+    assert!(SourceId::new(1).is_ok());
 }

@@ -3,33 +3,33 @@ use std::collections::HashSet;
 
 use postgres::{Row, Transaction};
 use shiba_operator::{
-    CompiledPlan, EffectBatch, EffectOrigin, EncodedOperatorState, ObjectAddress, OperatorId,
-    OutputContract, OutputDelta, apply_plan,
+    CompiledPlan, EffectOrigin, EncodedOperatorState, ObjectAddress, OperatorId, OutputContract,
+    OutputDelta, ValueType, apply_plan, initial_transition,
 };
 use shiba_protocol::SourceId;
 
+use crate::source_batch::SourceBatch;
 use crate::{M2Error, result_sink};
 
 pub(crate) fn apply_all(
     transaction: &mut Transaction<'_>,
     source_id: i64,
-    batch: &EffectBatch,
+    batch: &SourceBatch,
 ) -> Result<(), M2Error> {
-    let publish = result_visibility(transaction, source_id, batch.origin)?;
-    let inputs = load_input_bindings(transaction, source_id)?;
+    let publish = result_visibility(transaction, source_id, batch.delta.origin)?;
     let rows = load_locked_operators(transaction, source_id)?;
     for row in rows {
         validate_result_status(&row, if publish { "active" } else { "building" })?;
         let (operator_id, plan, state) = decode_operator(&row, source_id)?;
-        validate_plan_inputs(&plan, &inputs)?;
-        let transition = apply_plan(&plan, &state, &batch.effects)?;
+        validate_plan_inputs(&plan, &batch.bindings)?;
+        let transition = apply_plan(&plan, &state, &batch.delta)?;
         result_sink::persist_state(transaction, operator_id, &transition.next_state)?;
         result_sink::persist_output(
             transaction,
             operator_id,
             &plan.output_contract,
             transition.output_delta,
-            batch.effects.len(),
+            batch.delta.rows.len(),
             publish,
         )?;
     }
@@ -46,10 +46,10 @@ pub(crate) fn activate_results(
         validate_result_status(&row, "building")?;
         let (operator_id, plan, state) = decode_operator(&row, source_id)?;
         validate_plan_inputs(&plan, &inputs)?;
-        let output = apply_plan(&plan, &state, &[])?.output_delta;
+        let output = initial_transition(&plan, &state)?.output_delta;
         match output {
             OutputDelta::ScalarReplacement { value } => {
-                let value = result_sink::scalar_int8(value)?;
+                let value = result_sink::scalar_int8(&value)?;
                 result_sink::activate_header(transaction, operator_id, "scalar", Some(value))?;
             }
             OutputDelta::KeyedMutations { mutations } if mutations.is_empty() => {
@@ -185,13 +185,34 @@ fn metadata_matches(contract: &OutputContract, row: &Row) -> bool {
     let nullable: bool = row.get(9);
     let result_shape: &str = row.get(12);
     shape == result_shape
-        && value_type == "int8"
         && match contract {
-            OutputContract::Scalar { .. } => shape == "scalar" && key_type.is_none() && !nullable,
-            OutputContract::KeyedRows { nullable: plan, .. } => {
-                shape == "keyed" && key_type == Some("int8") && nullable == *plan
+            OutputContract::Scalar {
+                value_type: plan_value,
+            } => {
+                shape == "scalar"
+                    && value_type == value_type_name(*plan_value)
+                    && key_type.is_none()
+                    && !nullable
+            }
+            OutputContract::KeyedRows {
+                key_type: plan_key,
+                value_type: plan_value,
+                nullable: plan_nullable,
+            } => {
+                shape == "keyed"
+                    && key_type == Some(value_type_name(*plan_key))
+                    && value_type == value_type_name(*plan_value)
+                    && nullable == *plan_nullable
             }
         }
+}
+
+fn value_type_name(value_type: ValueType) -> &'static str {
+    match value_type {
+        ValueType::Bool => "bool",
+        ValueType::Int8 => "int8",
+        ValueType::Text => "text",
+    }
 }
 
 fn validate_result_status(row: &Row, expected: &str) -> Result<(), M2Error> {

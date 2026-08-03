@@ -5,8 +5,8 @@ use shiba_compiler::{
     CompilerError, OperatorSpecV1, SourceColumnDescriptor, SourceDescriptor, compile_plan,
 };
 use shiba_operator::{
-    CompiledPlan, ObjectAddress, OutputContract, OutputDelta, ScalarValue, apply_plan,
-    initial_state,
+    CompiledPlan, ObjectAddress, OutputContract, OutputDelta, TypedValue, ValueType, initial_state,
+    initial_transition,
 };
 use shiba_protocol::SourceId;
 
@@ -124,7 +124,7 @@ fn replace_registered_plan(
 ) -> Result<(), RegistrationError> {
     let plan = compile_plan(spec, &source_descriptor(transaction, spec)?)?;
     let state = initial_state(&plan).map_err(M2Error::from)?;
-    let initial = apply_plan(&plan, &state, &[]).map_err(M2Error::from)?;
+    let initial = initial_transition(&plan, &state).map_err(M2Error::from)?;
     let operator_id = as_bigint("operator_id", plan.operator_id.get())?;
     let state_codec =
         i32::try_from(state.codec_version).map_err(|_| M2Error::InvalidOperatorDefinition)?;
@@ -166,7 +166,7 @@ fn replace_registered_plan(
     }
     match initial.output_delta {
         OutputDelta::ScalarReplacement {
-            value: ScalarValue::Int8(_),
+            value: TypedValue::Int8(_),
         } => {}
         OutputDelta::KeyedMutations { ref mutations } if mutations.is_empty() => {}
         _ => return Err(M2Error::InvalidOperatorDefinition.into()),
@@ -195,7 +195,7 @@ fn register_in_transaction(
     let state = initial_state(&plan).map_err(M2Error::from)?;
     let state_codec =
         i32::try_from(state.codec_version).map_err(|_| M2Error::InvalidOperatorDefinition)?;
-    let initial = apply_plan(&plan, &state, &[]).map_err(M2Error::from)?;
+    let initial = initial_transition(&plan, &state).map_err(M2Error::from)?;
     let operator_id = as_bigint("operator_id", plan.operator_id.get())?;
     let spec_payload = spec
         .to_canonical_json()
@@ -228,7 +228,7 @@ fn register_in_transaction(
     )?;
     let scalar = match initial.output_delta {
         OutputDelta::ScalarReplacement {
-            value: ScalarValue::Int8(value),
+            value: TypedValue::Int8(value),
         } => Some(value),
         OutputDelta::KeyedMutations { ref mutations } if mutations.is_empty() => None,
         _ => return Err(M2Error::InvalidOperatorDefinition.into()),
@@ -246,8 +246,27 @@ fn output_metadata(
     contract: &OutputContract,
 ) -> (&'static str, &'static str, Option<&'static str>, bool) {
     match contract {
-        OutputContract::Scalar { .. } => ("scalar", "int8", None, false),
-        OutputContract::KeyedRows { nullable, .. } => ("keyed", "int8", Some("int8"), *nullable),
+        OutputContract::Scalar { value_type } => {
+            ("scalar", value_type_name(*value_type), None, false)
+        }
+        OutputContract::KeyedRows {
+            key_type,
+            value_type,
+            nullable,
+        } => (
+            "keyed",
+            value_type_name(*value_type),
+            Some(value_type_name(*key_type)),
+            *nullable,
+        ),
+    }
+}
+
+fn value_type_name(value_type: ValueType) -> &'static str {
+    match value_type {
+        ValueType::Bool => "bool",
+        ValueType::Int8 => "int8",
+        ValueType::Text => "text",
     }
 }
 

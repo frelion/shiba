@@ -3,6 +3,8 @@ use core::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
 use shiba_protocol::{BootstrapBatchId, SourceTransactionId};
 
+use crate::TypedValue;
+
 /// Stable identity of one registered operator.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -29,41 +31,6 @@ pub struct ObjectAddress {
     pub sub_id: i32,
 }
 
-/// Value carried by the first proven row-effect contract.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Value {
-    Absent,
-    Null,
-    Int8(i64),
-    Text(String),
-}
-
-/// One source row image visible inside the processor-owned transaction.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RowImage {
-    pub source_row_id: Option<i64>,
-    pub source_row_sub_id: Option<i64>,
-    pub payload: Value,
-}
-
-/// Before/after images for exactly one applied source-row mutation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RowEffect {
-    pub before: Option<RowImage>,
-    pub after: Option<RowImage>,
-}
-
-/// Transaction-local effects produced by Source Apply.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EffectBatch {
-    pub origin: EffectOrigin,
-    pub effects: Vec<RowEffect>,
-}
-
 /// Closed identity namespace for WAL and bootstrap effects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,27 +47,19 @@ pub struct EncodedOperatorState {
     pub payload: Vec<u8>,
 }
 
-/// First typed result-value contract; SQL NULL is explicit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScalarValue {
-    Null,
-    Int8(i64),
-}
-
 /// One explicit keyed-result mutation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mutation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum KeyedMutation {
-    Delete { key: i64 },
-    Upsert { key: i64, value: ScalarValue },
+    Delete { key: TypedValue },
+    Upsert { key: TypedValue, value: TypedValue },
 }
 
 /// Persistence-only output selected by the compiled output contract.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "shape", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OutputDelta {
-    ScalarReplacement { value: ScalarValue },
+    ScalarReplacement { value: TypedValue },
     KeyedMutations { mutations: Vec<KeyedMutation> },
 }
 

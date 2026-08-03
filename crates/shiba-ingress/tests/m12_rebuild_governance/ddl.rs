@@ -151,7 +151,7 @@ pub(crate) fn prove_identity_shape_and_operator_plan(database_url: &str, replica
     )
     .expect("decode durable target SumInt8 plan");
     match plan.implementation {
-        PlanImplementation::SumInt8 { input } => {
+        PlanImplementation::SumInt8 { input, .. } => {
             assert_eq!(input.object_id, fixture.target.relation);
             assert_eq!(input.sub_id, 2);
         }

@@ -2,11 +2,14 @@ use core::num::NonZeroU64;
 use std::collections::BTreeMap;
 
 use shiba_operator::{
-    CompiledPlan, EncodedOperatorState, InputBinding, InputRole, KernelError, KeyedMutation,
-    ObjectAddress, OperatorId, OutputContract, OutputDelta, PlanImplementation, RowEffect,
-    RowImage, ScalarValue, Value, ValueType, apply_plan, decode_state, initial_state,
+    ColumnBinding, CompiledPlan, DeltaBatch, EffectOrigin, EncodedOperatorState, InputBinding,
+    InputRole, KernelError, ObjectAddress, OperatorId, OutputContract, OutputDelta,
+    PlanImplementation, RowDelta, TypedRow, TypedValue, ValueType, apply_plan, decode_state,
+    initial_state, source_typed_layout,
 };
-use shiba_protocol::SourceId;
+use shiba_protocol::{
+    IngressTransactionId, PostgresLsn, SlotGeneration, SourceId, SourceTransactionId,
+};
 
 fn address(sub_id: i32) -> ObjectAddress {
     ObjectAddress {
@@ -16,253 +19,162 @@ fn address(sub_id: i32) -> ObjectAddress {
     }
 }
 
+fn source_id() -> SourceId {
+    SourceId::new(1).unwrap()
+}
+
 fn plan(id: u64, implementation: PlanImplementation) -> CompiledPlan {
-    let output_contract = match &implementation {
-        PlanImplementation::ProjectRows { .. } => OutputContract::KeyedRows {
-            key_type: ValueType::Int8,
-            value_type: ValueType::Int8,
-            nullable: true,
-        },
-        _ => OutputContract::Scalar {
-            value_type: ValueType::Int8,
-        },
-    };
     let inputs = match &implementation {
         PlanImplementation::CountRows => Vec::new(),
-        PlanImplementation::SumInt8 { input } => vec![InputBinding {
+        PlanImplementation::SumInt8 { input, .. } => vec![InputBinding {
             role: InputRole::Payload,
             address: *input,
         }],
-        PlanImplementation::ProjectRows { key, value } => vec![
-            InputBinding {
-                role: InputRole::Key,
-                address: *key,
-            },
-            InputBinding {
-                role: InputRole::Payload,
-                address: *value,
-            },
-        ],
+        PlanImplementation::Graph { .. } => unreachable!("graph tests own graph plans"),
     };
     CompiledPlan::build(
         OperatorId::new(NonZeroU64::new(id).unwrap()),
-        SourceId::new(1).unwrap(),
+        source_id(),
         inputs,
-        output_contract,
+        OutputContract::Scalar {
+            value_type: ValueType::Int8,
+        },
         implementation,
     )
     .unwrap()
 }
 
-fn image(key: i64, payload: Value) -> RowImage {
-    RowImage {
-        source_row_id: Some(key),
-        source_row_sub_id: None,
-        payload,
+fn origin() -> EffectOrigin {
+    EffectOrigin::Wal(
+        SourceTransactionId::new(
+            source_id(),
+            SlotGeneration::new(1).unwrap(),
+            PostgresLsn::from_u64(1),
+            IngressTransactionId::new(1).unwrap(),
+        )
+        .unwrap(),
+    )
+}
+
+fn layout() -> shiba_operator::TypedLayout {
+    source_typed_layout(
+        source_id(),
+        &[
+            ColumnBinding {
+                address: address(1),
+                value_type: ValueType::Int8,
+            },
+            ColumnBinding {
+                address: address(2),
+                value_type: ValueType::Int8,
+            },
+        ],
+    )
+    .unwrap()
+}
+
+fn row(key: i64, payload: Option<i64>) -> TypedRow {
+    let layout = layout();
+    TypedRow::new(
+        &layout,
+        vec![
+            TypedValue::Int8(key),
+            payload.map_or(TypedValue::Null(ValueType::Int8), TypedValue::Int8),
+        ],
+    )
+    .unwrap()
+}
+
+fn batch(delta: RowDelta) -> DeltaBatch {
+    DeltaBatch {
+        origin: origin(),
+        layout_identity: layout().identity,
+        rows: vec![delta],
     }
 }
 
-fn apply_scalar(
-    plan: &CompiledPlan,
-    state: &EncodedOperatorState,
-    effects: &[RowEffect],
-) -> (EncodedOperatorState, i64) {
-    let transition = apply_plan(plan, state, effects).unwrap();
+fn scalar(plan: &CompiledPlan, state: &EncodedOperatorState, batch: &DeltaBatch) -> i64 {
+    let transition = apply_plan(plan, state, batch).unwrap();
     let OutputDelta::ScalarReplacement {
-        value: ScalarValue::Int8(value),
+        value: TypedValue::Int8(value),
     } = transition.output_delta
     else {
         panic!("expected int8 scalar")
     };
-    (transition.next_state, value)
+    value
 }
 
 #[test]
-fn count_and_sum_use_opaque_checked_state() {
+fn count_and_sum_use_one_typed_batch_and_checked_state() {
     let count = plan(1, PlanImplementation::CountRows);
-    let sum = plan(2, PlanImplementation::SumInt8 { input: address(2) });
-    let effects = [
-        RowEffect {
-            before: None,
-            after: Some(image(1, Value::Int8(10))),
+    let sum = plan(
+        2,
+        PlanImplementation::SumInt8 {
+            input: address(2),
+            input_slot: 1,
         },
-        RowEffect {
-            before: None,
-            after: Some(image(2, Value::Null)),
-        },
-        RowEffect {
-            before: Some(image(2, Value::Null)),
-            after: Some(image(2, Value::Int8(7))),
-        },
-        RowEffect {
-            before: Some(image(1, Value::Int8(10))),
-            after: Some(image(1, Value::Null)),
-        },
-        RowEffect {
-            before: Some(image(2, Value::Int8(7))),
-            after: None,
-        },
-    ];
-    let (_, count_value) = apply_scalar(&count, &initial_state(&count).unwrap(), &effects);
-    let (_, sum_value) = apply_scalar(&sum, &initial_state(&sum).unwrap(), &effects);
-    assert_eq!((count_value, sum_value), (1, 0));
-
+    );
+    let input = batch(RowDelta {
+        before: None,
+        after: Some(row(1, Some(10))),
+    });
+    assert_eq!(scalar(&count, &initial_state(&count).unwrap(), &input), 1);
+    assert_eq!(scalar(&sum, &initial_state(&sum).unwrap(), &input), 10);
     let max = EncodedOperatorState {
         codec_version: 1,
         payload: i64::MAX.to_be_bytes().to_vec(),
     };
+    assert_eq!(apply_plan(&sum, &max, &input), Err(KernelError::Overflow));
+}
+
+#[test]
+fn corrupt_scalar_plan_state_and_absent_input_fail_closed() {
+    let count = plan(1, PlanImplementation::CountRows);
+    let mut corrupt = count.clone();
+    corrupt.digest[0] ^= 1;
+    assert_eq!(initial_state(&corrupt), Err(KernelError::InvalidPlan));
+    let bad_state = EncodedOperatorState {
+        codec_version: 1,
+        payload: vec![0],
+    };
+    assert_eq!(
+        decode_state(&count, &bad_state),
+        Err(KernelError::InvalidState)
+    );
+
+    let sum = plan(
+        2,
+        PlanImplementation::SumInt8 {
+            input: address(2),
+            input_slot: 1,
+        },
+    );
+    let typed_layout = layout();
+    let absent =
+        TypedRow::new(&typed_layout, vec![TypedValue::Int8(1), TypedValue::Absent]).unwrap();
     assert_eq!(
         apply_plan(
             &sum,
-            &max,
-            &[RowEffect {
+            &initial_state(&sum).unwrap(),
+            &batch(RowDelta {
                 before: None,
-                after: Some(image(3, Value::Int8(1)))
-            }]
-        ),
-        Err(KernelError::Overflow)
-    );
-}
-
-#[test]
-fn project_rows_emits_typed_withdrawals_upserts_and_null() {
-    let project = plan(
-        3,
-        PlanImplementation::ProjectRows {
-            key: address(1),
-            value: address(2),
-        },
-    );
-    let transition = apply_plan(
-        &project,
-        &initial_state(&project).unwrap(),
-        &[
-            RowEffect {
-                before: None,
-                after: Some(image(1, Value::Int8(10))),
-            },
-            RowEffect {
-                before: Some(image(2, Value::Null)),
-                after: Some(image(4, Value::Int8(7))),
-            },
-            RowEffect {
-                before: Some(image(5, Value::Int8(9))),
-                after: None,
-            },
-        ],
-    )
-    .unwrap();
-    assert_eq!(
-        transition.output_delta,
-        OutputDelta::KeyedMutations {
-            mutations: vec![
-                KeyedMutation::Upsert {
-                    key: 1,
-                    value: ScalarValue::Int8(10)
-                },
-                KeyedMutation::Delete { key: 2 },
-                KeyedMutation::Upsert {
-                    key: 4,
-                    value: ScalarValue::Int8(7)
-                },
-                KeyedMutation::Delete { key: 5 },
-            ]
-        }
-    );
-    let null_insert = apply_plan(
-        &project,
-        &initial_state(&project).unwrap(),
-        &[RowEffect {
-            before: None,
-            after: Some(image(8, Value::Null)),
-        }],
-    )
-    .unwrap();
-    assert!(matches!(
-        null_insert.output_delta,
-        OutputDelta::KeyedMutations { ref mutations }
-            if mutations == &[KeyedMutation::Upsert { key: 8, value: ScalarValue::Null }]
-    ));
-}
-
-#[test]
-fn corrupt_plan_state_input_and_output_amplification_fail_closed() {
-    let project = plan(
-        3,
-        PlanImplementation::ProjectRows {
-            key: address(1),
-            value: address(2),
-        },
-    );
-    let mut corrupt_plan = project.clone();
-    corrupt_plan.digest[0] ^= 1;
-    assert_eq!(initial_state(&corrupt_plan), Err(KernelError::InvalidPlan));
-    assert_eq!(
-        CompiledPlan::from_canonical_payload(&project.canonical_payload, project.digest),
-        Ok(project.clone())
-    );
-    let mut wrong_digest = project.digest;
-    wrong_digest[0] ^= 1;
-    assert!(
-        CompiledPlan::from_canonical_payload(&project.canonical_payload, wrong_digest).is_err()
-    );
-    assert!(
-        CompiledPlan::build(
-            OperatorId::new(NonZeroU64::new(9).unwrap()),
-            SourceId::new(1).unwrap(),
-            vec![InputBinding {
-                role: InputRole::Payload,
-                address: address(2),
-            }],
-            OutputContract::Scalar {
-                value_type: ValueType::Int8,
-            },
-            PlanImplementation::CountRows,
-        )
-        .is_err()
-    );
-    for state in [
-        EncodedOperatorState {
-            codec_version: 2,
-            payload: Vec::new(),
-        },
-        EncodedOperatorState {
-            codec_version: 1,
-            payload: vec![0],
-        },
-    ] {
-        assert_eq!(
-            decode_state(&project, &state),
-            Err(KernelError::InvalidState)
-        );
-    }
-    assert_eq!(
-        apply_plan(
-            &project,
-            &initial_state(&project).unwrap(),
-            &[RowEffect {
-                before: None,
-                after: Some(image(1, Value::Absent))
-            }]
+                after: Some(absent),
+            }),
         ),
         Err(KernelError::AbsentInput)
     );
-    let too_many = (0..10_001)
-        .map(|key| RowEffect {
-            before: None,
-            after: Some(image(key, Value::Null)),
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        apply_plan(&project, &initial_state(&project).unwrap(), &too_many),
-        Err(KernelError::OutputLimit)
-    );
 }
 
 #[test]
-fn deterministic_random_sequence_matches_reference_models() {
+fn deterministic_random_sequence_matches_count_and_sum_models() {
     let count = plan(1, PlanImplementation::CountRows);
-    let sum = plan(2, PlanImplementation::SumInt8 { input: address(2) });
+    let sum = plan(
+        2,
+        PlanImplementation::SumInt8 {
+            input: address(2),
+            input_slot: 1,
+        },
+    );
     let mut count_state = initial_state(&count).unwrap();
     let mut sum_state = initial_state(&sum).unwrap();
     let mut rows = BTreeMap::<i64, Option<i64>>::new();
@@ -280,14 +192,12 @@ fn deterministic_random_sequence_matches_reference_models() {
         if before.is_none() && after.is_none() {
             continue;
         }
-        let effect = RowEffect {
-            before: before.map(|value| image(key, value.map_or(Value::Null, Value::Int8))),
-            after: after.map(|value| image(key, value.map_or(Value::Null, Value::Int8))),
-        };
-        let (next_count, _) = apply_scalar(&count, &count_state, std::slice::from_ref(&effect));
-        let (next_sum, _) = apply_scalar(&sum, &sum_state, &[effect]);
-        count_state = next_count;
-        sum_state = next_sum;
+        let input = batch(RowDelta {
+            before: before.map(|value| row(key, value)),
+            after: after.map(|value| row(key, value)),
+        });
+        count_state = apply_plan(&count, &count_state, &input).unwrap().next_state;
+        sum_state = apply_plan(&sum, &sum_state, &input).unwrap().next_state;
         match after {
             Some(value) => {
                 rows.insert(key, value);
@@ -296,11 +206,13 @@ fn deterministic_random_sequence_matches_reference_models() {
                 rows.remove(&key);
             }
         }
-        let expected_sum: i64 = rows.values().copied().flatten().sum();
         assert_eq!(
             decode_state(&count, &count_state).unwrap(),
             i64::try_from(rows.len()).unwrap()
         );
-        assert_eq!(decode_state(&sum, &sum_state).unwrap(), expected_sum);
+        assert_eq!(
+            decode_state(&sum, &sum_state).unwrap(),
+            rows.values().flatten().sum::<i64>()
+        );
     }
 }

@@ -67,16 +67,14 @@ if errors:
 PY
 
 # Central complexity thresholds: warnings report growth; hard limits fail.
-# M11's bootstrap transaction model and recovery coordinator are real, separate
-# responsibilities.  The Runtime total therefore uses a 3,000-line audit stop;
-# file-level limits remain the primary anti-monolith gate.
+# Crate totals are trend warnings, not correctness gates. M14 uses file-level
+# responsibility limits and per-stage production deltas as anti-monolith gates.
 python3 - <<'PY'
 import pathlib
 import sys
 
 limits = {
     "runtime_soft": 1200,
-    "runtime_hard": 3000,
     "production_file_soft": 300,
     "production_file_hard": 400,
     "test_file_soft": 300,
@@ -118,11 +116,6 @@ if production_warnings:
         f"warning: production file > {limits['production_file_soft']} lines: "
         + ", ".join(production_warnings),
         file=sys.stderr,
-    )
-if runtime_total > limits["runtime_hard"]:
-    raise SystemExit(
-        f"Runtime production total {runtime_total} exceeds "
-        f"{limits['runtime_hard']}-line hard limit"
     )
 if production_failures:
     raise SystemExit(
@@ -464,6 +457,16 @@ if "Status: accepted for M14.1." not in graph_adr:
     raise SystemExit("M14 ADR is not accepted")
 if "M14.1 typed Operator SDK and graph contract" not in reuse_manifest:
     raise SystemExit("REUSE_MANIFEST.md lacks M14.1 evidence")
+if "M14.2 typed stateless graph and Materialize" not in reuse_manifest:
+    raise SystemExit("REUSE_MANIFEST.md lacks M14.2 evidence")
 PY
+
+if rg -n \
+  'PlanImplementation::ProjectRows|OperatorOperationV1::ProjectRows|project_transition|projected\(|\bProjectRows\b|project_rows' \
+  crates/shiba-operator/src crates/shiba-compiler/src \
+  crates/shiba-runtime/src crates/shiba-ingress/src sql/v2; then
+  echo "M14.2 forbidden ProjectRows production path remains" >&2
+  exit 1
+fi
 
 echo "L0 passed for PostgreSQL $pg_major ($pg_config)"

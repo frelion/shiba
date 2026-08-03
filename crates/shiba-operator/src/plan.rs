@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shiba_protocol::SourceId;
 
-use crate::{ObjectAddress, OperatorId};
+use crate::{ObjectAddress, OperatorGraph, OperatorId, ValueType};
 
 pub const PLAN_FORMAT_VERSION: u32 = 1;
 pub const STATE_CODEC_VERSION: u32 = 1;
@@ -23,12 +23,6 @@ pub enum InputRole {
 pub struct InputBinding {
     pub role: InputRole,
     pub address: ObjectAddress,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ValueType {
-    Int8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -56,10 +50,10 @@ pub enum PlanImplementation {
     CountRows,
     SumInt8 {
         input: ObjectAddress,
+        input_slot: u16,
     },
-    ProjectRows {
-        key: ObjectAddress,
-        value: ObjectAddress,
+    Graph {
+        graph: OperatorGraph,
     },
 }
 
@@ -211,14 +205,9 @@ fn validate_contract(plan: &CanonicalPlan) -> Result<(), PlanError> {
     let scalar = OutputContract::Scalar {
         value_type: ValueType::Int8,
     };
-    let keyed = OutputContract::KeyedRows {
-        key_type: ValueType::Int8,
-        value_type: ValueType::Int8,
-        nullable: true,
-    };
     let valid = match plan.implementation {
         PlanImplementation::CountRows => plan.inputs.is_empty() && plan.output_contract == scalar,
-        PlanImplementation::SumInt8 { input } => {
+        PlanImplementation::SumInt8 { input, .. } => {
             plan.inputs
                 == [InputBinding {
                     role: InputRole::Payload,
@@ -226,19 +215,32 @@ fn validate_contract(plan: &CanonicalPlan) -> Result<(), PlanError> {
                 }]
                 && plan.output_contract == scalar
         }
-        PlanImplementation::ProjectRows { key, value } => {
-            plan.inputs
-                == [
-                    InputBinding {
-                        role: InputRole::Key,
-                        address: key,
-                    },
-                    InputBinding {
-                        role: InputRole::Payload,
-                        address: value,
-                    },
-                ]
-                && plan.output_contract == keyed
+        PlanImplementation::Graph { ref graph } => {
+            graph.operator_id == plan.operator_id
+                && graph.source_id == plan.source_id
+                && graph.validate().is_ok()
+                && plan.inputs
+                    == graph
+                        .source_layout
+                        .iter()
+                        .enumerate()
+                        .map(|(index, binding)| InputBinding {
+                            role: if index == 0 {
+                                InputRole::Key
+                            } else {
+                                InputRole::Payload
+                            },
+                            address: binding.address,
+                        })
+                        .collect::<Vec<_>>()
+                && matches!(
+                    plan.output_contract,
+                    OutputContract::KeyedRows {
+                        key_type: ValueType::Int8,
+                        value_type: ValueType::Int8,
+                        nullable: true
+                    }
+                )
         }
     };
     if valid {

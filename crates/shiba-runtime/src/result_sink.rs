@@ -1,6 +1,6 @@
 use postgres::Transaction;
 use shiba_operator::{
-    EncodedOperatorState, KeyedMutation, OutputContract, OutputDelta, ScalarValue,
+    EncodedOperatorState, KeyedMutation, OutputContract, OutputDelta, TypedValue, ValueType,
 };
 
 use crate::M2Error;
@@ -36,11 +36,11 @@ pub(super) fn persist_output(
     match (contract, delta) {
         (OutputContract::Scalar { .. }, OutputDelta::ScalarReplacement { value }) => {
             if publish {
-                update_active_value(transaction, operator_id, scalar_int8(value)?)?;
+                update_active_value(transaction, operator_id, scalar_int8(&value)?)?;
             }
         }
-        (OutputContract::KeyedRows { .. }, OutputDelta::KeyedMutations { mutations }) => {
-            persist_keyed(transaction, operator_id, mutations, effect_count)?;
+        (OutputContract::KeyedRows { nullable, .. }, OutputDelta::KeyedMutations { mutations }) => {
+            persist_keyed(transaction, operator_id, mutations, effect_count, *nullable)?;
         }
         _ => return Err(M2Error::InvalidOperatorDefinition),
     }
@@ -52,6 +52,7 @@ fn persist_keyed(
     operator_id: i64,
     mutations: Vec<KeyedMutation>,
     effect_count: usize,
+    nullable: bool,
 ) -> Result<(), M2Error> {
     if mutations.len() > MAX_KEYED_MUTATIONS || mutations.len() > effect_count.saturating_mul(2) {
         return Err(M2Error::InvalidOperatorDefinition);
@@ -61,12 +62,19 @@ fn persist_keyed(
     let mut values = Vec::new();
     for mutation in mutations {
         match mutation {
-            KeyedMutation::Delete { key } => deletes.push(key),
+            KeyedMutation::Delete {
+                key: TypedValue::Int8(key),
+            } => deletes.push(key),
+            KeyedMutation::Delete { .. } => return Err(M2Error::InvalidOperatorDefinition),
             KeyedMutation::Upsert { key, value } => {
+                let TypedValue::Int8(key) = key else {
+                    return Err(M2Error::InvalidOperatorDefinition);
+                };
                 keys.push(key);
                 values.push(match value {
-                    ScalarValue::Null => None,
-                    ScalarValue::Int8(value) => Some(value),
+                    TypedValue::Null(ValueType::Int8) if nullable => None,
+                    TypedValue::Int8(value) => Some(value),
+                    _ => return Err(M2Error::InvalidOperatorDefinition),
                 });
             }
         }
@@ -92,10 +100,10 @@ fn persist_keyed(
     Ok(())
 }
 
-pub(super) fn scalar_int8(value: ScalarValue) -> Result<i64, M2Error> {
+pub(super) fn scalar_int8(value: &TypedValue) -> Result<i64, M2Error> {
     match value {
-        ScalarValue::Int8(value) => Ok(value),
-        ScalarValue::Null => Err(M2Error::InvalidOperatorDefinition),
+        TypedValue::Int8(value) => Ok(*value),
+        _ => Err(M2Error::InvalidOperatorDefinition),
     }
 }
 

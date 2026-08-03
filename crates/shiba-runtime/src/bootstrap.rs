@@ -1,9 +1,11 @@
 use postgres::{Client, Transaction};
-use shiba_operator::{EffectBatch, EffectOrigin, RowEffect, RowImage, Value};
+use shiba_operator::{EffectOrigin, RowDelta};
 
 use crate::M2Error;
+use crate::SourcePayload;
 use crate::bootstrap_model::BootstrapBatch;
 use crate::operator_execution;
+use crate::source_batch::SourceLayout;
 use crate::source_preflight;
 use crate::transaction::as_bigint;
 
@@ -85,6 +87,7 @@ fn process_batch_in_transaction(
     if last_key.is_some_and(|key| batch.rows[0].source_row_id <= key) {
         return Err(M2Error::BootstrapRowsOutOfOrder);
     }
+    let layout = SourceLayout::load(transaction, source_id)?;
 
     let row_ids: Vec<i64> = batch.rows.iter().map(|row| row.source_row_id).collect();
     let payloads: Vec<Option<i64>> = batch.rows.iter().map(|row| row.payload).collect();
@@ -101,26 +104,22 @@ fn process_batch_in_transaction(
         return Err(M2Error::InvalidSourceRowState);
     }
 
-    let effects = batch
+    let rows = batch
         .rows
         .iter()
-        .map(|row| RowEffect {
-            before: None,
-            after: Some(RowImage {
-                source_row_id: Some(row.source_row_id),
-                source_row_sub_id: None,
-                payload: row.payload.map_or(Value::Null, Value::Int8),
-            }),
+        .map(|row| {
+            Ok(RowDelta {
+                before: None,
+                after: Some(layout.row(
+                    Some(row.source_row_id),
+                    None,
+                    &row.payload.map_or(SourcePayload::Null, SourcePayload::Int8),
+                )?),
+            })
         })
-        .collect();
-    operator_execution::apply_all(
-        transaction,
-        source_id,
-        &EffectBatch {
-            origin: EffectOrigin::Bootstrap(batch.batch_id),
-            effects,
-        },
-    )?;
+        .collect::<Result<Vec<_>, M2Error>>()?;
+    let source_batch = layout.batch(EffectOrigin::Bootstrap(batch.batch_id), rows);
+    operator_execution::apply_all(transaction, source_id, &source_batch)?;
     if transaction.execute(
         "UPDATE shiba_internal.source_bootstrap
          SET last_batch_ordinal = $1, last_source_row_id = $2,

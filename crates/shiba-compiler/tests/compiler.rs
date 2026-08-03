@@ -2,10 +2,11 @@ use core::num::NonZeroU64;
 
 use shiba_compiler::{
     CompilerError, OPERATOR_SPEC_VERSION, OperatorOperationV1, OperatorSpecV1,
-    POSTGRES_INT8_TYPE_OID, SourceColumnDescriptor, SourceDescriptor, compile_plan,
+    POSTGRES_INT8_TYPE_OID, SourceColumnDescriptor, SourceDescriptor, compile_graph, compile_plan,
 };
 use shiba_operator::{
-    CompiledPlan, ObjectAddress, OperatorId, OutputContract, PlanImplementation, ValueType,
+    Expression, NodeInput, ObjectAddress, OperatorId, OperatorNodeKind, OutputContract,
+    PlanImplementation, ValueType,
 };
 use shiba_protocol::SourceId;
 
@@ -94,7 +95,8 @@ fn sum_resolves_exact_int8_address_once() {
     assert_eq!(
         compiled.implementation,
         PlanImplementation::SumInt8 {
-            input: address(16_384, 2)
+            input: address(16_384, 2),
+            input_slot: 0
         }
     );
 
@@ -152,60 +154,58 @@ fn constructed_invalid_ir_fails_closed() {
 }
 
 #[test]
-fn generic_plans_are_canonical_bound_and_strict() {
+fn project_declaration_compiles_to_canonical_graph_nodes() {
     let descriptor = source(vec![
         required_column("id", 1),
         column("payload", 2, POSTGRES_INT8_TYPE_OID),
     ]);
-    let project_spec = spec(OperatorOperationV1::ProjectRows {
+    let project_spec = spec(OperatorOperationV1::MaterializedProject {
         key_column: "id".into(),
-        input_column: "payload".into(),
+        value_column: "payload".into(),
     });
-    let first = compile_plan(&project_spec, &descriptor).unwrap();
-    let second = compile_plan(&project_spec, &descriptor).unwrap();
-    assert_eq!(
-        first.canonical_payload,
-        br#"{"format_version":1,"operator_id":2,"source_id":1,"inputs":[{"role":"key","address":{"class_id":1259,"object_id":16384,"sub_id":1}},{"role":"payload","address":{"class_id":1259,"object_id":16384,"sub_id":2}}],"state_contract":{"codec_version":1},"output_contract":{"shape":"keyed_rows","key_type":"int8","value_type":"int8","nullable":true},"implementation":{"kind":"project_rows","key":{"class_id":1259,"object_id":16384,"sub_id":1},"value":{"class_id":1259,"object_id":16384,"sub_id":2}}}"#
-    );
-    assert_eq!(
-        first.digest,
-        [
-            0x50, 0x51, 0x64, 0xec, 0xba, 0xfb, 0xb2, 0x8e, 0x66, 0xcf, 0x1d, 0x1c, 0x58, 0x09,
-            0xfd, 0x7e, 0x88, 0x69, 0xd0, 0x35, 0x06, 0x14, 0x48, 0x4d, 0xcc, 0xb2, 0x06, 0x8d,
-            0xda, 0x3f, 0x90, 0x93,
-        ]
-    );
+    let first = compile_graph(&project_spec, &descriptor).unwrap();
+    let second = compile_graph(&project_spec, &descriptor).unwrap();
     assert_eq!(first.canonical_payload, second.canonical_payload);
     assert_eq!(first.digest, second.digest);
     assert_eq!(
-        first.output_contract,
-        OutputContract::KeyedRows {
-            key_type: ValueType::Int8,
-            value_type: ValueType::Int8,
-            nullable: true
-        }
+        first
+            .source_layout
+            .iter()
+            .map(|binding| binding.address)
+            .collect::<Vec<_>>(),
+        vec![address(16_384, 1), address(16_384, 2)]
     );
-    assert_eq!(
-        first.implementation,
-        PlanImplementation::ProjectRows {
-            key: address(16_384, 1),
-            value: address(16_384, 2)
+    assert_eq!(first.nodes.len(), 2);
+    assert!(matches!(
+        first.nodes[0].kind,
+        OperatorNodeKind::Project { .. }
+    ));
+    assert!(matches!(first.nodes[1].input, NodeInput::Node(_)));
+    assert!(matches!(
+        first.nodes[1].kind,
+        OperatorNodeKind::Materialize {
+            output: OutputContract::KeyedRows {
+                key_type: ValueType::Int8,
+                value_type: ValueType::Int8,
+                nullable: true
+            },
+            ..
         }
-    );
+    ));
     first.validate().unwrap();
-    let mut unknown = serde_json::to_value(&first).unwrap();
-    unknown
-        .as_object_mut()
-        .unwrap()
-        .insert("unknown".into(), true.into());
-    assert!(serde_json::from_value::<CompiledPlan>(unknown).is_err());
+    let mut digest = first.digest;
+    digest[0] ^= 1;
+    assert!(
+        shiba_operator::OperatorGraph::from_canonical_payload(&first.canonical_payload, digest)
+            .is_err()
+    );
 
     let encoded = project_spec.to_canonical_json().unwrap();
     assert_eq!(OperatorSpecV1::from_json(&encoded).unwrap(), project_spec);
     for invalid in [
-        br#"{"version":1,"operator_id":2,"source_id":1,"operation":{"kind":"project_rows","key_column":"","input_column":"payload"}}"#.as_slice(),
-        br#"{"version":1,"operator_id":2,"source_id":1,"operation":{"kind":"project_rows","key_column":"id","input_column":" "}}"#,
-        br#"{"version":1,"operator_id":2,"source_id":1,"operation":{"kind":"project_rows","key_column":"id","input_column":"payload","alias":"x"}}"#,
+        br#"{"version":1,"operator_id":2,"source_id":1,"operation":{"kind":"materialized_project","key_column":"","value_column":"payload"}}"#.as_slice(),
+        br#"{"version":1,"operator_id":2,"source_id":1,"operation":{"kind":"materialized_project","key_column":"id","value_column":" "}}"#,
+        br#"{"version":1,"operator_id":2,"source_id":1,"operation":{"kind":"materialized_project","key_column":"id","value_column":"payload","alias":"x"}}"#,
     ] {
         assert!(OperatorSpecV1::from_json(invalid).is_err());
     }
@@ -213,9 +213,9 @@ fn generic_plans_are_canonical_bound_and_strict() {
 
 #[test]
 fn project_binding_rejects_missing_wrong_duplicate_and_nullable_key() {
-    let operation = OperatorOperationV1::ProjectRows {
+    let operation = OperatorOperationV1::MaterializedProject {
         key_column: "id".into(),
-        input_column: "payload".into(),
+        value_column: "payload".into(),
     };
     let cases = [
         (
@@ -244,8 +244,41 @@ fn project_binding_rejects_missing_wrong_duplicate_and_nullable_key() {
     ];
     for (columns, expected) in cases {
         assert_eq!(
-            compile_plan(&spec(operation.clone()), &source(columns)),
+            compile_graph(&spec(operation.clone()), &source(columns)),
             Err(expected)
         );
     }
+}
+
+#[test]
+fn graph_uses_the_full_descriptor_order_and_resolved_slots() {
+    let graph = compile_graph(
+        &spec(OperatorOperationV1::MaterializedProject {
+            key_column: "id".into(),
+            value_column: "payload".into(),
+        }),
+        &source(vec![
+            column("payload", 2, POSTGRES_INT8_TYPE_OID),
+            required_column("id", 1),
+            column("label", 3, shiba_compiler::POSTGRES_TEXT_TYPE_OID),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        graph
+            .source_layout
+            .iter()
+            .map(|binding| binding.address.sub_id)
+            .collect::<Vec<_>>(),
+        vec![2, 1, 3]
+    );
+    assert_eq!(
+        graph.nodes[0].kind,
+        OperatorNodeKind::Project {
+            expressions: vec![
+                Expression::Column { slot: 1 },
+                Expression::Column { slot: 0 }
+            ]
+        }
+    );
 }

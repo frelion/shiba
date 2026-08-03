@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod graph;
 mod plan;
 
 use core::fmt;
@@ -10,11 +11,14 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use shiba_operator::{ObjectAddress, OperatorId};
 use shiba_protocol::SourceId;
 
+pub use graph::compile_graph;
 pub use plan::compile_plan;
 
 pub const OPERATOR_SPEC_VERSION: u32 = 1;
 /// `PostgreSQL`'s built-in `int8` type OID.
 pub const POSTGRES_INT8_TYPE_OID: u32 = 20;
+/// `PostgreSQL`'s built-in `text` type OID.
+pub const POSTGRES_TEXT_TYPE_OID: u32 = 25;
 
 /// Strict version-1 declarative operator definition.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -40,7 +44,7 @@ impl OperatorSpecV1 {
     /// # Errors
     ///
     /// Rejects malformed JSON, trailing data, unknown fields, unsupported
-    /// versions, zero identities, and blank `SumInt8` column names.
+    /// versions, zero identities, and blank declared column names.
     pub fn from_json(input: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(input)
     }
@@ -72,12 +76,12 @@ impl<'de> Deserialize<'de> for OperatorSpecV1 {
             OperatorOperationV1::SumInt8 { input_column } => {
                 reject_blank::<D::Error>(input_column, "sum_int8 input_column")?;
             }
-            OperatorOperationV1::ProjectRows {
+            OperatorOperationV1::MaterializedProject {
                 key_column,
-                input_column,
+                value_column,
             } => {
-                reject_blank::<D::Error>(key_column, "project_rows key_column")?;
-                reject_blank::<D::Error>(input_column, "project_rows input_column")?;
+                reject_blank::<D::Error>(key_column, "materialized_project key_column")?;
+                reject_blank::<D::Error>(value_column, "materialized_project value_column")?;
             }
         }
         Ok(Self {
@@ -97,9 +101,9 @@ pub enum OperatorOperationV1 {
     SumInt8 {
         input_column: String,
     },
-    ProjectRows {
+    MaterializedProject {
         key_column: String,
-        input_column: String,
+        value_column: String,
     },
 }
 
@@ -137,6 +141,8 @@ pub enum CompilerError {
     DuplicateColumn(String),
     WrongColumnType { column: String, type_oid: u32 },
     NullableKey(String),
+    PlanRequired,
+    GraphEncoding,
     PlanEncoding,
 }
 
@@ -154,11 +160,15 @@ impl fmt::Display for CompilerError {
             }
             Self::WrongColumnType { column, type_oid } => write!(
                 formatter,
-                "source column {column:?} has type OID {type_oid}, expected 20"
+                "source column {column:?} has unsupported type OID {type_oid}"
             ),
             Self::NullableKey(column) => {
                 write!(formatter, "project key column {column:?} must be non-null")
             }
+            Self::PlanRequired => {
+                formatter.write_str("declaration requires scalar-plan compilation")
+            }
+            Self::GraphEncoding => formatter.write_str("operator graph encoding failed"),
             Self::PlanEncoding => formatter.write_str("compiled plan encoding failed"),
         }
     }

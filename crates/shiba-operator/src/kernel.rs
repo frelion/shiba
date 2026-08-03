@@ -1,11 +1,10 @@
-use core::fmt;
-use std::collections::BTreeSet;
-
 use crate::{
-    CompiledPlan, EncodedOperatorState, KeyedMutation, OperatorTransition, OutputContract,
-    OutputDelta, PlanImplementation, RowEffect, ScalarValue, Value,
-    plan::{MAX_KEYED_MUTATIONS, PlanError, STATE_CODEC_VERSION},
+    CompiledPlan, DeltaBatch, EncodedOperatorState, KeyedMutation, OperatorTransition,
+    OutputContract, OutputDelta, PlanImplementation, ResultDelta, ResultMutation, TypedRow,
+    TypedValue, ValueType, apply_graph,
+    plan::{PlanError, STATE_CODEC_VERSION},
 };
+use core::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelError {
@@ -17,9 +16,8 @@ pub enum KernelError {
     Overflow,
     AbsentInput,
     WrongType,
-    MissingKey,
-    ConflictingKey,
-    OutputLimit,
+    InvalidGraph,
+    InvalidTransition,
 }
 
 impl fmt::Display for KernelError {
@@ -47,12 +45,41 @@ pub fn initial_state(plan: &CompiledPlan) -> Result<EncodedOperatorState, Kernel
         PlanImplementation::CountRows | PlanImplementation::SumInt8 { .. } => {
             0_i64.to_be_bytes().to_vec()
         }
-        PlanImplementation::ProjectRows { .. } => Vec::new(),
+        PlanImplementation::Graph { .. } => Vec::new(),
     };
     Ok(EncodedOperatorState {
         codec_version: STATE_CODEC_VERSION,
         payload,
     })
+}
+
+/// Produces the empty terminal output for a newly registered plan.
+///
+/// # Errors
+///
+/// Rejects a corrupt plan/state or a graph without one supported terminal.
+pub fn initial_transition(
+    plan: &CompiledPlan,
+    state: &EncodedOperatorState,
+) -> Result<OperatorTransition, KernelError> {
+    let current = decode_state(plan, state)?;
+    match &plan.implementation {
+        PlanImplementation::CountRows | PlanImplementation::SumInt8 { .. } => {
+            scalar_transition(plan, current)
+        }
+        PlanImplementation::Graph { graph } => {
+            graph.validate().map_err(|_| KernelError::InvalidGraph)?;
+            if !matches!(plan.output_contract, OutputContract::KeyedRows { .. }) {
+                return Err(KernelError::OutputContractMismatch);
+            }
+            Ok(OperatorTransition {
+                next_state: state.clone(),
+                output_delta: OutputDelta::KeyedMutations {
+                    mutations: Vec::new(),
+                },
+            })
+        }
+    }
 }
 
 /// Strictly validates and decodes state for reference and sink validation.
@@ -72,8 +99,8 @@ pub fn decode_state(plan: &CompiledPlan, state: &EncodedOperatorState) -> Result
             .try_into()
             .map(i64::from_be_bytes)
             .map_err(|_| KernelError::InvalidState),
-        PlanImplementation::ProjectRows { .. } if state.payload.is_empty() => Ok(0),
-        PlanImplementation::ProjectRows { .. } => Err(KernelError::InvalidState),
+        PlanImplementation::Graph { .. } if state.payload.is_empty() => Ok(0),
+        PlanImplementation::Graph { .. } => Err(KernelError::InvalidState),
     }
 }
 
@@ -85,13 +112,15 @@ pub fn decode_state(plan: &CompiledPlan, state: &EncodedOperatorState) -> Result
 pub fn apply_plan(
     plan: &CompiledPlan,
     state: &EncodedOperatorState,
-    effects: &[RowEffect],
+    batch: &DeltaBatch,
 ) -> Result<OperatorTransition, KernelError> {
     let current = decode_state(plan, state)?;
-    match plan.implementation {
-        PlanImplementation::CountRows => scalar_transition(plan, apply_count(current, effects)?),
-        PlanImplementation::SumInt8 { .. } => scalar_transition(plan, apply_sum(current, effects)?),
-        PlanImplementation::ProjectRows { .. } => project_transition(plan, effects),
+    match &plan.implementation {
+        PlanImplementation::CountRows => scalar_transition(plan, apply_count(current, batch)?),
+        PlanImplementation::SumInt8 { input_slot, .. } => {
+            scalar_transition(plan, apply_sum(current, batch, *input_slot)?)
+        }
+        PlanImplementation::Graph { graph } => graph_transition(plan, graph, batch),
     }
 }
 
@@ -109,16 +138,16 @@ fn scalar_transition(plan: &CompiledPlan, value: i64) -> Result<OperatorTransiti
             payload: value.to_be_bytes().to_vec(),
         },
         output_delta: OutputDelta::ScalarReplacement {
-            value: ScalarValue::Int8(value),
+            value: TypedValue::Int8(value),
         },
     })
 }
 
-fn apply_count(mut value: i64, effects: &[RowEffect]) -> Result<i64, KernelError> {
+fn apply_count(mut value: i64, batch: &DeltaBatch) -> Result<i64, KernelError> {
     if value < 0 {
         return Err(KernelError::NegativeCount);
     }
-    for effect in effects {
+    for effect in &batch.rows {
         match (&effect.before, &effect.after) {
             (None, Some(_)) => value = value.checked_add(1).ok_or(KernelError::Overflow)?,
             (Some(_), None) => {
@@ -133,86 +162,61 @@ fn apply_count(mut value: i64, effects: &[RowEffect]) -> Result<i64, KernelError
     Ok(value)
 }
 
-fn apply_sum(mut value: i64, effects: &[RowEffect]) -> Result<i64, KernelError> {
-    for effect in effects {
+fn apply_sum(mut value: i64, batch: &DeltaBatch, input_slot: u16) -> Result<i64, KernelError> {
+    for effect in &batch.rows {
         if let Some(before) = &effect.before {
             value = value
-                .checked_sub(contribution(&before.payload)?)
+                .checked_sub(contribution(before, input_slot)?)
                 .ok_or(KernelError::Overflow)?;
         }
         if let Some(after) = &effect.after {
             value = value
-                .checked_add(contribution(&after.payload)?)
+                .checked_add(contribution(after, input_slot)?)
                 .ok_or(KernelError::Overflow)?;
         }
     }
     Ok(value)
 }
 
-fn contribution(value: &Value) -> Result<i64, KernelError> {
-    match value {
-        Value::Null => Ok(0),
-        Value::Int8(value) => Ok(*value),
-        Value::Absent => Err(KernelError::AbsentInput),
-        Value::Text(_) => Err(KernelError::WrongType),
+fn contribution(row: &TypedRow, input_slot: u16) -> Result<i64, KernelError> {
+    match row.values.get(usize::from(input_slot)) {
+        Some(TypedValue::Null(ValueType::Int8)) => Ok(0),
+        Some(TypedValue::Int8(value)) => Ok(*value),
+        Some(TypedValue::Absent) | None => Err(KernelError::AbsentInput),
+        _ => Err(KernelError::WrongType),
     }
 }
 
-fn project_transition(
+fn graph_transition(
     plan: &CompiledPlan,
-    effects: &[RowEffect],
+    graph: &crate::OperatorGraph,
+    batch: &DeltaBatch,
 ) -> Result<OperatorTransition, KernelError> {
-    if !matches!(
-        plan.output_contract,
-        OutputContract::KeyedRows {
-            key_type: crate::ValueType::Int8,
-            value_type: crate::ValueType::Int8,
-            nullable: true
-        }
-    ) {
+    let transition = apply_graph(graph, batch).map_err(|_| KernelError::InvalidGraph)?;
+    if !transition.states.is_empty() || transition.results.len() != 1 {
+        return Err(KernelError::InvalidTransition);
+    }
+    let result = transition
+        .results
+        .into_iter()
+        .next()
+        .expect("length checked");
+    let ResultDelta::Keyed { mutations, .. } = result;
+    let mutations = mutations
+        .into_iter()
+        .map(|mutation| match mutation {
+            ResultMutation::Delete { key } => KeyedMutation::Delete { key },
+            ResultMutation::Upsert { key, value } => KeyedMutation::Upsert { key, value },
+        })
+        .collect();
+    if !matches!(plan.output_contract, OutputContract::KeyedRows { .. }) {
         return Err(KernelError::OutputContractMismatch);
-    }
-    let capacity = effects
-        .len()
-        .checked_mul(2)
-        .ok_or(KernelError::OutputLimit)?;
-    if capacity > MAX_KEYED_MUTATIONS {
-        return Err(KernelError::OutputLimit);
-    }
-    let mut mutations = Vec::with_capacity(capacity);
-    let mut effect_keys = BTreeSet::new();
-    for effect in effects {
-        let old = effect.before.as_ref().map(projected).transpose()?;
-        let new = effect.after.as_ref().map(projected).transpose()?;
-        let mut keys = BTreeSet::new();
-        if let Some((key, _)) = old {
-            keys.insert(key);
-            mutations.push(KeyedMutation::Delete { key });
-        }
-        if let Some((key, value)) = new {
-            keys.insert(key);
-            mutations.push(KeyedMutation::Upsert { key, value });
-        }
-        if keys.iter().any(|key| !effect_keys.insert(*key)) {
-            return Err(KernelError::ConflictingKey);
-        }
     }
     Ok(OperatorTransition {
         next_state: EncodedOperatorState {
-            codec_version: STATE_CODEC_VERSION,
+            codec_version: crate::plan::STATE_CODEC_VERSION,
             payload: Vec::new(),
         },
         output_delta: OutputDelta::KeyedMutations { mutations },
     })
-}
-
-fn projected(image: &crate::RowImage) -> Result<(i64, ScalarValue), KernelError> {
-    let key = image.source_row_id.ok_or(KernelError::MissingKey)?;
-    let value = match image.payload {
-        Value::Null => ScalarValue::Null,
-        Value::Int8(value) => ScalarValue::Int8(value),
-        Value::Absent => return Err(KernelError::AbsentInput),
-        Value::Text(_) => return Err(KernelError::WrongType),
-    };
-    Ok((key, value))
 }

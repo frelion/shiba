@@ -32,7 +32,7 @@ pub fn compile_plan(
             PlanImplementation::CountRows,
         ),
         OperatorOperationV1::SumInt8 { input_column } => {
-            let column = resolve_int8(source, input_column)?;
+            let (input_slot, column) = resolve_int8(source, input_column)?;
             (
                 vec![InputBinding {
                     role: InputRole::Payload,
@@ -43,38 +43,33 @@ pub fn compile_plan(
                 },
                 PlanImplementation::SumInt8 {
                     input: column.address,
+                    input_slot,
                 },
             )
         }
-        OperatorOperationV1::ProjectRows {
-            key_column,
-            input_column,
-        } => {
-            let key = resolve_int8(source, key_column)?;
-            if key.nullable {
-                return Err(CompilerError::NullableKey(key_column.clone()));
-            }
-            let value = resolve_int8(source, input_column)?;
+        OperatorOperationV1::MaterializedProject { .. } => {
+            let graph = crate::compile_graph(spec, source)?;
+            let inputs = graph
+                .source_layout
+                .iter()
+                .enumerate()
+                .map(|(index, binding)| InputBinding {
+                    role: if index == 0 {
+                        InputRole::Key
+                    } else {
+                        InputRole::Payload
+                    },
+                    address: binding.address,
+                })
+                .collect();
             (
-                vec![
-                    InputBinding {
-                        role: InputRole::Key,
-                        address: key.address,
-                    },
-                    InputBinding {
-                        role: InputRole::Payload,
-                        address: value.address,
-                    },
-                ],
+                inputs,
                 OutputContract::KeyedRows {
                     key_type: ValueType::Int8,
                     value_type: ValueType::Int8,
                     nullable: true,
                 },
-                PlanImplementation::ProjectRows {
-                    key: key.address,
-                    value: value.address,
-                },
+                PlanImplementation::Graph { graph },
             )
         }
     };
@@ -91,12 +86,16 @@ pub fn compile_plan(
 fn resolve_int8<'a>(
     source: &'a SourceDescriptor,
     name: &str,
-) -> Result<&'a SourceColumnDescriptor, CompilerError> {
+) -> Result<(u16, &'a SourceColumnDescriptor), CompilerError> {
     if name.trim().is_empty() {
         return Err(CompilerError::BlankInputColumn);
     }
-    let mut matches = source.columns.iter().filter(|column| column.name == name);
-    let column = matches
+    let mut matches = source
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.name == name);
+    let (index, column) = matches
         .next()
         .ok_or_else(|| CompilerError::MissingColumn(name.to_owned()))?;
     if matches.next().is_some() {
@@ -108,5 +107,8 @@ fn resolve_int8<'a>(
             type_oid: column.type_oid,
         });
     }
-    Ok(column)
+    Ok((
+        u16::try_from(index).map_err(|_| CompilerError::PlanEncoding)?,
+        column,
+    ))
 }

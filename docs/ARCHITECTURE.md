@@ -9,6 +9,13 @@ cutover replaces, rather than mirrors, the flat plan set and source-scoped
 continuation. ADR 0005 fixes one slot/generation and one transaction authority
 for both sides of the admitted two-source INNER JOIN.
 
+M14.2 implements the first stateless vertical slice. Compiler binds the full
+ordered source layout and exact expression slots; Source Apply/Bootstrap create
+one typed DeltaBatch; Filter, Compute, Project and Materialize execute purely;
+Runtime loads and persists plans/state/results generically. The old ProjectRows
+implementation is removed rather than adapted. Grouped state, two-input join
+and graph-wide lifecycle remain M14.3--M14.6 work.
+
 M13.1 froze the generic execution successor to the M9 aggregate-shaped API;
 M13.2 supplied its pure kernel, and M13.3 made that kernel the sole Runtime and
 Catalog execution path. See

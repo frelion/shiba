@@ -1,12 +1,25 @@
 # V2 goal gap entering M14
 
+## M14.2 implementation status
+
+Typed values/rows/deltas, strict expressions, Filter, Compute, Project and
+Materialize now run in the database-free kernel. The compiler resolves names
+once to exact ObjectAddress slots in the complete binding-ordered source
+layout. Source Apply and bootstrap construct one transaction-local DeltaBatch;
+Runtime performs generic plan/state/result persistence without matching node or
+operator names. The former ProjectRows declaration and execution variant no
+longer exists in production; its behavior is Project followed by Materialize.
+
+M14.3--M14.7 still must add generic grouped state, freeze and implement the
+two-input join authority, unify graph lifecycle, and close the full PG17/18
+release matrix. These are not claimed by M14.2.
+
 ## M14.1 contract status
 
 M14.1 freezes one canonical typed OperatorGraph, graph-wide transaction and
 continuation authority, generic keyed state, explicit terminal materialization,
-bounded two-source INNER JOIN, and the SourceId/row/node lock order. No M14
-production capability is claimed yet. M14.2--M14.7 must replace ProjectRows,
-add stateless/grouped/join nodes, cut over lifecycle authority, and re-prove the
+bounded two-source INNER JOIN, and the SourceId/row/node lock order. M14.2 adds
+the stateless single-input slice. M14.3--M14.7 must add grouped/join nodes, cut over lifecycle authority, and re-prove the
 complete PG17/18 matrix without a second Runtime or continuation.
 
 ## M13 completion status

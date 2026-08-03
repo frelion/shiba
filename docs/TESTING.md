@@ -1,5 +1,18 @@
 # Testing strategy
 
+## M14.2 typed stateless graph gates
+
+M14.2 implements the database-free `TypedValue`/`TypedRow`/`DeltaBatch` and
+canonical `OperatorGraph` codecs, SQL-three-valued expressions, checked bigint
+arithmetic, Filter, Compute, Project and Materialize. Pure tests cover exact
+false/NULL filtering, key-changing retract/upsert, absent/type/layout/plan
+corruption, deterministic canonical digests, fixed-seed keyed reference-model
+differential and the 10,000-row/20,000-node-output/200,000-total-delta/64 MiB
+hard bounds. Runtime constructs one binding-ordered batch and invokes every
+plan with it; no concrete operator kind is matched outside `shiba-operator`.
+PG17/PG18 M13 keyed differential remains the vertical regression gate for the
+Project-to-Materialize replacement.
+
 ## M14.1 frozen graph gates
 
 M14.1 freezes the typed SDK, single/multi-input graph authority, graph-scoped

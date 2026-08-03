@@ -81,7 +81,7 @@ fn assert_sum_definition(client: &mut Client, plan: &CompiledPlan) {
         row.get::<_, i16>(2).into(),
     );
     match plan.implementation {
-        PlanImplementation::SumInt8 { input } => {
+        PlanImplementation::SumInt8 { input, .. } => {
             assert_eq!((input.class_id, input.object_id, input.sub_id), expected);
         }
         _ => panic!("expected SumInt8 plan"),

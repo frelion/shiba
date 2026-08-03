@@ -63,9 +63,9 @@ pub(crate) fn establish_active_source(
         &mut admin,
         &operator_spec(
             3,
-            OperatorOperationV1::ProjectRows {
+            OperatorOperationV1::MaterializedProject {
                 key_column: "id".to_owned(),
-                input_column: "payload".to_owned(),
+                value_column: "payload".to_owned(),
             },
         ),
     )

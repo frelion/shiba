@@ -192,3 +192,7 @@ decision is recorded in [ADR 0004](adr/0004-m13-generic-operator-kernel.md).
 M14 operator development follows the
 [typed Operator Graph contract](OPERATOR_GRAPH_CONTRACT.md) and
 [ADR 0005](adr/0005-m14-operator-graph.md); it does not introduce a SQL parser.
+M14.2 implements typed expressions plus Filter/Compute/Project/Materialize on
+one binding-ordered transaction-local DeltaBatch and removes the production
+ProjectRows execution variant. Grouping, Join and graph lifecycle remain later
+M14 stages.

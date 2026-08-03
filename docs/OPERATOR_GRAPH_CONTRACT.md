@@ -1,5 +1,12 @@
 # M14 Operator SDK and graph contract
 
+M14.2 implementation evidence: the typed row/delta codecs, canonical graph,
+strict expressions, Filter/Compute/Project/Materialize evaluator and generic
+Runtime batch/result path are implemented. ProjectRows has been replaced by
+ordinary Project plus Materialize without a compatibility execution variant.
+The graph enforces the frozen row/delta/work-memory bounds before persistence.
+Grouped state, Join and graph-wide lifecycle remain later M14 stages.
+
 M14 extends the M13 database-free kernel; it does not add a SQL frontend or a
 second Runtime. This contract freezes graph identity, typed deltas, state,
 results, transaction ownership, recovery and bounds before production changes.

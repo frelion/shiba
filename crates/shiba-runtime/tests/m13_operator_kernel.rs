@@ -92,9 +92,9 @@ fn generic_kernel_persists_scalar_and_keyed_outputs_atomically() {
         ),
         spec(
             3,
-            OperatorOperationV1::ProjectRows {
+            OperatorOperationV1::MaterializedProject {
                 key_column: "id".into(),
-                input_column: "payload".into(),
+                value_column: "payload".into(),
             },
         ),
     ] {
