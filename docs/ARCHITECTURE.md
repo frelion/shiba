@@ -1,5 +1,14 @@
 # Architecture boundary
 
+M14.1 freezes the next database-free execution boundary in
+[OPERATOR_GRAPH_CONTRACT.md](OPERATOR_GRAPH_CONTRACT.md): one canonical typed
+graph owns its exact source membership, nodes, edges, terminal outputs and hard
+bounds. Runtime will schedule canonical topology and persist generic deltas;
+only the Operator crate may dispatch concrete node implementations. The M14.6
+cutover replaces, rather than mirrors, the flat plan set and source-scoped
+continuation. ADR 0005 fixes one slot/generation and one transaction authority
+for both sides of the admitted two-source INNER JOIN.
+
 M13.1 froze the generic execution successor to the M9 aggregate-shaped API;
 M13.2 supplied its pure kernel, and M13.3 made that kernel the sole Runtime and
 Catalog execution path. See

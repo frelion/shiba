@@ -1,5 +1,21 @@
 # Testing strategy
 
+## M14.1 frozen graph gates
+
+M14.1 freezes the typed SDK, single/multi-input graph authority, graph-scoped
+continuation, canonical lock order, complete-transaction retry and hard work
+bounds in `OPERATOR_GRAPH_CONTRACT.md`. Pure gates use independent fixed-seed
+reference models for every expression/node. PostgreSQL gates compare every
+grouped and joined row with SQL oracles on PG17.10 and PG18.4; count or digest
+comparison alone is insufficient.
+
+The current 49-script/98-invocation M13 matrix remains the regression floor.
+New M14 scripts must enter the release runner's exact enrollment before their
+stage can close. The unchanged CountRows/SumInt8 five-run Apply medians are
+782.302750/787.157125 ms; M14 stops at 899.648163/905.230694 ms. All M8--M13
+absolute thresholds remain fixed, including 10,000 changes, 16 MiB assembly
+and M12 retained WAL <=256 MiB.
+
 ## M13 gates and current evidence
 
 M13.1 records the pre-change five-run medians in

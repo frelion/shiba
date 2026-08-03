@@ -1,4 +1,13 @@
-# V2 goal gap during M13
+# V2 goal gap entering M14
+
+## M14.1 contract status
+
+M14.1 freezes one canonical typed OperatorGraph, graph-wide transaction and
+continuation authority, generic keyed state, explicit terminal materialization,
+bounded two-source INNER JOIN, and the SourceId/row/node lock order. No M14
+production capability is claimed yet. M14.2--M14.7 must replace ProjectRows,
+add stateless/grouped/join nodes, cut over lifecycle authority, and re-prove the
+complete PG17/18 matrix without a second Runtime or continuation.
 
 ## M13 completion status
 

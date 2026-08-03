@@ -407,7 +407,7 @@ import pathlib
 
 goal_gap = pathlib.Path("docs/GOAL_GAP.md").read_text()
 required = (
-    "# V2 goal gap during M13",
+    "# V2 goal gap entering M14",
     "Active/non-pristine rebuild for the declared",
     "That green gate closes the declared active",
     "96 successful PG invocations",
@@ -449,6 +449,21 @@ for phrase in (
 ):
     if phrase in reuse_manifest:
         raise SystemExit(f"REUSE_MANIFEST.md retains stale M12 status: {phrase}")
+
+graph_contract = pathlib.Path("docs/OPERATOR_GRAPH_CONTRACT.md").read_text()
+graph_adr = pathlib.Path("docs/adr/0005-m14-operator-graph.md").read_text()
+for marker in (
+    "One durable graph authority",
+    "Two-input INNER JOIN",
+    "graph/generation ownership mutex",
+    "PG17/PG18 Apply medians are 782.302750/787.157125 ms",
+):
+    if marker not in graph_contract:
+        raise SystemExit(f"M14 graph contract lacks frozen marker: {marker}")
+if "Status: accepted for M14.1." not in graph_adr:
+    raise SystemExit("M14 ADR is not accepted")
+if "M14.1 typed Operator SDK and graph contract" not in reuse_manifest:
+    raise SystemExit("REUSE_MANIFEST.md lacks M14.1 evidence")
 PY
 
 echo "L0 passed for PostgreSQL $pg_major ($pg_config)"

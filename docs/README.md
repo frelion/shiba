@@ -189,3 +189,6 @@ Compiler, EffectBatch, Operator, and sink work must follow the
 [operator contract](OPERATOR_CONTRACT.md) and the
 [M13 Operator Kernel contract](OPERATOR_KERNEL_CONTRACT.md). The design
 decision is recorded in [ADR 0004](adr/0004-m13-generic-operator-kernel.md).
+M14 operator development follows the
+[typed Operator Graph contract](OPERATOR_GRAPH_CONTRACT.md) and
+[ADR 0005](adr/0005-m14-operator-graph.md); it does not introduce a SQL parser.
