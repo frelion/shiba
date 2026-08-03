@@ -340,5 +340,23 @@ ordinary live progress. The control/Apply/scanner role is
 NOSUPERUSER/NOREPLICATION, transport is separately trusted
 NOSUPERUSER/REPLICATION with target `SELECT`, and reader is public-result-only.
 Missing or exchanged privileges fail closed without partial results or a new
-lifecycle/checkpoint authority. M12.6 performance/release evidence remains
-outstanding.
+lifecycle/checkpoint authority. M12.6 closes the bounded performance/release
+evidence without changing this authority.
+
+## M12.6 active-rebuild boundedness gate
+
+M12.6 does not fork the M11 bootstrap contract. It applies the existing
+10,000-row bounded snapshot batches to one million rows after an active-source
+destructive prepare, then consumes one real 10,000-change WAL transaction
+through the existing catch-up and activation path. The source begins with a
+nonzero operator result and a real continuation; final rows, CountRows and
+SumInt8 must equal the SQL oracle and ordinary live ingress must remain usable.
+
+Limits fixed before the run are scan <= 12 s, catch-up <= 8 s, activation
+<= 2 s, total <= 25 s, RSS growth <= 128 MiB and retained WAL <= 256 MiB.
+The comparison point is M11's approximately 3.1 s scan, 1.3 s catch-up and
+3.6 MiB RSS increase. PG17.10 records 4.357951916 s scan, 1.946769416 s
+catch-up, 9.755875 ms activation, 6.343139667 s total, 4,272 KiB RSS growth and
+252,864,952 retained bytes. PG18.4 records 4.429333333 s, 1.907849875 s,
+9.981958 ms, 6.375927458 s, 4,320 KiB and 252,898,072 bytes. The complete
+48-script/96-invocation release matrix is green.

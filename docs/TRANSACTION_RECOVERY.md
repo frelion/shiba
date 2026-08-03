@@ -565,3 +565,26 @@ under `AccessShareLock` with `pg_relation_size`, closing the
 shape-check/replacement race without adding state. The shared source fence gives
 one same-source winner while independent sources remain independent. This is
 not a claim to detect privileged identical slot replacement.
+
+## M12.6 recovery and boundedness acceptance
+
+The performance workload must preserve all M12.4 recovery points while the
+snapshot contains one million rows and the slot retains a real 10,000-change
+transaction. Its measurements are observational only: they do not advance a
+checkpoint, authorize ACK or add recovery metadata. Snapshot batches,
+catch-up Apply, activation and feedback retain their existing transaction
+owners and retry identities.
+
+Before observing results, limits are scan <= 12 s, catch-up <= 8 s, activation
+<= 2 s, total <= 25 s, RSS growth <= 128 MiB and retained WAL <= 256 MiB.
+The M11 reference is approximately 3.1 s / 1.3 s / 3.6 MiB for scan,
+catch-up and RSS growth. PG17.10/PG18.4 observed scan
+4.357951916/4.429333333 s, catch-up 1.946769416/1.907849875 s, activation
+9.755875/9.981958 ms, total 6.343139667/6.375927458 s, RSS +4,272/+4,320 KiB,
+and retained WAL 252,864,952/252,898,072 bytes. All remain below the frozen
+bounds; no recovery rule was weakened.
+
+The final release matrix must re-run PG17 and PG18 crash, retry, concurrency,
+role and differential gates. Passing it will not prove host-loss slot failover,
+compromised replication credentials, cross-host network partitions, automatic
+reconnect supervision or indefinite-writer convergence.

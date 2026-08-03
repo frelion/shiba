@@ -209,6 +209,7 @@ scripts = [
         "m12-rebuild-snapshot-live", "m12-rebuild-identity-authority",
         "m12-rebuild-recovery",
         "m12-rebuild-governance",
+        "m12-rebuild-performance",
     )
 ]
 for path in scripts:

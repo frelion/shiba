@@ -1,4 +1,4 @@
-# V2 goal gap during M12.1
+# V2 goal gap after M12
 
 M1–M9 are the reference correctness kernel, not a complete Shiba V2. They
 prove the transaction and recovery semantics that later architecture must
@@ -8,7 +8,7 @@ operator, effect, and sink contracts.
 | Original link | Current state | Remaining gap |
 |---|---|---|
 | Protocol | Strong IDs, canonical JSON/digest, strict pgoutput values | Broader cross-process plan/wire contracts |
-| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap lifecycle, M12.2--M12.5 admission/identity/recovery/governance | M12.6 performance and final release gate remain |
+| Catalog | Version, source/publication authority, operator state/result, sole `source_row_state`, one bootstrap lifecycle, complete M12 rebuild admission/identity/recovery/governance/release evidence | Broader lifecycle automation and operator/result shapes |
 | Compiler | Strict V1 IR to ObjectAddress-bound plan | SQL frontend and broader plan language |
 | Source Ingress | M10 production COPY BOTH plus complete M11 consistent snapshot, recovery, bounded million-row catch-up and live handoff | TLS/disconnect policy, Apply-time shutdown, reconnect/backoff, indefinite-writer tail latency and cross-host soak |
 | Source Apply | Current-row authority plus transaction-local before/after effects | Broader row shapes and non-aggregate effects |
@@ -80,7 +80,7 @@ authorizing Apply/ACK. PG17.10 and PG18.4 now pass
 exact old-slot retirement, real exported snapshot, bounded scan, concurrent WAL
 catch-up, fence, atomic activation and ordinary M10 live ACK without copying old
 continuation or switching identity twice. M12.4 recovery and M12.5 DDL/role
-governance are recorded below; M12.6 performance/release remains work.
+governance are recorded below; M12.6 closes the frozen performance/release gate.
 
 M10.3 deliberately does not add persisted partial-stream recovery: partial
 stream bytes are volatile and PostgreSQL's replication slot replays them after
@@ -126,4 +126,21 @@ invalidation, same-source one-winner/different-source progress, and split
 least-privilege roles. It also proves side-effect-free transport
 `IDENTIFY_SYSTEM`+database and control target-`SELECT` preflight, exact-index
 `AccessShareLock` validation through `pg_relation_size`, and fail-closed role
-or grant loss. M12.6 performance/release remains unfinished.
+or grant loss. M12.6 then closes the bounded performance/release matrix.
+
+M12.6 freezes its acceptance limits before measurement: one-million-row scan
+<= 12 s, real 10,000-change catch-up <= 8 s, activation <= 2 s, complete
+rebuild <= 25 s, RSS growth <= 128 MiB and retained WAL <= 256 MiB. The M11
+comparison baseline is approximately 3.1 s scan, 1.3 s catch-up and 3.6 MiB RSS
+growth. PG17.10/PG18.4 observed scan 4.357951916/4.429333333 s, catch-up
+1.946769416/1.907849875 s, activation 9.755875/9.981958 ms, total
+6.343139667/6.375927458 s, RSS +4,272/+4,320 KiB and retained WAL
+252,864,952/252,898,072 bytes. The fixed-order runner reports 48 unique scripts
+and 96 successful PG invocations.
+
+Passing that gate will close the declared active nullable-`int8`
+CountRows/SumInt8 rebuild lifecycle, not V2. Remaining product gaps include a
+SQL frontend, additional source/operator/result shapes, TLS and credential
+rotation, automatic receiver supervision/reconnect, cross-host and failover
+operation, sustained soak/heap/tail-latency evidence, and defense against a
+privileged indistinguishable same-name/same-shape slot replacement.

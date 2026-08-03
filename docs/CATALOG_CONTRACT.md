@@ -241,7 +241,7 @@ M12.1 is the frozen contract. M12.2 establishes the destructive writer and
 durable index identity. M12.3 proves the target authority survives real
 snapshot-to-live activation without another binding/config switch. Crash and
 later lifecycle claims are proved by M12.4 recovery and M12.5 governance;
-M12.6 performance/release remains.
+M12.6 closes bounded performance and the full release matrix.
 
 ## M12.2 admitted rebuild state
 
@@ -331,3 +331,19 @@ transport has `REPLICATION` plus target `SELECT`; reader remains public-result
 read-only. Missing control function/table/source privileges and role exchanges
 fail closed. A compromised trusted replication credential remains the stated
 residual physical-slot risk.
+
+## M12.6 catalog acceptance boundary
+
+The performance and release gate adds no catalog object, cursor or writer. A
+million-row rebuild must continue to use the sole `source_bootstrap` lifecycle,
+the sole exact-four target binding, the one ingress config, one WAL continuation
+and the existing operator state/result rows. The 10,000-change catch-up and
+activation therefore exercise the same transaction and authority boundaries as
+M12.3--M12.5; measurement state is test output, never durable Catalog state.
+
+The release matrix must re-prove cardinality, generation, visibility and old-
+generation rejection on PG17 and PG18. Frozen limits are scan <= 12 s,
+catch-up <= 8 s, activation <= 2 s, total <= 25 s, RSS growth <= 128 MiB and
+retained WAL <= 256 MiB. PG17.10/PG18.4 complete in 6.343139667/6.375927458 s,
+retain at most 252,864,952/252,898,072 bytes, and pass all 96 PG invocations.
+No measurement row or additional Catalog state is created.

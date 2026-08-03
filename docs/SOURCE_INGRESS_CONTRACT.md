@@ -493,3 +493,26 @@ post-prepare invalidation cannot be repaired by a same name: they stop the
 building generation before Apply or ACK. The common ownership fence permits one
 same-source rebuild/live transition while another source progresses normally.
 M12.6, not this gate, owns final performance and release evidence.
+
+## M12.6 bounded rebuild ingress acceptance
+
+The final M12 ingress gate runs an active, non-pristine one-million-row source
+through the existing receiver and scanner while one real 10,000-change source
+transaction accumulates behind the exported-snapshot boundary. Backpressure
+remains synchronous: one bounded scan batch or one complete bounded WAL
+transaction is handed forward at a time, with no channel, spool or per-row
+network round trip. The test records scan, catch-up, activation and total time,
+RSS growth and retained WAL.
+
+Thresholds were frozen before observation: scan <= 12 s, catch-up <= 8 s,
+activation <= 2 s, total <= 25 s, RSS growth <= 128 MiB and retained WAL
+<= 256 MiB. M11's comparison evidence is approximately 3.1 s scan, 1.3 s
+catch-up and 3.6 MiB RSS growth. PG17.10/PG18.4 observed scan
+4.357951916/4.429333333 s, catch-up 1.946769416/1.907849875 s, activation
+9.755875/9.981958 ms, total 6.343139667/6.375927458 s, RSS +4,272/+4,320 KiB,
+and retained WAL 252,864,952/252,898,072 bytes. The release wrapper ran 48
+unique scripts and 96 PG invocations without skipping an old gate.
+
+Even after acceptance, TLS, remote-network failure policy, automatic reconnect
+and backoff, cross-host soak, slot failover and indefinite concurrent-writer
+tail latency remain outside the proved ingress boundary.

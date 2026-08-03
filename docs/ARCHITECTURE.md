@@ -371,8 +371,7 @@ model. See [the rebuild contract](REBUILD_CONTRACT.md) and
 [ADR 0003](adr/0003-m12-offline-rebuild.md). M12.1 freezes this architecture;
 M12.2 proves destructive admission and durable identity; M12.3 proves the real
 snapshot-to-live path; M12.4 proves forward recovery and M12.5 governs DDL,
-concurrency and roles. M12.6 still owns the million-row/release performance
-matrix.
+concurrency and roles. M12.6 closes the million-row/release performance matrix.
 
 ## M12.2 destructive admission architecture
 
@@ -478,5 +477,34 @@ The existing per-source ownership fence serializes live, DDL and rebuild work:
 two rebuilds for one source have one winner, while another source can continue
 ordinary Apply. Permission loss or a swapped role rolls back before prepare, or
 leaves an already prepared target safely `building/NULL`; it never revives the
-retired generation. M12.6 still owns million-row rebuild performance and the
-release matrix.
+retired generation. M12.6 closes million-row rebuild performance and the
+release matrix without changing the execution path.
+
+## M12.6 bounded rebuild and release architecture
+
+M12.6 adds evidence, not another execution path. The million-row active rebuild
+must use the same destructive prepare, M11 bounded scanner, M10 catch-up,
+activation, feedback and live handoff described above. Before measurements, the
+acceptance limits are frozen at snapshot scan <= 12 s, 10,000-change catch-up
+<= 8 s, activation <= 2 s, complete rebuild <= 25 s, RSS growth <= 128 MiB and
+retained WAL <= 256 MiB. A failed limit requires implementation work; observed
+results cannot be used to relax the limit.
+
+The release matrix runs formatting/checks and focused tests, workspace tests
+and clippy, the complete PG17 matrix, the complete PG18 matrix, then the M12
+differential, crash, concurrency, least-privilege and performance gates. It
+reports exact script and server-version counts rather than treating a wrapper
+exit status as evidence. The green release run executes 48 unique PG scripts
+per version grouping (41 foundation plus seven M12), 96 invocations total, on
+PG17.10 and PG18.4. PG17/PG18 scan is 4.357951916/4.429333333 s, catch-up is
+1.946769416/1.907849875 s, activation is 9.755875/9.981958 ms, total is
+6.343139667/6.375927458 s, RSS growth is 4,272/4,320 KiB, and retained-WAL
+peak is 252,864,952/252,898,072 bytes.
+
+The comparison baseline is M11's pristine bootstrap: approximately 3.1 s scan,
+1.3 s catch-up and 3.6 MiB RSS growth. Rebuild adds deliberate prepare,
+retirement and activation work, but still may not add a queue, per-row SQL path,
+second authority or parallel generation. M12.6 completes only the
+declared active nullable-`int8` CountRows/SumInt8 rebuild boundary; TLS,
+automatic reconnect supervision, cross-host/failover operation, broader source
+shapes, SQL frontend and broader result/operator shapes remain outside it.

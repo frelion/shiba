@@ -593,3 +593,47 @@ separate trusted `REPLICATION` transport role with target `SELECT`, and a
 public-result reader; exchanged roles and missing control/source/internal
 privileges fail closed. It is not M12.6 performance, release-matrix, TLS,
 reconnect or privileged-identical-slot-replacement evidence.
+
+## M12.6 performance and release gate
+
+Freeze these limits before running the active rebuild benchmark:
+
+- snapshot scan <= 12 s;
+- one real 10,000-change WAL catch-up <= 8 s;
+- activation <= 2 s;
+- complete rebuild <= 25 s;
+- RSS growth <= 128 MiB;
+- retained WAL <= 256 MiB.
+
+The scenario starts from one million active rows with nonzero CountRows,
+SumInt8 and a real WAL continuation. During the exported snapshot it commits
+one 10,000-change transaction, then measures the existing bounded scan,
+catch-up, activation and live handoff. It must assert the SQL differential,
+building/NULL visibility, exact generation transition, ordinary post-cutover
+live Apply and absence of an unbounded queue or per-row SQL path. The comparison
+baseline from M11 is approximately 3.1 s scan, 1.3 s catch-up and 3.6 MiB RSS
+growth. PG17.10/PG18.4 values are scan 4.357951916/4.429333333 s, catch-up
+1.946769416/1.907849875 s, activation 9.755875/9.981958 ms, total
+6.343139667/6.375927458 s, RSS +4,272/+4,320 KiB, and retained WAL
+252,864,952/252,898,072 bytes. Relative to the recorded M11 baseline, rebuild
+adds about 1.3 s scan, 0.6 s catch-up, and under 0.7 MiB RSS; this is the
+deliberate prepare/retirement/generation validation cost, not a second queue or
+per-row execution path.
+
+The one-command current release matrix has this fixed order:
+
+1. formatting, workspace check and focused tests;
+2. workspace tests and clippy with warnings denied;
+3. the complete PG17 integration matrix;
+4. the complete PG18 integration matrix;
+5. M12 differential, crash, concurrency, least-privilege and performance
+   evidence;
+6. exact script count, exact PostgreSQL versions and the observed performance
+   report.
+
+It may reuse existing scripts, but may not skip, delete or weaken a historical
+gate. The wrapper's final status is insufficient unless every constituent
+result and count is reported. `scripts/release-matrix.sh` is green on
+PostgreSQL 17.10 and 18.4: 48 unique PG scripts, 41 foundation plus seven M12
+per version grouping, and 96 successful invocations. It emits exactly one
+performance record for each server version.
