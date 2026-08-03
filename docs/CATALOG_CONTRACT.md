@@ -291,3 +291,20 @@ ordinary live Apply/ACK. Activation changes lifecycle and result visibility;
 it does not install binding/config again. The retired generation-2 triple is
 preserved in the active row, and no old continuation is copied into generation
 3. M12.4 still owns crash recovery between these durable transitions.
+
+## M12.4 abandoned-attempt replacement
+
+`source_bootstrap` remains the sole lifecycle and checkpoint authority. For a
+marker-null M11 attempt, `replace_pristine_source_bootstrap` keeps its existing
+narrow recovery contract. For an M12-marked `creating`, `scanning`,
+`cleanup_pending`, or `failed` attempt, the same writer additionally requires
+the durable abandoned BootstrapId/slot/generation, a different slot, and exact
+`old_generation + 1`. It atomically clears partial rows, private state and
+checkpoint, installs the fresh attempt, and records the abandoned triple as the
+next retired identity.
+
+Recovery reads and validates the durable four-row target binding before
+mutation; it cannot select a current primary key. Missing, stale, malformed or
+replacement-OID identity fails closed while results remain `building/NULL`.
+This is forward replacement of an ephemeral snapshot, not a fallback or new
+catalog authority.

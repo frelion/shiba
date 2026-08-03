@@ -528,3 +528,21 @@ existing lifecycle is `catching_up` or `active`. Consequently a retired worker
 cannot write either immediately after prepare or after activation, and the
 target generation cannot skip the snapshot during `rebuild_prepared`,
 `creating`, `scanning`, or `scan_complete`.
+
+## M12.4 rebuild crash recovery
+
+Recovery does not infer authority from process-local `RebuildSpec` or a newly
+discovered primary key. `rebuild_prepared` resumes from durable target
+binding/config/retired coordinates through the prepared handoff. A lost
+exported snapshot in an M12-marked `creating` or `scanning` attempt is terminal
+for that attempt: the existing abandoned-attempt writer creates a fresh
+BootstrapId, distinct slot and exact successor generation in a short catalog
+transaction.
+
+That transaction retires partial scan rows, private values and checkpoint
+together, leaves results `building/NULL`, and records the abandoned identity so
+retry has one forward direction. It validates exact-four target binding before
+mutation. `scan_complete`/`catching_up` resume using their existing checkpoint
+and WAL paths; activation and pre/post-ACK recovery retain M11/M10 atomic
+result and durable-feedback rules. No window creates a second continuation,
+spool, EffectStream, candidate binding or old-generation fallback.

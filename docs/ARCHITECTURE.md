@@ -436,3 +436,20 @@ exists, ordinary WAL processing is eligible only in `catching_up` or `active`.
 Thus the retired generation rejects both immediately after prepare and after
 activation, while target generation 3 cannot bypass bootstrap during
 `rebuild_prepared`, `creating`, `scanning`, or `scan_complete`.
+
+## M12.4 interrupted rebuild architecture
+
+M12.4 retains one lifecycle and one data path. A durable `rebuild_prepared`
+row resumes through the existing prepared-rebuild handoff and performs only its
+next exact slot action. An M12-produced `creating` or `scanning` row whose
+exported snapshot is lost uses the existing `restart_abandoned` mechanism: it
+retires the abandoned attempt and reserves a fresh BootstrapId, distinct slot,
+and exact successor generation. It never restores the retired active generation
+or reuses an old snapshot or continuation.
+
+This is not a second bootstrap implementation. It reuses the sole lifecycle
+row, M11 scanner/checkpoint, and M10/M11 catch-up, fence, activation and ACK
+paths. The target remains the same exact-four binding—including durable
+identity-index OID—and stays `building/NULL` until ordinary activation. M11
+marker-null recovery keeps its existing semantics; the fresh-slot/exact-successor
+rule is restricted to M12-marked abandoned attempts.

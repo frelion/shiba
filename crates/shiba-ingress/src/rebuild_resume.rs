@@ -89,6 +89,26 @@ pub(crate) fn load_prepared_authority(
     target_bootstrap_id: BootstrapId,
     target_generation: SlotGeneration,
 ) -> Result<PreparedAuthority, IngressError> {
+    let (authority, phase) = load_rebuild_authority(
+        transaction,
+        source_id,
+        target_bootstrap_id,
+        target_generation,
+    )?;
+    if phase != "rebuild_prepared" {
+        return Err(IngressError::Governance(
+            "prepared rebuild authority is missing",
+        ));
+    }
+    Ok(authority)
+}
+
+pub(crate) fn load_rebuild_authority(
+    transaction: &mut postgres::Transaction<'_>,
+    source_id: SourceId,
+    target_bootstrap_id: BootstrapId,
+    target_generation: SlotGeneration,
+) -> Result<(PreparedAuthority, String), IngressError> {
     let source_key = as_bigint(source_id.get())?;
     let row = transaction
         .query_opt(
@@ -96,7 +116,8 @@ pub(crate) fn load_prepared_authority(
                     bootstrap.retired_slot_name::text,
                     bootstrap.retired_slot_generation,
                     config.publication_objid::bigint,
-                    binding.address_classid::bigint, binding.address_objid::bigint
+                    binding.address_classid::bigint, binding.address_objid::bigint,
+                    bootstrap.phase
              FROM shiba_internal.source_bootstrap AS bootstrap
              JOIN shiba_internal.source_ingress_config AS config USING (source_id)
              JOIN shiba_internal.source_binding AS binding
@@ -105,7 +126,6 @@ pub(crate) fn load_prepared_authority(
               AND binding.address_objsubid = 0
              WHERE bootstrap.source_id = $1 AND bootstrap.bootstrap_id = $2
                AND bootstrap.slot_generation = $3
-               AND bootstrap.phase = 'rebuild_prepared'
                AND config.slot_name = bootstrap.slot_name
                AND config.slot_generation = bootstrap.slot_generation
              FOR UPDATE OF bootstrap, config, binding",
@@ -126,7 +146,7 @@ pub(crate) fn load_prepared_authority(
         ))?;
     let (count_operator_id, sum_operator_id) =
         load_operator_ids(transaction, source_key, relation_class, relation_oid)?;
-    Ok(PreparedAuthority {
+    let authority = PreparedAuthority {
         source_id,
         target: RebuildIdentity {
             bootstrap_id: target_bootstrap_id,
@@ -141,7 +161,8 @@ pub(crate) fn load_prepared_authority(
         retired_slot_generation: slot_generation(row.get(3))?,
         count_operator_id,
         sum_operator_id,
-    })
+    };
+    Ok((authority, row.get(7)))
 }
 
 fn load_operator_ids(

@@ -113,3 +113,11 @@ a same-name/same-shape replacement by a superuser or holder of the trusted
 `REPLICATION` credential cannot be detected and is outside the correctness
 threat model. Credential exclusivity and audit are deployment prerequisites;
 no slot-birth marker is introduced in M12.1.
+
+M12.4 adds the forward recovery contract, not a second bootstrap: durable
+`rebuild_prepared` resumes its exact handoff; a lost M12 `creating`/`scanning`
+snapshot is abandoned and replaced with a fresh BootstrapId, distinct slot and
+exact successor generation. It cannot return to generation 2 or reuse its
+continuation. `scripts/test-m12-rebuild-recovery.sh` is the focused PG17.10/
+PG18.4 evidence gate. M12.5 DDL/role matrix and M12.6 performance/release
+remain unfinished.

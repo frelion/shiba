@@ -6,6 +6,7 @@ use crate::{
     connection_config::{open_apply, replication_database},
     governed::advisory_key,
     limits::ActivePermit,
+    rebuild_abandoned::validate_m12_abandoned,
     transport::ReplicationTransport,
 };
 
@@ -58,8 +59,13 @@ impl BootstrapSession {
             &abandoned.slot_name,
             &replacement.slot_name,
         )?;
-        reconcile_abandoned(&mut apply, &database, abandoned)?;
-        if exact_slot_exists(&mut apply, &database, &abandoned.slot_name)? {
+        let m12 = reconcile_abandoned(&mut apply, &database, abandoned, &replacement)?;
+        let old_slot_exists = if m12 {
+            exact_m12_slot_exists(&mut apply, &database, &abandoned.slot_name)?
+        } else {
+            exact_slot_exists(&mut apply, &database, &abandoned.slot_name)?
+        };
+        if old_slot_exists {
             ReplicationTransport::connect(replication_conninfo)?.drop_slot(&abandoned.slot_name)?;
         }
         replace_catalog_attempt(&mut apply, abandoned, &replacement)?;
@@ -112,7 +118,8 @@ fn reconcile_abandoned(
     apply: &mut Client,
     database: &str,
     spec: &BootstrapSpec,
-) -> Result<(), IngressError> {
+    replacement: &BootstrapSpec,
+) -> Result<bool, IngressError> {
     let source_id = as_bigint(spec.source_id.get())?;
     let bootstrap_id = as_bigint(spec.bootstrap_id.get())?;
     let generation = as_bigint(spec.slot_generation.get())?;
@@ -152,6 +159,7 @@ fn reconcile_abandoned(
             "only a pre-scan attempt can be replaced",
         ));
     }
+    let m12 = validate_m12_abandoned(&mut transaction, spec, replacement, row.get(2))?;
     if transaction.execute(
         "UPDATE shiba_internal.source_bootstrap
          SET phase = 'cleanup_pending'
@@ -166,7 +174,7 @@ fn reconcile_abandoned(
         ));
     }
     transaction.commit()?;
-    Ok(())
+    Ok(m12)
 }
 
 fn exact_slot_exists(
@@ -189,6 +197,32 @@ fn exact_slot_exists(
     {
         return Err(IngressError::Governance(
             "bootstrap slot is active or has foreign identity",
+        ));
+    }
+    Ok(true)
+}
+
+fn exact_m12_slot_exists(
+    apply: &mut Client,
+    database: &str,
+    slot_name: &str,
+) -> Result<bool, IngressError> {
+    let Some(row) = apply.query_opt(
+        "SELECT slot_type, plugin, database, temporary, active,
+                two_phase, failover, synced
+         FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+        &[&slot_name],
+    )?
+    else {
+        return Ok(false);
+    };
+    if row.get::<_, &str>(0) != "logical"
+        || row.get::<_, Option<&str>>(1) != Some("pgoutput")
+        || row.get::<_, Option<&str>>(2) != Some(database)
+        || (3..=7).any(|index| row.get::<_, bool>(index))
+    {
+        return Err(IngressError::Governance(
+            "M12 bootstrap slot has foreign observable identity",
         ));
     }
     Ok(true)

@@ -307,3 +307,17 @@ The public sink stays `building/NULL` until the activation transaction exposes
 the complete target result. The same target identity remains installed, and
 the retired triple remains after activation. Crash/restart behavior during
 these steps remains M12.4 rather than an M12.3 claim.
+
+## M12.4 lost-snapshot recovery
+
+An exported snapshot is ephemeral. If an M12-produced `creating` or `scanning`
+attempt cannot prove its original snapshot is usable, recovery cannot resume
+that scan. It uses existing `restart_abandoned`, not a parallel bootstrap path:
+partial bootstrap state retires transactionally, a fresh BootstrapId and
+distinct slot are reserved, and generation advances by exactly one. The new
+slot exports a new snapshot for the ordinary bounded M11 scanner.
+
+The old active generation never returns and its continuation is never
+relabelled. The same relation/key/payload/identity-index authority is read from
+Catalog; marker-null M11 recovery remains unchanged. Readers stay on
+`building/NULL` until ordinary catch-up and activation complete.

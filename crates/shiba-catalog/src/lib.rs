@@ -504,6 +504,13 @@ mod tests {
             "delete from shiba_internal.source_bootstrap",
             "delete from shiba_internal.source_ingress_config",
             "perform shiba_internal.reserve_source_bootstrap",
+            "bootstrap.retired_bootstrap_id is not null",
+            "new_generation <> old_generation + 1 or new_slot = old_slot",
+            "m12 replacement binding identity drifted",
+            "retired_bootstrap_id = old_bootstrap_id",
+            "retired_slot_name = old_slot",
+            "retired_slot_generation = old_generation",
+            "m12 replacement lost successor ownership",
             "revoke all on function shiba_internal.replace_pristine_source_bootstrap",
         ] {
             assert!(

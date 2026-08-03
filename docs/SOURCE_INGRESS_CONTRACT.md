@@ -460,3 +460,18 @@ ordinary WAL is admitted only in `catching_up` or `active`: retired generation
 2 rejects before and after activation, and target generation 3 cannot enter the
 ordinary path during `rebuild_prepared`, `creating`, `scanning`, or
 `scan_complete`.
+
+## M12.4 crash and resume ingress boundary
+
+Each durable phase has one forward action. `rebuild_prepared` resumes exact
+old-slot retirement/new-slot creation. If a M12 `creating` or `scanning`
+attempt loses its exported snapshot, ingress does not import it again: the
+existing abandoned-attempt replacement path obtains a fresh BootstrapId,
+distinct slot and exact successor generation, then runs the ordinary M11 scan
+and M10 catch-up path. `scan_complete`, `catching_up` and `active` retain their
+existing M11/M10 resume rules.
+
+Runtime validates the one current target binding/config/generation (including
+the durable identity-index OID) at each boundary. Old-generation attach,
+Apply, token authorization and ACK fail closed. Replacement scan work never
+manufactures WAL identity or an ACK position.

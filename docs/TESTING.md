@@ -558,3 +558,20 @@ The gate also probes Runtime eligibility before replay/Apply: retired generation
 2 rejects after prepare and after activation; target generation 3 rejects in
 `rebuild_prepared`, `creating`, `scanning`, and `scan_complete`; only
 `catching_up` and `active` admit ordinary WAL under the locked sole binding.
+
+## M12.4 rebuild recovery gate
+
+`scripts/test-m12-rebuild-recovery.sh` is the focused PG17.10/PG18.4 gate for
+instruction-level M12 recovery. It uses observable barriers, slot state and
+deterministic transaction failures rather than sleeps. It covers prepare,
+old-slot cleanup/new-slot creation, lost exporter/snapshot replacement, first/
+middle/final scan retry, scan-complete PostgreSQL restart, catch-up, fence,
+activation and pre-feedback restart, exact retry, stale/foreign slot rejection
+and concurrent-worker exclusion.
+
+Each injected boundary asserts lifecycle, public visibility, current rows,
+private operator values, continuation/checkpoint, generation, slot flush
+position and SQL oracle after retry. M12 lost snapshots must restart only with
+fresh BootstrapId, distinct slot and exact successor generation; M11 marker-null
+recovery is separately regressed unchanged. This gate is not evidence for M12.5
+DDL/least-privilege or M12.6 million-row performance.
