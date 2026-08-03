@@ -5,6 +5,7 @@ use std::{
 };
 
 use postgres::{Client, NoTls};
+use shiba_operator::TypedValue;
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{
     GraphTransaction, PgoutputSource, ProcessOutcome, decode_committed_changes, process,
@@ -177,6 +178,9 @@ fn capture_inputs(
 }
 
 fn results(client: &mut Client) -> Vec<(i64, i64, i64)> {
+    let scalar_partition = TypedValue::Bool(true)
+        .to_canonical_json()
+        .expect("canonical scalar state partition");
     client
         .query(
             "SELECT ((result.graph_id - 1) * 2 + result.result_id - 2),
@@ -184,11 +188,13 @@ fn results(client: &mut Client) -> Vec<(i64, i64, i64)> {
                     COALESCE(state.state_payload, decode('0000000000000000','hex'))
              FROM shiba.graph_result AS result
              LEFT JOIN shiba_internal.graph_node_state AS state
-               ON state.graph_id = result.graph_id
+              ON state.graph_id = result.graph_id
               AND state.node_id = result.result_id - 2
               AND state.namespace = 0
+              AND state.partition_key_payload = $1
+              AND state.item_key_payload = $2
              ORDER BY result.graph_id, result.result_id",
-            &[],
+            &[&scalar_partition, &b"null".as_slice()],
         )
         .unwrap()
         .into_iter()

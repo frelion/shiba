@@ -1,6 +1,6 @@
-# V2 goal gap after M15.6
+# V2 goal gap after M15
 
-## M15.1--M15.6 SQL frontend status
+## M15.1--M15.7 SQL frontend status
 
 The bounded SQL `SELECT` parser emits an ephemeral `UnboundQuery`. M15.4 now
 implements a pure Binder for the first single-source projection/filter/compute
@@ -31,8 +31,8 @@ It did not add the SQL parser. Ten pure Compiler tests prove strict bounds,
 canonical digest/topology, generic M14-shape equivalence, exact catalog type
 coordinates and corrupt/old declaration rejection. The complete PG17.10/PG18.4
 release matrix passed 52 scripts and 104 invocations, including registration,
-bootstrap, rebuild, recovery and two-source lifecycle gates. M15.2 is green;
-M15 as a whole is not complete.
+bootstrap, rebuild, recovery and two-source lifecycle gates. M15.2 was green but
+was not completion by itself; M15.3--M15.7 subsequently close the milestone.
 
 M15.4 directed PG17.10/PG18.4 runs prove the quoted single-source SQL example
 through atomic registration/rollback, full-keyed SQL differential, deterministic
@@ -62,9 +62,13 @@ continuation, both-side atomic WAL, live ACK/replay, right-PK replacement
 fail-closed and whole-graph changed-ObjectAddress rebuild. No production
 authority or legacy implementation was added.
 
-Still unproved are the frozen 10,000-query and registration performance/heap
-gates, remaining final negative/static checks, and the complete M15.7 matrix.
-M15.6 is not M15 completion.
+M15.7 closes the frozen frontend, registration and release gates. The final
+runner passed 56 scripts on PG17.10 and PG18.4, for 112 PostgreSQL invocations.
+Frontend median/p95 latency was 6.833/11.958 us and 8.125/13.792 us; admitted
+64 KiB input latency was 170.959/216.500 us. Registration median/p95 was
+1.546625/1.623708 ms and 1.687958/1.782958 ms. Modeled frontend heap was
+3,342,336 bytes, with observed frontend/registration RSS growth no greater
+than 112 KiB. M15 is complete at its declared SQL subset; V2 is not complete.
 
 ## M14.7 completion status
 
@@ -201,11 +205,10 @@ count authority itself has been removed.
 
 ## Still unproved
 
-Final frontend performance/release closure, additional operator families,
-non-bigint result shapes, cross-host
-sustained soak, empirical heap peak, contention tail latency, automatic
-receiver supervision/reconnect, and broader binding/operator lifecycles remain
-outside the proved boundary.
+Additional operator families, non-bigint result shapes, cross-host sustained
+soak, whole-system allocator/heap behavior under prolonged load, contention
+tail latency, automatic receiver supervision/reconnect, and broader
+binding/operator lifecycles remain outside the proved boundary.
 
 ## M13.5 release evidence
 

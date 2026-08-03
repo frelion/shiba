@@ -3,6 +3,7 @@ use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
     QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
+use shiba_operator::TypedValue;
 use shiba_protocol::{GraphId, SlotGeneration, SourceId};
 use shiba_runtime::{
     M2Error, PgoutputSource, ProcessOutcome, compile_and_register, decode_committed_changes,
@@ -255,34 +256,79 @@ fn generic_kernel_persists_scalar_and_keyed_outputs_atomically() {
         )
         .unwrap();
     assert_eq!(durable(&mut client), before_corrupt);
+    let scalar_partition = TypedValue::Bool(true)
+        .to_canonical_json()
+        .expect("canonical scalar state partition");
+    let scalar_item = b"null".as_slice();
     let state: Vec<u8> = client
         .query_one(
-            "SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id=1 AND node_id=1 AND namespace=0",
-            &[],
+            "SELECT state_payload FROM shiba_internal.graph_node_state
+             WHERE graph_id=1 AND node_id=1 AND namespace=0
+               AND partition_key_payload=$1 AND item_key_payload=$2",
+            &[&scalar_partition, &scalar_item],
         )
         .unwrap()
         .get(0);
-    client.execute("UPDATE shiba_internal.graph_node_state SET state_payload=decode('00','hex') WHERE graph_id=1 AND node_id=1 AND namespace=0", &[]).unwrap();
+    client
+        .execute(
+            "UPDATE shiba_internal.graph_node_state SET state_payload=decode('00','hex')
+         WHERE graph_id=1 AND node_id=1 AND namespace=0
+           AND partition_key_payload=$1 AND item_key_payload=$2",
+            &[&scalar_partition, &scalar_item],
+        )
+        .unwrap();
     assert!(matches!(
         process(&mut client, &corrupt_input),
         Err(M2Error::Kernel(_))
     ));
     client
         .execute(
-            "UPDATE shiba_internal.graph_node_state SET state_payload=$1 WHERE graph_id=1 AND node_id=1 AND namespace=0",
-            &[&state],
+            "UPDATE shiba_internal.graph_node_state SET state_payload=$1
+             WHERE graph_id=1 AND node_id=1 AND namespace=0
+               AND partition_key_payload=$2 AND item_key_payload=$3",
+            &[&state, &scalar_partition, &scalar_item],
         )
         .unwrap();
     assert_eq!(durable(&mut client), before_corrupt);
 
-    client.batch_execute("UPDATE shiba_internal.graph_node_state SET state_payload=decode('7fffffffffffffff','hex') WHERE graph_id=1 AND node_id=2 AND namespace=0; UPDATE shiba.graph_result SET value_bigint=9223372036854775807 WHERE graph_id=1 AND result_id=5").unwrap();
+    client
+        .execute(
+            "UPDATE shiba_internal.graph_node_state
+         SET state_payload=decode('7fffffffffffffff','hex')
+         WHERE graph_id=1 AND node_id=2 AND namespace=0
+           AND partition_key_payload=$1 AND item_key_payload=$2",
+            &[&scalar_partition, &scalar_item],
+        )
+        .unwrap();
+    client
+        .execute(
+            "UPDATE shiba.graph_result SET value_bigint=9223372036854775807
+         WHERE graph_id=1 AND result_id=5",
+            &[],
+        )
+        .unwrap();
     let overflow = durable(&mut client);
     assert!(matches!(
         process(&mut client, &corrupt_input),
         Err(M2Error::Kernel(_))
     ));
     assert_eq!(durable(&mut client), overflow);
-    client.batch_execute("UPDATE shiba_internal.graph_node_state SET state_payload=decode('0000000000000028','hex') WHERE graph_id=1 AND node_id=2 AND namespace=0; UPDATE shiba.graph_result SET value_bigint=40 WHERE graph_id=1 AND result_id=5").unwrap();
+    client
+        .execute(
+            "UPDATE shiba_internal.graph_node_state
+         SET state_payload=decode('0000000000000028','hex')
+         WHERE graph_id=1 AND node_id=2 AND namespace=0
+           AND partition_key_payload=$1 AND item_key_payload=$2",
+            &[&scalar_partition, &scalar_item],
+        )
+        .unwrap();
+    client
+        .execute(
+            "UPDATE shiba.graph_result SET value_bigint=40
+         WHERE graph_id=1 AND result_id=5",
+            &[],
+        )
+        .unwrap();
     assert_eq!(
         process(&mut client, &corrupt_input).unwrap(),
         ProcessOutcome::Applied

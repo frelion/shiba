@@ -43,6 +43,7 @@ scripts/check-m15-parser.sh
 scripts/check-m15-registration.sh
 scripts/check-m15-aggregates.sh
 scripts/check-m15-join.sh
+scripts/check-m15-release.sh
 
 # An unborn branch has no tracked diff, so check every tracked-or-untracked
 # text file directly for whitespace damage and missing final newlines.
@@ -412,10 +413,13 @@ import pathlib
 
 goal_gap = pathlib.Path("docs/GOAL_GAP.md").read_text()
 required = (
-    "# V2 goal gap after M15.6",
+    "# V2 goal gap after M15",
     "Active/non-pristine rebuild for the declared",
     "That green gate closes the declared active",
     "96 successful PG invocations",
+    "56 scripts on PG17.10 and PG18.4",
+    "112 PostgreSQL invocations",
+    "M15 is complete at its declared SQL subset",
 )
 for marker in required:
     if marker not in goal_gap:

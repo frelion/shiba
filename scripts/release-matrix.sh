@@ -95,6 +95,7 @@ m15_gates=(
   test-m15-sql-vertical.sh
   test-m15-sql-aggregates.sh
   test-m15-sql-join.sh
+  test-m15-sql-performance.sh
 )
 
 cd "$root"
@@ -190,6 +191,7 @@ scripts/check-m15-parser.sh
 scripts/check-m15-registration.sh
 scripts/check-m15-aggregates.sh
 scripts/check-m15-join.sh
+scripts/check-m15-release.sh
 cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo test -p shiba-operator -p shiba-compiler
@@ -235,4 +237,16 @@ for label in pg17-m12 pg18-m12; do
   fi
   performance_line="$(grep -o 'M12 performance measured .*' "$performance_log")"
   echo "$label: $performance_line"
+done
+echo "M15 SQL frontend performance evidence:"
+for label in pg17-m15 pg18-m15; do
+  performance_log="$logs/${label}_test-m15-sql-performance.log"
+  frontend_count="$(grep -c 'M15 SQL frontend performance ' "$performance_log" || true)"
+  registration_count="$(grep -c 'M15 SQL registration performance ' "$performance_log" || true)"
+  if [[ "$frontend_count" -ne 1 || "$registration_count" -ne 1 ]]; then
+    echo "M15 performance test for $label emitted frontend=$frontend_count registration=$registration_count markers, expected one each" >&2
+    exit 1
+  fi
+  echo "$label: $(grep 'M15 SQL frontend performance ' "$performance_log")"
+  echo "$label: $(grep 'M15 SQL registration performance ' "$performance_log")"
 done

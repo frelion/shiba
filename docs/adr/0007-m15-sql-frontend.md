@@ -1,6 +1,6 @@
 # ADR 0007: bounded SQL frontend over QuerySpec
 
-Status: accepted for M15.1; implemented through the M15.6 two-source SQL vertical.
+Status: accepted and completed through M15.7.
 
 ## Context
 
@@ -69,7 +69,7 @@ Directed PG17.10/PG18.4 production lifecycle tests now prove bootstrap,
 catch-up, live Apply/ACK, rollback/retry/replay and aggregate rebuild against
 SQL oracles. At the M15.5 boundary they did not prove Join SQL or the final
 least-privilege/performance/release gates; M15.6 closes the directed Join and
-split-role portion below, while M15.7 retains performance and final release.
+split-role portion below, and M15.7 closes performance and final release.
 
 M15.6 validates the two-source edge using the existing M14 InnerJoin rather
 than a complete-query recipe. QuerySpec membership remains sorted by SourceId,
@@ -84,8 +84,13 @@ publication/slot/generation/snapshot/continuation, both-source Apply and ACK,
 Apply-before-ACK replay, exact right-PK replacement invalidation and graph-wide
 changed-ObjectAddress rebuild. No Runtime, Ingress, Bootstrap, Rebuild,
 continuation or ACK authority changes, and no legacy implementation is reused.
-M15.7 still owns frozen frontend/registration performance and the complete
-release matrix.
+M15.7 closes the frozen frontend/registration performance and complete release
+matrix without changing the decision. The exact runner passed 56 scripts on
+PG17.10 and PG18.4 (112 PostgreSQL invocations). Frontend median/p95 was
+6.833/11.958 us and 8.125/13.792 us; registration median/p95 was
+1.546625/1.623708 ms and 1.687958/1.782958 ms. The 64 KiB case, modeled heap
+and observed RSS all passed their predeclared bounds. This accepts M15's bounded
+SQL subset, not general SQL or the whole V2.
 
 ## Bounds
 

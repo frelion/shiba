@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use postgres::{Client, NoTls};
+use shiba_operator::TypedValue;
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{M2Error, PgoutputSource, ProcessOutcome, decode_committed_changes, process};
 
@@ -37,18 +38,23 @@ fn source(client: &mut Client) -> PgoutputSource {
 }
 
 fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
+    let scalar_partition = TypedValue::Bool(true)
+        .to_canonical_json()
+        .expect("canonical scalar state partition");
     let row = client
         .query_one(
             "SELECT
                 (SELECT value_bigint FROM shiba.graph_result WHERE graph_id=1 AND result_id=3),
                 (SELECT value_bigint FROM shiba.graph_result WHERE graph_id=1 AND result_id=4),
                 (SELECT state_payload FROM shiba_internal.graph_node_state
-                 WHERE graph_id=1 AND node_id=1 AND namespace=0),
+                 WHERE graph_id=1 AND node_id=1 AND namespace=0
+                   AND partition_key_payload=$1 AND item_key_payload=$2),
                 (SELECT state_payload FROM shiba_internal.graph_node_state
-                 WHERE graph_id=1 AND node_id=2 AND namespace=0),
+                 WHERE graph_id=1 AND node_id=2 AND namespace=0
+                   AND partition_key_payload=$1 AND item_key_payload=$2),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.graph_continuation)",
-            &[],
+            &[&scalar_partition, &b"null".as_slice()],
         )
         .expect("query count and sum durable state");
     (

@@ -4,6 +4,7 @@ use shiba_ingress::{
     AttachOptions, BootstrapOptions, BootstrapSession, BootstrapSpec, GovernedGraphSession,
     ReplicationMode,
 };
+use shiba_operator::TypedValue;
 use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
 
 #[path = "m12_rebuild_contract/support.rs"]
@@ -30,14 +31,22 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
             "SELECT bootstrap.phase, bootstrap.bootstrap_id, config.slot_generation,
                     (SELECT count(*) FROM shiba_internal.source_row_state WHERE source_id = 1),
                     (SELECT array_agg(encode(state.state_payload, 'hex') ORDER BY state.node_id)
-                     FROM shiba_internal.graph_node_state state WHERE state.graph_id = 1),
+                     FROM shiba_internal.graph_node_state state
+                     WHERE state.graph_id = 1
+                       AND state.partition_key_payload = $1
+                       AND state.item_key_payload = $2),
                     (SELECT array_agg(result.value_bigint ORDER BY result.result_id)
                      FROM shiba.graph_result result WHERE result.graph_id = 1),
                     (SELECT count(*) FROM shiba_internal.graph_continuation WHERE graph_id = 1)
              FROM shiba_internal.graph_bootstrap bootstrap
              JOIN shiba_internal.graph_ingress_config config USING (graph_id)
              WHERE bootstrap.graph_id = 1",
-            &[],
+            &[
+                &TypedValue::Bool(true)
+                    .to_canonical_json()
+                    .expect("canonical scalar state partition"),
+                &b"null".as_slice(),
+            ],
         )
         .expect("prove active non-pristine authority");
     assert_eq!(active_fact.get::<_, &str>(0), "active");

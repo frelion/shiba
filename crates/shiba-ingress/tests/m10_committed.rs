@@ -31,16 +31,21 @@ fn attach(database_url: &str, replication_url: &str) -> GovernedGraphSession {
 }
 
 fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
+    let scalar_partition = support::scalar_state_partition();
     let row = client
         .query_one(
             "SELECT
                 (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 3),
                 (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 4),
-                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1),
-                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 2),
+                (SELECT state_payload FROM shiba_internal.graph_node_state
+                 WHERE graph_id = 1 AND node_id = 1
+                   AND partition_key_payload = $1 AND item_key_payload = $2),
+                (SELECT state_payload FROM shiba_internal.graph_node_state
+                 WHERE graph_id = 1 AND node_id = 2
+                   AND partition_key_payload = $1 AND item_key_payload = $2),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.graph_continuation)",
-            &[],
+            &[&scalar_partition, &support::scalar_state_item()],
         )
         .expect("query durable business state");
     (

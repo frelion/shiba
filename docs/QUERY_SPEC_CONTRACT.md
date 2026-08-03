@@ -1,6 +1,6 @@
 # M15 QuerySpecV1 contract
 
-## M15.2 cutover and M15.6 binding status
+## M15 declaration cutover and completion status
 
 M15.2 replaced the complete-query `GraphSpecV1`/
 `GraphOutputSpecV1` recipes with this generic QuerySpec. Compiler version 2
@@ -172,10 +172,10 @@ assumptions: sum-only state could not distinguish numeric zero from no non-NULL
 input, and the generic scalar sink/catalog rejected typed NULL active results.
 Both fixes remain inside existing plan/state/result authorities.
 
-This is directed two-version M15.5 evidence, not the M15.7 complete release
+This is directed two-version M15.5 evidence, not by itself the complete release
 matrix. M15.6 subsequently closes the admitted two-table Join SQL and directed
-least-privilege lifecycle boundary below; frozen frontend/registration
-performance remains unproved.
+least-privilege lifecycle boundary below; M15.7 closes frozen frontend and
+registration performance.
 
 ## M15.6 two-source Join binding and lifecycle evidence
 
@@ -206,5 +206,11 @@ keyed SQL oracle, exact right-PK replacement invalidation with no durable/ACK
 advance, and changed-ObjectAddress whole-graph rebuild with post-cutover live
 ACK. No production authority, transaction, continuation or ACK rule changes.
 
-This is directed M15.6 evidence, not the M15.7 complete release matrix or
-frontend/registration performance closure.
+M15.7 re-enrolls this directed evidence in the final 56-script/112-invocation
+PG17.10/PG18.4 release matrix. The same run closes the frozen frontend and
+registration performance gates: frontend median/p95 6.833/11.958 us on PG17
+and 8.125/13.792 us on PG18; registration median/p95
+1.546625/1.623708 ms and 1.687958/1.782958 ms. QuerySpec remains the only
+durable declaration and no SQL text, parser AST or complete-query recipe is
+introduced. M15 is complete at this contract's bounded query shapes, not at a
+general SQL or complete-V2 boundary.

@@ -1,4 +1,5 @@
 use postgres::{Client, NoTls};
+use shiba_operator::TypedValue;
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{M2Error, PgoutputSource, ProcessOutcome, decode_committed_changes, process};
 
@@ -38,16 +39,21 @@ fn values(client: &mut Client) -> (i64, i64, i64) {
         )
         .expect("query results and continuation");
     let public = (row.get(0), row.get(1), row.get(2));
+    let scalar_partition = TypedValue::Bool(true)
+        .to_canonical_json()
+        .expect("canonical scalar state partition");
     let private = client
         .query(
             "SELECT state.state_payload
              FROM shiba.graph_result AS result
              LEFT JOIN shiba_internal.graph_node_state AS state
-               ON state.graph_id = result.graph_id
+              ON state.graph_id = result.graph_id
               AND state.node_id = result.result_id - 2
               AND state.namespace = 0
+              AND state.partition_key_payload = $1
+              AND state.item_key_payload = $2
              WHERE result.graph_id = 1 ORDER BY result.result_id",
-            &[],
+            &[&scalar_partition, &b"null".as_slice()],
         )
         .expect("query private states")
         .into_iter()

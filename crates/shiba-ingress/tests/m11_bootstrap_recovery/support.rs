@@ -5,6 +5,7 @@ use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
     QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
+use shiba_operator::TypedValue;
 use shiba_protocol::{GraphId, SourceId};
 use shiba_runtime::compile_and_register;
 
@@ -110,12 +111,15 @@ pub(crate) fn install_source(client: &mut Client) -> u32 {
 }
 
 pub(crate) fn states(client: &mut Client) -> Vec<(i64, i64)> {
+    let scalar_partition = scalar_state_partition();
     client
         .query(
             "SELECT node_id, state_payload
              FROM shiba_internal.graph_node_state
-             WHERE graph_id = 1 AND node_id IN (1, 2) ORDER BY node_id",
-            &[],
+             WHERE graph_id = 1 AND node_id IN (1, 2)
+               AND partition_key_payload = $1 AND item_key_payload = $2
+             ORDER BY node_id",
+            &[&scalar_partition, &b"null".as_slice()],
         )
         .expect("query operator states")
         .into_iter()
@@ -127,6 +131,16 @@ pub(crate) fn states(client: &mut Client) -> Vec<(i64, i64)> {
             )
         })
         .collect()
+}
+
+pub(crate) fn scalar_state_partition() -> Vec<u8> {
+    TypedValue::Bool(true)
+        .to_canonical_json()
+        .expect("canonical scalar state partition")
+}
+
+pub(crate) const fn scalar_state_item() -> &'static [u8] {
+    b"null"
 }
 
 pub(crate) fn rows(client: &mut Client) -> Vec<(i64, Option<i64>)> {

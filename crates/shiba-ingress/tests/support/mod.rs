@@ -8,10 +8,23 @@ use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
     QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
+use shiba_operator::TypedValue;
 use shiba_protocol::{GraphId, SourceId};
 
 #[allow(dead_code)]
 pub const TEST_GRAPH_ID: u64 = 1;
+
+#[allow(dead_code)]
+pub fn scalar_state_partition() -> Vec<u8> {
+    TypedValue::Bool(true)
+        .to_canonical_json()
+        .expect("canonical scalar state partition")
+}
+
+#[allow(dead_code)]
+pub const fn scalar_state_item() -> &'static [u8] {
+    b"null"
+}
 
 #[allow(dead_code)]
 pub fn count_sum_spec(source_id: u64) -> QuerySpecV1 {

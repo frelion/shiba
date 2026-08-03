@@ -47,8 +47,8 @@ sole durable declaration and OperatorGraph the sole executable authority;
 rebuild recompiles the stored QuerySpec against the explicit target without
 reparsing SQL. This directed gate is enrolled in the now 53-script release
 runner. At the M15.4 boundary the complete 53×2 runner, aggregate/Join SQL,
-registration least privilege and frontend/performance closure were still
-M15.5--M15.7 work; M15.5 subsequently closes the aggregate portion below.
+registration least privilege and frontend/performance closure were still open;
+M15.5--M15.7 subsequently close all of those milestone gates below.
 
 M15.5 extends that same control-plane and execution architecture to four SQL
 aggregate shapes: scalar Count, nullable scalar Sum, filtered grouped Count and
@@ -92,9 +92,17 @@ PG17.10/PG18.4 directed evidence uses separate NOREPLICATION control/Apply and
 REPLICATION receiver credentials plus a public-result-only reader. It proves
 one publication/slot/generation, one snapshot and graph continuation, two-side
 atomic WAL, explicit ACK/replay, right identity replacement fail-closed and
-whole-graph changed-ObjectAddress rebuild. These are new SQL frontend/lifecycle
-proofs over unchanged M14 authorities, not the M15.7 performance or full-release
-closure.
+whole-graph changed-ObjectAddress rebuild. These are SQL frontend/lifecycle
+proofs over unchanged M14 authorities.
+
+M15.7 closes the frontend without changing this architecture. The final
+PG17.10/PG18.4 runner passed 56 exactly enrolled scripts and 112 PostgreSQL
+invocations. Frozen parser and registration latency, 64 KiB admission,
+modeled-heap/RSS and the inherited M12 retained-WAL gates all passed. Raw SQL
+and parser AST therefore remain bounded control-plane inputs; QuerySpec,
+OperatorGraph, Runtime transaction, continuation and ACK ownership remain the
+authorities described above. M15 is complete at this declared SQL subset, not
+the whole V2.
 
 M14.6 cuts the production lifecycle over to the graph boundary frozen in
 [OPERATOR_GRAPH_CONTRACT.md](OPERATOR_GRAPH_CONTRACT.md): one canonical typed
@@ -526,11 +534,10 @@ backoff policy, allocator/RSS peaks, cross-host soak, admission
 for `D + O` or replica identity `FULL`, composite UPDATE and broader old-tuple
 shapes, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving,
-production failover and persisted partial-stream recovery, and the final
-frontend/performance release matrix beyond M15.6's SQL lifecycles,
-additional operator families beyond non-aggregate ProjectRows, broader result
-types, cross-host sustained soak, empirical heap peak, contention tail latency,
-and recovery workers
+production failover and persisted partial-stream recovery, additional operator
+families and result types beyond the M15 subset, cross-host sustained soak,
+whole-system allocator/heap behavior under prolonged load, contention tail
+latency, and recovery workers
 remain.
 
 ## M12.1 one-authority rebuild architecture

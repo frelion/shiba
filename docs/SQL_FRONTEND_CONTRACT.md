@@ -287,8 +287,8 @@ input, overflow rollback with no continuation/feedback advance, retry/replay,
 and changed-ObjectAddress grouped-SUM rebuild. Failure-first tests fixed the
 sum-state zero/empty ambiguity and the generic scalar sink/catalog's previous
 non-NULL-only assumption. M15.6 subsequently closes the admitted cross-schema
-Join SQL and directed least-privilege registration boundary below. Remaining
-negative families and complete release evidence stay M15.7 work.
+Join SQL and directed least-privilege registration boundary below. M15.7 closes
+the remaining frozen negative/static and release evidence.
 
 M15.6 lowers the exact two-source SQL shape to one generic `InnerJoin` QuerySpec
 node and one keyed result. QuerySpec source membership is canonical SourceId
@@ -309,11 +309,17 @@ members, catch-up/live Apply/ACK, one transaction changing both tables,
 Apply-before-ACK replay, full keyed SQL oracle, right effective-PK replacement
 invalidation and graph-wide changed-ObjectAddress rebuild. Missing registration
 and bootstrap writer privileges leave no partial authority. This directed gate
-does not claim M15.7 performance or the complete release runner.
+is re-enrolled by the M15.7 complete release runner.
 
 The final release runner retains exact script enrollment, every M1--M14 gate,
 the frozen parser/registration thresholds and a static scan proving SQL/parser
-types do not enter Operator, Runtime, Ingress or durable graph payloads.
+types do not enter Operator, Runtime, Ingress or durable graph payloads. It
+passed 56 scripts on both PG17.10 and PG18.4, for 112 PostgreSQL invocations.
+Frontend median/p95 latency was 6.833/11.958 us and 8.125/13.792 us; the 64 KiB
+case took 170.959/216.500 us. Registration median/p95 was
+1.546625/1.623708 ms and 1.687958/1.782958 ms. Modeled frontend heap was
+3,342,336 bytes; observed frontend/registration RSS deltas were 96/112 KiB on
+PG17 and 80/64 KiB on PG18. All values remain within the predeclared limits.
 
 ## Non-goals and unproved boundary
 
@@ -327,5 +333,6 @@ pure SQL-to-UnboundQuery parser, and M15.4 completed the Binder/registration and
 first single-source production SQL vertical. M15.5 completed the admitted
 single-source aggregate SQL verticals with nullable scalar output semantics.
 M15.6 completed the admitted two-table Join SQL and its directed split-role
-lifecycle. Frontend/registration performance measurements, remaining negative
-permission/admission families and the full release matrix remain M15.7 work.
+lifecycle. M15.7 completed the frozen performance, negative/static and full
+release gates. M15 is complete at this explicitly bounded frontend scope, not
+as general PostgreSQL SQL and not as the whole V2.

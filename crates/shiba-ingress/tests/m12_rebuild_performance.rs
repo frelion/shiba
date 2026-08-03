@@ -5,6 +5,7 @@ use shiba_ingress::{
     BOOTSTRAP_CONNECTIONS_PER_GRAPH, BootstrapCatchupProgress, BootstrapOptions, PreparedRebuild,
     SnapshotProgress,
 };
+use shiba_operator::TypedValue;
 use shiba_runtime::MAX_BOOTSTRAP_BATCH_ROWS;
 
 #[path = "m12_rebuild_admission/support.rs"]
@@ -57,8 +58,15 @@ fn million_row_active_source_rebuild_is_bounded_and_catches_up_exactly() {
     let old_state = admin
         .query(
             "SELECT state_payload FROM shiba_internal.graph_node_state
-             WHERE graph_id = 1 AND node_id IN (1, 2) ORDER BY node_id",
-            &[],
+             WHERE graph_id = 1 AND node_id IN (1, 2)
+               AND partition_key_payload = $1 AND item_key_payload = $2
+             ORDER BY node_id",
+            &[
+                &TypedValue::Bool(true)
+                    .to_canonical_json()
+                    .expect("canonical scalar state partition"),
+                &b"null".as_slice(),
+            ],
         )
         .expect("read non-pristine operator state");
     assert_eq!(old_state.len(), 2);

@@ -76,8 +76,8 @@ PG18.4 `pg_config`. Both directed runs are green. They execute:
 runner now contains 53 PostgreSQL scripts (106 versioned invocations). M15.4
 acceptance uses the two directed invocations, not a claimed complete 53×2 run.
 The following M15.5 section records its later directed aggregate evidence.
-M15.6 Join SQL and M15.7 least privilege, parser/registration performance and
-complete release matrix remain unproved.
+At the M15.4 boundary, M15.6 Join SQL and M15.7 performance/release evidence
+were unproved; the later sections record their closure.
 
 ## M15.5 aggregate SQL lifecycle evidence
 
@@ -115,9 +115,9 @@ explicit scalar nullability through QuerySpec, compiled output contract and the
 same sink. Neither fix adds a writer, table or execution path, and no legacy
 implementation or SQL workflow was reused.
 
-These are directed PG17.10/PG18.4 M15.5 results. They do not claim the complete
-release matrix, M15.6 Join SQL, M15.7 least-privilege registration or frozen
-frontend/registration performance.
+These are directed PG17.10/PG18.4 M15.5 results. They did not by themselves
+claim the complete release matrix; M15.6 and M15.7 subsequently close Join,
+least-privilege, frontend/registration performance and release enrollment.
 
 ## M15.6 two-source SQL Join lifecycle evidence
 
@@ -155,8 +155,36 @@ Run `scripts/test-m15-sql-join.sh` separately with absolute PG17.10 and PG18.4
   Apply/ACK with the complete SQL oracle.
 
 This reuses M10--M14 production authority and changes no transaction or ACK
-rule. It is not evidence for M15.7 frozen performance or the complete release
-matrix.
+rule. M15.7 re-enrolls it in the complete release matrix.
+
+## M15.7 performance and final release evidence
+
+The exact-enrollment runner passed 56 unique scripts on PostgreSQL 17.10 and
+18.4: 112 successful PostgreSQL invocations, followed by fmt, workspace check
+and tests, clippy with `-D warnings`, L0 and every M15 static contract gate.
+No M1--M14 threshold, workload or assertion was relaxed.
+
+The frozen frontend workload used 10,000 representative accepted queries. On
+PG17 its median/p95 latency was 6.833/11.958 us, the admitted 64 KiB case took
+170.959 us, modeled heap was 3,342,336 bytes and observed RSS growth was
+96 KiB. PG18 measured 8.125/13.792 us, 216.500 us, the same modeled heap and
+80 KiB RSS growth. The registration workload used 200 measured samples after
+10 warmups: PG17 median/p95 was 1.546625/1.623708 ms with 112 KiB RSS growth;
+PG18 was 1.687958/1.782958 ms with 64 KiB RSS growth. These are below the
+predeclared 1 ms median, 5 ms p95, 20 ms maximum-input, 4 MiB modeled-heap and
+25 ms registration-p95 limits.
+
+The inherited M12 million-row gate also remained green. PG17 prepare/handoff/
+scan/catch-up/activation/total was 16.071625 ms, 22.582292 ms, 5.610511417 s,
+2.220375833 s, 18.177958 ms and 7.898309 s; scan rate was 178,236.87 rows/s,
+RSS grew 6,240 KiB and retained WAL peaked at 252,926,624 bytes. PG18 measured
+20.439041 ms, 26.418334 ms, 5.635338791 s, 2.388243375 s, 18.448541 ms and
+8.098652667 s; scan rate was 177,451.62 rows/s, RSS grew 6,368 KiB and retained
+WAL peaked at 252,959,792 bytes. Both WAL peaks remain below 256 MiB.
+
+M15 is complete at the declared bounded SQL frontend and QuerySpec scope. The
+remaining general-SQL, broader-operator/result, cross-host, supervision and
+long-running production boundaries are not covered by this matrix.
 
 ## M15.2 QuerySpec cutover evidence status
 

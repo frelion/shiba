@@ -303,6 +303,16 @@ writes fail without partial authority. Runtime, Ingress, Bootstrap, Rebuild,
 continuation and ACK semantics are unchanged, and no legacy implementation was
 reused.
 
-The frozen frontend/registration performance measurements and final complete
-release matrix remain M15.7 work; M15 is not complete. Directed M15.5/M15.6
-evidence is not a claim that the complete release runner has passed.
+M15.7 closes the frozen performance and release gates. The exact-enrollment
+runner passed 56 scripts on PostgreSQL 17.10 and 18.4, for 112 successful
+PostgreSQL invocations. Frontend median/p95 latency was 6.833/11.958 us on
+PG17 and 8.125/13.792 us on PG18; the admitted 64 KiB input took
+170.959/216.500 us. Registration median/p95 was 1.546625/1.623708 ms and
+1.687958/1.782958 ms. Modeled frontend heap was 3,342,336 bytes and observed
+RSS growth was at most 112 KiB. The unchanged million-row M12 gate retained
+252,926,624/252,959,792 bytes of WAL, below 256 MiB.
+
+M15 is complete at its declared bounded SQL frontend and generic declaration
+scope. This is not completion of V2: general PostgreSQL SQL, broader operators
+and result types, cross-host failover, automatic receiver supervision and
+long-running production soak remain outside the proved boundary.

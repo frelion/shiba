@@ -36,12 +36,15 @@ fn public_results(client: &mut Client) -> Vec<(i64, String, Option<i64>)> {
 }
 
 fn private_state(client: &mut Client) -> Vec<(i64, i64)> {
+    let scalar_partition = support::scalar_state_partition();
     client
         .query(
             "SELECT node_id, state_payload
              FROM shiba_internal.graph_node_state
-             WHERE graph_id = 1 AND node_id IN (1, 2) ORDER BY node_id",
-            &[],
+             WHERE graph_id = 1 AND node_id IN (1, 2)
+               AND partition_key_payload = $1 AND item_key_payload = $2
+             ORDER BY node_id",
+            &[&scalar_partition, &support::scalar_state_item()],
         )
         .expect("query private operator state")
         .into_iter()
