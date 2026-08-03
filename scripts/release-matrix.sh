@@ -88,6 +88,7 @@ m13_gates=(
 m14_gates=(
   test-m14-grouped.sh
   test-m14-graph-runtime.sh
+  test-m14-join-lifecycle.sh
 )
 
 cd "$root"
