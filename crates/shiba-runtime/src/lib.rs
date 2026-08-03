@@ -39,7 +39,7 @@ pub use pgoutput_source::{PgoutputGraph, PgoutputSource};
 pub use processor::{ProcessOutcome, process};
 pub use registration::{
     GraphResultContract, RebuildGraphArtifact, RebuildSourceTarget, RegistrationError,
-    compile_and_register, compile_rebuild_graph,
+    compile_and_register, compile_and_register_in_transaction, compile_rebuild_graph,
 };
 pub use streamed_pgoutput::{decode_streamed_changes, decode_streamed_changes_in_session};
 pub use transaction::{

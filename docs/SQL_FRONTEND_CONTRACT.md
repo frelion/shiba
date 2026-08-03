@@ -258,20 +258,25 @@ families, quoted/unquoted identifiers, aliases, precedence, NULL and arithmetic
 syntax, canonical equivalence/difference and digest golden, stable codes,
 direct exact UTF-8 spans, hard-limit boundaries and malformed/no-panic input.
 They also prove iterative fail-closed canonical validation for public
-UnboundQuery values. Type checking and deterministic QuerySpec NodeIds remain
-Binder/lowering evidence, not parser evidence.
+UnboundQuery values. M15.4 separately proves type checking and deterministic
+QuerySpec lowering in the pure Binder; these are not retroactively parser
+evidence.
 
-This pure evidence does not cover Binder/type checker behavior,
-SourceId/ObjectAddress resolution, QuerySpec lowering or registration. It also
-provides no PG17/18 SQL differential, DDL/lifecycle race or 10,000-query
-performance evidence; those remain later M15 slices.
+M15.4's independent control-plane and PG evidence covers the first
+single-source projection/filter/compute shape. On PG17.10 and PG18.4,
+`scripts/test-m15-sql-vertical.sh` proves the quoted cross-schema query
+`SELECT e."Id", e."Payload" + 1 ... WHERE e."Payload" > 0` through exact
+SourceId/ObjectAddress binding, registration rollback/success, deterministic
+DDL-first drift rejection, bootstrap and concurrent WAL catch-up, live
+Apply/ACK, exact replay, complete key/value SQL differential, and rebuild to a
+changed target ObjectAddress followed by live ACK. Raw SQL/parser AST are not
+persisted and Runtime/Ingress remain parser-free.
 
-Later PG17.10 and PG18.4 directed tests must prove exact relation/column/index binding,
-schema qualification, registration rollback, concurrent DDL barriers,
-drop/recreate, invalidation, duplicate GraphId, least privilege, and full SQL
-oracles for projection/filter/compute/grouped Count/Sum and cross-schema Join.
-Lifecycle tests cover bootstrap, catch-up, live ACK/replay and non-pristine
-rebuild rebind with the same QuerySpec and changed target ObjectAddresses.
+Later PG17.10 and PG18.4 directed tests must still prove grouped Count/Sum and
+cross-schema Join SQL oracles, least-privilege SQL registration and the remaining
+negative binding families. M15.4 has only directed two-version evidence. Its
+script is enrolled as gate 53, but the complete 53-script/106-invocation runner
+is reserved for M15.7 and is not claimed here.
 
 The final release runner retains exact script enrollment, every M1--M14 gate,
 the frozen parser/registration thresholds and a static scan proving SQL/parser
@@ -284,7 +289,8 @@ expressions/functions, implicit casts, durable output naming, SQL result executi
 outer/three-table joins, windows, DISTINCT, Min/Max/Avg, HAVING, subqueries,
 parameters, prepared statements, views, permissions inferred from SQL,
 scheduler, plugins, remote databases or cross-host failover. M15.1 freezes this
-contract. M15.2 completed the generic QuerySpec cutover and M15.3 completed the
-pure SQL-to-UnboundQuery parser. Binder/type checking, QuerySpec lowering,
-registration and their PG17/18/lifecycle/performance evidence remain later
-work.
+contract. M15.2 completed the generic QuerySpec cutover, M15.3 completed the
+pure SQL-to-UnboundQuery parser, and M15.4 completed the Binder/registration and
+first single-source production SQL vertical. Aggregate SQL, two-table Join SQL,
+least-privilege registration, frontend/performance measurements and the full
+release matrix remain M15.5--M15.7 work.

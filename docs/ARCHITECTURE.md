@@ -26,9 +26,28 @@ OperatorGraph, Runtime state/results, continuation, ACK and lifecycle ownership
 do not change. Pure compiler tests and the 52-script/104-invocation
 PG17.10/PG18.4 release matrix are green. M15.3 subsequently adds only the pure
 SQL-to-`UnboundQuery` boundary; it does not change Catalog, Runtime, transaction,
-continuation, rebuild or ACK authority. Binder/type checking, SourceId and
-ObjectAddress resolution, QuerySpec lowering and registration remain later M15
-work.
+continuation, rebuild or ACK authority.
+
+M15.4 implements the next control-plane boundary without moving those
+authorities. The database-independent Binder turns one admitted single-source
+`UnboundQuery` plus exact descriptors into QuerySpec. The separate
+`shiba-sql-registration` crate parses before opening a transaction, then in one
+short transaction resolves the schema-qualified relation to its unique
+registered SourceId, locks bindings in SourceId order, acquires the exact
+relation lock, revalidates ObjectAddresses/invalidation, invokes the pure
+Binder, and delegates all durable writes to Runtime's transaction-local sole
+registration entry. SQL text, spans and parser AST never cross into Runtime,
+Ingress, bootstrap or rebuild.
+
+Directed PG17.10/PG18.4 evidence takes the quoted single-source expression
+`SELECT e."Id", e."Payload" + 1 ... WHERE e."Payload" > 0` through atomic
+registration, exported-snapshot bootstrap, concurrent WAL catch-up, live
+Apply/ACK, exact replay and changed-ObjectAddress rebuild. QuerySpec remains the
+sole durable declaration and OperatorGraph the sole executable authority;
+rebuild recompiles the stored QuerySpec against the explicit target without
+reparsing SQL. This directed gate is enrolled in the now 53-script release
+runner, but the complete 53×2 runner, aggregate/Join SQL, registration least
+privilege and frontend/performance closure remain M15.5--M15.7 work.
 
 M14.6 cuts the production lifecycle over to the graph boundary frozen in
 [OPERATOR_GRAPH_CONTRACT.md](OPERATOR_GRAPH_CONTRACT.md): one canonical typed
@@ -460,8 +479,9 @@ backoff policy, allocator/RSS peaks, cross-host soak, admission
 for `D + O` or replica identity `FULL`, composite UPDATE and broader old-tuple
 shapes, NULL text, binary payloads, TOAST keys, composite replica indexes,
 streaming interleaving,
-production failover and persisted partial-stream recovery, SQL Binder/
-registration and its PostgreSQL lifecycle evidence,
+production failover and persisted partial-stream recovery, aggregate/Join SQL
+binding and the final least-privilege/performance matrix beyond M15.4's first
+single-source PostgreSQL lifecycle,
 additional operator families beyond non-aggregate ProjectRows, broader result
 types, cross-host sustained soak, empirical heap peak, contention tail latency,
 and recovery workers
@@ -631,7 +651,8 @@ The comparison baseline is M11's pristine bootstrap: approximately 3.1 s scan,
 1.3 s catch-up and 3.6 MiB RSS growth. Rebuild adds deliberate prepare,
 retirement and activation work, but still may not add a queue, per-row SQL path,
 second authority or parallel generation. M12.6 completes only the
-declared active nullable-`int8` CountRows/SumInt8 rebuild boundary; TLS,
+declared active nullable-`int8` CountRows/SumInt8 rebuild boundary. M15.4 later
+reuses it for the first SQL-declared changed-ObjectAddress rebuild; TLS,
 automatic reconnect supervision, cross-host/failover operation, broader source
-shapes, SQL Binder/registration and broader result/operator shapes remain
+shapes, aggregate/Join SQL registration and broader result/operator shapes remain
 outside it.

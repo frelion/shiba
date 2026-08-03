@@ -71,9 +71,27 @@ pub fn compile_and_register(
     spec: &QuerySpecV1,
 ) -> Result<OperatorGraph, RegistrationError> {
     let mut transaction = client.transaction()?;
-    let graph = compile_current(&mut transaction, spec)?;
-    insert_graph(&mut transaction, spec, &graph, "active")?;
+    let graph = compile_and_register_in_transaction(&mut transaction, spec)?;
     transaction.commit()?;
+    Ok(graph)
+}
+
+/// Compiles and installs the canonical graph inside the caller-owned transaction.
+///
+/// This is the transaction-local registration boundary for control-plane
+/// frontends. Callers may perform bounded catalog binding in the same
+/// transaction, but this function remains the sole graph definition/member/
+/// result writer and does not commit or roll back the transaction itself.
+///
+/// # Errors
+/// Fails closed if the canonical declaration, exact source descriptors,
+/// compiler contract, or any authority write is invalid.
+pub fn compile_and_register_in_transaction(
+    transaction: &mut Transaction<'_>,
+    spec: &QuerySpecV1,
+) -> Result<OperatorGraph, RegistrationError> {
+    let graph = compile_current(transaction, spec)?;
+    insert_graph(transaction, spec, &graph, "active")?;
     Ok(graph)
 }
 
@@ -134,14 +152,24 @@ fn compile_current(
     transaction: &mut Transaction<'_>,
     spec: &QuerySpecV1,
 ) -> Result<OperatorGraph, RegistrationError> {
-    let mut descriptors = Vec::with_capacity(spec.sources.len());
-    let mut indexes = Vec::new();
-    for source_id in &spec.sources {
-        let (descriptor, identity) =
-            crate::registration_descriptor::source_descriptor(transaction, *source_id)?;
-        descriptors.push(descriptor);
-        indexes.push(identity);
+    let mut lock_order = spec.sources.iter().copied().enumerate().collect::<Vec<_>>();
+    lock_order.sort_unstable_by_key(|(_, source_id)| source_id.get());
+    if lock_order.windows(2).any(|pair| pair[0].1 == pair[1].1) {
+        return Err(CompilerError::InvalidSpec.into());
     }
+
+    let mut resolved = (0..spec.sources.len()).map(|_| None).collect::<Vec<_>>();
+    for (ordinal, source_id) in lock_order {
+        let (descriptor, identity) =
+            crate::registration_descriptor::source_descriptor(transaction, source_id)?;
+        resolved[ordinal] = Some((descriptor, identity));
+    }
+    let (descriptors, indexes): (Vec<_>, Vec<_>) = resolved
+        .into_iter()
+        .map(|entry| entry.ok_or(CompilerError::InvalidSpec))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .unzip();
     Ok(shiba_compiler::compile_query_with_optional_identities(
         spec,
         &descriptors,

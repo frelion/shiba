@@ -17,6 +17,7 @@ shiba-operator = { path = "../shiba-operator" }
 [dev-dependencies]
 shiba-compiler = { path = "../shiba-compiler" }
 shiba-protocol = { path = "../shiba-protocol" }
+shiba-sql-registration = { path = "../shiba-sql-registration" }
 
 [lints]
 workspace = true

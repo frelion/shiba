@@ -42,6 +42,42 @@ M15.3 does not prove Binder types, SourceId/ObjectAddress lookup, QuerySpec
 lowering, registration rollback, PG17/18 SQL differential, DDL/lifecycle races
 or the 10,000-query performance thresholds. Those remain later M15 gates.
 
+## M15.4 Binder, registration and first SQL lifecycle evidence
+
+Pure Binder tests cover the admitted single-source keyed projection, checked
+bigint expression, predicate typing, quoted column lookup, exact identity,
+missing/wrong-type inputs and stable binding diagnostics. The independent
+`shiba-sql-registration` tests prove parser diagnostics retain their class/code/
+span and that control-plane diagnostics use the binding class. Static
+`scripts/check-m15-registration.sh` proves only that this control-plane crate may
+join the pure frontend to PostgreSQL/Runtime, Runtime and Ingress remain parser-
+free, the transaction-local registration entry exists, raw SQL is not a Catalog
+field, unsafe is absent and production files respect the frozen limits.
+
+Run `scripts/test-m15-sql-vertical.sh` separately with the absolute PG17.10 and
+PG18.4 `pg_config`. Both directed runs are green. They execute:
+
+- quoted, schema-qualified `SELECT e."Id", e."Payload" + 1 ... WHERE
+  e."Payload" > 0` binding to one already registered SourceId;
+- injected result-registration failure with zero definition/member/result rows,
+  followed by atomic successful registration and canonical graph verification;
+- an observed DDL-first lock race that replaces the payload ObjectAddress,
+  returns `ddl_drift`, persists invalidation and leaves no graph authority;
+- exported-snapshot bootstrap with concurrent INSERT/UPDATE/DELETE, building
+  visibility, WAL catch-up and complete key/value SQL oracle;
+- production live receiver Apply and explicit ACK, NULL/predicate/key-change
+  transitions, Apply-before-ACK session loss, exact `AlreadyApplied` replay and
+  confirmed-flush advancement only after ACK;
+- rebuild to a different relation, column and identity-index ObjectAddress using
+  the durable QuerySpec, concurrent target WAL catch-up, atomic activation and
+  post-cutover live Apply/ACK with the full SQL oracle.
+
+`test-m15-sql-vertical.sh` is enrolled exactly once, so the current release
+runner now contains 53 PostgreSQL scripts (106 versioned invocations). M15.4
+acceptance uses the two directed invocations, not a claimed complete 53×2 run.
+M15.5 aggregate SQL, M15.6 Join SQL, and M15.7 least privilege, parser/
+registration performance and complete release matrix remain unproved.
+
 ## M15.2 QuerySpec cutover evidence status
 
 The green cutover deletes complete-query GraphOutputSpec recipes, changes the

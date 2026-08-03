@@ -7,6 +7,7 @@ members = [
     "crates/shiba-protocol",
     "crates/shiba-runtime",
     "crates/shiba-sql-frontend",
+    "crates/shiba-sql-registration",
 ]
 resolver = "3"
 

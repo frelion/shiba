@@ -1,0 +1,19 @@
+[package]
+name = "shiba-sql-registration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "PostgreSQL control-plane binding for bounded Shiba SQL declarations"
+
+[dependencies]
+postgres = "0.19"
+shiba-compiler = { path = "../shiba-compiler" }
+shiba-operator = { path = "../shiba-operator" }
+shiba-protocol = { path = "../shiba-protocol" }
+shiba-runtime = { path = "../shiba-runtime" }
+shiba-sql-frontend = { path = "../shiba-sql-frontend" }
+
+[lints]
+workspace = true

@@ -20,6 +20,7 @@ pub enum ErrorClass {
     Parser,
     Unsupported,
     Limit,
+    Binding,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +104,14 @@ impl FrontendError {
     pub(crate) const fn limit(code: ErrorCode, span: Span) -> Self {
         Self {
             class: ErrorClass::Limit,
+            code,
+            span,
+        }
+    }
+
+    pub(crate) const fn binding(code: ErrorCode, span: Span) -> Self {
+        Self {
+            class: ErrorClass::Binding,
             code,
             span,
         }

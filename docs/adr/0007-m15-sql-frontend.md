@@ -1,6 +1,6 @@
 # ADR 0007: bounded SQL frontend over QuerySpec
 
-Status: accepted for M15.1.
+Status: accepted for M15.1; implemented through the first M15.4 SQL vertical.
 
 ## Context
 
@@ -46,6 +46,13 @@ are used once for binding/rebinding, never execution identity. This intentionall
 rejects much valid PostgreSQL SQL; extending the subset requires a separate
 vertical slice with pure semantics, PG17/18 oracle evidence and unchanged
 authority boundaries.
+
+M15.4 validates the decision with a pure Binder and a separate short-lived
+PostgreSQL registration adapter. The directed PG17.10/PG18.4 vertical preserves
+the existing QuerySpec/OperatorGraph authority through registration, bootstrap,
+live ACK/replay and changed-ObjectAddress rebuild. This is not evidence for the
+remaining aggregate/Join SQL shapes, least privilege, frontend performance or
+the final complete release matrix.
 
 ## Bounds
 

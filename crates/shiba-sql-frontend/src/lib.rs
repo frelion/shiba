@@ -4,6 +4,8 @@
 
 mod ast;
 mod ast_validate;
+mod bind;
+mod bind_expression;
 mod bounds;
 mod error;
 mod expression;
@@ -16,5 +18,6 @@ pub use ast::{
     Aggregate, BinaryOperator, ColumnRef, Identifier, Join, QualifiedRelation, SelectExpression,
     UnaryOperator, UnboundExpression, UnboundQuery, UnboundSelectItem,
 };
+pub use bind::{ResolvedSource, bind_query};
 pub use error::{ErrorClass, ErrorCode, FrontendError, Span};
 pub use parser::parse_sql;

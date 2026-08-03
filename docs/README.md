@@ -244,6 +244,23 @@ half-open byte spans and closed snake_case errors, and validates public ASTs
 iteratively before canonical encoding. Twenty-two pure tests plus doc-tests,
 fmt/check/clippy and static dependency-isolation gates are green. It adds no
 parser dependency to Runtime, Ingress or Operator and changes no durable
-authority. Binder/type checking, SourceId/ObjectAddress resolution, QuerySpec
-lowering, registration, PG17/18 SQL differential/lifecycle evidence and the
-frozen 10,000-query performance gate remain unproved; M15 is not complete.
+authority.
+
+M15.4 adds the pure Binder/type checker and the separate
+`shiba-sql-registration` control-plane adapter. Parsing finishes before its
+single short PostgreSQL transaction; that transaction resolves one exact
+schema-qualified registered SourceId, locks and revalidates its relation,
+columns and effective identity, lowers canonical QuerySpec, and calls Runtime's
+transaction-local sole registration writer. The directed PG17.10/PG18.4 SQL
+vertical proves quoted cross-schema registration and rollback, a deterministic
+DDL-first ObjectAddress race, exported-snapshot bootstrap, concurrent I/U/D
+catch-up, production live Apply/explicit ACK, Apply-before-ACK replay, full
+key/value SQL differential, and rebuild to a changed target ObjectAddress with
+post-cutover live ACK. Raw SQL and parser AST remain ephemeral; QuerySpec and
+OperatorGraph authority are unchanged.
+
+The new gate is enrolled as the 53rd release script, but the complete
+53-script/106-invocation runner has not yet been executed as M15.4 evidence.
+Aggregate SQL (M15.5), two-table Join SQL (M15.6), least-privilege registration,
+the frozen frontend/performance measurements and the final full matrix (M15.7)
+remain unproved; M15 is not complete.

@@ -1,6 +1,6 @@
 # M15 QuerySpecV1 contract
 
-## M15.2 cutover status
+## M15.2 cutover and M15.4 binding status
 
 M15.2 replaced the complete-query `GraphSpecV1`/
 `GraphOutputSpecV1` recipes with this generic QuerySpec. Compiler version 2
@@ -13,9 +13,11 @@ Acceptance evidence is complete: ten pure Compiler tests cover strict
 codec/bounds/digest/topology and generic M14-shape compilation; the full
 PG17.10/PG18.4 release runner passed 52 scripts and 104 invocations, including
 Runtime registration, bootstrap/rebuild/recovery and Join lifecycle. M15.3 now
-provides a bounded pure SQL-to-`UnboundQuery` parser, but the Binder/type checker
-and `UnboundQuery`-to-QuerySpec lowering remain later M15 work. SQL text and
-UnboundQuery are still ephemeral and are not accepted by Runtime.
+provides a bounded pure SQL-to-`UnboundQuery` parser. M15.4 adds the pure Binder
+and the separate SQL registration control plane for the first single-source
+projection/filter/compute vertical. SQL text and UnboundQuery remain ephemeral
+and are not accepted by Runtime; only the resulting canonical QuerySpec enters
+the existing registration writer.
 
 ## Authority
 
@@ -116,3 +118,27 @@ Runtime and Join lifecycle gates passed within the complete 52-script,
 104-invocation release matrix. Failure-first migration also preserved the exact
 wrong-column catalog coordinate and corrected stale test-only node/result IDs;
 no production fallback or alternate declaration path was introduced.
+
+## M15.4 binding and lifecycle evidence
+
+The pure Binder accepts an exact ordered `ResolvedSource` containing the live
+`SourceDescriptor` and effective `IdentityIndexDescriptor`. It type-checks the
+first admitted SQL shape, assigns deterministic generic nodes, and emits the
+same strict QuerySpec contract; it performs no PostgreSQL access and owns no
+transaction. `shiba-sql-registration` is the only control-plane bridge from
+parser output to PostgreSQL. Parse completes before its short transaction; the
+transaction resolves the exact schema/relation, requires one registered
+SourceId, locks bindings in canonical order, takes/revalidates the relation and
+ObjectAddresses, rejects invalidation, invokes the pure Binder, and calls
+Runtime's transaction-local registration writer. Commit or rollback covers the
+QuerySpec, OperatorGraph, membership and result contracts together.
+
+On both PG17.10 and PG18.4, `scripts/test-m15-sql-vertical.sh` proves the quoted
+cross-schema query `SELECT e."Id", e."Payload" + 1 ... WHERE e."Payload" > 0`
+through registration rollback/success, exact bound graph persistence,
+bootstrap/catch-up, live Apply/ACK, `AlreadyApplied` replay, complete keyed SQL
+oracle, and an explicit target relation/index/publication with changed
+ObjectAddresses rebuilt from the durable QuerySpec. A DDL-first column
+replacement creates an observed lock wait and returns stable `ddl_drift`
+without partial graph rows. The script is enrolled as release gate 53; a full
+53-script run on both versions is not claimed as M15.4 evidence.

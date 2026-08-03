@@ -5,7 +5,9 @@ use shiba_compiler::{
 };
 use shiba_operator::{ObjectAddress, OperatorGraph, OperatorNodeKind};
 use shiba_protocol::{GraphId, SourceId};
-use shiba_runtime::{M2Error, RegistrationError, compile_and_register};
+use shiba_runtime::{
+    M2Error, RegistrationError, compile_and_register, compile_and_register_in_transaction,
+};
 
 mod support;
 
@@ -220,6 +222,25 @@ fn m9_live_graph_compile_and_registration_are_atomic_and_private() {
     client
         .batch_execute("DROP SCHEMA m9_registration_test CASCADE")
         .unwrap();
+
+    {
+        let mut transaction = client.transaction().expect("open caller-owned transaction");
+        let compiled = compile_and_register_in_transaction(&mut transaction, &declaration)
+            .expect("register inside caller-owned transaction");
+        assert_eq!(compiled.graph_id, declaration.graph_id);
+        let count: i64 = transaction
+            .query_one(
+                "SELECT count(*) FROM shiba_internal.graph_definition WHERE graph_id = 1",
+                &[],
+            )
+            .expect("query uncommitted definition")
+            .get(0);
+        assert_eq!(count, 1);
+        transaction
+            .rollback()
+            .expect("roll back caller-owned transaction");
+    }
+    assert_eq!(authority_counts(&mut client), (0, 0, 0));
 
     let compiled = compile_and_register(&mut client, &declaration).expect("register graph");
     assert_eq!(authority_counts(&mut client), (1, 1, 2));

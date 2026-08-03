@@ -1333,6 +1333,7 @@ dependencies = [
  "shiba-operator",
  "shiba-protocol",
  "shiba-runtime",
+ "shiba-sql-registration",
 ]
 
 [[package]]
@@ -1369,7 +1370,22 @@ name = "shiba-sql-frontend"
 version = "0.1.0"
 dependencies = [
  "sha2 0.10.9",
+ "shiba-compiler",
+ "shiba-operator",
+ "shiba-protocol",
  "sqlparser",
+]
+
+[[package]]
+name = "shiba-sql-registration"
+version = "0.1.0"
+dependencies = [
+ "postgres",
+ "shiba-compiler",
+ "shiba-operator",
+ "shiba-protocol",
+ "shiba-runtime",
+ "shiba-sql-frontend",
 ]
 
 [[package]]
