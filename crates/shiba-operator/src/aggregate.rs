@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::aggregate_group::GroupState;
 use crate::aggregate_plan::{AggregateSpec, prepare, specs};
@@ -21,6 +21,7 @@ pub(crate) fn state_read_set(
 ) -> Result<StateReadSet, KernelError> {
     let mut keys = Vec::new();
     let mut partitions = Vec::new();
+    let mut ranges = Vec::new();
     for spec in specs(graph)? {
         let prepared = prepare(graph, batch, &spec)?;
         crate::graph_budget::EvaluationBudget::check_batch(&prepared)
@@ -37,8 +38,9 @@ pub(crate) fn state_read_set(
             .map_err(|_| KernelError::InvalidTransition)?;
         keys.extend(local.keys);
         partitions.extend(local.partitions);
+        ranges.extend(local.ranges);
     }
-    StateReadSet::with_partitions(keys, partitions).map_err(|_| KernelError::InvalidState)
+    StateReadSet::with_ranges(keys, partitions, ranges).map_err(|_| KernelError::InvalidState)
 }
 
 pub(crate) fn apply(
@@ -67,10 +69,10 @@ pub(crate) fn apply(
             return Err(KernelError::InvalidTransition);
         }
         let mut initial = BTreeMap::new();
-        for (key, values) in &touched {
+        for (key, group) in &touched {
             initial.insert(
                 key.clone(),
-                crate::aggregate_group::decode(&spec, snapshot, values.clone())?,
+                crate::aggregate_group::decode(&spec, snapshot, group.values.clone())?,
             );
         }
         let mut normalized = touched
@@ -116,13 +118,19 @@ fn touched_groups(
     spec: &AggregateSpec,
     batch: &DeltaBatch,
     budget: &mut crate::graph_budget::GraphBudget,
-) -> Result<BTreeMap<TypedValue, Vec<TypedValue>>, KernelError> {
+) -> Result<BTreeMap<TypedValue, crate::aggregate_group::TouchedGroup>, KernelError> {
     let mut groups = BTreeMap::new();
     if spec.groups.is_empty() {
         budget
             .charge_touched_groups(1)
             .map_err(|_| KernelError::InvalidTransition)?;
-        groups.insert(TypedValue::Bool(true), Vec::new());
+        groups.insert(
+            TypedValue::Bool(true),
+            crate::aggregate_group::TouchedGroup {
+                values: Vec::new(),
+                extrema_values: vec![BTreeSet::new(); spec.calls.len()],
+            },
+        );
     }
     for row in batch
         .rows
@@ -135,7 +143,33 @@ fn touched_groups(
                 .charge_touched_groups(1)
                 .map_err(|_| KernelError::InvalidTransition)?;
         }
-        groups.insert(key, values);
+        let group = groups
+            .entry(key)
+            .or_insert_with(|| crate::aggregate_group::TouchedGroup {
+                values,
+                extrema_values: vec![BTreeSet::new(); spec.calls.len()],
+            });
+        for (index, call) in spec.calls.iter().enumerate() {
+            if !matches!(
+                call.function,
+                crate::AggregateFunctionV1::MinInt8 | crate::AggregateFunctionV1::MaxInt8
+            ) {
+                continue;
+            }
+            let Some(expression) = call.expression.as_ref() else {
+                return Err(KernelError::WrongType);
+            };
+            match expression
+                .evaluate(&spec.input_layout, row)
+                .map_err(|_| KernelError::WrongType)?
+            {
+                TypedValue::Int8(value) => {
+                    group.extrema_values[index].insert(value);
+                }
+                TypedValue::Null(crate::ValueType::Int8) => {}
+                _ => return Err(KernelError::WrongType),
+            }
+        }
     }
     Ok(groups)
 }

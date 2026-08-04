@@ -250,7 +250,7 @@ pub(crate) fn decode_extrema<'a>(
             return Err(KernelError::InvalidState);
         };
         let Some(state) = &entry.state else {
-            return Err(KernelError::InvalidState);
+            continue;
         };
         if state.codec_version != AGGREGATE_STATE_CODEC_VERSION {
             return Err(KernelError::InvalidState);

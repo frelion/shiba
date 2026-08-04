@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    DeltaBatch, GraphError, GraphTransition, ResultMutation, StateKey, StateMutation, StateReadSet,
-    TypedValue,
+    DeltaBatch, GraphError, GraphTransition, ResultMutation, StateKey, StateMutation, StateRange,
+    StateReadSet, TypedValue,
     graph::{MAX_GRAPH_DELTA_ROWS, MAX_GRAPH_WORK_BYTES, MAX_NODE_DELTA_ROWS},
 };
 
@@ -106,6 +106,22 @@ impl GraphBudget {
         Ok(())
     }
 
+    pub(crate) fn charge_range(&mut self, range: &StateRange) -> Result<(), GraphError> {
+        self.charge_partition_entry()?;
+        let limit = usize::try_from(range.limit).map_err(|_| GraphError::OutputLimit)?;
+        self.state_keys = self
+            .state_keys
+            .checked_add(limit)
+            .ok_or(GraphError::OutputLimit)?;
+        if self.state_keys > MAX_STATE_KEYS {
+            return Err(GraphError::OutputLimit);
+        }
+        let bytes = value_bytes(&range.partition_key)?
+            .checked_add(16)
+            .ok_or(GraphError::OutputLimit)?;
+        self.charge_work_bytes(bytes)
+    }
+
     pub(crate) fn charge_state_mutation(&mut self) -> Result<(), GraphError> {
         self.state_mutations = self
             .state_mutations
@@ -139,6 +155,9 @@ impl GraphBudget {
             .ok_or(GraphError::OutputLimit)?;
         if self.state_keys > MAX_STATE_KEYS || self.partition_entries > MAX_PARTITION_ENTRIES {
             return Err(GraphError::OutputLimit);
+        }
+        for range in &read_set.ranges {
+            self.charge_range(range)?;
         }
         self.charge_work_bytes(read_set_bytes(read_set)?)
     }
@@ -206,6 +225,12 @@ fn read_set_bytes(read_set: &StateReadSet) -> Result<usize, GraphError> {
     for partition in &read_set.partitions {
         bytes = bytes
             .checked_add(value_bytes(&partition.partition_key)?)
+            .ok_or(GraphError::OutputLimit)?;
+    }
+    for range in &read_set.ranges {
+        bytes = bytes
+            .checked_add(value_bytes(&range.partition_key)?)
+            .and_then(|value| value.checked_add(16))
             .ok_or(GraphError::OutputLimit)?;
     }
     Ok(bytes)

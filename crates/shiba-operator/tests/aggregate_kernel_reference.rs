@@ -6,8 +6,9 @@ use shiba_operator::{
     EncodedOperatorState, Expression, GraphEffectOrigin, KernelError, MultiInputBatch, NodeId,
     NodeInput, ObjectAddress, OperatorGraph, OperatorNode, OperatorNodeKind, OutputContract,
     ResultField, ResultMutation, ResultSchemaV1, RowDelta, SourceDeltaBatch, SourcePort,
-    StateContract, StateEntry, StateKey, StateMutation, StateSnapshot, TypedResultRowV1, TypedRow,
-    TypedValue, ValueType, apply_graph_plan, graph_state_read_set, source_typed_layout,
+    StateContract, StateEntry, StateKey, StateMutation, StateRangeDirection, StateSnapshot,
+    TypedResultRowV1, TypedRow, TypedValue, ValueType, apply_graph_plan, graph_state_read_set,
+    source_typed_layout,
 };
 use shiba_protocol::{BootstrapBatchId, BootstrapId, GraphId, SourceId};
 
@@ -170,33 +171,41 @@ fn apply(
     batch: &MultiInputBatch,
 ) -> Result<Vec<TypedValue>, KernelError> {
     let read_set = graph_state_read_set(graph, batch)?;
-    let snapshot = StateSnapshot::new(
-        &read_set,
-        read_set
-            .keys
+    let mut entries = read_set
+        .keys
+        .iter()
+        .map(|key| StateEntry {
+            key: key.clone(),
+            state: store.get(key).cloned(),
+        })
+        .collect::<Vec<_>>();
+    for range in &read_set.ranges {
+        let mut candidates = store
             .iter()
-            .map(|key| StateEntry {
-                key: key.clone(),
-                state: store.get(key).cloned(),
+            .filter(|(key, _)| {
+                range.node_id == key.node_id
+                    && range.namespace == key.namespace
+                    && range.partition_key == key.partition_key
+                    && matches!(key.item_key, Some(TypedValue::Int8(_)))
             })
-            .chain(
-                store
-                    .iter()
-                    .filter(|(key, _)| {
-                        read_set.partitions.iter().any(|partition| {
-                            partition.node_id == key.node_id
-                                && partition.namespace == key.namespace
-                                && partition.partition_key == key.partition_key
-                        })
-                    })
-                    .map(|(key, state)| StateEntry {
-                        key: key.clone(),
-                        state: Some(state.clone()),
-                    }),
-            )
-            .collect(),
-    )
-    .map_err(|_| KernelError::InvalidState)?;
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(key, _)| key.item_key.clone());
+        if matches!(range.direction, StateRangeDirection::Descending) {
+            candidates.reverse();
+        }
+        entries.extend(
+            candidates
+                .into_iter()
+                .take(usize::try_from(range.limit).unwrap())
+                .map(|(key, state)| StateEntry {
+                    key: key.clone(),
+                    state: Some(state.clone()),
+                }),
+        );
+    }
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+    entries.dedup_by(|left, right| left.key == right.key);
+    let snapshot = StateSnapshot::new(&read_set, entries).map_err(|_| KernelError::InvalidState)?;
     let transition = apply_graph_plan(graph, &snapshot, batch)?;
     for delta in transition.state_deltas {
         match delta.mutation {

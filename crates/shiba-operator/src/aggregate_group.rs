@@ -1,7 +1,10 @@
+use std::collections::BTreeSet;
+
 use crate::aggregate_plan::AggregateSpec;
 use crate::aggregate_state::{self, CallState};
 use crate::{
-    KernelError, StateDelta, StateKey, StateMutation, StatePartition, StateReadSet, TypedValue,
+    INT8_ORDER_KEY_VERSION, KernelError, StateDelta, StateKey, StateMutation, StateRange,
+    StateRangeDirection, StateReadSet, TypedValue,
 };
 
 pub(crate) const MEMBERSHIP_NAMESPACE: u16 = 0;
@@ -13,18 +16,28 @@ pub(crate) struct GroupState {
     pub calls: Vec<CallState>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TouchedGroup {
+    pub values: Vec<TypedValue>,
+    pub extrema_values: Vec<BTreeSet<i64>>,
+}
+
 pub(crate) fn read_set(
     spec: &AggregateSpec,
-    groups: impl IntoIterator<Item = Vec<TypedValue>>,
+    groups: impl IntoIterator<Item = TouchedGroup>,
     budget: &mut crate::graph_budget::GraphBudget,
 ) -> Result<StateReadSet, KernelError> {
     let mut keys = Vec::new();
-    let mut partitions = Vec::new();
-    for (index, values) in groups.into_iter().enumerate() {
+    let mut ranges = Vec::new();
+    for (index, group) in groups.into_iter().enumerate() {
         if index >= crate::MAX_TOUCHED_GROUPS {
             return Err(KernelError::InvalidTransition);
         }
-        let partition_key = values.first().cloned().unwrap_or(TypedValue::Bool(true));
+        let partition_key = group
+            .values
+            .first()
+            .cloned()
+            .unwrap_or(TypedValue::Bool(true));
         if keys.len() >= crate::MAX_STATE_KEYS {
             return Err(KernelError::InvalidTransition);
         }
@@ -32,16 +45,46 @@ pub(crate) fn read_set(
             .charge_state_key()
             .map_err(|_| KernelError::InvalidTransition)?;
         keys.push(state_key(spec, partition_key.clone(), MEMBERSHIP_NAMESPACE));
-        for call in &spec.calls {
+        for (call_index, call) in spec.calls.iter().enumerate() {
             if is_extrema(call.function) {
-                budget
-                    .charge_partition_entry()
-                    .map_err(|_| KernelError::InvalidTransition)?;
-                partitions.push(StatePartition {
+                let touched = group
+                    .extrema_values
+                    .get(call_index)
+                    .ok_or(KernelError::InvalidState)?;
+                for value in touched {
+                    budget
+                        .charge_state_key()
+                        .map_err(|_| KernelError::InvalidTransition)?;
+                    keys.push(state_key_with_item(
+                        spec,
+                        partition_key.clone(),
+                        call.ordinal,
+                        *value,
+                    ));
+                }
+                let limit = u32::try_from(
+                    touched
+                        .len()
+                        .checked_add(1)
+                        .ok_or(KernelError::InvalidTransition)?,
+                )
+                .map_err(|_| KernelError::InvalidTransition)?;
+                let range = StateRange {
                     node_id: spec.node_id,
                     namespace: call.ordinal,
                     partition_key: partition_key.clone(),
-                });
+                    direction: if matches!(call.function, crate::AggregateFunctionV1::MinInt8) {
+                        StateRangeDirection::Ascending
+                    } else {
+                        StateRangeDirection::Descending
+                    },
+                    limit,
+                    order_key_version: INT8_ORDER_KEY_VERSION,
+                };
+                budget
+                    .charge_range(&range)
+                    .map_err(|_| KernelError::InvalidTransition)?;
+                ranges.push(range);
             } else {
                 budget
                     .charge_state_key()
@@ -50,7 +93,7 @@ pub(crate) fn read_set(
             }
         }
     }
-    StateReadSet::with_partitions(keys, partitions).map_err(|_| KernelError::InvalidState)
+    StateReadSet::with_ranges(keys, Vec::new(), ranges).map_err(|_| KernelError::InvalidState)
 }
 
 pub(crate) fn decode(

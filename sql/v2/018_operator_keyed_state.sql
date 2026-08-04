@@ -11,6 +11,12 @@ CREATE TABLE shiba_internal.graph_node_state (
     item_key_payload bytea NOT NULL CHECK (
         pg_catalog.octet_length(item_key_payload) > 0
     ),
+    item_order_key bytea CHECK (
+        (item_key_payload = pg_catalog.convert_to('null', 'UTF8')
+            AND item_order_key IS NULL)
+        OR (item_key_payload <> pg_catalog.convert_to('null', 'UTF8')
+            AND pg_catalog.octet_length(item_order_key) = 8)
+    ),
     codec_version integer NOT NULL CHECK (codec_version > 0),
     state_payload bytea NOT NULL,
     CONSTRAINT graph_node_state_primary PRIMARY KEY (
@@ -19,6 +25,12 @@ CREATE TABLE shiba_internal.graph_node_state (
     CONSTRAINT graph_node_state_definition FOREIGN KEY (graph_id, codec_version)
         REFERENCES shiba_internal.graph_definition (graph_id, state_codec_version)
 );
+
+CREATE INDEX graph_node_state_ordered_item
+    ON shiba_internal.graph_node_state (
+        graph_id, node_id, namespace, partition_key_payload, item_order_key
+    )
+    WHERE item_order_key IS NOT NULL;
 
 CREATE TABLE shiba_internal.graph_result_row (
     graph_id bigint NOT NULL,

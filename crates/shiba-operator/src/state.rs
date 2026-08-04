@@ -6,6 +6,7 @@ use crate::{EncodedOperatorState, NodeId, TypedValue};
 
 /// Version of the signed-int8 order-key encoding used by ordered state reads.
 pub const INT8_ORDER_KEY_VERSION: u32 = 1;
+pub const MAX_STATE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -265,7 +266,9 @@ impl fmt::Display for StateError {
 /// Encodes an `i64` so bytewise ascending order is signed numeric order.
 #[must_use]
 pub const fn int8_order_key(value: i64) -> [u8; 8] {
-    (value as u64 ^ (1_u64 << 63)).to_be_bytes()
+    let mut bytes = value.to_be_bytes();
+    bytes[0] ^= 0x80;
+    bytes
 }
 
 /// Validates one persisted order key against its canonical int8 item key.
@@ -286,6 +289,11 @@ pub fn validate_int8_order_key(value: &TypedValue, order_key: &[u8]) -> Result<(
 }
 
 /// Returns the derived order key for a state item, or `None` for unit state.
+///
+/// # Errors
+///
+/// Returns [`StateError::InvalidOrderKey`] when a keyed state item is not an
+/// `Int8`, because no ordered-key contract exists for other value types.
 pub fn state_item_order_key(key: &StateKey) -> Result<Option<Vec<u8>>, StateError> {
     match key.item_key.as_ref() {
         None => Ok(None),
@@ -293,6 +301,8 @@ pub fn state_item_order_key(key: &StateKey) -> Result<Option<Vec<u8>>, StateErro
         Some(_) => Err(StateError::InvalidOrderKey),
     }
 }
+
+impl std::error::Error for StateError {}
 
 #[cfg(test)]
 mod tests {
@@ -381,5 +391,3 @@ mod tests {
         );
     }
 }
-
-impl std::error::Error for StateError {}
