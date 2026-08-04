@@ -41,12 +41,14 @@ pub(crate) fn compile_having(
     compile_having_inner(expression, 0, &mut nodes, &mut boolean_terms)
 }
 
+#[allow(clippy::too_many_lines)]
 fn compile_having_inner(
     expression: &crate::QueryHavingExpressionV1,
     depth: usize,
     nodes: &mut usize,
     boolean_terms: &mut usize,
 ) -> Result<HavingExpression, CompilerError> {
+    use crate::QueryHavingExpressionV1 as H;
     *nodes = nodes.checked_add(1).ok_or(CompilerError::InvalidSpec)?;
     if depth > shiba_operator::MAX_HAVING_DEPTH || *nodes > shiba_operator::MAX_HAVING_NODES {
         return Err(CompilerError::InvalidSpec);
@@ -72,7 +74,6 @@ fn compile_having_inner(
             return Err(CompilerError::InvalidSpec);
         }
     }
-    use crate::QueryHavingExpressionV1 as H;
     Ok(match expression {
         H::Call { ordinal } => HavingExpression::Call { ordinal: *ordinal },
         H::Int8Literal { value } => HavingExpression::Int8Literal { value: *value },

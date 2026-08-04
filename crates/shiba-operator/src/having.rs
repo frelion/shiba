@@ -79,14 +79,9 @@ impl HavingExpression {
                 )
             }
             Self::Int8Literal { .. } | Self::NullLiteral => Ok(ValueType::Int8),
-            Self::Equal { left, right } | Self::NotEqual { left, right } => {
-                charge_boolean(boolean_terms)?;
-                require_comparison(
-                    left.validate_inner(calls, depth + 1, nodes, boolean_terms)?,
-                    right.validate_inner(calls, depth + 1, nodes, boolean_terms)?,
-                )
-            }
-            Self::Less { left, right }
+            Self::Equal { left, right }
+            | Self::NotEqual { left, right }
+            | Self::Less { left, right }
             | Self::LessEqual { left, right }
             | Self::Greater { left, right }
             | Self::GreaterEqual { left, right } => {
