@@ -351,8 +351,10 @@ functions. Building rows remain private and activation publishes the complete
 set. Fixed scalar/key/value columns and the keyed-only sink were removed in
 place; no compatibility view, dual write or second result authority exists.
 Generic Aggregate, multi-call, exact MinInt8/MaxInt8 and restricted grouped
-HAVING are complete through M16.6; final performance/extensibility evidence is
-the remaining M16 slice.
+HAVING are complete through M16.6. M16.7 closes the frozen performance,
+release-matrix and function-ABI extensibility audit for the declared Int8
+subset; AVG/variance/Numeric, DISTINCT, outer joins, windows and production
+soak remain outside M16.
 
 ## M16.3 generic Aggregate kernel
 

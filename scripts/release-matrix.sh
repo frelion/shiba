@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-click M1--current-M15 release matrix. Every PostgreSQL scenario owns an isolated cluster.
+# One-click M1--current-M16 release matrix. Every PostgreSQL scenario owns an isolated cluster.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then

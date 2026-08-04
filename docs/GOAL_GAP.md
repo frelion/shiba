@@ -1,4 +1,4 @@
-# V2 goal gap during M16
+# V2 goal gap after M16
 
 ## M16.3 generic Aggregate status
 
@@ -11,8 +11,9 @@ wire shapes without adapters. M16.4 now adds multi-call SQL and Count(expr)
 through the same Aggregate node and wide result authority, with PG17/18
 bootstrap, live, ACK and rebuild evidence. M16.5 now adds production
 MinInt8/MaxInt8 with exact multiplicity and PG17/18 SQL differential evidence.
-M16.6 now adds exact grouped HAVING visibility transitions; final M16
-performance/release evidence remains M16.7.
+M16.6 adds exact grouped HAVING visibility transitions. M16.7 closes the
+frozen performance, release and extensibility evidence without changing the
+authority or transaction model.
 
 ## M16.4 multi-call Aggregate status
 
@@ -30,7 +31,27 @@ live Apply. No new authority, state table, result sink, or transaction path was
 introduced. M16.5 extends the same gate with complete MIN/MAX rows, duplicate
 extrema deletion, NULL transitions and SQL oracle comparison on PG17/18.
 M16.6 extends the same gate with grouped HAVING transitions and complete-row
-SQL oracle comparison; final M16 performance/extensibility closure remains.
+SQL oracle comparison. M16.7 closes the exact-enrollment release matrix and
+the static function-ABI extensibility audit.
+
+## M16.7 release and extensibility status
+
+M16.7 retains the M15/M12 frozen workload and stop lines and passes the exact
+current release matrix on PostgreSQL 17.10 and 18.4: 57 unique scripts and
+114 successful PostgreSQL invocations. The matrix includes the complete M1–M15
+correctness, recovery, bootstrap, rebuild, concurrency and performance gates,
+plus the M16 wide-result gate. No threshold, workload, ACK rule or recovery
+assertion was relaxed.
+
+The static extensibility audit confirms that concrete aggregate-function
+dispatch is confined to `shiba-operator` aggregate modules. Runtime, Ingress,
+Catalog SQL, Bootstrap, Rebuild and Result Sink remain function-independent;
+adding a future function over an existing `ValueType` requires only its
+versioned descriptor/kernel, Binder mapping and shared reference fixtures.
+
+M16 is complete for the declared Int8 aggregate subset. AVG, variance/stddev,
+Numeric/Decimal, DISTINCT, outer or three-table joins, windows, plugins,
+cross-host failover and long-running production soak remain unproved.
 
 ## M16.5 exact MIN/MAX status
 

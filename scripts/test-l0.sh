@@ -426,7 +426,7 @@ import pathlib
 
 goal_gap = pathlib.Path("docs/GOAL_GAP.md").read_text()
 required = (
-    "# V2 goal gap during M16",
+    "# V2 goal gap after M16",
     "M16.2 wide-result implementation status",
     "Active/non-pristine rebuild for the declared",
     "That green gate closes the declared active",

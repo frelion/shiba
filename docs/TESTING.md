@@ -30,9 +30,13 @@ bootstrap, live I/U/D, explicit feedback, exact replay, and changed-target
 rebuild plus post-rebuild live Apply. M16.5 extends this production gate with
 `min(payload)`/`max(payload)`, duplicate-extrema and NULL transitions, and
 complete PG17.10/PG18.4 SQL row comparison. M16.6 adds complete-row HAVING
-transitions; final M16 performance closure remains later.
+transitions; M16.7 records the final performance and extensibility evidence
+without changing these semantics.
 
-The full PG17 matrix exposed the existing two-second walsender timeout while a
+M16.7 closes the frozen release and extensibility gates: the exact-enrollment
+runner passes 57 scripts and 114 PostgreSQL invocations on PG17.10/PG18.4.
+The static audit proves function dispatch remains confined to operator aggregate
+modules. The full PG17 matrix previously exposed the existing two-second walsender timeout while a
 10,000-row generic Aggregate retry was synchronously applying. The receiver now
 refreshes only the prior durable coordinate before and during Apply. The M10 streaming
 gate proves that the retry still advances slot feedback only after Runtime
@@ -1106,6 +1110,8 @@ The one-command current release matrix has this fixed order:
 It may reuse existing scripts, but may not skip, delete or weaken a historical
 gate. The wrapper's final status is insufficient unless every constituent
 result and count is reported. `scripts/release-matrix.sh` is green on
-PostgreSQL 17.10 and 18.4: 48 unique PG scripts, 41 foundation plus seven M12
-per version grouping, and 96 successful invocations. It emits exactly one
-performance record for each server version.
+PostgreSQL 17.10 and 18.4: 57 unique scripts and 114 successful invocations.
+It emits exactly one performance record for each server version. The M16.7
+static gate additionally verifies that concrete aggregate ABI dispatch is
+absent from Runtime, Ingress, Catalog SQL, Bootstrap, Rebuild and Result Sink,
+and remains confined to operator aggregate modules.

@@ -20,8 +20,9 @@ per-group multiplicity map stored in the existing graph-node state authority;
 NULL is excluded, duplicate extrema retract one copy at a time, and an empty
 multiset finalizes to typed NULL. The same generic binder/compiler/runtime
 path is exercised through PostgreSQL 17.10/18.4 bootstrap and live I/U/D SQL
-oracles. M16.6 now adds restricted grouped HAVING visibility transitions;
-final M16 performance/extensibility closure remains later.
+oracles. M16.6 adds restricted grouped HAVING visibility transitions. M16.7
+closes the frozen release, performance and extensibility gates; the remaining
+function families below are deliberately outside this milestone.
 
 M16 replaces aggregate-kind knowledge outside `shiba-operator` with one stable,
 versioned function ABI and replaces the scalar-or-key/value result assumption
@@ -410,6 +411,27 @@ Result Sink production paths; concrete dispatch is confined to
 `shiba-operator`. It must also prove one Aggregate node owns group expressions,
 namespace `0` is kernel membership, call namespaces are ordinal-derived, and
 there is no function registry table, dual codec or compatibility path.
+
+## M16.7 release and extensibility closure
+
+The final M16 gate runs the exact-enrollment release matrix on PostgreSQL
+17.10 and 18.4: 57 unique scripts and 114 successful PostgreSQL invocations.
+It retains the M15 parser/registration/Apply limits, the 16 MiB and 10,000
+change bounds, the one-million-row bootstrap/rebuild limits and the M12
+retained-WAL limit of 256 MiB. No threshold is widened for M16.
+
+The static extensibility audit is structural: concrete `AggregateFunctionV1`
+dispatch is confined to `shiba-operator` aggregate modules. Runtime, Ingress,
+Catalog SQL, Bootstrap, Rebuild and Result Sink do not name a function variant.
+A future function using an existing `ValueType` therefore changes only its
+versioned descriptor/kernel, Binder name mapping and shared reference fixtures;
+it does not change Runtime transaction orchestration, Catalog authority,
+lifecycle, Result Sink, continuation or ACK.
+
+M16 is complete for the closed Int8 aggregate subset once that matrix and
+audit are green. AVG, variance/stddev, Numeric/Decimal, DISTINCT, outer or
+three-table joins, windows, plugins, cross-host failover and long-running
+production soak remain outside this milestone.
 
 At M16.3 the production result path is generic and wide and CountStar,
 Count(nullable `int8`) and SumInt8 run through the versioned Aggregate ABI.

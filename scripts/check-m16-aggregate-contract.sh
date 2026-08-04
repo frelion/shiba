@@ -202,6 +202,56 @@ if operator_dispatch:
         "M16.3 concrete function dispatch escaped Operator aggregate modules: "
         + ", ".join(operator_dispatch)
     )
+
+# M16.7 extensibility audit: aggregate-function identity and concrete dispatch
+# must not leak into lifecycle, persistence, or transport code.  The operator
+# aggregate modules are the only place allowed to name concrete ABI variants.
+forbidden_runtime_names = (
+    "AggregateFunctionV1::",
+    "AggregateFunctionDescriptor",
+    "CountStar",
+    "MinInt8",
+    "MaxInt8",
+    "GroupedCount",
+    "GroupedSumInt8",
+)
+for scope_root in (
+    pathlib.Path("crates/shiba-runtime/src"),
+    pathlib.Path("crates/shiba-ingress/src"),
+    pathlib.Path("crates/shiba-catalog/src"),
+):
+    for path in scope_root.glob("*.rs"):
+        text = path.read_text()
+        leaks = [marker for marker in forbidden_runtime_names if marker in text]
+        if leaks:
+            raise SystemExit(
+                f"M16.7 concrete aggregate ABI leaked into {path}: {leaks}"
+            )
+
+for path in pathlib.Path("sql/v2").glob("*.sql"):
+    text = path.read_text()
+    if any(marker in text for marker in forbidden_runtime_names):
+        raise SystemExit(f"M16.7 concrete aggregate ABI leaked into Catalog SQL: {path}")
+
+aggregate_modules = {
+    path.name for path in pathlib.Path("crates/shiba-operator/src").glob("aggregate*.rs")
+}
+if not aggregate_modules:
+    raise SystemExit("M16.7 aggregate dispatch modules are missing")
+for path in pathlib.Path("crates/shiba-operator/src").glob("*.rs"):
+    if path.name in aggregate_modules:
+        continue
+    if "AggregateFunctionV1::" in path.read_text():
+        raise SystemExit(f"M16.7 dispatch escaped aggregate module: {path}")
+
+for marker in (
+    "The M16.7 extensibility acceptance test is exact:",
+    "M16.7 release and extensibility closure",
+    "57 unique scripts",
+    "114 successful PostgreSQL invocations",
+):
+    if marker not in contract:
+        raise SystemExit(f"M16.7 evidence marker is missing: {marker}")
 PY
 
-echo "M16 aggregate ABI, wide-result, MIN/MAX and HAVING contract gate passed"
+echo "M16 aggregate ABI, wide-result, MIN/MAX, HAVING and extensibility gate passed"
