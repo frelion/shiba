@@ -40,7 +40,10 @@ fn manually_constructed_ast_cannot_bypass_identifier_or_cardinality_bounds() {
     );
 
     let mut query = parse_sql("SELECT id, payload FROM s.t").unwrap();
-    query.projection.extend(query.projection.clone());
+    let original_projection = query.projection.clone();
+    for _ in 0..8 {
+        query.projection.extend(original_projection.clone());
+    }
     assert_eq!(
         query.canonical_digest().unwrap_err().code,
         ErrorCode::CanonicalizationFailed
