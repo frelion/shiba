@@ -85,7 +85,42 @@ fn validate_having<'a>(
     identifiers: &mut Vec<&'a Identifier>,
     expressions: &mut Vec<(&'a UnboundExpression, usize)>,
 ) -> Result<(), FrontendError> {
+    let mut nodes = 0;
+    let mut boolean_terms = 0;
+    validate_having_inner(
+        having,
+        source_count,
+        identifiers,
+        expressions,
+        0,
+        &mut nodes,
+        &mut boolean_terms,
+    )
+}
+
+fn validate_having_inner<'a>(
+    having: &'a crate::UnboundHavingExpression,
+    source_count: usize,
+    identifiers: &mut Vec<&'a Identifier>,
+    expressions: &mut Vec<(&'a UnboundExpression, usize)>,
+    depth: usize,
+    nodes: &mut usize,
+    boolean_terms: &mut usize,
+) -> Result<(), FrontendError> {
     use crate::UnboundHavingExpression as H;
+    *nodes = nodes.checked_add(1).ok_or_else(|| limit(having.span()))?;
+    if depth > crate::bounds::MAX_HAVING_DEPTH || *nodes > crate::bounds::MAX_HAVING_NODES {
+        return Err(limit(having.span()));
+    }
+    let is_boolean = matches!(having, H::Binary { .. } | H::Unary { .. });
+    if is_boolean {
+        *boolean_terms = boolean_terms
+            .checked_add(1)
+            .ok_or_else(|| limit(having.span()))?;
+        if *boolean_terms > crate::bounds::MAX_HAVING_BOOLEAN_TERMS {
+            return Err(limit(having.span()));
+        }
+    }
     match having {
         H::Aggregate(aggregate) => {
             if aggregate.function.is_empty()
@@ -103,10 +138,34 @@ fn validate_having<'a>(
         }
         H::Int8(..) | H::Null(_) => {}
         H::Binary { left, right, .. } => {
-            validate_having(left, source_count, identifiers, expressions)?;
-            validate_having(right, source_count, identifiers, expressions)?;
+            validate_having_inner(
+                left,
+                source_count,
+                identifiers,
+                expressions,
+                depth + 1,
+                nodes,
+                boolean_terms,
+            )?;
+            validate_having_inner(
+                right,
+                source_count,
+                identifiers,
+                expressions,
+                depth + 1,
+                nodes,
+                boolean_terms,
+            )?;
         }
-        H::Unary { input, .. } => validate_having(input, source_count, identifiers, expressions)?,
+        H::Unary { input, .. } => validate_having_inner(
+            input,
+            source_count,
+            identifiers,
+            expressions,
+            depth + 1,
+            nodes,
+            boolean_terms,
+        )?,
     }
     if let H::Aggregate(aggregate) = having
         && let AggregateArgument::Expression(UnboundExpression::Column(column)) =

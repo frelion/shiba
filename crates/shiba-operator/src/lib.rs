@@ -45,7 +45,9 @@ pub use graph_transition::{
     DeltaBatch, GraphEffectOrigin, GraphTransition, MultiInputBatch, RowDelta, SourceDeltaBatch,
 };
 pub use graph_validation::source_typed_layout;
-pub use having::{HavingError, HavingExpression};
+pub use having::{
+    HavingError, HavingExpression, MAX_HAVING_BOOLEAN_TERMS, MAX_HAVING_DEPTH, MAX_HAVING_NODES,
+};
 pub use kernel::{KernelError, apply_graph_plan, graph_state_read_set};
 pub use model::{EffectOrigin, EncodedOperatorState, ObjectAddress};
 pub use plan::{OutputContract, StateContract};

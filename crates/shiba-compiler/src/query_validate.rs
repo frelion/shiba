@@ -169,8 +169,28 @@ fn validate_having<E: de::Error>(
     expression: &QueryHavingExpressionV1,
     calls: usize,
 ) -> Result<HavingType, E> {
+    let mut nodes = 0;
+    let mut boolean_terms = 0;
+    validate_having_inner(expression, calls, 0, &mut nodes, &mut boolean_terms)
+}
+
+fn validate_having_inner<E: de::Error>(
+    expression: &QueryHavingExpressionV1,
+    calls: usize,
+    depth: usize,
+    nodes: &mut usize,
+    boolean_terms: &mut usize,
+) -> Result<HavingType, E> {
+    *nodes = nodes
+        .checked_add(1)
+        .ok_or_else(|| E::custom("HAVING node overflow"))?;
+    if depth > shiba_operator::MAX_HAVING_DEPTH {
+        return Err(E::custom("HAVING depth bound exceeded"));
+    }
+    if *nodes > shiba_operator::MAX_HAVING_NODES {
+        return Err(E::custom("HAVING node bound exceeded"));
+    }
     use QueryHavingExpressionV1 as H;
-    let child = |value: &H| validate_having::<E>(value, calls);
     match expression {
         H::Call { ordinal } if *ordinal != 0 && usize::from(*ordinal) <= calls => {
             Ok(HavingType::Int8)
@@ -183,25 +203,59 @@ fn validate_having<E: de::Error>(
         | H::LessEqual { left, right }
         | H::Greater { left, right }
         | H::GreaterEqual { left, right } => {
-            if child(left)? == HavingType::Int8 && child(right)? == HavingType::Int8 {
+            *boolean_terms = boolean_terms
+                .checked_add(1)
+                .ok_or_else(|| E::custom("HAVING boolean overflow"))?;
+            if *boolean_terms > shiba_operator::MAX_HAVING_BOOLEAN_TERMS {
+                return Err(E::custom("HAVING boolean bound exceeded"));
+            }
+            if validate_having_inner(left, calls, depth + 1, nodes, boolean_terms)?
+                == HavingType::Int8
+                && validate_having_inner(right, calls, depth + 1, nodes, boolean_terms)?
+                    == HavingType::Int8
+            {
                 Ok(HavingType::Bool)
             } else {
                 Err(E::custom("invalid HAVING comparison"))
             }
         }
         H::IsNull { input } => {
-            child(input)?;
+            *boolean_terms = boolean_terms
+                .checked_add(1)
+                .ok_or_else(|| E::custom("HAVING boolean overflow"))?;
+            if *boolean_terms > shiba_operator::MAX_HAVING_BOOLEAN_TERMS {
+                return Err(E::custom("HAVING boolean bound exceeded"));
+            }
+            validate_having_inner(input, calls, depth + 1, nodes, boolean_terms)?;
             Ok(HavingType::Bool)
         }
         H::And { left, right } | H::Or { left, right } => {
-            if child(left)? == HavingType::Bool && child(right)? == HavingType::Bool {
+            *boolean_terms = boolean_terms
+                .checked_add(1)
+                .ok_or_else(|| E::custom("HAVING boolean overflow"))?;
+            if *boolean_terms > shiba_operator::MAX_HAVING_BOOLEAN_TERMS {
+                return Err(E::custom("HAVING boolean bound exceeded"));
+            }
+            if validate_having_inner(left, calls, depth + 1, nodes, boolean_terms)?
+                == HavingType::Bool
+                && validate_having_inner(right, calls, depth + 1, nodes, boolean_terms)?
+                    == HavingType::Bool
+            {
                 Ok(HavingType::Bool)
             } else {
                 Err(E::custom("invalid HAVING boolean"))
             }
         }
         H::Not { input } => {
-            if child(input)? == HavingType::Bool {
+            *boolean_terms = boolean_terms
+                .checked_add(1)
+                .ok_or_else(|| E::custom("HAVING boolean overflow"))?;
+            if *boolean_terms > shiba_operator::MAX_HAVING_BOOLEAN_TERMS {
+                return Err(E::custom("HAVING boolean bound exceeded"));
+            }
+            if validate_having_inner(input, calls, depth + 1, nodes, boolean_terms)?
+                == HavingType::Bool
+            {
                 Ok(HavingType::Bool)
             } else {
                 Err(E::custom("invalid HAVING negation"))

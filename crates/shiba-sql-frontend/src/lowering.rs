@@ -102,7 +102,7 @@ fn lower_select(
     let having = select
         .having
         .as_ref()
-        .map(|value| lower_having(value, &context, &mut budget))
+        .map(|value| lower_having(value, &context, &mut budget, 0))
         .transpose()?;
     validate_shape(
         &projection,
@@ -155,11 +155,17 @@ fn lower_having(
     expression: &Expr,
     context: &LoweringContext<'_>,
     budget: &mut Budget,
+    depth: usize,
 ) -> Result<UnboundHavingExpression, FrontendError> {
     let span = context.map.span(expression.span());
     if let Expr::Nested(input) = expression {
-        return lower_having(input, context, budget);
+        return lower_having(input, context, budget, depth + 1);
     }
+    let boolean = matches!(
+        expression,
+        Expr::BinaryOp { .. } | Expr::UnaryOp { .. } | Expr::IsNull(_) | Expr::IsNotNull(_)
+    );
+    budget.having(depth, boolean, span)?;
     budget.expression(1, span)?;
     match expression {
         Expr::Function(function) => Ok(UnboundHavingExpression::Aggregate(
@@ -181,7 +187,7 @@ fn lower_having(
             expr,
         } => Ok(UnboundHavingExpression::Unary {
             operator: UnaryOperator::Not,
-            input: Box::new(lower_having(expr, context, budget)?),
+            input: Box::new(lower_having(expr, context, budget, depth + 1)?),
             span,
         }),
         Expr::IsNull(input) | Expr::IsNotNull(input) => Ok(UnboundHavingExpression::Unary {
@@ -190,7 +196,7 @@ fn lower_having(
             } else {
                 UnaryOperator::IsNotNull
             },
-            input: Box::new(lower_having(input, context, budget)?),
+            input: Box::new(lower_having(input, context, budget, depth + 1)?),
             span,
         }),
         Expr::BinaryOp { left, op, right } => {
@@ -212,8 +218,8 @@ fn lower_having(
             };
             Ok(UnboundHavingExpression::Binary {
                 operator,
-                left: Box::new(lower_having(left, context, budget)?),
-                right: Box::new(lower_having(right, context, budget)?),
+                left: Box::new(lower_having(left, context, budget, depth + 1)?),
+                right: Box::new(lower_having(right, context, budget, depth + 1)?),
                 span,
             })
         }

@@ -1,4 +1,7 @@
-use shiba_operator::{AggregateCall, AggregateFunctionV1, HavingExpression, TypedValue, ValueType};
+use shiba_operator::{
+    AggregateCall, AggregateFunctionV1, HavingError, HavingExpression, MAX_HAVING_DEPTH,
+    MAX_HAVING_NODES, TypedValue, ValueType,
+};
 
 fn calls() -> Vec<AggregateCall> {
     vec![
@@ -54,4 +57,38 @@ fn having_rejects_unknown_call_and_wrong_boolean_type() {
         right: Box::new(HavingExpression::Int8Literal { value: 2 }),
     };
     assert!(wrong.validate(&calls()).is_err());
+}
+
+#[test]
+fn having_rejects_depth_node_and_boolean_budget_before_evaluation() {
+    let mut deep = HavingExpression::Call { ordinal: 1 };
+    for _ in 0..=MAX_HAVING_DEPTH {
+        deep = HavingExpression::Not {
+            input: Box::new(deep),
+        };
+    }
+    assert_eq!(deep.validate(&calls()), Err(HavingError::DepthLimit));
+
+    let mut many = HavingExpression::Call { ordinal: 1 };
+    for _ in 0..MAX_HAVING_NODES {
+        many = HavingExpression::IsNull {
+            input: Box::new(many),
+        };
+    }
+    assert!(many.validate(&calls()).is_err());
+
+    fn boolean_tree(level: usize) -> HavingExpression {
+        if level == 0 {
+            HavingExpression::IsNull {
+                input: Box::new(HavingExpression::Call { ordinal: 1 }),
+            }
+        } else {
+            HavingExpression::And {
+                left: Box::new(boolean_tree(level - 1)),
+                right: Box::new(boolean_tree(level - 1)),
+            }
+        }
+    }
+    let booleans = boolean_tree(6);
+    assert_eq!(booleans.validate(&calls()), Err(HavingError::BooleanLimit));
 }

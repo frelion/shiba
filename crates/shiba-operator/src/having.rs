@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AggregateCall, TypedValue, ValueType};
 
+/// Shared structural limits for the closed HAVING predicate contract.
+pub const MAX_HAVING_NODES: usize = 256;
+pub const MAX_HAVING_DEPTH: usize = 32;
+pub const MAX_HAVING_BOOLEAN_TERMS: usize = 64;
+
 /// A bounded predicate evaluated against finalized aggregate-call values.
 ///
 /// This is deliberately separate from source-row expressions: a HAVING
@@ -33,7 +38,9 @@ impl HavingExpression {
     ///
     /// Rejects unknown call ordinals, wrong types and excessive depth.
     pub fn validate(&self, calls: &[AggregateCall]) -> Result<ValueType, HavingError> {
-        self.validate_inner(calls, 0)
+        let mut nodes = 0;
+        let mut boolean_terms = 0;
+        self.validate_inner(calls, 0, &mut nodes, &mut boolean_terms)
     }
 
     /// Evaluates one predicate using finalized aggregate values.
@@ -42,18 +49,25 @@ impl HavingExpression {
     ///
     /// Rejects unknown call ordinals, wrong types and excessive depth.
     pub fn evaluate(&self, calls: &[TypedValue]) -> Result<TypedValue, HavingError> {
-        self.evaluate_inner(calls, 0)
+        let mut nodes = 0;
+        let mut boolean_terms = 0;
+        self.evaluate_inner(calls, 0, &mut nodes, &mut boolean_terms)
     }
 
     fn validate_inner(
         &self,
         calls: &[AggregateCall],
         depth: usize,
+        nodes: &mut usize,
+        boolean_terms: &mut usize,
     ) -> Result<ValueType, HavingError> {
-        if depth >= 32 {
+        *nodes = nodes.checked_add(1).ok_or(HavingError::NodeLimit)?;
+        if depth > MAX_HAVING_DEPTH {
             return Err(HavingError::DepthLimit);
         }
-        let child = |value: &Self| value.validate_inner(calls, depth + 1);
+        if *nodes > MAX_HAVING_NODES {
+            return Err(HavingError::NodeLimit);
+        }
         match self {
             Self::Call { ordinal } => {
                 if *ordinal == 0 || usize::from(*ordinal) > calls.len() {
@@ -66,21 +80,38 @@ impl HavingExpression {
             }
             Self::Int8Literal { .. } | Self::NullLiteral => Ok(ValueType::Int8),
             Self::Equal { left, right } | Self::NotEqual { left, right } => {
-                require_comparison(child(left)?, child(right)?)
+                charge_boolean(boolean_terms)?;
+                require_comparison(
+                    left.validate_inner(calls, depth + 1, nodes, boolean_terms)?,
+                    right.validate_inner(calls, depth + 1, nodes, boolean_terms)?,
+                )
             }
             Self::Less { left, right }
             | Self::LessEqual { left, right }
             | Self::Greater { left, right }
-            | Self::GreaterEqual { left, right } => require_comparison(child(left)?, child(right)?),
+            | Self::GreaterEqual { left, right } => {
+                charge_boolean(boolean_terms)?;
+                require_comparison(
+                    left.validate_inner(calls, depth + 1, nodes, boolean_terms)?,
+                    right.validate_inner(calls, depth + 1, nodes, boolean_terms)?,
+                )
+            }
             Self::IsNull { input } => {
-                child(input)?;
+                charge_boolean(boolean_terms)?;
+                input.validate_inner(calls, depth + 1, nodes, boolean_terms)?;
                 Ok(ValueType::Bool)
             }
             Self::And { left, right } | Self::Or { left, right } => {
-                require_bool(child(left)?, child(right)?)
+                charge_boolean(boolean_terms)?;
+                require_bool(
+                    left.validate_inner(calls, depth + 1, nodes, boolean_terms)?,
+                    right.validate_inner(calls, depth + 1, nodes, boolean_terms)?,
+                )
             }
             Self::Not { input } => {
-                if child(input)? == ValueType::Bool {
+                charge_boolean(boolean_terms)?;
+                if input.validate_inner(calls, depth + 1, nodes, boolean_terms)? == ValueType::Bool
+                {
                     Ok(ValueType::Bool)
                 } else {
                     Err(HavingError::WrongType)
@@ -93,11 +124,16 @@ impl HavingExpression {
         &self,
         calls: &[TypedValue],
         depth: usize,
+        nodes: &mut usize,
+        boolean_terms: &mut usize,
     ) -> Result<TypedValue, HavingError> {
-        if depth >= 32 {
+        *nodes = nodes.checked_add(1).ok_or(HavingError::NodeLimit)?;
+        if depth > MAX_HAVING_DEPTH {
             return Err(HavingError::DepthLimit);
         }
-        let child = |value: &Self| value.evaluate_inner(calls, depth + 1);
+        if *nodes > MAX_HAVING_NODES {
+            return Err(HavingError::NodeLimit);
+        }
         match self {
             Self::Call { ordinal } => calls
                 .get(usize::from(ordinal.saturating_sub(1)))
@@ -105,26 +141,68 @@ impl HavingExpression {
                 .ok_or(HavingError::InvalidCall),
             Self::Int8Literal { value } => Ok(TypedValue::Int8(*value)),
             Self::NullLiteral => Ok(TypedValue::Null(ValueType::Int8)),
-            Self::Equal { left, right } => compare(&child(left)?, &child(right)?, |a, b| a == b),
-            Self::NotEqual { left, right } => compare(&child(left)?, &child(right)?, |a, b| a != b),
-            Self::Less { left, right } => compare(&child(left)?, &child(right)?, |a, b| a < b),
+            Self::Equal { left, right } => {
+                charge_boolean(boolean_terms)?;
+                let left = left.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                let right = right.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                compare(&left, &right, |a, b| a == b)
+            }
+            Self::NotEqual { left, right } => {
+                charge_boolean(boolean_terms)?;
+                let left = left.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                let right = right.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                compare(&left, &right, |a, b| a != b)
+            }
+            Self::Less { left, right } => {
+                charge_boolean(boolean_terms)?;
+                let left = left.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                let right = right.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                compare(&left, &right, |a, b| a < b)
+            }
             Self::LessEqual { left, right } => {
-                compare(&child(left)?, &child(right)?, |a, b| a <= b)
+                charge_boolean(boolean_terms)?;
+                let left = left.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                let right = right.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                compare(&left, &right, |a, b| a <= b)
             }
-            Self::Greater { left, right } => compare(&child(left)?, &child(right)?, |a, b| a > b),
+            Self::Greater { left, right } => {
+                charge_boolean(boolean_terms)?;
+                let left = left.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                let right = right.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                compare(&left, &right, |a, b| a > b)
+            }
             Self::GreaterEqual { left, right } => {
-                compare(&child(left)?, &child(right)?, |a, b| a >= b)
+                charge_boolean(boolean_terms)?;
+                let left = left.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                let right = right.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                compare(&left, &right, |a, b| a >= b)
             }
-            Self::IsNull { input } => Ok(TypedValue::Bool(matches!(
-                child(input)?,
-                TypedValue::Null(_)
-            ))),
-            Self::And { left, right } => boolean(&child(left)?, &child(right)?, and_3vl),
-            Self::Or { left, right } => boolean(&child(left)?, &child(right)?, or_3vl),
-            Self::Not { input } => match as_bool(&child(input)?)? {
-                Some(value) => Ok(TypedValue::Bool(!value)),
-                None => Ok(TypedValue::Null(ValueType::Bool)),
-            },
+            Self::IsNull { input } => {
+                charge_boolean(boolean_terms)?;
+                Ok(TypedValue::Bool(matches!(
+                    input.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?,
+                    TypedValue::Null(_)
+                )))
+            }
+            Self::And { left, right } => {
+                charge_boolean(boolean_terms)?;
+                let left = left.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                let right = right.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                boolean(&left, &right, and_3vl)
+            }
+            Self::Or { left, right } => {
+                charge_boolean(boolean_terms)?;
+                let left = left.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                let right = right.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?;
+                boolean(&left, &right, or_3vl)
+            }
+            Self::Not { input } => {
+                charge_boolean(boolean_terms)?;
+                match as_bool(&input.evaluate_inner(calls, depth + 1, nodes, boolean_terms)?)? {
+                    Some(value) => Ok(TypedValue::Bool(!value)),
+                    None => Ok(TypedValue::Null(ValueType::Bool)),
+                }
+            }
         }
     }
 }
@@ -134,6 +212,15 @@ fn require_comparison(left: ValueType, right: ValueType) -> Result<ValueType, Ha
         Ok(ValueType::Bool)
     } else {
         Err(HavingError::WrongType)
+    }
+}
+
+fn charge_boolean(terms: &mut usize) -> Result<(), HavingError> {
+    *terms = terms.checked_add(1).ok_or(HavingError::BooleanLimit)?;
+    if *terms > MAX_HAVING_BOOLEAN_TERMS {
+        Err(HavingError::BooleanLimit)
+    } else {
+        Ok(())
     }
 }
 
@@ -205,6 +292,8 @@ pub enum HavingError {
     InvalidCall,
     WrongType,
     DepthLimit,
+    NodeLimit,
+    BooleanLimit,
 }
 
 impl fmt::Display for HavingError {
