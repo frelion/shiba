@@ -103,6 +103,12 @@ pub fn apply_graph_plan(
 }
 
 /// Validates graph-wide state/result/work limits before Runtime persistence.
+/// Validates the graph-wide state/result/work budget before persistence.
+///
+/// # Errors
+///
+/// Returns `KernelError::Graph` when any cumulative graph budget is exceeded
+/// or a transition payload cannot be measured canonically.
 pub fn validate_transition_budget(transition: &GraphTransition) -> Result<(), KernelError> {
     let mut budget = crate::graph_budget::GraphBudget::new();
     budget

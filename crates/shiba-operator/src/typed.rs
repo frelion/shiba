@@ -139,6 +139,11 @@ impl TypedLayout {
 
     /// Derives a node output identity from its exact input layout, node id,
     /// value types, and nullable bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TypedError` when the value/nullability widths or derived layout
+    /// bounds are invalid, or when canonical identity encoding fails.
     pub fn derive(
         input: &Self,
         node_id: NodeId,
