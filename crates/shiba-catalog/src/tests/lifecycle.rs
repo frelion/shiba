@@ -33,6 +33,8 @@ fn reservation_and_replacement_are_graph_wide_and_forward_only() {
         "reserve_graph_bootstrap",
         "graph_source_member",
         "graph_bootstrap_checkpoint",
+        "delete from shiba_internal.graph_result_row",
+        "update shiba.graph_result set result_status = 'building'",
         "publication member set does not match graph",
         "replace_pristine_graph_bootstrap",
         "new_generation <> old_generation + 1",
@@ -59,7 +61,9 @@ fn rebuild_is_exact_graph_digest_and_generation_cas() {
         "delete from shiba_internal.graph_continuation",
         "delete from shiba_internal.graph_node_state",
         "update shiba_internal.graph_definition",
-        "result_status, value_payload, value_bigint",
+        "result_status, schema_payload, schema_digest",
+        "target_schema_payloads bytea[]",
+        "target_schema_digests bytea[]",
         "phase = 'rebuild_prepared'",
     ] {
         assert!(sql.contains(required), "missing rebuild rule: {required}");

@@ -30,6 +30,8 @@ fn graph_replaces_all_source_scoped_execution_authorities() {
         "create table shiba_internal.graph_ingress_source",
         "create table shiba_internal.graph_ingress_invalidation",
         "create table shiba.graph_result",
+        "schema_payload bytea not null",
+        "schema_digest bytea not null",
     ] {
         assert!(
             sql.contains(required),

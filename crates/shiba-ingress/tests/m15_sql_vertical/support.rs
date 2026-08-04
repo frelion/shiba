@@ -127,14 +127,12 @@ pub(crate) fn scan_all(bootstrap: &mut BootstrapSession, client: &mut Client) {
 pub(crate) fn assert_building(client: &mut Client) {
     let row = client
         .query_one(
-            "SELECT result_status,value_payload,value_bigint
+            "SELECT result_status
              FROM shiba.graph_result WHERE graph_id=1",
             &[],
         )
         .expect("read building result");
     assert_eq!(row.get::<_, &str>(0), "building");
-    assert_eq!(row.get::<_, Option<Vec<u8>>>(1), None);
-    assert_eq!(row.get::<_, Option<i64>>(2), None);
     assert!(
         client
             .query(
@@ -161,8 +159,10 @@ pub(crate) fn assert_oracle(client: &mut Client, schema: &str, relation: &str) {
         .collect::<Vec<_>>();
     let actual = client
         .query(
-            "SELECT result_key_bigint,result_value_bigint
-             FROM shiba.graph_result_rows WHERE graph_id=1 ORDER BY result_key_bigint",
+            "SELECT
+                (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint,
+                (convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,value}')::bigint
+             FROM shiba.graph_result_rows WHERE graph_id=1 ORDER BY 1",
             &[],
         )
         .expect("query materialized SQL result")

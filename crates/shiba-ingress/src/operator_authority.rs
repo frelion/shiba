@@ -52,7 +52,7 @@ fn load_graph(
     let graph = OperatorGraph::from_canonical_payload(&row.get::<_, Vec<u8>>(2), digest)
         .map_err(|_| IngressError::Governance("compiled graph is invalid"))?;
     if graph.graph_id != graph_id
-        || row.get::<_, i32>(0) != 2
+        || row.get::<_, i32>(0) != 3
         || u32::try_from(row.get::<_, i32>(1)).ok() != Some(graph.format_version)
         || row.get::<_, i32>(4) != 1
         || usize::try_from(row.get::<_, i16>(5)).ok() != Some(graph.sources.len())
@@ -109,18 +109,13 @@ fn validate_results(
     for (result_id, output) in outputs {
         let result = client
             .query_opt(
-                "SELECT output_shape, output_key_type, output_key_nullable,
-                    output_value_type, output_value_nullable, result_status,
-                    value_payload, value_bigint
+                "SELECT result_status, schema_payload, schema_digest
              FROM shiba.graph_result WHERE graph_id = $1 AND result_id = $2",
                 &[&graph_key, &result_id],
             )?
             .ok_or(IngressError::Governance("graph result header is missing"))?;
         if !output_matches(output, &result)
-            || expected_status.is_some_and(|status| result.get::<_, &str>(5) != status)
-            || (require_pristine
-                && (result.get::<_, Option<Vec<u8>>>(6).is_some()
-                    || result.get::<_, Option<i64>>(7).is_some()))
+            || expected_status.is_some_and(|status| result.get::<_, &str>(0) != status)
         {
             return Err(IngressError::Governance("graph result authority drifted"));
         }
@@ -180,30 +175,9 @@ fn load_members(
 }
 
 fn output_matches(contract: &OutputContract, row: &postgres::Row) -> bool {
-    let shape: &str = row.get(0);
-    let key_type: Option<&str> = row.get(1);
-    let key_nullable: bool = row.get(2);
-    let value_type: &str = row.get(3);
-    let value_nullable: bool = row.get(4);
-    value_type == "int8"
-        && match contract {
-            OutputContract::Scalar { nullable, .. } => {
-                shape == "scalar"
-                    && key_type.is_none()
-                    && !key_nullable
-                    && value_nullable == *nullable
-            }
-            OutputContract::KeyedRows {
-                key_nullable: expected_key_nullable,
-                nullable,
-                ..
-            } => {
-                shape == "keyed"
-                    && key_type == Some("int8")
-                    && key_nullable == *expected_key_nullable
-                    && value_nullable == *nullable
-            }
-        }
+    contract.validate().is_ok()
+        && row.get::<_, Vec<u8>>(1) == contract.schema.canonical_payload
+        && exact_digest(row.get(2)).ok() == Some(contract.schema.digest)
 }
 
 fn exact_digest(value: Vec<u8>) -> Result<[u8; 32], IngressError> {

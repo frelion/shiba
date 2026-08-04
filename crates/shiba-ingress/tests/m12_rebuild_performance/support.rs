@@ -38,7 +38,7 @@ pub(crate) fn retained_wal_bytes(client: &mut Client, slot: &str) -> i64 {
 pub(crate) fn assert_building(client: &mut Client) {
     let rows = client
         .query(
-            "SELECT result_status, value_bigint
+            "SELECT result_status, NULL::bigint
              FROM shiba.graph_result WHERE graph_id = 1 AND result_id IN (3, 4) ORDER BY result_id",
             &[],
         )
@@ -60,8 +60,10 @@ pub(crate) fn assert_differential(client: &mut Client) -> (i64, i64) {
     let expected = (oracle.get::<_, i64>(0), oracle.get::<_, i64>(1));
     let result = client
         .query(
-            "SELECT result_status, value_bigint
-             FROM shiba.graph_result WHERE graph_id = 1 AND result_id IN (3, 4) ORDER BY result_id",
+            "SELECT result.result_status,
+                    (SELECT (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint
+                     FROM shiba.graph_result_rows row WHERE row.graph_id=result.graph_id AND row.result_id=result.result_id)
+             FROM shiba.graph_result result WHERE graph_id = 1 AND result_id IN (3, 4) ORDER BY result_id",
             &[],
         )
         .expect("query rebuilt public results");

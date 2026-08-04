@@ -93,7 +93,7 @@ fn install_fixture(client: &mut Client) {
 fn count_rows(client: &mut Client) -> i64 {
     client
         .query_one(
-            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2",
+            "SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 2",
             &[],
         )
         .expect("read CountRows result")

@@ -81,7 +81,12 @@ fn execute_mode(
         batch,
     )?;
     let transition = apply_graph_plan(&locked_graph.graph, &state.snapshot, batch)?;
-    let results = result_sink::lock(transaction, locked_graph.graph_id, expected_status)?;
+    let results = result_sink::lock(
+        transaction,
+        locked_graph.graph_id,
+        &locked_graph.graph,
+        expected_status,
+    )?;
     keyed_state::persist(
         transaction,
         locked_graph.graph_id,

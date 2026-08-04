@@ -1,5 +1,5 @@
 use shiba_compiler::{
-    QUERY_SPEC_VERSION, QueryNodeV1, QueryOperationV1, QueryResultShapeV1, QueryResultV1,
+    QUERY_SPEC_VERSION, QueryNodeV1, QueryOperationV1, QueryResultFieldV1, QueryResultV1,
     QuerySpecV1,
 };
 use shiba_protocol::GraphId;
@@ -40,9 +40,9 @@ fn bind_scalar(
     let [item] = query.projection.as_slice() else {
         return Err(binding(ErrorCode::UnsupportedSyntax, query.span));
     };
-    let (operation, value_nullable) = match &item.expression {
+    let (operation, value_nullable, default_name) = match &item.expression {
         SelectExpression::Aggregate(Aggregate::CountStar { .. }) => {
-            (QueryOperationV1::CountRows, false)
+            (QueryOperationV1::CountRows, false, "count")
         }
         SelectExpression::Aggregate(Aggregate::Sum { input, .. }) => {
             let UnboundExpression::Column(column) = input else {
@@ -54,6 +54,7 @@ fn bind_scalar(
                     value: source_column(descriptor),
                 },
                 true,
+                "sum",
             )
         }
         _ => return Err(binding(ErrorCode::UnsupportedSyntax, item.span)),
@@ -66,10 +67,12 @@ fn bind_scalar(
             state_codec_version: Some(1),
             operation,
         }],
-        QueryResultShapeV1::Scalar {
+        vec![QueryResultFieldV1 {
+            name: crate::bind::result_name(item, default_name),
             value_slot: 0,
-            value_nullable,
-        },
+            nullable: value_nullable,
+        }],
+        vec![],
         query.span,
     )
 }
@@ -162,12 +165,22 @@ fn bind_grouped(
         graph_id,
         source,
         nodes,
-        QueryResultShapeV1::Keyed {
-            key_slot: 0,
-            key_nullable: group.nullable,
-            value_slot: 1,
-            value_nullable: sum.is_some(),
-        },
+        vec![
+            QueryResultFieldV1 {
+                name: crate::bind::result_name(group_item, &group.name),
+                value_slot: 0,
+                nullable: group.nullable,
+            },
+            QueryResultFieldV1 {
+                name: crate::bind::result_name(
+                    aggregate_item,
+                    if sum.is_some() { "sum" } else { "count" },
+                ),
+                value_slot: 1,
+                nullable: sum.is_some(),
+            },
+        ],
+        vec![1],
         query.span,
     )
 }
@@ -176,7 +189,8 @@ fn finish(
     graph_id: GraphId,
     source: &ResolvedSource,
     nodes: Vec<QueryNodeV1>,
-    shape: QueryResultShapeV1,
+    fields: Vec<QueryResultFieldV1>,
+    key_ordinals: Vec<u16>,
     span: crate::Span,
 ) -> Result<QuerySpecV1, FrontendError> {
     let input_node =
@@ -186,7 +200,11 @@ fn finish(
         graph_id,
         sources: vec![source.descriptor.source_id],
         nodes,
-        results: vec![QueryResultV1 { input_node, shape }],
+        results: vec![QueryResultV1 {
+            input_node,
+            fields,
+            key_ordinals,
+        }],
     };
     spec.to_canonical_json()
         .map_err(|_| binding(ErrorCode::CanonicalizationFailed, span))?;

@@ -1,6 +1,6 @@
-# V2 goal gap after M15
+# V2 goal gap during M16
 
-## M16.1 contract and reference status
+## M16.2 wide-result implementation status
 
 M16.1 freezes one closed aggregate descriptor ABI
 for CountStar, Count(nullable `int8`), SumInt8, MinInt8 and MaxInt8, exact
@@ -12,11 +12,17 @@ Ingress, Bootstrap, Rebuild and Result Sink must remain function-independent.
 Twelve database-free reference tests prove the frozen CountStar/Count/Sum/Min/
 Max, grouped/HAVING, corruption, randomized I/U/D and exact-bound semantics.
 
-None of the M16 production or PostgreSQL cutover is yet proved: MIN/MAX execution and
-retraction, multiple aggregate calls, grouped HAVING, wide Catalog/result
-persistence, lifecycle recovery, PG17.10/PG18.4 differential evidence and the
-frozen M16 performance limits remain open. M15 is still the latest implemented
-and release-proved boundary.
+M16.2 replaces the fixed scalar/key/value result authority with one canonical
+schema header and one complete typed-row store. QuerySpec field names/order and
+key ordinals compile into the graph schema; scalar and keyed terminals emit the
+same generic ResultDelta, and Runtime persists it without aggregate dispatch.
+Registration, bootstrap and rebuild carry the exact schema payload/digest;
+building output remains hidden until atomic activation. The superseded columns
+and keyed-only sink are deleted without an adapter, dual write or fallback.
+
+Generic Aggregate execution, MIN/MAX retraction, multiple calls and HAVING are
+still open for M16.3--M16.6. M16.2 does not claim those functions or final M16
+release/performance evidence.
 
 ## M15.1--M15.7 SQL frontend status
 

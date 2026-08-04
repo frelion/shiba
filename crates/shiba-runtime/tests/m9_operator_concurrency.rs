@@ -5,7 +5,7 @@ use std::{
 };
 
 use postgres::{Client, NoTls};
-use shiba_operator::TypedValue;
+use shiba_operator::{ResultSchemaV1, TypedResultRowV1, TypedValue};
 use shiba_protocol::{SlotGeneration, SourceId};
 use shiba_runtime::{
     GraphTransaction, PgoutputSource, ProcessOutcome, decode_committed_changes, process,
@@ -177,16 +177,16 @@ fn capture_inputs(
     (first, second, independent)
 }
 
-fn results(client: &mut Client) -> Vec<(i64, i64, i64)> {
+fn results(client: &mut Client) -> Vec<(i64, Option<i64>, i64)> {
     let scalar_partition = TypedValue::Bool(true)
         .to_canonical_json()
         .expect("canonical scalar state partition");
     client
         .query(
-            "SELECT ((result.graph_id - 1) * 2 + result.result_id - 2),
-                    result.value_bigint,
+            "SELECT result.graph_id, result.result_id, result.schema_payload,
+                    result.schema_digest, result.row_payload,
                     COALESCE(state.state_payload, decode('0000000000000000','hex'))
-             FROM shiba.graph_result AS result
+             FROM shiba.graph_result_rows AS result
              LEFT JOIN shiba_internal.graph_node_state AS state
               ON state.graph_id = result.graph_id
               AND state.node_id = result.result_id - 2
@@ -199,10 +199,29 @@ fn results(client: &mut Client) -> Vec<(i64, i64, i64)> {
         .unwrap()
         .into_iter()
         .map(|row| {
+            let graph_id: i64 = row.get(0);
+            let result_id: i64 = row.get(1);
+            let schema_payload: Vec<u8> = row.get(2);
+            let schema_digest: Vec<u8> = row.get(3);
+            let row_payload: Vec<u8> = row.get(4);
+            let schema = ResultSchemaV1::from_canonical_payload(
+                &schema_payload,
+                schema_digest
+                    .try_into()
+                    .expect("exact schema digest length"),
+            )
+            .expect("decode exact result schema");
+            let result = TypedResultRowV1::from_canonical_payload(&schema, &row_payload)
+                .expect("decode exact result row");
+            let value = match result.values[0] {
+                TypedValue::Int8(value) => Some(value),
+                TypedValue::Null(_) => None,
+                _ => panic!("concurrency scalar result must be nullable int8"),
+            };
             (
-                row.get(0),
-                row.get(1),
-                support::decode_optional_scalar_state(row.get::<_, Option<Vec<u8>>>(2).as_deref()),
+                (graph_id - 1) * 2 + result_id - 2,
+                value,
+                support::decode_optional_scalar_state(row.get::<_, Option<Vec<u8>>>(5).as_deref()),
             )
         })
         .collect()
@@ -249,7 +268,12 @@ fn m9_operator_lock_order_serializes_one_source_without_blocking_another() {
     independent_task.join().unwrap();
     assert_eq!(
         results(&mut client),
-        vec![(1, 0, 0), (2, 0, 0), (3, 1, 1), (4, 5, 5)]
+        vec![
+            (1, Some(0), 0),
+            (2, None, 0),
+            (3, Some(1), 1),
+            (4, Some(5), 5)
+        ]
     );
     assert_eq!(
         continuations(&mut client),
@@ -282,7 +306,12 @@ fn m9_operator_lock_order_serializes_one_source_without_blocking_another() {
     second_task.join().unwrap();
     assert_eq!(
         results(&mut client),
-        vec![(1, 2, 2), (2, 17, 17), (3, 1, 1), (4, 5, 5)]
+        vec![
+            (1, Some(2), 2),
+            (2, Some(17), 17),
+            (3, Some(1), 1),
+            (4, Some(5), 5)
+        ]
     );
     assert_eq!(continuations(&mut client).len(), 3);
     assert_eq!(
@@ -299,6 +328,11 @@ fn m9_operator_lock_order_serializes_one_source_without_blocking_another() {
     );
     assert_eq!(
         results(&mut client),
-        vec![(1, 2, 2), (2, 17, 17), (3, 1, 1), (4, 5, 5)]
+        vec![
+            (1, Some(2), 2),
+            (2, Some(17), 17),
+            (3, Some(1), 1),
+            (4, Some(5), 5)
+        ]
     );
 }

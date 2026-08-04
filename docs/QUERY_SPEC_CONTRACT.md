@@ -1,17 +1,25 @@
 # M15 QuerySpecV1 contract
 
-## M16.1 planned declaration extension
+## M16.2 result declaration cutover
 
-M16.1 freezes a future strict QuerySpec extension in which each normalized
+M16.1 freezes a strict QuerySpec extension in which each normalized
 aggregate expression has one deterministic `AggregateCallId` and one closed,
 versioned function descriptor. Repeated semantically identical calls are
 interned once; result fields and HAVING refer to call identity, never to SQL
 text, aliases or runtime recipes. Compiler resolves this declaration into the
 same sole OperatorGraph authority and canonical `ResultSchemaV1`.
 
-This extension is not implemented in M16.1. The current M15 QuerySpec codec and
-production authority remain unchanged until a later clean-room cutover; no
-parallel decoder, adapter or dual format is authorized.
+M16.2 implements its result declaration half: each terminal owns an ordered
+list of named fields with value slots/nullability and canonical 1-based key
+ordinals. Empty key ordinals denote the scalar singleton. SQL aliases are
+durable public schema names and therefore change QuerySpec/schema/graph digest;
+formatting and spans do not. Compiler emits one canonical `ResultSchemaV1` and
+generic Materialize field-slot list. The old Scalar/Keyed result-shape enum is
+deleted with no parallel decoder, adapter or dual format. AggregateCall
+declarations remain M16.3 work.
+
+This in-place format cutover is stored by compiler version `3`; compiler
+version `2` remains historical M15 evidence, not an accepted current decoder.
 
 ## M15 declaration cutover and completion status
 

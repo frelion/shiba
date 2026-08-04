@@ -188,7 +188,7 @@ pub(crate) fn grant_prepare(client: &mut Client, role: &str) {
              GRANT EXECUTE ON FUNCTION shiba_internal.prepare_graph_rebuild(
                  bigint, bytea, bigint, oid[], oid[], oid, name, bigint,
                  bigint, bigint[], oid[], oid[], oid, name, bigint,
-                 bytea, bytea, bytea, bigint[], text[], boolean[], boolean[]
+                 bytea, bytea, bytea, bigint[], bytea[], bytea[]
              ) TO {role};"
         ))
         .expect("grant only rebuild admission entrypoint");

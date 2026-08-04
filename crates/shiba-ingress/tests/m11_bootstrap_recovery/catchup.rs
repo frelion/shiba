@@ -100,8 +100,11 @@ pub(crate) fn prove_feedback_and_cutover_recovery(
     assert_eq!(
         admin
             .query(
-                "SELECT result_id, result_status, value_bigint
-                 FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
+                "SELECT result.result_id, result.result_status,
+                        (SELECT CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,type}'='null'
+                                     THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint END
+                         FROM shiba.graph_result_rows row WHERE row.graph_id=result.graph_id AND row.result_id=result.result_id)
+                 FROM shiba.graph_result result WHERE graph_id = 1 ORDER BY result_id",
                 &[],
             )
             .expect("query active results")

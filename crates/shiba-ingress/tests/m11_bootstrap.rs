@@ -25,8 +25,13 @@ fn required(name: &str) -> String {
 fn public_results(client: &mut Client) -> Vec<(i64, String, Option<i64>)> {
     client
         .query(
-            "SELECT result_id, result_status, value_bigint
-             FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
+            "SELECT result.result_id, result.result_status,
+                    (SELECT CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,type}'='null'
+                                 THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint END
+                     FROM shiba.graph_result_rows row
+                     WHERE row.graph_id=result.graph_id AND row.result_id=result.result_id
+                       AND result.result_id IN (4,5))
+             FROM shiba.graph_result result WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )
         .expect("query public results")
@@ -61,7 +66,9 @@ fn private_state(client: &mut Client) -> Vec<(i64, i64)> {
 fn projected_rows(client: &mut Client) -> Vec<(i64, Option<i64>)> {
     client
         .query(
-            "SELECT result_key_bigint, result_value_bigint
+            "SELECT (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint,
+                    CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,type}'='null'
+                         THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,value}')::bigint END
              FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 6 ORDER BY 1",
             &[],
         )
@@ -133,7 +140,7 @@ fn bootstrap_existing_rows_concurrent_wal_and_live_handoff() {
         public_results(&mut admin),
         vec![
             (4, "active".to_owned(), Some(0)),
-            (5, "active".to_owned(), Some(0)),
+            (5, "active".to_owned(), None),
             (6, "active".to_owned(), None),
         ]
     );

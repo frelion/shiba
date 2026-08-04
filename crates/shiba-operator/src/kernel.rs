@@ -131,7 +131,5 @@ fn singleton_batch<'a>(
 }
 
 fn result_node_id(result: &ResultDelta) -> crate::NodeId {
-    match result {
-        ResultDelta::Scalar { node_id, .. } | ResultDelta::Keyed { node_id, .. } => *node_id,
-    }
+    result.node_id
 }

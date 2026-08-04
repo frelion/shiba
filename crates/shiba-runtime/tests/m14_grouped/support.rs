@@ -1,4 +1,5 @@
 use postgres::Client;
+use shiba_operator::TypedValue;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct DurableSnapshot {
@@ -45,11 +46,11 @@ pub(crate) fn durable_snapshot(client: &mut Client) -> DurableSnapshot {
                  'headers', (SELECT jsonb_agg(to_jsonb(header) ORDER BY graph_id, result_id)
                              FROM shiba.graph_result AS header),
                  'rows', (SELECT COALESCE(jsonb_agg(to_jsonb(result_row)
-                                  ORDER BY graph_id, result_id, key_payload), '[]')
+                                  ORDER BY graph_id, result_id, row_identity), '[]')
                           FROM (SELECT graph_id, result_id,
-                                       pg_catalog.encode(key_payload, 'hex') AS key_payload,
-                                       result_key_is_null, result_key_bigint,
-                                       result_value_is_null, result_value_bigint
+                                       pg_catalog.encode(schema_digest, 'hex') AS schema_digest,
+                                       pg_catalog.encode(row_identity, 'hex') AS row_identity,
+                                       pg_catalog.encode(row_payload, 'hex') AS row_payload
                                 FROM shiba_internal.graph_result_row) AS result_row)
              )::text",
         ),
@@ -76,21 +77,27 @@ fn result_rows(client: &mut Client, query: &str) -> Vec<ResultRow> {
 pub(crate) fn assert_sql_oracle(client: &mut Client) {
     let actual = result_rows(
         client,
-        "SELECT result_id, result_key_bigint, result_value_bigint,
-                result_key_is_null, result_value_is_null
+        "SELECT result_id,
+                CASE WHEN convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,type}' = 'null'
+                     THEN NULL ELSE (convert_from(row_payload, 'UTF8')::jsonb
+                         #>> '{values,0,value}')::bigint END,
+                CASE WHEN convert_from(row_payload, 'UTF8')::jsonb #>> '{values,1,type}' = 'null'
+                     THEN NULL ELSE (convert_from(row_payload, 'UTF8')::jsonb
+                         #>> '{values,1,value}')::bigint END,
+                convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,type}' = 'null',
+                convert_from(row_payload, 'UTF8')::jsonb #>> '{values,1,type}' = 'null'
          FROM shiba.graph_result_rows WHERE graph_id = 1
-         ORDER BY result_id, result_key_is_null DESC,
-                  result_key_bigint NULLS FIRST",
+         ORDER BY result_id, 4 DESC, 2 NULLS FIRST",
     );
     let expected = result_rows(
         client,
-        "SELECT operator_id, result_key_bigint, result_value_bigint,
-                result_key_is_null, result_value_is_null
+        "SELECT operator_id, key_value, aggregate_value,
+                key_is_null, aggregate_is_null
          FROM (
-             SELECT 7::bigint AS operator_id, payload AS result_key_bigint,
-                    count(*)::bigint AS result_value_bigint,
-                    payload IS NULL AS result_key_is_null,
-                    false AS result_value_is_null
+             SELECT 7::bigint AS operator_id, payload AS key_value,
+                    count(*)::bigint AS aggregate_value,
+                    payload IS NULL AS key_is_null,
+                    false AS aggregate_is_null
              FROM source.events GROUP BY payload
              UNION ALL
              SELECT 8, payload, sum(id)::bigint, payload IS NULL, false
@@ -100,25 +107,23 @@ pub(crate) fn assert_sql_oracle(client: &mut Client) {
                     sum(payload) IS NULL
              FROM source.events GROUP BY id
          ) AS oracle
-         ORDER BY operator_id, result_key_is_null DESC,
-                  result_key_bigint NULLS FIRST",
+         ORDER BY operator_id, key_is_null DESC,
+                  key_value NULLS FIRST",
     );
     assert_eq!(actual, expected, "grouped results differ from SQL oracle");
 }
 
 pub(crate) fn node_state_payload(client: &mut Client, operator_id: i64, key: i64) -> Vec<u8> {
+    let partition = TypedValue::Int8(key)
+        .to_canonical_json()
+        .expect("canonical grouped partition");
     client
         .query_one(
             "SELECT state.state_payload
-         FROM shiba_internal.graph_node_state AS state
-             JOIN shiba_internal.graph_result_row AS result
-               ON result.graph_id = state.graph_id
-              AND result.result_id = CASE state.node_id WHEN 2 THEN 7 WHEN 4 THEN 8 WHEN 6 THEN 9 END
-              AND result.key_payload = state.partition_key_payload
+             FROM shiba_internal.graph_node_state AS state
              WHERE state.graph_id = 1 AND state.node_id = $1
-               AND result.result_key_bigint = $2
-               AND NOT result.result_key_is_null",
-            &[&operator_id, &key],
+               AND state.partition_key_payload = $2",
+            &[&operator_id, &partition],
         )
         .expect("query exact grouped node state")
         .get(0)
@@ -130,19 +135,17 @@ pub(crate) fn set_node_state_payload(
     key: i64,
     payload: &[u8],
 ) {
+    let partition = TypedValue::Int8(key)
+        .to_canonical_json()
+        .expect("canonical grouped partition");
     assert_eq!(
         client
             .execute(
-                "UPDATE shiba_internal.graph_node_state AS state
+                "UPDATE shiba_internal.graph_node_state
                  SET state_payload = $3
-                 FROM shiba_internal.graph_result_row AS result
-                 WHERE state.graph_id = 1 AND state.node_id = $1
-                   AND result.graph_id = state.graph_id
-                   AND result.result_id = CASE state.node_id WHEN 2 THEN 7 WHEN 4 THEN 8 WHEN 6 THEN 9 END
-                   AND result.key_payload = state.partition_key_payload
-                   AND result.result_key_bigint = $2
-                   AND NOT result.result_key_is_null",
-                &[&operator_id, &key, &payload],
+                 WHERE graph_id = 1 AND node_id = $1
+                   AND partition_key_payload = $2",
+                &[&operator_id, &partition, &payload],
             )
             .expect("replace exact grouped node state"),
         1

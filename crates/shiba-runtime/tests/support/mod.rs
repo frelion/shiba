@@ -5,12 +5,12 @@
 
 use std::{fs, num::NonZeroU32, path::PathBuf, process::Command};
 
-use postgres::Client;
+use postgres::{Client, GenericClient};
 use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
-use shiba_operator::NodeId;
+use shiba_operator::{NodeId, ResultSchemaV1, TypedResultRowV1, TypedValue, ValueType};
 use shiba_protocol::{GraphId, SourceId};
 use shiba_runtime::{PgoutputGraph, PgoutputSource, compile_and_register};
 
@@ -31,7 +31,7 @@ pub(super) fn register_count_operator(client: &mut Client, source_id: u64, _oper
         graph_id: GraphId::new(source_id.get()).expect("source-backed graph ID"),
         sources: vec![source_id],
         nodes: vec![query_node(source_id, QueryOperationV1::CountRows, true)],
-        results: vec![scalar_result(1)],
+        results: vec![scalar_result(1, false)],
     };
     compile_and_register(client, &spec).expect("compile and register CountRows graph");
 }
@@ -52,7 +52,7 @@ pub(super) fn register_count_sum_graph(client: &mut Client, source_id: u64) {
                 true,
             ),
         ],
-        results: vec![scalar_result(1), scalar_result(2)],
+        results: vec![scalar_result(1, false), scalar_result(2, true)],
     };
     compile_and_register(client, &spec).expect("compile and register CountRows + SumInt8 graph");
 }
@@ -126,13 +126,15 @@ pub(super) fn column(input: u8, name: &str) -> QueryExpressionV1 {
     }
 }
 
-pub(super) fn scalar_result(input_node: u16) -> QueryResultV1 {
+pub(super) fn scalar_result(input_node: u16, nullable: bool) -> QueryResultV1 {
     QueryResultV1 {
         input_node,
-        shape: QueryResultShapeV1::Scalar {
+        fields: vec![QueryResultFieldV1 {
+            name: "value".into(),
             value_slot: 0,
-            value_nullable: false,
-        },
+            nullable,
+        }],
+        key_ordinals: vec![],
     }
 }
 
@@ -170,6 +172,114 @@ pub(super) fn scalar_state_sum(client: &mut Client) -> i64 {
         .into_iter()
         .map(|row| decode_scalar_state(&row.get::<_, Vec<u8>>(0)))
         .sum()
+}
+
+pub(super) fn canonical_result_rows(
+    client: &mut impl GenericClient,
+    graph_id: i64,
+    result_id: i64,
+) -> (ResultSchemaV1, Vec<TypedResultRowV1>) {
+    let rows = client
+        .query(
+            "SELECT schema_payload, schema_digest, row_payload
+             FROM shiba.graph_result_rows
+             WHERE graph_id = $1 AND result_id = $2
+             ORDER BY row_identity",
+            &[&graph_id, &result_id],
+        )
+        .expect("query complete canonical result rows");
+    let header = client
+        .query_one(
+            "SELECT schema_payload, schema_digest FROM shiba.graph_result
+             WHERE graph_id = $1 AND result_id = $2",
+            &[&graph_id, &result_id],
+        )
+        .expect("query canonical result schema");
+    let schema_payload: Vec<u8> = header.get(0);
+    let schema_digest = digest(header.get(1));
+    let schema = ResultSchemaV1::from_canonical_payload(&schema_payload, schema_digest)
+        .expect("validate canonical result schema");
+    let decoded = rows
+        .into_iter()
+        .map(|row| {
+            assert_eq!(row.get::<_, Vec<u8>>(0), schema_payload);
+            assert_eq!(digest(row.get(1)), schema_digest);
+            TypedResultRowV1::from_canonical_payload(&schema, &row.get::<_, Vec<u8>>(2))
+                .expect("validate complete canonical result row")
+        })
+        .collect();
+    (schema, decoded)
+}
+
+pub(super) fn scalar_int8_result(
+    client: &mut impl GenericClient,
+    graph_id: i64,
+    result_id: i64,
+) -> Option<i64> {
+    let (schema, rows) = canonical_result_rows(client, graph_id, result_id);
+    assert!(schema.is_scalar(), "scalar helper requires scalar schema");
+    assert_eq!(rows.len(), 1, "scalar result has exactly one row");
+    match rows[0].values.as_slice() {
+        [TypedValue::Int8(value)] => Some(*value),
+        [TypedValue::Null(_)] => None,
+        values => panic!("scalar int8 result has unexpected values: {values:?}"),
+    }
+}
+
+pub(super) fn set_scalar_int8_result(
+    client: &mut impl GenericClient,
+    graph_id: i64,
+    result_id: i64,
+    value: Option<i64>,
+) {
+    let (schema, rows) = canonical_result_rows(client, graph_id, result_id);
+    assert!(schema.is_scalar(), "scalar helper requires scalar schema");
+    assert_eq!(rows.len(), 1, "scalar result has exactly one row");
+    let value = value.map_or(TypedValue::Null(ValueType::Int8), TypedValue::Int8);
+    let row = TypedResultRowV1::new(&schema, vec![value]).expect("encode scalar result row");
+    let payload = row.to_canonical_payload().expect("canonical scalar row");
+    assert_eq!(
+        client
+            .execute(
+                "UPDATE shiba_internal.graph_result_row SET row_payload = $1
+                 WHERE graph_id = $2 AND result_id = $3",
+                &[&payload, &graph_id, &result_id],
+            )
+            .expect("inject scalar result state"),
+        1
+    );
+}
+
+pub(super) fn keyed_int8_results(
+    client: &mut impl GenericClient,
+    graph_id: i64,
+    result_id: i64,
+) -> Vec<(Option<i64>, Option<i64>)> {
+    let (schema, rows) = canonical_result_rows(client, graph_id, result_id);
+    assert_eq!(schema.key_ordinals, [1]);
+    let mut decoded: Vec<_> = rows
+        .into_iter()
+        .map(|row| match row.values.as_slice() {
+            [key, value] => (optional_int8(key), optional_int8(value)),
+            values => panic!("keyed int8 result has unexpected values: {values:?}"),
+        })
+        .collect();
+    decoded.sort();
+    decoded
+}
+
+fn optional_int8(value: &TypedValue) -> Option<i64> {
+    match value {
+        TypedValue::Int8(value) => Some(*value),
+        TypedValue::Null(_) => None,
+        value => panic!("expected typed int8 or null, got {value:?}"),
+    }
+}
+
+fn digest(bytes: Vec<u8>) -> [u8; 32] {
+    bytes
+        .try_into()
+        .expect("result schema digest is exactly 32 bytes")
 }
 
 pub(super) struct PgoutputCapture {

@@ -376,10 +376,14 @@ truncating `i64` division, binary `f64`, or an order-dependent approximation as
 canonical state or result. DISTINCT, percentile and median additionally require
 separately bounded exact multiplicity/ordering contracts.
 
-Still unproved after M16.1: every production item described above, including
-the ABI implementation, wide Catalog/Sink, Min/Max ordered state reads,
-multi-call SQL lowering, HAVING deltas, PG17.10/PG18.4 differentials,
-crash/replay/bootstrap/rebuild/least-privilege evidence and performance. Also
+M16.2 implements the canonical wide ResultSchema/TypedResultRow codec, the
+single Catalog header/row authority, generic ResultDelta persistence and the
+registration/bootstrap/rebuild schema handoff. It deliberately does not yet
+implement the Aggregate Function ABI execution path.
+
+Still unproved after M16.2: Aggregate ABI production dispatch, Min/Max ordered
+state reads, multi-call SQL lowering, HAVING deltas, and final M16 performance
+evidence. Also
 outside M16 are Avg/VarPop/VarSamp/StddevPop/StddevSamp and Numeric exactness,
 Count over non-`int8` expressions, CountDistinct/SumDistinct, BoolAnd/BoolOr,
 percentile/median, multi-key grouping, grouping sets, ordered-set aggregates,
@@ -393,6 +397,7 @@ Result Sink production paths; concrete dispatch is confined to
 namespace `0` is kernel membership, call namespaces are ordinal-derived, and
 there is no function registry table, dual codec or compatibility path.
 
-At M16.1 the production system is still the specialized M15 implementation.
-This contract and its reference semantics do not claim that the generic ABI,
-wide result schema, MIN/MAX, multi-call aggregation or HAVING exists in code.
+At M16.2 the production result path is generic and wide, while aggregate nodes
+remain the specialized M15 implementations pending their deletion in M16.3.
+This contract does not claim that the generic ABI, MIN/MAX, multi-call
+aggregation or HAVING exists in production yet.

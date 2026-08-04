@@ -1,7 +1,7 @@
 use postgres::{Client, NoTls};
 use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
 use shiba_operator::TypedValue;
 use shiba_protocol::{GraphId, SlotGeneration, SourceId};
@@ -15,7 +15,7 @@ mod state;
 mod support;
 
 use state::{durable, pairs};
-use support::PgoutputCapture;
+use support::{PgoutputCapture, set_scalar_int8_result};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m13-operator-kernel.sh",
@@ -64,26 +64,37 @@ fn spec() -> QuerySpecV1 {
         results: vec![
             QueryResultV1 {
                 input_node: 1,
-                shape: QueryResultShapeV1::Scalar {
+                fields: vec![QueryResultFieldV1 {
+                    name: "count".into(),
                     value_slot: 0,
-                    value_nullable: false,
-                },
+                    nullable: false,
+                }],
+                key_ordinals: vec![],
             },
             QueryResultV1 {
                 input_node: 2,
-                shape: QueryResultShapeV1::Scalar {
+                fields: vec![QueryResultFieldV1 {
+                    name: "sum".into(),
                     value_slot: 0,
-                    value_nullable: false,
-                },
+                    nullable: true,
+                }],
+                key_ordinals: vec![],
             },
             QueryResultV1 {
                 input_node: 3,
-                shape: QueryResultShapeV1::Keyed {
-                    key_slot: 0,
-                    key_nullable: false,
-                    value_slot: 1,
-                    value_nullable: true,
-                },
+                fields: vec![
+                    QueryResultFieldV1 {
+                        name: "id".into(),
+                        value_slot: 0,
+                        nullable: false,
+                    },
+                    QueryResultFieldV1 {
+                        name: "payload".into(),
+                        value_slot: 1,
+                        nullable: true,
+                    },
+                ],
+                key_ordinals: vec![1],
             },
         ],
     }
@@ -300,13 +311,7 @@ fn generic_kernel_persists_scalar_and_keyed_outputs_atomically() {
             &[&scalar_partition, &scalar_item],
         )
         .unwrap();
-    client
-        .execute(
-            "UPDATE shiba.graph_result SET value_bigint=9223372036854775807
-         WHERE graph_id=1 AND result_id=5",
-            &[],
-        )
-        .unwrap();
+    set_scalar_int8_result(&mut client, 1, 5, Some(i64::MAX));
     let overflow = durable(&mut client);
     assert!(matches!(
         process(&mut client, &corrupt_input),
@@ -322,13 +327,7 @@ fn generic_kernel_persists_scalar_and_keyed_outputs_atomically() {
             &[&scalar_partition, &scalar_item],
         )
         .unwrap();
-    client
-        .execute(
-            "UPDATE shiba.graph_result SET value_bigint=40
-         WHERE graph_id=1 AND result_id=5",
-            &[],
-        )
-        .unwrap();
+    set_scalar_int8_result(&mut client, 1, 5, Some(40));
     assert_eq!(
         process(&mut client, &corrupt_input).unwrap(),
         ProcessOutcome::Applied

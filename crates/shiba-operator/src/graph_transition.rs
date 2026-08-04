@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use shiba_protocol::{BootstrapBatchId, GraphTransactionId, SourceId};
 
-use crate::{EffectOrigin, NodeId, StateDelta, TypedRow, TypedValue};
+use crate::{EffectOrigin, ResultDelta, StateDelta, TypedRow};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,26 +37,6 @@ pub struct MultiInputBatch {
 pub enum GraphEffectOrigin {
     Wal(GraphTransactionId),
     Bootstrap(BootstrapBatchId),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "mutation", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ResultMutation {
-    Delete { key: TypedValue },
-    Upsert { key: TypedValue, value: TypedValue },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "shape", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ResultDelta {
-    Scalar {
-        node_id: NodeId,
-        value: TypedValue,
-    },
-    Keyed {
-        node_id: NodeId,
-        mutations: Vec<ResultMutation>,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

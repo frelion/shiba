@@ -7,7 +7,7 @@ use shiba_runtime::{
 
 mod support;
 
-use support::{PgoutputCapture, message_end, read_u16, register_source};
+use support::{PgoutputCapture, message_end, read_u16, register_source, set_scalar_int8_result};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m4-delete.sh",
@@ -20,7 +20,7 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2),
+                (SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 2),
                 (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 0),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.graph_continuation)",
@@ -85,10 +85,10 @@ fn prove_count_underflow(client: &mut Client, delete: &GraphTransaction) {
             "UPDATE shiba_internal.graph_node_state
                  SET state_payload = decode('0000000000000000', 'hex')
                  WHERE graph_id = 1 AND node_id = 1 AND namespace = 0;
-             UPDATE shiba.graph_result
-                 SET value_bigint = 0 WHERE graph_id = 1 AND result_id = 2;",
+             ",
         )
         .expect("install count underflow precondition");
+    set_scalar_int8_result(client, 1, 2, Some(0));
     assert!(matches!(
         process(client, delete),
         Err(M2Error::Kernel(KernelError::Underflow))
@@ -100,10 +100,10 @@ fn prove_count_underflow(client: &mut Client, delete: &GraphTransaction) {
             "UPDATE shiba_internal.graph_node_state
                  SET state_payload = decode('0000000000000002', 'hex')
                  WHERE graph_id = 1 AND node_id = 1 AND namespace = 0;
-             UPDATE shiba.graph_result
-                 SET value_bigint = 2 WHERE graph_id = 1 AND result_id = 2;",
+             ",
         )
         .expect("restore count after underflow proof");
+    set_scalar_int8_result(client, 1, 2, Some(2));
 }
 
 fn prove_missing_row(client: &mut Client, source: PgoutputSource) {

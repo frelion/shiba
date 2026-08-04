@@ -85,7 +85,7 @@ pub(crate) fn evidence(client: &mut Client) -> Vec<Vec<String>> {
 pub(crate) fn assert_building(client: &mut Client) {
     let row = client
         .query_one(
-            "SELECT count(*) FILTER (WHERE result_status = 'building' AND value_bigint IS NULL),
+            "SELECT count(*) FILTER (WHERE result_status = 'building'),
                     count(*) FROM shiba.graph_result",
             &[],
         )
@@ -102,13 +102,14 @@ pub(crate) fn assert_oracle(client: &mut Client) {
         .expect("query SQL oracle");
     let result = client
         .query(
-            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
+            "SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint
+             FROM shiba.graph_result_rows
+             WHERE graph_id = 1 AND result_id IN (4,5) ORDER BY result_id",
             &[],
         )
         .expect("query active results");
     assert_eq!(result[0].get::<_, i64>(0), oracle.get::<_, i64>(0));
     assert_eq!(result[1].get::<_, i64>(0), oracle.get::<_, i64>(1));
-    assert!(result[2].get::<_, Option<i64>>(0).is_none());
     let expected = client
         .query("SELECT id, payload FROM target.events ORDER BY id", &[])
         .expect("query ProjectRows recovery oracle")
@@ -117,7 +118,9 @@ pub(crate) fn assert_oracle(client: &mut Client) {
         .collect::<Vec<_>>();
     let actual = client
         .query(
-            "SELECT result_key_bigint, result_value_bigint
+            "SELECT (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint,
+                    CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,type}'='null'
+                         THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,value}')::bigint END
              FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 6 ORDER BY 1",
             &[],
         )

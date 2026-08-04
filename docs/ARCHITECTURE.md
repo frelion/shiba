@@ -1,9 +1,9 @@
 # Architecture boundary
 
-## M16.1 contract and reference extension
+## M16.2 canonical wide-result cutover
 
-M16.1 freezes, but does not implement, the generic aggregate ABI and wide
-result boundary in [AGGREGATE_FUNCTION_CONTRACT.md](AGGREGATE_FUNCTION_CONTRACT.md).
+M16.1 freezes the generic aggregate ABI and wide-result boundary in
+[AGGREGATE_FUNCTION_CONTRACT.md](AGGREGATE_FUNCTION_CONTRACT.md).
 CountStar, Count(nullable `int8`), SumInt8, MinInt8 and MaxInt8 are closed
 function descriptors owned
 by `shiba-operator`; Compiler consumes descriptors and Runtime schedules only
@@ -12,12 +12,20 @@ describes scalar or keyed rows of at most 16 typed fields, and HAVING is an
 old/new row visibility transition. No function dispatch may enter Runtime,
 Catalog, Ingress, Bootstrap, Rebuild or the sink.
 
-This is an intended in-place evolution of the single QuerySpec/OperatorGraph,
-state/result and lifecycle authorities. Its database-free test-only reference
-model proves the frozen function/state/result semantics but adds no production
-implementation, second registry, persistent intermediate delta, dual write or
-compatibility path. M15 remains the latest implemented and release-proved
-architecture.
+M16.2 implements the result half of that contract in place. QuerySpec terminals
+declare ordered named fields and key ordinals; Compiler produces the canonical
+schema/digest and Operator emits complete schema-bound rows. Catalog stores one
+header and one scalar/keyed row authority. Runtime validates the exact graph
+schema and persists only generic ReplaceScalar/Upsert/Delete mutations. Ingress,
+Bootstrap and Rebuild compare or transport the same opaque schema contract and
+never infer field count, result shape or aggregate function. Building rows stay
+private and activation publishes the complete row set atomically.
+
+The fixed scalar/key/value authority and keyed-only sink are removed in the
+same cutover. No second registry, result writer, persistent intermediate delta,
+dual write or compatibility path is introduced. Generic Aggregate execution,
+multi-call state, MIN/MAX and HAVING remain M16.3--M16.6 work and must use this
+result authority unchanged.
 
 M15.1 freezes a bounded SQL declaration frontend in
 [SQL_FRONTEND_CONTRACT.md](SQL_FRONTEND_CONTRACT.md) and

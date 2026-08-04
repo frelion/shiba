@@ -302,7 +302,8 @@ sql = "\n".join(
 for required in (
     "rebuild_prepared", "retired_bootstrap_id", "retired_slot_name",
     "retired_slot_generation", "prepare_graph_rebuild",
-    "insert into shiba.graph_result", "'building', null, null",
+    "insert into shiba.graph_result", "result_status, schema_payload, schema_digest",
+    "'building', target_schema_payloads", "target_schema_digests",
     "shiba_internal.graph_definition",
     "shiba_internal.graph_ingress_config",
     "shiba_internal.graph_bootstrap",
@@ -414,7 +415,8 @@ import pathlib
 
 goal_gap = pathlib.Path("docs/GOAL_GAP.md").read_text()
 required = (
-    "# V2 goal gap after M15",
+    "# V2 goal gap during M16",
+    "M16.2 wide-result implementation status",
     "Active/non-pristine rebuild for the declared",
     "That green gate closes the declared active",
     "96 successful PG invocations",
@@ -569,7 +571,7 @@ import pathlib
 
 identity = pathlib.Path("crates/shiba-protocol/src/identity.rs").read_text()
 graph = "\n".join(
-    path.read_text() for path in pathlib.Path("crates/shiba-operator/src").glob("graph*.rs")
+    path.read_text() for path in pathlib.Path("crates/shiba-operator/src").glob("*.rs")
 )
 kernel = pathlib.Path("crates/shiba-operator/src/kernel.rs").read_text()
 compiler = "\n".join(
@@ -583,7 +585,7 @@ for marker in (
     "pub sources: Vec<SourcePort>",
     "SourcePort(SourceId)",
     "pub struct MultiInputBatch",
-    "pub enum ResultDelta",
+    "pub struct ResultDelta",
     "pub struct GraphTransition",
 ):
     if marker not in graph:

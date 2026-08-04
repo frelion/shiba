@@ -136,7 +136,7 @@ impl UnboundQuery {
         write_option(&mut out, self.join.as_ref(), write_join)?;
         write_len(&mut out, self.projection.len(), self.span)?;
         for item in &self.projection {
-            write_select(&mut out, &item.expression)?;
+            write_select(&mut out, item)?;
         }
         write_option(&mut out, self.selection.as_ref(), write_expr)?;
         write_option(&mut out, self.group_by.as_ref(), write_expr)?;
@@ -156,8 +156,8 @@ impl UnboundQuery {
     }
 }
 
-fn write_select(out: &mut Vec<u8>, value: &SelectExpression) -> Result<(), FrontendError> {
-    match value {
+fn write_select(out: &mut Vec<u8>, item: &UnboundSelectItem) -> Result<(), FrontendError> {
+    match &item.expression {
         SelectExpression::Expression(expr) => {
             out.push(0);
             write_expr(out, expr)?;
@@ -168,7 +168,7 @@ fn write_select(out: &mut Vec<u8>, value: &SelectExpression) -> Result<(), Front
             write_expr(out, input)?;
         }
     }
-    Ok(())
+    write_option(out, item.presentation_alias.as_ref(), write_ident)
 }
 
 fn write_join(out: &mut Vec<u8>, join: &Join) -> Result<(), FrontendError> {

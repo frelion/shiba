@@ -31,11 +31,11 @@ required = {
     "generic scalar sum lowering": (frontend, r"QueryOperationV1::SumInt8"),
     "generic grouped count lowering": (frontend, r"QueryOperationV1::GroupedCount"),
     "generic grouped sum lowering": (frontend, r"QueryOperationV1::GroupedSumInt8"),
-    "declared scalar nullability": (compiler, r"Scalar\s*\{[^}]*value_nullable:\s*bool"),
-    "compiled scalar nullability": (operator, r"Scalar\s*\{[^}]*nullable:\s*bool"),
+    "declared result field nullability": (compiler, r"QueryResultFieldV1\s*\{[^}]*nullable:\s*bool"),
+    "compiled result field nullability": (operator, r"ResultField\s*\{[^}]*nullable:\s*bool"),
     "sum non-null count state": (operator, r"fn\s+non_null_key\s*\("),
-    "nullable scalar sink": (runtime, r"Scalar\s*\{\s*value_nullable:\s*bool"),
-    "nullable scalar Catalog header": (sql, r"output_shape = 'scalar'.*NOT output_key_nullable"),
+    "schema-driven result sink": (runtime, r"ResultSchemaV1::from_canonical_payload"),
+    "canonical result schema header": (sql, r"schema_payload bytea NOT NULL.*schema_digest bytea NOT NULL"),
 }
 missing = [name for name, (text, pattern) in required.items() if not re.search(pattern, text, re.S)]
 if missing:

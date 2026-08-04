@@ -35,7 +35,13 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
                      WHERE state.graph_id = 1
                        AND state.partition_key_payload = $1
                        AND state.item_key_payload = $2),
-                    (SELECT array_agg(result.value_bigint ORDER BY result.result_id)
+                    (SELECT array_agg(
+                         (SELECT CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,type}'='null'
+                                      THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint END
+                          FROM shiba.graph_result_rows row
+                          WHERE row.graph_id=result.graph_id AND row.result_id=result.result_id
+                            AND result.result_id IN (4,5))
+                         ORDER BY result.result_id)
                      FROM shiba.graph_result result WHERE result.graph_id = 1),
                     (SELECT count(*) FROM shiba_internal.graph_continuation WHERE graph_id = 1)
              FROM shiba_internal.graph_bootstrap bootstrap

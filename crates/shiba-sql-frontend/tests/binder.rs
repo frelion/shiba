@@ -1,7 +1,7 @@
 use shiba_compiler::{
     IdentityIndexDescriptor, POSTGRES_INT8_TYPE_OID, POSTGRES_TEXT_TYPE_OID, QueryExpressionV1,
-    QueryInputV1, QueryOperationV1, QueryResultShapeV1, QuerySelectorV1, SourceColumnDescriptor,
-    SourceDescriptor, compile_query,
+    QueryInputV1, QueryOperationV1, QuerySelectorV1, SourceColumnDescriptor, SourceDescriptor,
+    compile_query,
 };
 use shiba_operator::ObjectAddress;
 use shiba_protocol::{GraphId, SourceId};
@@ -100,15 +100,14 @@ fn sample_lowers_names_then_filter_then_slot_project() {
         &expressions[1],
         QueryExpressionV1::CheckedAdd { .. }
     ));
-    assert_eq!(
-        spec.results[0].shape,
-        QueryResultShapeV1::Keyed {
-            key_slot: 0,
-            key_nullable: false,
-            value_slot: 1,
-            value_nullable: true,
-        }
-    );
+    assert_eq!(spec.results[0].key_ordinals, vec![1]);
+    assert_eq!(spec.results[0].fields.len(), 2);
+    assert_eq!(spec.results[0].fields[0].name, "id");
+    assert_eq!(spec.results[0].fields[0].value_slot, 0);
+    assert!(!spec.results[0].fields[0].nullable);
+    assert_eq!(spec.results[0].fields[1].name, "expression");
+    assert_eq!(spec.results[0].fields[1].value_slot, 1);
+    assert!(spec.results[0].fields[1].nullable);
     compile_query(
         &spec,
         core::slice::from_ref(&source.descriptor),
@@ -129,7 +128,15 @@ fn aliases_and_quoted_names_do_not_become_execution_identity() {
          FROM app.\"Events\" AS row WHERE row.\"Payload\" > 0",
         &source,
     );
-    assert_eq!(plain, renamed);
+    assert_eq!(plain.sources, renamed.sources);
+    assert_eq!(plain.nodes, renamed.nodes);
+    assert_eq!(
+        plain.results[0].key_ordinals,
+        renamed.results[0].key_ordinals
+    );
+    assert_ne!(plain.results[0].fields, renamed.results[0].fields);
+    assert_eq!(renamed.results[0].fields[0].name, "visible_key");
+    assert_eq!(renamed.results[0].fields[1].name, "visible_value");
     let QueryOperationV1::Project { expressions } = &plain.nodes[0].operation else {
         panic!()
     };
@@ -144,22 +151,10 @@ fn aliases_and_quoted_names_do_not_become_execution_identity() {
 fn nullability_is_inferred_without_conflating_null_and_absent() {
     let nullable = source(("id", "payload"), true);
     let nullable_spec = bind("SELECT id, payload + NULL FROM app.events", &nullable);
-    assert!(matches!(
-        nullable_spec.results[0].shape,
-        QueryResultShapeV1::Keyed {
-            value_nullable: true,
-            ..
-        }
-    ));
+    assert!(nullable_spec.results[0].fields[1].nullable);
     let required = source(("id", "payload"), false);
     let required_spec = bind("SELECT id, payload - 1 FROM app.events", &required);
-    assert!(matches!(
-        required_spec.results[0].shape,
-        QueryResultShapeV1::Keyed {
-            value_nullable: false,
-            ..
-        }
-    ));
+    assert!(!required_spec.results[0].fields[1].nullable);
 }
 
 #[test]

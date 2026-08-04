@@ -1,6 +1,4 @@
-use crate::{
-    KernelError, NodeId, NodeInput, OperatorGraph, OperatorNodeKind, OutputContract, TypedLayout,
-};
+use crate::{KernelError, NodeId, NodeInput, OperatorGraph, OperatorNodeKind, TypedLayout};
 use shiba_protocol::SourceId;
 
 pub(crate) struct JoinSpec {
@@ -13,8 +11,8 @@ pub(crate) struct JoinSpec {
     pub(crate) right_payload_slot: u16,
     pub(crate) output_layout: TypedLayout,
     pub(crate) materialize_id: NodeId,
-    pub(crate) key_nullable: bool,
-    pub(crate) value_nullable: bool,
+    pub(crate) materialize_field_slots: Vec<u16>,
+    pub(crate) output: crate::OutputContract,
 }
 
 pub(crate) fn join_spec(graph: &OperatorGraph) -> Result<Option<JoinSpec>, KernelError> {
@@ -45,13 +43,11 @@ pub(crate) fn join_spec(graph: &OperatorGraph) -> Result<Option<JoinSpec>, Kerne
     let OperatorNodeKind::Materialize { output, .. } = &materialize.kind else {
         return Err(KernelError::InvalidGraph);
     };
-    let OutputContract::KeyedRows {
-        key_nullable,
-        nullable,
-        ..
-    } = output
-    else {
+    if output.schema.is_scalar() {
         return Err(KernelError::InvalidGraph);
+    }
+    let OperatorNodeKind::Materialize { field_slots, .. } = &materialize.kind else {
+        unreachable!()
     };
     let (_, layouts) = graph.layouts().map_err(|_| KernelError::InvalidGraph)?;
     Ok(Some(JoinSpec {
@@ -67,7 +63,7 @@ pub(crate) fn join_spec(graph: &OperatorGraph) -> Result<Option<JoinSpec>, Kerne
             .ok_or(KernelError::InvalidGraph)?
             .clone(),
         materialize_id: materialize.node_id,
-        key_nullable: *key_nullable,
-        value_nullable: *nullable,
+        materialize_field_slots: field_slots.clone(),
+        output: output.clone(),
     }))
 }

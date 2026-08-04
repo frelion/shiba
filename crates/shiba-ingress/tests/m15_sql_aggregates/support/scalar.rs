@@ -80,8 +80,13 @@ pub(crate) fn exercise_nullable_sum(
 fn scalar(client: &mut Client, graph: u64) -> Option<i64> {
     client
         .query_one(
-            "SELECT value_bigint FROM shiba.graph_result
-             WHERE graph_id=$1 AND result_status='active'",
+            "SELECT CASE WHEN convert_from(row_payload,'UTF8')::jsonb
+                                  #>> '{values,0,type}' = 'null'
+                         THEN NULL
+                         ELSE (convert_from(row_payload,'UTF8')::jsonb
+                                  #>> '{values,0,value}')::bigint END
+             FROM shiba.graph_result_rows
+             WHERE graph_id=$1",
             &[&i64::try_from(graph).expect("graph ID fits")],
         )
         .expect("query scalar aggregate result")

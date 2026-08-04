@@ -1,6 +1,6 @@
 use shiba_compiler::{
     CompilerError, IdentityIndexDescriptor, QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1,
-    QueryInputV1, QueryNodeV1, QueryOperationV1, QueryResultShapeV1, QueryResultV1,
+    QueryInputV1, QueryNodeV1, QueryOperationV1, QueryResultFieldV1, QueryResultV1,
     QuerySelectorV1, QuerySpecV1, SourceColumnDescriptor, SourceDescriptor, compile_query,
     compile_query_with_optional_identities,
 };
@@ -92,25 +92,34 @@ fn stateless(inputs: Vec<QueryInputV1>, operation: QueryOperationV1) -> QueryNod
     }
 }
 
-fn scalar(input_node: u16) -> QueryResultV1 {
+fn scalar(input_node: u16, nullable: bool) -> QueryResultV1 {
     QueryResultV1 {
         input_node,
-        shape: QueryResultShapeV1::Scalar {
+        fields: vec![QueryResultFieldV1 {
+            name: "value".into(),
             value_slot: 0,
-            value_nullable: false,
-        },
+            nullable,
+        }],
+        key_ordinals: vec![],
     }
 }
 
 fn keyed(input_node: u16) -> QueryResultV1 {
     QueryResultV1 {
         input_node,
-        shape: QueryResultShapeV1::Keyed {
-            key_slot: 0,
-            key_nullable: false,
-            value_slot: 1,
-            value_nullable: true,
-        },
+        fields: vec![
+            QueryResultFieldV1 {
+                name: "key".into(),
+                value_slot: 0,
+                nullable: false,
+            },
+            QueryResultFieldV1 {
+                name: "value".into(),
+                value_slot: 1,
+                nullable: true,
+            },
+        ],
+        key_ordinals: vec![1],
     }
 }
 
@@ -167,7 +176,13 @@ fn generic_query_preserves_all_single_source_graph_shapes() {
                 },
             ),
         ],
-        results: vec![scalar(1), scalar(2), keyed(3), keyed(5), keyed(7)],
+        results: vec![
+            scalar(1, false),
+            scalar(2, true),
+            keyed(3),
+            keyed(5),
+            keyed(7),
+        ],
     };
     let graph = compile_query(&spec, &[source], &[index]).unwrap();
     assert_eq!(graph.nodes.len(), 12);
@@ -204,7 +219,7 @@ fn source_column_type_error_preserves_exact_catalog_coordinate() {
                 value: name("label"),
             },
         )],
-        results: vec![scalar(1)],
+        results: vec![scalar(1, false)],
     };
     assert_eq!(
         compile_query(&spec, &[source.clone()], &[identity(&source, 11_000)]),
@@ -325,7 +340,7 @@ fn strict_json_digest_and_input_selector_boundaries_fail_closed() {
             source_input(source.source_id),
             QueryOperationV1::CountRows,
         )],
-        results: vec![scalar(1)],
+        results: vec![scalar(1, false)],
     };
     let bytes = valid.to_canonical_json().unwrap();
     assert_eq!(QuerySpecV1::from_json(&bytes).unwrap(), valid);
@@ -373,7 +388,7 @@ fn identity_free_zero_column_count_remains_the_only_exception() {
             source_input(source.source_id),
             QueryOperationV1::CountRows,
         )],
-        results: vec![scalar(1)],
+        results: vec![scalar(1, false)],
     };
     assert!(compile_query_with_optional_identities(&spec, &[source], &[None]).is_ok());
 }
@@ -413,12 +428,12 @@ fn bounded_spec() -> QuerySpecV1 {
         )],
         results: vec![QueryResultV1 {
             input_node: 1,
-            shape: QueryResultShapeV1::Keyed {
-                key_slot: 0,
-                key_nullable: false,
+            fields: vec![QueryResultFieldV1 {
+                name: "id".into(),
                 value_slot: 0,
-                value_nullable: false,
-            },
+                nullable: false,
+            }],
+            key_ordinals: vec![1],
         }],
     }
 }
@@ -461,12 +476,19 @@ fn query_wide_expression_count_fails_before_encoding() {
         nodes: many_expressions,
         results: vec![QueryResultV1 {
             input_node: 31,
-            shape: QueryResultShapeV1::Keyed {
-                key_slot: 0,
-                key_nullable: false,
-                value_slot: 1,
-                value_nullable: false,
-            },
+            fields: vec![
+                QueryResultFieldV1 {
+                    name: "key".into(),
+                    value_slot: 0,
+                    nullable: false,
+                },
+                QueryResultFieldV1 {
+                    name: "value".into(),
+                    value_slot: 1,
+                    nullable: false,
+                },
+            ],
+            key_ordinals: vec![1],
         }],
         ..base.clone()
     };

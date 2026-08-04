@@ -5,7 +5,7 @@ use shiba_protocol::SourceId;
 
 use crate::{
     ColumnBinding, Expression, GraphError, NodeId, NodeInput, OperatorNode, OperatorNodeKind,
-    OutputContract, TypedLayout, ValueType, graph::CanonicalGraph,
+    TypedLayout, ValueType, graph::CanonicalGraph,
 };
 
 const LAYOUT_DOMAIN: &[u8] = b"shiba.operator.layout.v1\0";
@@ -192,26 +192,17 @@ fn node_output_types(
         }
         OperatorNodeKind::InnerJoin { .. } => return Err(GraphError::InvalidNode),
         OperatorNodeKind::Materialize {
-            key_slot,
-            value_slot,
+            field_slots,
             output,
         } => {
-            let valid = match output {
-                OutputContract::Scalar {
-                    value_type: ValueType::Int8,
-                    ..
-                } => input.value_types.get(usize::from(*value_slot)) == Some(&ValueType::Int8),
-                OutputContract::KeyedRows {
-                    key_type: ValueType::Int8,
-                    key_nullable: _,
-                    value_type: ValueType::Int8,
-                    nullable: _,
-                } => {
-                    input.value_types.get(usize::from(*key_slot)) == Some(&ValueType::Int8)
-                        && input.value_types.get(usize::from(*value_slot)) == Some(&ValueType::Int8)
-                }
-                _ => false,
-            };
+            output.validate().map_err(|_| GraphError::WrongType)?;
+            let valid = field_slots.len() == output.schema.fields.len()
+                && field_slots
+                    .iter()
+                    .zip(&output.schema.fields)
+                    .all(|(slot, field)| {
+                        input.value_types.get(usize::from(*slot)) == Some(&field.value_type)
+                    });
             if !valid {
                 return Err(GraphError::WrongType);
             }

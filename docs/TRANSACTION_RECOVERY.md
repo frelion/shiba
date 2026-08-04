@@ -1,8 +1,8 @@
 # Transaction and recovery contract
 
-## M16.1 planned aggregate recovery boundary
+## M16.2 wide-result recovery boundary
 
-M16.1 does not change the proven transaction or ACK rule. A future aggregate
+M16 does not change the proven transaction or ACK rule. A generic aggregate
 execution locks generic exact/range state reads in deterministic node/key
 order, computes one deterministic transition, persists all state and wide
 result deltas, writes continuation last, commits, and only then authorizes ACK.
@@ -11,9 +11,13 @@ error; bound violation; sink failure; or backend failure rolls the entire graph
 transaction back. MIN/MAX ordered reads are bounded transaction inputs, never
 a persistent EffectStream or second recovery authority.
 
-Bootstrap and rebuild must load the same canonical graph/schema and use the
-same generic Runtime entry. These M16 behaviors are frozen here but remain
-unimplemented and unproved after M16.1.
+M16.2 implements the result-side boundary: registration installs schema header
+and initial scalar row together; Apply locks the exact header, validates every
+row/key digest and persists all normalized row mutations in the processor-owned
+transaction before continuation. Bootstrap/rebuild write hidden building rows
+through the same sink and activation exposes the complete set atomically. A
+schema/row/sink failure rolls source state, graph state, results and continuation
+back; ACK remains unauthorized. Aggregate state/retraction remains M16.3--M16.6.
 
 ## M14.6 graph transaction and recovery boundary
 

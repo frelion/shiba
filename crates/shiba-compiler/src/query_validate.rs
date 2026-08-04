@@ -13,6 +13,7 @@ const MAX_EXPRESSION_NODES: usize = 256;
 const MAX_EXPRESSION_DEPTH: usize = 32;
 const MAX_BOOLEAN_TERMS: usize = 64;
 const MAX_PROJECTED_ITEMS: usize = 2;
+const MAX_RESULT_FIELDS: usize = 16;
 
 pub(crate) fn validate_query<E: de::Error>(
     version: u32,
@@ -62,7 +63,23 @@ fn validate_references<E: de::Error>(
     }
     let mut terminals = Vec::with_capacity(results.len());
     for result in results {
-        if result.input_node == 0 || usize::from(result.input_node) > nodes.len() {
+        if result.input_node == 0
+            || usize::from(result.input_node) > nodes.len()
+            || result.fields.is_empty()
+            || result.fields.len() > MAX_RESULT_FIELDS
+            || result
+                .fields
+                .iter()
+                .any(|field| field.name.is_empty() || field.name.len() > MAX_IDENTIFIER_BYTES)
+            || result
+                .key_ordinals
+                .iter()
+                .any(|ordinal| *ordinal == 0 || usize::from(*ordinal) > result.fields.len())
+            || result
+                .key_ordinals
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
             return Err(E::custom("invalid result input reference"));
         }
         referenced[usize::from(result.input_node - 1)] = true;

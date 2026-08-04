@@ -1,7 +1,7 @@
 use postgres::Client;
 use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryFieldV1, QueryInputV1, QueryNodeV1, QueryOperationV1,
-    QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
 use shiba_ingress::SnapshotProgress;
 use shiba_protocol::{GraphId, SourceId};
@@ -79,12 +79,19 @@ pub(crate) fn register_join_graph(client: &mut Client, _fixture: &Fixture) {
         }],
         results: vec![QueryResultV1 {
             input_node: 1,
-            shape: QueryResultShapeV1::Keyed {
-                key_slot: 0,
-                key_nullable: false,
-                value_slot: 1,
-                value_nullable: true,
-            },
+            fields: vec![
+                QueryResultFieldV1 {
+                    name: "id".into(),
+                    value_slot: 0,
+                    nullable: false,
+                },
+                QueryResultFieldV1 {
+                    name: "payload".into(),
+                    value_slot: 1,
+                    nullable: true,
+                },
+            ],
+            key_ordinals: vec![1],
         }],
     };
     compile_and_register(client, &spec).expect("register exact two-source graph");
@@ -106,7 +113,9 @@ pub(crate) fn assert_registered(client: &mut Client, fixture: &Fixture) {
             "SELECT definition.source_count,
                     (SELECT count(*) FROM shiba_internal.graph_source_member
                      WHERE graph_id=definition.graph_id),
-                    result.output_shape, result.result_status
+                    pg_catalog.convert_from(result.schema_payload,'UTF8')::jsonb
+                        #> '{key_ordinals}' = '[1]'::jsonb,
+                    result.result_status
              FROM shiba_internal.graph_definition AS definition
              JOIN shiba.graph_result AS result USING (graph_id)
              WHERE definition.graph_id=1 AND result.result_id=2",
@@ -115,7 +124,7 @@ pub(crate) fn assert_registered(client: &mut Client, fixture: &Fixture) {
         .expect("read registered graph authority");
     assert_eq!(row.get::<_, i16>(0), 2);
     assert_eq!(row.get::<_, i64>(1), 2);
-    assert_eq!(row.get::<_, &str>(2), "keyed");
+    assert!(row.get::<_, bool>(2));
     assert_eq!(row.get::<_, &str>(3), "active");
     let relations = client
         .query(
@@ -181,13 +190,12 @@ pub(crate) fn assert_snapshot_rows(client: &mut Client) {
 pub(crate) fn assert_building(client: &mut Client) {
     let row = client
         .query_one(
-            "SELECT result_status,value_bigint FROM shiba.graph_result
+            "SELECT result_status FROM shiba.graph_result
              WHERE graph_id=1 AND result_id=2",
             &[],
         )
         .expect("read public building result");
     assert_eq!(row.get::<_, &str>(0), "building");
-    assert_eq!(row.get::<_, Option<i64>>(1), None);
     assert!(
         client
             .query(
@@ -214,9 +222,14 @@ pub(crate) fn assert_oracle(client: &mut Client) {
         .collect::<Vec<_>>();
     let actual = client
         .query(
-            "SELECT result_key_bigint,result_value_bigint
+            "SELECT
+                (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint,
+                CASE WHEN convert_from(row_payload,'UTF8')::jsonb
+                               #>> '{values,1,type}' = 'null'
+                     THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb
+                               #>> '{values,1,value}')::bigint END
              FROM shiba.graph_result_rows
-             WHERE graph_id=1 AND result_id=2 ORDER BY result_key_bigint",
+             WHERE graph_id=1 AND result_id=2 ORDER BY 1",
             &[],
         )
         .expect("query materialized join result")

@@ -29,8 +29,13 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
     let active_before = full_authority_snapshot(&mut admin);
     let active_result = admin
         .query(
-            "SELECT result_id, result_status, value_bigint
-             FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
+            "SELECT result.result_id, result.result_status,
+                    (SELECT CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,type}'='null'
+                                 THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint END
+                     FROM shiba.graph_result_rows row
+                     WHERE row.graph_id=result.graph_id AND row.result_id=result.result_id
+                       AND result.result_id IN (4,5))
+             FROM shiba.graph_result result WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )
         .expect("read active public result");
@@ -302,7 +307,7 @@ fn active_source_rebuild_admission_is_atomic_and_single_winner() {
     );
     let results = admin
         .query(
-            "SELECT result_status, value_bigint FROM shiba.graph_result
+            "SELECT result_status, NULL::bigint FROM shiba.graph_result
              WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )

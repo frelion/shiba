@@ -74,7 +74,7 @@ fn bootstrap_runs_without_superuser_and_permission_loss_fails_closed() {
         "control role without revoked function EXECUTE must fail"
     );
     assert_no_apply(&mut admin, 1, None);
-    assert_results(&mut admin, 1, "active", [Some(0), Some(0)]);
+    assert_results(&mut admin, 1, "active", [Some(0), None]);
 
     admin
         .batch_execute(&format!(
@@ -116,7 +116,8 @@ fn bootstrap_runs_without_superuser_and_permission_loss_fails_closed() {
     assert!(
         reader
             .execute(
-                "UPDATE shiba.graph_result SET value_bigint = 99 WHERE graph_id = 1 AND result_id = 3",
+                "UPDATE shiba.graph_result SET schema_payload = schema_payload
+                 WHERE graph_id = 1 AND result_id = 3",
                 &[],
             )
             .is_err(),

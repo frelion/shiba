@@ -1,6 +1,6 @@
 use shiba_compiler::{
     IdentityIndexDescriptor, POSTGRES_INT8_TYPE_OID, POSTGRES_TEXT_TYPE_OID, QueryOperationV1,
-    QueryResultShapeV1, QuerySelectorV1, SourceColumnDescriptor, SourceDescriptor, compile_query,
+    QuerySelectorV1, SourceColumnDescriptor, SourceDescriptor, compile_query,
 };
 use shiba_operator::ObjectAddress;
 use shiba_protocol::{GraphId, SourceId};
@@ -81,13 +81,11 @@ fn scalar_count_and_sum_use_generic_stateful_nodes() {
         QueryOperationV1::CountRows
     ));
     assert_eq!(count.nodes[0].state_codec_version, Some(1));
-    assert_eq!(
-        count.results[0].shape,
-        QueryResultShapeV1::Scalar {
-            value_slot: 0,
-            value_nullable: false,
-        }
-    );
+    assert!(count.results[0].key_ordinals.is_empty());
+    assert_eq!(count.results[0].fields.len(), 1);
+    assert_eq!(count.results[0].fields[0].name, "count");
+    assert_eq!(count.results[0].fields[0].value_slot, 0);
+    assert!(!count.results[0].fields[0].nullable);
     assert_compiles(&count, &source);
 
     let sum = bind("SELECT sum(payload) FROM app.events", &source);
@@ -99,13 +97,10 @@ fn scalar_count_and_sum_use_generic_stateful_nodes() {
         shiba_compiler::QueryExpressionV1::Column { field }
             if matches!(&field.selector, QuerySelectorV1::Name { name, quoted: false } if name == "payload")
     ));
-    assert_eq!(
-        sum.results[0].shape,
-        QueryResultShapeV1::Scalar {
-            value_slot: 0,
-            value_nullable: true,
-        }
-    );
+    assert!(sum.results[0].key_ordinals.is_empty());
+    assert_eq!(sum.results[0].fields.len(), 1);
+    assert_eq!(sum.results[0].fields[0].name, "sum");
+    assert!(sum.results[0].fields[0].nullable);
     assert_compiles(&sum, &source);
 }
 
@@ -134,15 +129,10 @@ fn grouped_count_lowers_filter_keyby_aggregate_and_keyed_result() {
         QueryOperationV1::GroupedCount { .. }
     ));
     assert_eq!(spec.nodes[3].state_codec_version, Some(1));
-    assert_eq!(
-        spec.results[0].shape,
-        QueryResultShapeV1::Keyed {
-            key_slot: 0,
-            key_nullable: false,
-            value_slot: 1,
-            value_nullable: false,
-        }
-    );
+    assert_eq!(spec.results[0].key_ordinals, vec![1]);
+    assert_eq!(spec.results[0].fields.len(), 2);
+    assert!(!spec.results[0].fields[0].nullable);
+    assert!(!spec.results[0].fields[1].nullable);
     assert_compiles(&spec, &source);
 }
 
@@ -157,15 +147,9 @@ fn grouped_sum_preserves_nullable_key_and_all_null_value_contract() {
         spec.nodes.last().unwrap().operation,
         QueryOperationV1::GroupedSumInt8 { .. }
     ));
-    assert_eq!(
-        spec.results[0].shape,
-        QueryResultShapeV1::Keyed {
-            key_slot: 0,
-            key_nullable: true,
-            value_slot: 1,
-            value_nullable: true,
-        }
-    );
+    assert_eq!(spec.results[0].key_ordinals, vec![1]);
+    assert!(spec.results[0].fields[0].nullable);
+    assert!(spec.results[0].fields[1].nullable);
     assert_compiles(&spec, &source);
 }
 
@@ -181,8 +165,10 @@ fn grouped_sum_aliases_and_parentheses_have_one_canonical_spec() {
          WHERE ((e.payload) > (100)) GROUP BY (e.id)",
         &source,
     );
-    assert_eq!(plain, formatted);
-    assert_eq!(
+    assert_eq!(plain.sources, formatted.sources);
+    assert_eq!(plain.nodes, formatted.nodes);
+    assert_ne!(plain.results[0].fields, formatted.results[0].fields);
+    assert_ne!(
         plain.to_canonical_json().unwrap(),
         formatted.to_canonical_json().unwrap()
     );

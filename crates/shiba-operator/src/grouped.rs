@@ -71,10 +71,8 @@ pub(crate) fn apply(
             spec.materialize_id,
             &aggregate_batch,
             &spec.aggregate_layout,
-            spec.materialize_key_slot,
-            spec.materialize_value_slot,
-            spec.key_nullable,
-            spec.value_nullable,
+            &spec.materialize_field_slots,
+            &spec.output,
         )
         .map_err(|_| KernelError::InvalidTransition)?;
         transition.state_deltas.extend(state);

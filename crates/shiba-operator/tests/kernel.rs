@@ -3,9 +3,9 @@ use core::num::NonZeroU32;
 use shiba_operator::{
     ColumnBinding, DeltaBatch, EffectOrigin, Expression, GraphEffectOrigin, MultiInputBatch,
     NodeId, NodeInput, ObjectAddress, OperatorGraph, OperatorNode, OperatorNodeKind,
-    OutputContract, ResultDelta, RowDelta, SourceDeltaBatch, SourcePort, StateContract, StateEntry,
-    StateSnapshot, TypedRow, TypedValue, ValueType, apply_graph_plan, graph_state_read_set,
-    source_typed_layout,
+    OutputContract, ResultDelta, ResultField, ResultMutation, ResultSchemaV1, RowDelta,
+    SourceDeltaBatch, SourcePort, StateContract, StateEntry, StateSnapshot, TypedResultRowV1,
+    TypedRow, TypedValue, ValueType, apply_graph_plan, graph_state_read_set, source_typed_layout,
 };
 use shiba_protocol::{BootstrapBatchId, BootstrapId, GraphId, SourceId};
 
@@ -15,16 +15,8 @@ fn node(value: u32) -> NodeId {
 
 fn graph() -> OperatorGraph {
     let source_id = SourceId::new(1).unwrap();
-    let scalar = OutputContract::Scalar {
-        value_type: ValueType::Int8,
-        nullable: false,
-    };
-    let keyed = OutputContract::KeyedRows {
-        key_type: ValueType::Int8,
-        key_nullable: false,
-        value_type: ValueType::Int8,
-        nullable: true,
-    };
+    let scalar = scalar_output(false);
+    let keyed = keyed_output();
     OperatorGraph::build(
         GraphId::new(7).unwrap(),
         vec![SourcePort {
@@ -102,6 +94,48 @@ fn binding(sub_id: i32) -> ColumnBinding {
     }
 }
 
+fn scalar_output(nullable: bool) -> OutputContract {
+    let schema = ResultSchemaV1::new(
+        vec![ResultField {
+            ordinal: 1,
+            name: "value".into(),
+            value_type: ValueType::Int8,
+            nullable,
+        }],
+        vec![],
+    )
+    .unwrap();
+    let initial = if nullable {
+        TypedValue::Null(ValueType::Int8)
+    } else {
+        TypedValue::Int8(0)
+    };
+    let row = TypedResultRowV1::new(&schema, vec![initial]).unwrap();
+    OutputContract::new(schema, Some(row)).unwrap()
+}
+
+fn keyed_output() -> OutputContract {
+    let schema = ResultSchemaV1::new(
+        vec![
+            ResultField {
+                ordinal: 1,
+                name: "key".into(),
+                value_type: ValueType::Int8,
+                nullable: false,
+            },
+            ResultField {
+                ordinal: 2,
+                name: "value".into(),
+                value_type: ValueType::Int8,
+                nullable: true,
+            },
+        ],
+        vec![1],
+    )
+    .unwrap();
+    OutputContract::new(schema, None).unwrap()
+}
+
 fn stateful(id: u32, source_id: SourceId, kind: OperatorNodeKind) -> OperatorNode {
     OperatorNode {
         node_id: node(id),
@@ -123,8 +157,11 @@ fn terminal(
         input: NodeInput::Node(node(input)),
         state_contract: None,
         kind: OperatorNodeKind::Materialize {
-            key_slot,
-            value_slot,
+            field_slots: if output.schema.is_scalar() {
+                vec![value_slot]
+            } else {
+                vec![key_slot, value_slot]
+            },
             output,
         },
     }
@@ -180,21 +217,30 @@ fn multiple_terminals_share_one_batch_and_generic_state() {
     assert_eq!(transition.results.len(), 5);
     assert_eq!(
         transition.results[0],
-        ResultDelta::Scalar {
+        ResultDelta {
             node_id: node(2),
-            value: TypedValue::Int8(2)
+            mutations: vec![ResultMutation::ReplaceScalar {
+                row: TypedResultRowV1::new(&scalar_output(false).schema, vec![TypedValue::Int8(2)])
+                    .unwrap()
+            }]
         }
     );
     assert_eq!(
         transition.results[1],
-        ResultDelta::Scalar {
+        ResultDelta {
             node_id: node(4),
-            value: TypedValue::Int8(10)
+            mutations: vec![ResultMutation::ReplaceScalar {
+                row: TypedResultRowV1::new(
+                    &scalar_output(false).schema,
+                    vec![TypedValue::Int8(10)]
+                )
+                .unwrap()
+            }]
         }
     );
     assert!(matches!(
         transition.results[2],
-        ResultDelta::Keyed { node_id, ref mutations } if node_id == node(6) && mutations.len() == 2
+        ResultDelta { node_id, ref mutations } if node_id == node(6) && mutations.len() == 2
     ));
 }
 

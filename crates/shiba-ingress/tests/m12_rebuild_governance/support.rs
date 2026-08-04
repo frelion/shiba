@@ -37,7 +37,7 @@ pub(crate) fn as_role(conninfo: &str, role: &str) -> String {
 pub(crate) fn assert_building(client: &mut Client) {
     let rows = client
         .query(
-            "SELECT result_status, value_bigint FROM shiba.graph_result ORDER BY graph_id, result_id",
+            "SELECT result_status, NULL::bigint FROM shiba.graph_result ORDER BY graph_id, result_id",
             &[],
         )
         .expect("query public rebuild visibility");
@@ -144,7 +144,7 @@ pub(crate) fn grant_rebuild_control(client: &mut Client) {
              GRANT EXECUTE ON FUNCTION shiba_internal.prepare_graph_rebuild(
                  bigint, bytea, bigint, oid[], oid[], oid, name, bigint,
                  bigint, bigint[], oid[], oid[], oid, name, bigint,
-                 bytea, bytea, bytea, bigint[], text[], boolean[], boolean[]
+                 bytea, bytea, bytea, bigint[], bytea[], bytea[]
              ) TO {CONTROL_ROLE};
              GRANT USAGE ON SCHEMA target TO {RECEIVER_ROLE};
              GRANT SELECT ON target.events TO {RECEIVER_ROLE};

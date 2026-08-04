@@ -1,14 +1,15 @@
 use core::num::NonZeroU32;
 
 use shiba_operator::{
-    NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind, OutputContract,
-    StateContract, TypedLayout, ValueType, source_typed_layout,
+    NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind, OutputContract, ResultField,
+    ResultSchemaV1, StateContract, TypedLayout, TypedResultRowV1, TypedValue, ValueType,
+    source_typed_layout,
 };
 
 use crate::binding::{identity_for, source, source_port};
 use crate::expression::InputBinding;
 use crate::{
-    CompilerError, IdentityIndexDescriptor, QUERY_SPEC_VERSION, QueryInputV1, QueryResultShapeV1,
+    CompilerError, IdentityIndexDescriptor, QUERY_SPEC_VERSION, QueryInputV1, QueryResultV1,
     QuerySpecV1, SourceDescriptor,
 };
 
@@ -102,14 +103,13 @@ pub fn compile_query_with_optional_identities(
         let input_layout = layouts
             .get(input_index)
             .ok_or(CompilerError::InvalidTopology)?;
-        let (key_slot, value_slot, output) = result_contract(&result.shape, input_layout)?;
+        let output = result_contract(result, input_layout, &spec.nodes[input_index].operation)?;
         nodes.push(OperatorNode {
             node_id: node_id(spec.nodes.len() + index + 1)?,
             input: NodeInput::Node(node_id(usize::from(result.input_node))?),
             state_contract: None,
             kind: OperatorNodeKind::Materialize {
-                key_slot,
-                value_slot,
+                field_slots: result.fields.iter().map(|field| field.value_slot).collect(),
                 output,
             },
         });
@@ -149,42 +149,45 @@ fn compile_input<'a>(
 }
 
 fn result_contract(
-    shape: &QueryResultShapeV1,
+    result: &QueryResultV1,
     layout: &TypedLayout,
-) -> Result<(u16, u16, OutputContract), CompilerError> {
-    match *shape {
-        QueryResultShapeV1::Scalar {
-            value_slot,
-            value_nullable,
-        } if layout.value_types.get(usize::from(value_slot)) == Some(&ValueType::Int8) => Ok((
-            0,
-            value_slot,
-            OutputContract::Scalar {
-                value_type: ValueType::Int8,
-                nullable: value_nullable,
-            },
-        )),
-        QueryResultShapeV1::Keyed {
-            key_slot,
-            key_nullable,
-            value_slot,
-            value_nullable,
-        } if layout.value_types.get(usize::from(key_slot)) == Some(&ValueType::Int8)
-            && layout.value_types.get(usize::from(value_slot)) == Some(&ValueType::Int8) =>
-        {
-            Ok((
-                key_slot,
-                value_slot,
-                OutputContract::KeyedRows {
-                    key_type: ValueType::Int8,
-                    key_nullable,
-                    value_type: ValueType::Int8,
-                    nullable: value_nullable,
-                },
-            ))
-        }
-        _ => Err(CompilerError::WrongType),
-    }
+    operation: &crate::QueryOperationV1,
+) -> Result<OutputContract, CompilerError> {
+    let fields = result
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let value_type = *layout
+                .value_types
+                .get(usize::from(field.value_slot))
+                .ok_or(CompilerError::WrongType)?;
+            Ok(ResultField {
+                ordinal: u16::try_from(index + 1).map_err(|_| CompilerError::GraphEncoding)?,
+                name: field.name.clone(),
+                value_type,
+                nullable: field.nullable,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let schema = ResultSchemaV1::new(fields, result.key_ordinals.clone())
+        .map_err(|_| CompilerError::GraphEncoding)?;
+    let initial_row = if schema.is_scalar() {
+        let values = match operation {
+            crate::QueryOperationV1::CountRows => vec![TypedValue::Int8(0)],
+            crate::QueryOperationV1::SumInt8 { .. } => {
+                vec![TypedValue::Null(shiba_operator::ValueType::Int8)]
+            }
+            _ => return Err(CompilerError::InvalidSpec),
+        };
+        Some(TypedResultRowV1::new(&schema, values).map_err(|_| CompilerError::WrongType)?)
+    } else {
+        None
+    };
+    Ok(OutputContract {
+        schema,
+        initial_row,
+    })
 }
 
 fn node_id(value: usize) -> Result<NodeId, CompilerError> {

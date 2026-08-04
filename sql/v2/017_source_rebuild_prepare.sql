@@ -10,8 +10,8 @@ CREATE FUNCTION shiba_internal.prepare_graph_rebuild(
     target_identity_indexes oid[], target_publication oid, target_slot name,
     target_generation bigint, target_spec_payload bytea,
     target_graph_payload bytea, target_graph_digest bytea,
-    target_result_ids bigint[], target_result_shapes text[],
-    target_key_nullable boolean[], target_value_nullable boolean[]
+    target_result_ids bigint[], target_schema_payloads bytea[],
+    target_schema_digests bytea[]
 ) RETURNS void LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp AS $function$
 DECLARE target record; position integer; key_subid integer; payload_subid integer;
@@ -19,15 +19,26 @@ BEGIN
     IF pg_catalog.octet_length(target_spec_payload) = 0
        OR pg_catalog.octet_length(target_graph_payload) = 0
        OR pg_catalog.array_length(target_result_ids, 1) IS NULL
-       OR pg_catalog.array_length(target_result_shapes, 1)
+       OR pg_catalog.array_length(target_schema_payloads, 1)
           <> pg_catalog.array_length(target_result_ids, 1)
-       OR pg_catalog.array_length(target_key_nullable, 1)
-          <> pg_catalog.array_length(target_result_ids, 1)
-       OR pg_catalog.array_length(target_value_nullable, 1)
+       OR pg_catalog.array_length(target_schema_digests, 1)
           <> pg_catalog.array_length(target_result_ids, 1)
        OR (SELECT count(DISTINCT result_id)
-           FROM pg_catalog.unnest(target_result_ids) AS result_id)
+          FROM pg_catalog.unnest(target_result_ids) AS result_id)
           <> pg_catalog.array_length(target_result_ids, 1)
+       OR EXISTS (SELECT 1 FROM pg_catalog.unnest(target_result_ids) AS result_id
+                  WHERE result_id <= 0)
+       OR EXISTS (
+          SELECT 1 FROM pg_catalog.generate_series(
+              1, pg_catalog.array_length(target_result_ids, 1)
+          ) AS numbered(position)
+          WHERE (pg_catalog.octet_length(
+                    target_schema_payloads[numbered.position]
+                 ) BETWEEN 1 AND 16384) IS NOT TRUE
+             OR pg_catalog.octet_length(
+                    target_schema_digests[numbered.position]
+                ) IS DISTINCT FROM 32
+       )
     THEN RAISE EXCEPTION 'target graph result contract is invalid'; END IF;
     SELECT * INTO STRICT target FROM shiba_internal.validate_graph_rebuild_current(
         requested_graph_id, expected_old_digest, expected_old_bootstrap_id,
@@ -97,15 +108,10 @@ BEGIN
         ON member.prpubid = target_publication
        AND member.prrelid = target_relations[numbered.position];
     INSERT INTO shiba.graph_result (
-        graph_id, result_id, output_shape, output_key_type,
-        output_key_nullable, output_value_type, output_value_nullable,
-        result_status, value_payload, value_bigint
+        graph_id, result_id, result_status, schema_payload, schema_digest
     ) SELECT requested_graph_id, target_result_ids[numbered.position],
-        target_result_shapes[numbered.position],
-        CASE target_result_shapes[numbered.position] WHEN 'keyed' THEN 'int8' END,
-        target_key_nullable[numbered.position], 'int8',
-        target_value_nullable[numbered.position],
-        'building', NULL, NULL
+        'building', target_schema_payloads[numbered.position],
+        target_schema_digests[numbered.position]
       FROM pg_catalog.generate_series(1, pg_catalog.array_length(target_result_ids, 1))
            AS numbered(position);
     UPDATE shiba_internal.graph_bootstrap SET graph_digest = target_graph_digest,
@@ -126,5 +132,5 @@ $function$;
 REVOKE ALL ON FUNCTION shiba_internal.prepare_graph_rebuild(
     bigint, bytea, bigint, oid[], oid[], oid, name, bigint,
     bigint, bigint[], oid[], oid[], oid, name, bigint, bytea, bytea, bytea,
-    bigint[], text[], boolean[], boolean[]
+    bigint[], bytea[], bytea[]
 ) FROM PUBLIC;

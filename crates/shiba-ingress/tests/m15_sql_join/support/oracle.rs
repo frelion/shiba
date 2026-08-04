@@ -42,8 +42,13 @@ fn assert_oracle(client: &mut Client, left: &str, right: &str) {
     let expected = oracle(client, left, right);
     let actual = client
         .query(
-            "SELECT result_key_bigint,result_value_bigint,result_value_is_null
-             FROM shiba.graph_result_rows WHERE graph_id=1 ORDER BY result_key_bigint",
+            "SELECT
+                (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint,
+                CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,type}' = 'null'
+                     THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb
+                                      #>> '{values,1,value}')::bigint END,
+                convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,type}' = 'null'
+             FROM shiba.graph_result_rows WHERE graph_id=1 ORDER BY 1",
             &[],
         )
         .expect("query complete materialized SQL join rows")

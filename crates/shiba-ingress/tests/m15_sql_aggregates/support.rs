@@ -181,7 +181,7 @@ pub(crate) fn assert_registration_contracts(client: &mut Client) {
     for (ordinal, row) in rows.iter().enumerate() {
         assert_eq!(row.get::<_, i64>(0), i64::try_from(ordinal + 1).unwrap());
         assert_eq!(row.get::<_, i16>(1), 1);
-        assert_eq!(row.get::<_, i32>(2), 2);
+        assert_eq!(row.get::<_, i32>(2), 3);
         assert!(!row.get::<_, bool>(3));
     }
 }
@@ -190,15 +190,13 @@ pub(crate) fn assert_building(client: &mut Client, graph: u64) {
     let graph = i64::try_from(graph).expect("graph ID fits");
     let rows = client
         .query(
-            "SELECT result_status,value_payload,value_bigint
+            "SELECT result_status
              FROM shiba.graph_result WHERE graph_id=$1",
             &[&graph],
         )
         .expect("query building aggregate result");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, &str>(0), "building");
-    assert_eq!(rows[0].get::<_, Option<Vec<u8>>>(1), None);
-    assert_eq!(rows[0].get::<_, Option<i64>>(2), None);
     assert!(
         client
             .query(

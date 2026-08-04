@@ -1,5 +1,15 @@
 # Source Ingress contract
 
+## M16.2 result-schema governance
+
+Ingress remains transport/lifecycle orchestration and does not interpret result
+fields or aggregate functions. At startup, resume, bootstrap and rebuild
+handoff it validates each terminal's exact canonical schema payload and digest
+against the sole OperatorGraph. Rebuild prepare carries result IDs plus opaque
+schema payloads/digests; it no longer carries scalar/key/value shape arrays.
+Schema drift fails before receive, Apply or ACK. This changes no WAL,
+continuation, transaction or feedback authority.
+
 ## M14.6 graph ingress cutover
 
 Ingress is now graph-scoped for both one- and two-member graphs. One

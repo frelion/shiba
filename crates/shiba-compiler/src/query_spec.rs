@@ -187,20 +187,14 @@ pub enum QuerySelectorV1 {
 #[serde(deny_unknown_fields)]
 pub struct QueryResultV1 {
     pub input_node: u16,
-    pub shape: QueryResultShapeV1,
+    pub fields: Vec<QueryResultFieldV1>,
+    pub key_ordinals: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "shape", rename_all = "snake_case", deny_unknown_fields)]
-pub enum QueryResultShapeV1 {
-    Scalar {
-        value_slot: u16,
-        value_nullable: bool,
-    },
-    Keyed {
-        key_slot: u16,
-        key_nullable: bool,
-        value_slot: u16,
-        value_nullable: bool,
-    },
+#[serde(deny_unknown_fields)]
+pub struct QueryResultFieldV1 {
+    pub name: String,
+    pub value_slot: u16,
+    pub nullable: bool,
 }

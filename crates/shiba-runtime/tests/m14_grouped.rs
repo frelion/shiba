@@ -1,7 +1,7 @@
 use postgres::{Client, NoTls};
 use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
 use shiba_protocol::{GraphId, SlotGeneration, SourceId};
 use shiba_runtime::{
@@ -16,7 +16,7 @@ mod support;
 use grouped_support::{
     assert_sql_oracle, durable_snapshot, node_state_payload, set_node_state_payload,
 };
-use support::PgoutputCapture;
+use support::{PgoutputCapture, keyed_int8_results};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m14-grouped.sh",
@@ -71,12 +71,19 @@ fn spec() -> QuerySpecV1 {
             .step_by(2)
             .map(|input_node| QueryResultV1 {
                 input_node,
-                shape: QueryResultShapeV1::Keyed {
-                    key_slot: 0,
-                    key_nullable: input_node != 6,
-                    value_slot: 1,
-                    value_nullable: input_node == 6,
-                },
+                fields: vec![
+                    QueryResultFieldV1 {
+                        name: "key".into(),
+                        value_slot: 0,
+                        nullable: input_node != 6,
+                    },
+                    QueryResultFieldV1 {
+                        name: "value".into(),
+                        value_slot: 1,
+                        nullable: input_node == 6,
+                    },
+                ],
+                key_ordinals: vec![1],
             })
             .collect(),
     }
@@ -140,7 +147,8 @@ fn prove_permissions(client: &mut Client) {
     assert!(
         client
             .execute(
-                "UPDATE shiba.graph_result SET value_bigint = 0 WHERE graph_id = 1 AND result_id = 7",
+                "UPDATE shiba.graph_result SET schema_payload = schema_payload
+                 WHERE graph_id = 1 AND result_id = 7",
                 &[],
             )
             .is_err()
@@ -156,7 +164,7 @@ fn grouped_runtime_sql_is_set_based() {
     );
     let sink = concat!(
         include_str!("../src/result_sink.rs"),
-        include_str!("../src/result_sink/keyed.rs")
+        include_str!("../src/result_sink/rows.rs")
     );
     for required in ["FROM unnest(", "ON CONFLICT (graph_id, node_id, namespace"] {
         assert!(
@@ -164,7 +172,7 @@ fn grouped_runtime_sql_is_set_based() {
             "missing set-based keyed state SQL: {required}"
         );
     }
-    for required in ["key_payload = ANY($3)", "FROM unnest($3::bytea[]"] {
+    for required in ["row_identity = ANY($3)", "FROM unnest($4::bytea[]"] {
         assert!(
             sink.contains(required),
             "missing set-based result SQL: {required}"
@@ -209,37 +217,8 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
         "insert.pgoutput",
     );
     apply_once(&mut client, &insert);
-    let null_key = client
-        .query_one(
-            "SELECT result_value_bigint, result_key_is_null, result_value_is_null
-             FROM shiba.graph_result_rows
-             WHERE graph_id = 1 AND result_id = 7 AND result_key_is_null",
-            &[],
-        )
-        .expect("query NULL group count");
-    assert_eq!(
-        (
-            null_key.get::<_, Option<i64>>(0),
-            null_key.get::<_, bool>(1),
-            null_key.get::<_, bool>(2),
-        ),
-        (Some(2), true, false)
-    );
-    let all_null_sum = client
-        .query_one(
-            "SELECT result_value_bigint, result_value_is_null
-             FROM shiba.graph_result_rows
-             WHERE graph_id = 1 AND result_id = 9 AND result_key_bigint = 3",
-            &[],
-        )
-        .expect("query all-NULL SUM group");
-    assert_eq!(
-        (
-            all_null_sum.get::<_, Option<i64>>(0),
-            all_null_sum.get::<_, bool>(1),
-        ),
-        (None, true)
-    );
+    assert!(keyed_int8_results(&mut client, 1, 7).contains(&(None, Some(2))));
+    assert!(keyed_int8_results(&mut client, 1, 9).contains(&(Some(3), None)));
     let after_insert = durable_snapshot(&mut client);
     assert_eq!(
         process(&mut client, &insert).unwrap(),
@@ -268,15 +247,16 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
         "empty-group.pgoutput",
     );
     apply_once(&mut client, &empty_group);
-    let deleted_group: i64 = client
-        .query_one(
-            "SELECT count(*) FROM shiba.graph_result_rows
-             WHERE graph_id = 1 AND result_id IN (7, 8) AND result_key_bigint = 10",
-            &[],
-        )
-        .expect("query deleted empty group")
-        .get(0);
-    assert_eq!(deleted_group, 0);
+    assert!(
+        !keyed_int8_results(&mut client, 1, 7)
+            .iter()
+            .any(|row| row.0 == Some(10))
+    );
+    assert!(
+        !keyed_int8_results(&mut client, 1, 8)
+            .iter()
+            .any(|row| row.0 == Some(10))
+    );
 
     let overflow_input = capture(
         &mut client,

@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use shiba_operator::{
     ColumnBinding, DeltaBatch, EffectOrigin, EncodedOperatorState, GraphEffectOrigin,
     MultiInputBatch, NodeId, NodeInput, ObjectAddress, OperatorGraph, OperatorNode,
-    OperatorNodeKind, OutputContract, ResultDelta, ResultMutation, SourceDeltaBatch, SourcePort,
-    StateContract, StateDelta, StateEntry, StateMutation, StateSnapshot, TypedLayout, TypedRow,
-    TypedValue, ValueType, apply_graph_plan, graph_state_read_set, source_typed_layout,
+    OperatorNodeKind, OutputContract, ResultField, ResultMutation, ResultRowKey, ResultSchemaV1,
+    SourceDeltaBatch, SourcePort, StateContract, StateDelta, StateEntry, StateMutation,
+    StateSnapshot, TypedLayout, TypedResultRowV1, TypedRow, TypedValue, ValueType,
+    apply_graph_plan, graph_state_read_set, source_typed_layout,
 };
 use shiba_protocol::{
     GraphId, GraphTransactionId, IngressTransactionId, PostgresLsn, SlotGeneration, SourceId,
@@ -31,12 +32,7 @@ fn binding(object: u32, sub: i32) -> ColumnBinding {
 fn graph() -> OperatorGraph {
     let left = SourceId::new(2).unwrap();
     let right = SourceId::new(1).unwrap();
-    let output = OutputContract::KeyedRows {
-        key_type: ValueType::Int8,
-        key_nullable: false,
-        value_type: ValueType::Int8,
-        nullable: true,
-    };
+    let output = keyed_output();
     OperatorGraph::build(
         GraphId::new(9).unwrap(),
         vec![
@@ -78,14 +74,54 @@ fn graph() -> OperatorGraph {
                 input: NodeInput::Node(node(1)),
                 state_contract: None,
                 kind: OperatorNodeKind::Materialize {
-                    key_slot: 0,
-                    value_slot: 1,
+                    field_slots: vec![0, 1],
                     output,
                 },
             },
         ],
     )
     .unwrap()
+}
+
+fn keyed_output() -> OutputContract {
+    let schema = ResultSchemaV1::new(
+        vec![
+            ResultField {
+                ordinal: 1,
+                name: "id".into(),
+                value_type: ValueType::Int8,
+                nullable: false,
+            },
+            ResultField {
+                ordinal: 2,
+                name: "payload".into(),
+                value_type: ValueType::Int8,
+                nullable: true,
+            },
+        ],
+        vec![1],
+    )
+    .unwrap();
+    OutputContract::new(schema, None).unwrap()
+}
+
+fn upsert(id: i64, value: TypedValue) -> ResultMutation {
+    let schema = keyed_output().schema;
+    let row = TypedResultRowV1::new(&schema, vec![TypedValue::Int8(id), value]).unwrap();
+    ResultMutation::Upsert {
+        key: ResultRowKey::from_row(&schema, &row).unwrap(),
+        row,
+    }
+}
+
+fn delete(id: i64) -> ResultMutation {
+    let schema = keyed_output().schema;
+    ResultMutation::Delete {
+        key: ResultRowKey {
+            schema_digest: schema.digest,
+            values: vec![TypedValue::Int8(id)],
+        },
+    }
 }
 
 fn layout(graph: &OperatorGraph, source: SourceId) -> TypedLayout {
@@ -197,33 +233,30 @@ fn evaluate(
             }
         }
     }
-    let ResultDelta::Keyed { mutations, .. } = transition.results.into_iter().next().unwrap()
-    else {
-        panic!()
-    };
-    Ok(mutations)
+    Ok(transition.results.into_iter().next().unwrap().mutations)
 }
 
 fn apply_output(output: &mut BTreeMap<i64, Option<i64>>, mutations: Vec<ResultMutation>) {
     for mutation in mutations {
         match mutation {
-            ResultMutation::Delete {
-                key: TypedValue::Int8(id),
-            } => {
+            ResultMutation::Delete { key } => {
+                let TypedValue::Int8(id) = key.values[0] else {
+                    panic!("bad join key")
+                };
                 output.remove(&id);
             }
-            ResultMutation::Upsert {
-                key: TypedValue::Int8(id),
-                value,
-            } => {
-                let payload = match value {
+            ResultMutation::Upsert { key, row } => {
+                let TypedValue::Int8(id) = key.values[0] else {
+                    panic!("bad join key")
+                };
+                let payload = match row.values[1] {
                     TypedValue::Int8(value) => Some(value),
                     TypedValue::Null(ValueType::Int8) => None,
                     _ => panic!("join emitted a value outside its contract"),
                 };
                 output.insert(id, payload);
             }
-            _ => panic!("join emitted a key outside its contract"),
+            ResultMutation::ReplaceScalar { .. } => panic!("join emitted scalar output"),
         }
     }
 }
@@ -246,10 +279,7 @@ fn both_sides_share_one_pre_to_final_transition() {
     );
     assert_eq!(
         evaluate(&graph, &mut state, &first).unwrap(),
-        vec![ResultMutation::Upsert {
-            key: TypedValue::Int8(10),
-            value: TypedValue::Null(ValueType::Int8)
-        }]
+        vec![upsert(10, TypedValue::Null(ValueType::Int8))]
     );
     let both = batch(
         &graph,
@@ -265,10 +295,7 @@ fn both_sides_share_one_pre_to_final_transition() {
     );
     assert_eq!(
         evaluate(&graph, &mut state, &both).unwrap(),
-        vec![ResultMutation::Upsert {
-            key: TypedValue::Int8(10),
-            value: TypedValue::Int8(7)
-        }]
+        vec![upsert(10, TypedValue::Int8(7))]
     );
     let right_update = batch(
         &graph,
@@ -281,10 +308,7 @@ fn both_sides_share_one_pre_to_final_transition() {
     );
     assert_eq!(
         evaluate(&graph, &mut state, &right_update).unwrap(),
-        vec![ResultMutation::Upsert {
-            key: TypedValue::Int8(10),
-            value: TypedValue::Null(ValueType::Int8)
-        }]
+        vec![upsert(10, TypedValue::Null(ValueType::Int8))]
     );
     let right_delete = batch(
         &graph,
@@ -297,9 +321,7 @@ fn both_sides_share_one_pre_to_final_transition() {
     );
     assert_eq!(
         evaluate(&graph, &mut state, &right_delete).unwrap(),
-        vec![ResultMutation::Delete {
-            key: TypedValue::Int8(10)
-        }]
+        vec![delete(10)]
     );
     let remove = batch(
         &graph,

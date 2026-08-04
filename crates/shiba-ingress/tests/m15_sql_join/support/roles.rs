@@ -38,7 +38,7 @@ pub(crate) fn install(client: &mut Client) {
              GRANT EXECUTE ON FUNCTION shiba_internal.prepare_graph_rebuild(
                  bigint,bytea,bigint,oid[],oid[],oid,name,bigint,
                  bigint,bigint[],oid[],oid[],oid,name,bigint,
-                 bytea,bytea,bytea,bigint[],text[],boolean[],boolean[]
+                 bytea,bytea,bytea,bigint[],bytea[],bytea[]
              ) TO {CONTROL_ROLE};
              GRANT USAGE ON SCHEMA left_source,right_source,
                  join_target_left,join_target_right TO {RECEIVER_ROLE};
@@ -182,7 +182,10 @@ pub(crate) fn assert_reader_building(reader: &mut Client) {
     );
     assert!(
         reader
-            .execute("UPDATE shiba.graph_result SET value_bigint=1", &[])
+            .execute(
+                "UPDATE shiba.graph_result SET schema_payload=schema_payload",
+                &[]
+            )
             .is_err()
     );
 }
@@ -196,8 +199,13 @@ pub(crate) fn assert_reader_matches(
     let expected = oracle(admin, left, right);
     let actual = reader
         .query(
-            "SELECT result_key_bigint,result_value_bigint,result_value_is_null
-             FROM shiba.graph_result_rows WHERE graph_id=1 ORDER BY result_key_bigint",
+            "SELECT
+                (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint,
+                CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,type}' = 'null'
+                     THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb
+                                      #>> '{values,1,value}')::bigint END,
+                convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,type}' = 'null'
+             FROM shiba.graph_result_rows WHERE graph_id=1 ORDER BY 1",
             &[],
         )
         .expect("SELECT-only reader queries complete SQL join result")

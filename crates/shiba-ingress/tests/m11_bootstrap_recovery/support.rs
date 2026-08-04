@@ -3,7 +3,7 @@ use std::process::Command;
 use postgres::Client;
 use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
 use shiba_operator::TypedValue;
 use shiba_protocol::{GraphId, SourceId};
@@ -72,17 +72,21 @@ fn graph_spec() -> QuerySpecV1 {
         results: vec![
             QueryResultV1 {
                 input_node: 1,
-                shape: QueryResultShapeV1::Scalar {
+                fields: vec![QueryResultFieldV1 {
+                    name: "count".into(),
                     value_slot: 0,
-                    value_nullable: false,
-                },
+                    nullable: false,
+                }],
+                key_ordinals: vec![],
             },
             QueryResultV1 {
                 input_node: 2,
-                shape: QueryResultShapeV1::Scalar {
+                fields: vec![QueryResultFieldV1 {
+                    name: "sum".into(),
                     value_slot: 0,
-                    value_nullable: false,
-                },
+                    nullable: true,
+                }],
+                key_ordinals: vec![],
             },
         ],
     }

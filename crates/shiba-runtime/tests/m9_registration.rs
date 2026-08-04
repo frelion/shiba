@@ -1,7 +1,7 @@
 use postgres::{Client, NoTls};
 use shiba_compiler::{
     CompilerError, QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
 use shiba_operator::{ObjectAddress, OperatorGraph, OperatorNodeKind};
 use shiba_protocol::{GraphId, SourceId};
@@ -51,17 +51,21 @@ fn spec(graph_id: u64, source_id: u64, input_column: &str) -> QuerySpecV1 {
         results: vec![
             QueryResultV1 {
                 input_node: 1,
-                shape: QueryResultShapeV1::Scalar {
+                fields: vec![QueryResultFieldV1 {
+                    name: "count".into(),
                     value_slot: 0,
-                    value_nullable: false,
-                },
+                    nullable: false,
+                }],
+                key_ordinals: vec![],
             },
             QueryResultV1 {
                 input_node: 2,
-                shape: QueryResultShapeV1::Scalar {
+                fields: vec![QueryResultFieldV1 {
+                    name: "sum".into(),
                     value_slot: 0,
-                    value_nullable: false,
-                },
+                    nullable: true,
+                }],
+                key_ordinals: vec![],
             },
         ],
     }
@@ -178,7 +182,10 @@ fn prove_permissions(client: &mut Client) {
     );
     assert!(
         client
-            .execute("UPDATE shiba.graph_result SET value_bigint = 9", &[])
+            .execute(
+                "UPDATE shiba.graph_result SET schema_payload = schema_payload",
+                &[]
+            )
             .is_err()
     );
     assert!(

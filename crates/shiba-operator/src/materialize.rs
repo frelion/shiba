@@ -1,19 +1,21 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    DeltaBatch, GraphError, NodeId, ResultDelta, ResultMutation, TypedLayout, TypedRow, TypedValue,
-    ValueType, graph::MAX_NODE_DELTA_ROWS,
+    DeltaBatch, GraphError, NodeId, OutputContract, ResultDelta, ResultMutation, ResultRowKey,
+    TypedLayout, TypedResultRowV1, TypedRow, graph::MAX_NODE_DELTA_ROWS,
 };
 
 pub(crate) fn materialize(
     node_id: NodeId,
     batch: &DeltaBatch,
     layout: &TypedLayout,
-    key_slot: u16,
-    value_slot: u16,
-    key_nullable: bool,
-    value_nullable: bool,
+    field_slots: &[u16],
+    output: &OutputContract,
 ) -> Result<ResultDelta, GraphError> {
+    output.schema.validate().map_err(|_| GraphError::Codec)?;
+    if field_slots.len() != output.schema.fields.len() || output.schema.is_scalar() {
+        return Err(GraphError::WrongType);
+    }
     let capacity = batch
         .rows
         .len()
@@ -26,59 +28,66 @@ pub(crate) fn materialize(
         let before = delta
             .before
             .as_ref()
-            .map(|row| result_value(row, layout, key_slot, key_nullable))
+            .map(|row| result_row(row, layout, field_slots, output))
             .transpose()?;
         let after = delta
             .after
             .as_ref()
-            .map(|row| {
-                Ok::<_, GraphError>((
-                    result_value(row, layout, key_slot, key_nullable)?,
-                    result_value(row, layout, value_slot, value_nullable)?,
-                ))
-            })
+            .map(|row| result_row(row, layout, field_slots, output))
             .transpose()?;
+        let before = match before {
+            Some(row) => Some((
+                ResultRowKey::from_row(&output.schema, &row).map_err(|_| GraphError::WrongType)?,
+                row,
+            )),
+            None => None,
+        };
+        let after = match after {
+            Some(row) => Some((
+                ResultRowKey::from_row(&output.schema, &row).map_err(|_| GraphError::WrongType)?,
+                row,
+            )),
+            None => None,
+        };
         match (before, after) {
-            (Some(old_key), Some((new_key, value))) if old_key == new_key => {
+            (Some((old_key, _)), Some((new_key, row))) if old_key == new_key => {
                 insert_key(&mut keys, &old_key)?;
-                push_mutation(
-                    &mut mutations,
-                    ResultMutation::Upsert {
-                        key: old_key,
-                        value,
-                    },
-                )?;
+                push(&mut mutations, ResultMutation::Upsert { key: old_key, row })?;
             }
-            (Some(old_key), Some((new_key, value))) => {
+            (Some((old_key, _)), Some((new_key, row))) => {
                 insert_key(&mut keys, &old_key)?;
                 insert_key(&mut keys, &new_key)?;
-                push_mutation(&mut mutations, ResultMutation::Delete { key: old_key })?;
-                push_mutation(
-                    &mut mutations,
-                    ResultMutation::Upsert {
-                        key: new_key,
-                        value,
-                    },
-                )?;
+                push(&mut mutations, ResultMutation::Delete { key: old_key })?;
+                push(&mut mutations, ResultMutation::Upsert { key: new_key, row })?;
             }
-            (Some(key), None) => {
+            (Some((key, _)), None) => {
                 insert_key(&mut keys, &key)?;
-                push_mutation(&mut mutations, ResultMutation::Delete { key })?;
+                push(&mut mutations, ResultMutation::Delete { key })?;
             }
-            (None, Some((key, value))) => {
+            (None, Some((key, row))) => {
                 insert_key(&mut keys, &key)?;
-                push_mutation(&mut mutations, ResultMutation::Upsert { key, value })?;
+                push(&mut mutations, ResultMutation::Upsert { key, row })?;
             }
             (None, None) => {}
         }
     }
-    Ok(ResultDelta::Keyed { node_id, mutations })
+    Ok(ResultDelta { node_id, mutations })
 }
 
-fn push_mutation(
-    mutations: &mut Vec<ResultMutation>,
-    mutation: ResultMutation,
-) -> Result<(), GraphError> {
+fn result_row(
+    row: &TypedRow,
+    layout: &TypedLayout,
+    slots: &[u16],
+    output: &OutputContract,
+) -> Result<TypedResultRowV1, GraphError> {
+    let values = slots
+        .iter()
+        .map(|slot| row.value(layout, *slot).cloned())
+        .collect::<Result<Vec<_>, _>>()?;
+    TypedResultRowV1::new(&output.schema, values).map_err(|_| GraphError::WrongType)
+}
+
+fn push(mutations: &mut Vec<ResultMutation>, mutation: ResultMutation) -> Result<(), GraphError> {
     if mutations.len() == MAX_NODE_DELTA_ROWS {
         return Err(GraphError::OutputLimit);
     }
@@ -86,24 +95,10 @@ fn push_mutation(
     Ok(())
 }
 
-fn insert_key(keys: &mut BTreeSet<TypedValue>, key: &TypedValue) -> Result<(), GraphError> {
+fn insert_key(keys: &mut BTreeSet<ResultRowKey>, key: &ResultRowKey) -> Result<(), GraphError> {
     if keys.insert(key.clone()) {
         Ok(())
     } else {
         Err(GraphError::ConflictingKey)
-    }
-}
-
-fn result_value(
-    row: &TypedRow,
-    layout: &TypedLayout,
-    slot: u16,
-    nullable: bool,
-) -> Result<TypedValue, GraphError> {
-    match row.value(layout, slot)? {
-        TypedValue::Int8(value) => Ok(TypedValue::Int8(*value)),
-        TypedValue::Null(ValueType::Int8) if nullable => Ok(TypedValue::Null(ValueType::Int8)),
-        TypedValue::Absent => Err(GraphError::Expression),
-        _ => Err(GraphError::WrongType),
     }
 }

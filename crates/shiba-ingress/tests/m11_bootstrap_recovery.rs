@@ -208,7 +208,7 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
         admin
             .query_one(
                 "SELECT count(*) FROM shiba.graph_result
-                 WHERE result_status = 'building' AND value_bigint IS NULL",
+                 WHERE result_status = 'building'",
                 &[],
             )
             .expect("replacement results remain unavailable")

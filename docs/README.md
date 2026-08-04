@@ -334,3 +334,20 @@ the Result Sink remain function-independent. Twelve pure reference tests prove
 the frozen semantics, codec rejection and exact bounds. M16.1 adds no
 production path, Catalog schema, PostgreSQL evidence or compatibility
 authority; those remain the work of subsequent M16 implementation slices.
+
+## M16.2 canonical wide results
+
+M16.2 cuts the frozen result contract into production. QuerySpec terminals now
+declare an ordered field list and canonical key ordinals; aliases are durable
+field names and participate in QuerySpec, schema and graph identity. Compiler
+produces one `ResultSchemaV1`, and Operator emits complete
+`TypedResultRowV1` values through generic scalar replacement or keyed
+upsert/delete deltas.
+
+Catalog stores only the schema header and schema-bound row payloads. Runtime is
+the sole generic row writer, while Ingress, Bootstrap and Rebuild validate or
+carry the exact schema bytes and digest without interpreting aggregate
+functions. Building rows remain private and activation publishes the complete
+set. Fixed scalar/key/value columns and the keyed-only sink were removed in
+place; no compatibility view, dual write or second result authority exists.
+Generic Aggregate, multi-call, MIN/MAX and HAVING remain later M16 slices.

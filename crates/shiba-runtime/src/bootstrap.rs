@@ -86,7 +86,7 @@ pub fn reset_abandoned_bootstrap_state(
     if continuation_exists {
         return Err(M2Error::BootstrapIdentityConflict);
     }
-    let results = crate::result_sink::lock(transaction, graph_key, "building")?;
+    let results = crate::result_sink::lock(transaction, graph_key, &graph.graph, "building")?;
     let source_ids = graph
         .graph
         .sources
@@ -106,7 +106,7 @@ pub fn reset_abandoned_bootstrap_state(
         &[&graph_key],
     )?;
     if transaction.execute(
-        "UPDATE shiba.graph_result SET value_payload=NULL,value_bigint=NULL
+        "UPDATE shiba.graph_result SET result_status='building'
          WHERE graph_id=$1 AND result_status='building'",
         &[&graph_key],
     )? != u64::try_from(results.contract_count())

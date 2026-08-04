@@ -85,26 +85,18 @@ pub fn apply_graph(
             | OperatorNodeKind::GroupedSumInt8 { .. }
             | OperatorNodeKind::InnerJoin { .. } => unreachable!(),
             OperatorNodeKind::Materialize {
-                key_slot,
-                value_slot,
+                field_slots,
                 output,
             } => {
-                let crate::OutputContract::KeyedRows {
-                    key_nullable,
-                    nullable,
-                    ..
-                } = output
-                else {
+                if output.schema.is_scalar() {
                     return Err(GraphError::WrongType);
-                };
+                }
                 results.push(crate::materialize::materialize(
                     node.node_id,
                     batch,
                     layout,
-                    *key_slot,
-                    *value_slot,
-                    *key_nullable,
-                    *nullable,
+                    field_slots,
+                    output,
                 )?);
             }
         }

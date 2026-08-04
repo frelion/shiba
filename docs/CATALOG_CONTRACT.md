@@ -1,18 +1,30 @@
 # Catalog contract
 
-## M16.1 planned wide-result authority
+## M16.2 canonical wide-result authority
 
-M16.1 has contract and database-free reference evidence only. A later
-clean-room cutover may replace the current
-scalar/key/value result shape in place with one canonical `ResultSchemaV1`
-digest and typed scalar/keyed rows of at most 16 fields. The existing graph
-definition, node state, result and lifecycle tables remain the only authority;
-MIN/MAX candidate multiplicities belong to generic graph node state, not a new
-aggregate registry or cache. Runtime remains the sole state/result writer.
+M16.2 replaces the fixed scalar/key/value result shape in place. The only
+terminal contract header is `shiba.graph_result(graph_id, result_id,
+result_status, schema_payload, schema_digest)`. The only materialized row store
+is `shiba_internal.graph_result_row(graph_id, result_id, schema_digest,
+row_identity, row_payload)`. A composite foreign key requires every row to use
+the exact schema digest installed in its header. The active-only
+`shiba.graph_result_rows` API exposes schema metadata and complete canonical row
+payloads; it contains none of the superseded fixed key/value columns.
 
-M16.1 changes no SQL schema. A later implementation must remove the superseded
-shape in the same cutover and may not add compatibility views, dual writes or
-a second result authority.
+`ResultSchemaV1` owns ordered field names, types, nullability and canonical key
+ordinals. `TypedResultRowV1` owns a complete schema-bound row. Scalar output is
+the same row authority with the one canonical singleton identity; keyed output
+derives its canonical identity from the schema key fields. Registration writes
+the schema and its operator-supplied initial scalar row atomically. Runtime is
+the sole row writer and applies generic ReplaceScalar/Upsert/Delete mutations
+without interpreting a node or aggregate function. Rebuild installs the target
+schema while building, clears old rows, keeps building rows private and
+publishes the same authority only at activation.
+
+The old shape, scalar bigint/payload, result key/value columns and keyed-only
+sink are deleted. There is no compatibility view, adapter, dual write, function
+registry or second result authority. MIN/MAX and generic Aggregate execution
+remain subsequent M16 slices and must reuse these tables unchanged.
 
 ## M14.6 graph execution authority
 
@@ -35,8 +47,8 @@ two-member graph, not only the JOIN right side.
 `graph_node_state` is Runtime's sole scalar/keyed private state authority.
 Scalar state uses the graph contract's unit key; keyed state uses canonical
 partition/item payloads. `shiba.graph_result` owns terminal output contracts,
-building/active visibility and scalar values;
-`shiba_internal.graph_result_row` owns private keyed rows and
+building/active visibility; `shiba_internal.graph_result_row` owns every
+private scalar/keyed typed row and
 `shiba.graph_result_rows` exposes only active rows. Runtime is
 the sole state/result writer and persists `GraphTransition` generically. It
 does not match Filter, aggregate, Join or Materialize names.
@@ -258,7 +270,8 @@ execution takes `FOR UPDATE` on the phase to serialize with active cutover;
 PUBLIC still has no privilege. Runtime remains the only writer of current
 source rows and operator state/result. A batch's row/operator writes
 and checkpoint advance share one transaction. Public results must represent
-building/unavailable as `result_status = building, value_bigint = NULL`;
+building/unavailable as `result_status = building`; its private typed rows are
+not exposed by the active-only result API;
 complete values require `result_status = active` and become visible with active
 lifecycle in one cutover transaction. M11.2 replaces the WAL-cause-shaped
 `applied_insert` with the sole key-owned `source_row_state`; no alias or second

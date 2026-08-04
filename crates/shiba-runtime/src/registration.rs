@@ -23,9 +23,8 @@ pub struct RebuildSourceTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphResultContract {
     pub result_id: i64,
-    pub output_shape: &'static str,
-    pub key_nullable: bool,
-    pub value_nullable: bool,
+    pub schema_payload: Vec<u8>,
+    pub schema_digest: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,6 +1,6 @@
 use postgres::Client;
 
-use crate::support::PgoutputCapture;
+use crate::support::{PgoutputCapture, keyed_int8_results};
 
 pub(crate) const SINGLE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m14-graph-runtime.sh",
@@ -42,16 +42,9 @@ pub(crate) fn configure(client: &mut Client, graph_id: i64, publication: &str, s
 }
 
 pub(crate) fn join_rows(client: &mut Client) -> Vec<(i64, Option<i64>)> {
-    client
-        .query(
-            "SELECT result_key_bigint, result_value_bigint
-             FROM shiba.graph_result_rows
-             WHERE graph_id = 2 AND result_id = 2 ORDER BY result_key_bigint",
-            &[],
-        )
-        .expect("query materialized join")
+    keyed_int8_results(client, 2, 2)
         .into_iter()
-        .map(|row| (row.get(0), row.get(1)))
+        .map(|(key, value)| (key.expect("join key is non-null"), value))
         .collect()
 }
 

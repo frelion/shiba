@@ -127,7 +127,7 @@ pub(crate) fn assert_prepared_closed(client: &mut Client, target_slot: &str) {
                 (SELECT count(*) FROM shiba_internal.graph_continuation WHERE graph_id = 1),
                 (SELECT count(*) FROM shiba_internal.graph_node_state WHERE graph_id = 1),
                 (SELECT count(*) FROM shiba.graph_result
-                 WHERE result_status <> 'building' OR value_bigint IS NOT NULL),
+                 WHERE result_status <> 'building'),
                 (SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1)",
             &[&target_slot],
         )

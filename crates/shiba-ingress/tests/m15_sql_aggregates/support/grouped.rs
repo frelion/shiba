@@ -79,13 +79,13 @@ pub(crate) fn exercise_sum_and_recovery(
 
     let state = client
         .query_one(
-            "SELECT state.node_id,state.state_payload
-             FROM shiba_internal.graph_node_state AS state
-             JOIN shiba_internal.graph_result_row AS result
-               ON result.graph_id=state.graph_id
-              AND result.key_payload=state.partition_key_payload
-             WHERE state.graph_id=4 AND result.result_key_bigint=20
-               AND NOT result.result_key_is_null",
+            "SELECT node_id,state_payload
+             FROM shiba_internal.graph_node_state
+             WHERE graph_id=4
+               AND (convert_from(partition_key_payload,'UTF8')::jsonb
+                    #>> '{value}')::bigint=20
+               AND convert_from(partition_key_payload,'UTF8')::jsonb
+                    #>> '{type}' = 'int8'",
             &[],
         )
         .expect("read grouped SUM partition state");
@@ -97,10 +97,11 @@ pub(crate) fn exercise_sum_and_recovery(
     client
         .execute(
             "UPDATE shiba_internal.graph_node_state SET state_payload=$2
-             WHERE graph_id=4 AND node_id=$1 AND partition_key_payload=(
-                 SELECT key_payload FROM shiba_internal.graph_result_row
-                 WHERE graph_id=4 AND result_key_bigint=20
-                   AND NOT result_key_is_null)",
+             WHERE graph_id=4 AND node_id=$1
+               AND (convert_from(partition_key_payload,'UTF8')::jsonb
+                    #>> '{value}')::bigint=20
+               AND convert_from(partition_key_payload,'UTF8')::jsonb
+                    #>> '{type}' = 'int8'",
             &[&node, &overflow],
         )
         .expect("inject checked-overflow state");
@@ -118,10 +119,11 @@ pub(crate) fn exercise_sum_and_recovery(
     client
         .execute(
             "UPDATE shiba_internal.graph_node_state SET state_payload=$2
-             WHERE graph_id=4 AND node_id=$1 AND partition_key_payload=(
-                 SELECT key_payload FROM shiba_internal.graph_result_row
-                 WHERE graph_id=4 AND result_key_bigint=20
-                   AND NOT result_key_is_null)",
+             WHERE graph_id=4 AND node_id=$1
+               AND (convert_from(partition_key_payload,'UTF8')::jsonb
+                    #>> '{value}')::bigint=20
+               AND convert_from(partition_key_payload,'UTF8')::jsonb
+                    #>> '{type}' = 'int8'",
             &[&node, &original],
         )
         .expect("restore valid grouped SUM state");
@@ -162,10 +164,19 @@ fn actual(client: &mut Client, graph: u64) -> Vec<ResultRow> {
     rows(
         client,
         &format!(
-            "SELECT result_key_bigint,result_value_bigint,
-                    result_key_is_null,result_value_is_null
+            "SELECT
+                    CASE WHEN convert_from(row_payload,'UTF8')::jsonb
+                                   #>> '{{values,0,type}}' = 'null'
+                         THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb
+                                   #>> '{{values,0,value}}')::bigint END,
+                    CASE WHEN convert_from(row_payload,'UTF8')::jsonb
+                                   #>> '{{values,1,type}}' = 'null'
+                         THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb
+                                   #>> '{{values,1,value}}')::bigint END,
+                    convert_from(row_payload,'UTF8')::jsonb #>> '{{values,0,type}}' = 'null',
+                    convert_from(row_payload,'UTF8')::jsonb #>> '{{values,1,type}}' = 'null'
              FROM shiba.graph_result_rows WHERE graph_id={graph}
-             ORDER BY result_key_is_null,result_key_bigint"
+             ORDER BY 3,1"
         ),
     )
 }
@@ -187,7 +198,7 @@ fn durable(client: &mut Client, fixture: &GraphFixture) -> String {
                            FROM shiba_internal.source_row_state s WHERE source_id=4),
                  'state',(SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY node_id,partition_key_payload),'[]')
                           FROM shiba_internal.graph_node_state s WHERE graph_id=4),
-                 'result',(SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY key_payload),'[]')
+                 'result',(SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY row_identity),'[]')
                            FROM shiba_internal.graph_result_row r WHERE graph_id=4),
                  'continuation',(SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY commit_lsn),'[]')
                                  FROM shiba_internal.graph_continuation c WHERE graph_id=4)

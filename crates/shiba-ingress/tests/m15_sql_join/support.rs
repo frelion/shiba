@@ -221,7 +221,7 @@ fn durable_snapshot(client: &mut Client) -> String {
                         FROM shiba_internal.source_row_state AS s WHERE source_id IN (1,2)),
                 'state',(SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY node_id,partition_key_payload),'[]')
                          FROM shiba_internal.graph_node_state AS s WHERE graph_id=1),
-                'results',(SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY key_payload),'[]')
+                'results',(SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY row_identity),'[]')
                            FROM shiba_internal.graph_result_row AS r WHERE graph_id=1),
                 'continuation',(SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY commit_lsn),'[]')
                                 FROM shiba_internal.graph_continuation AS c WHERE graph_id=1)

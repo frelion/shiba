@@ -72,21 +72,20 @@ pub(crate) fn apply(
             .iter()
             .find(|candidate| candidate.input == NodeInput::Node(node.node_id))
             .ok_or(KernelError::InvalidGraph)?;
-        if !matches!(
-            terminal.kind,
-            OperatorNodeKind::Materialize {
-                output: crate::OutputContract::Scalar {
-                    value_type: ValueType::Int8,
-                    ..
-                },
-                ..
-            }
-        ) {
+        let OperatorNodeKind::Materialize { output, .. } = &terminal.kind else {
+            return Err(KernelError::OutputContractMismatch);
+        };
+        if !output.schema.is_scalar()
+            || output.schema.fields.len() != 1
+            || output.schema.fields[0].value_type != ValueType::Int8
+        {
             return Err(KernelError::OutputContractMismatch);
         }
-        results.push(ResultDelta::Scalar {
+        let row = crate::TypedResultRowV1::new(&output.schema, vec![value])
+            .map_err(|_| KernelError::OutputContractMismatch)?;
+        results.push(ResultDelta {
             node_id: terminal.node_id,
-            value,
+            mutations: vec![crate::ResultMutation::ReplaceScalar { row }],
         });
     }
     Ok((state_deltas, results))
@@ -259,14 +258,16 @@ fn sum_result(
         .iter()
         .find(|candidate| candidate.input == NodeInput::Node(node_id))
         .ok_or(KernelError::InvalidGraph)?;
-    let OperatorNodeKind::Materialize {
-        output: crate::OutputContract::Scalar { nullable, .. },
-        ..
-    } = terminal.kind
-    else {
+    let OperatorNodeKind::Materialize { output, .. } = &terminal.kind else {
         return Err(KernelError::OutputContractMismatch);
     };
-    if state.non_null_count == 0 && nullable {
+    let Some(field) = output.schema.fields.first() else {
+        return Err(KernelError::OutputContractMismatch);
+    };
+    if !output.schema.is_scalar() || output.schema.fields.len() != 1 {
+        return Err(KernelError::OutputContractMismatch);
+    }
+    if state.non_null_count == 0 && field.nullable {
         Ok(TypedValue::Null(ValueType::Int8))
     } else {
         Ok(TypedValue::Int8(state.sum))

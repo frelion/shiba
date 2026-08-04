@@ -209,7 +209,7 @@ fn governed_session_uses_split_roles_and_revalidates_before_empty_ack() {
     assert_eq!(
         admin
             .query_one(
-                "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 2",
+                "SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 2",
                 &[]
             )
             .expect("query unchanged CountRows")

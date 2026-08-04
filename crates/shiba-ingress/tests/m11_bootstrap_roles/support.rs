@@ -1,7 +1,7 @@
 use postgres::Client;
 use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
 use shiba_ingress::BootstrapSpec;
 use shiba_protocol::{BootstrapId, GraphId, SlotGeneration, SourceId};
@@ -121,17 +121,21 @@ fn graph_spec(source_id: u64) -> QuerySpecV1 {
         results: vec![
             QueryResultV1 {
                 input_node: 1,
-                shape: QueryResultShapeV1::Scalar {
+                fields: vec![QueryResultFieldV1 {
+                    name: "count".into(),
                     value_slot: 0,
-                    value_nullable: false,
-                },
+                    nullable: false,
+                }],
+                key_ordinals: vec![],
             },
             QueryResultV1 {
                 input_node: 2,
-                shape: QueryResultShapeV1::Scalar {
+                fields: vec![QueryResultFieldV1 {
+                    name: "sum".into(),
                     value_slot: 0,
-                    value_nullable: false,
-                },
+                    nullable: true,
+                }],
+                key_ordinals: vec![],
             },
         ],
     }
@@ -150,9 +154,18 @@ pub fn load_publication_oid(client: &mut Client, publication: &str) -> u32 {
 pub fn assert_results(client: &mut Client, graph_id: i64, status: &str, values: [Option<i64>; 2]) {
     let actual = client
         .query(
-            "SELECT result_status, value_bigint
-             FROM shiba.graph_result
-             WHERE graph_id = $1 ORDER BY result_id",
+            "SELECT result.result_status,
+                    (SELECT CASE
+                        WHEN convert_from(row.row_payload,'UTF8')::jsonb
+                             #>> '{values,0,type}' = 'null' THEN NULL
+                        ELSE (convert_from(row.row_payload,'UTF8')::jsonb
+                              #>> '{values,0,value}')::bigint
+                     END
+                     FROM shiba.graph_result_rows AS row
+                     WHERE row.graph_id=result.graph_id
+                       AND row.result_id=result.result_id)
+             FROM shiba.graph_result AS result
+             WHERE result.graph_id = $1 ORDER BY result.result_id",
             &[&graph_id],
         )
         .expect("query public results")

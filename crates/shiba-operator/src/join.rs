@@ -83,10 +83,8 @@ pub(crate) fn apply(
             rows: result_rows,
         },
         &spec.output_layout,
-        0,
-        1,
-        spec.key_nullable,
-        spec.value_nullable,
+        &spec.materialize_field_slots,
+        &spec.output,
     )
     .map_err(|_| KernelError::InvalidTransition)?;
     Ok(Some(GraphTransition {

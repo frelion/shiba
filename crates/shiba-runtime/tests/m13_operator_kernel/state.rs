@@ -1,5 +1,7 @@
 use postgres::Client;
 
+use crate::support::keyed_int8_results;
+
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct Durable {
     pub(super) scalar: (i64, i64),
@@ -13,18 +15,21 @@ pub(super) fn durable(client: &mut Client) -> Durable {
     let scalar = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 4),
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 5)",
+                (SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 4),
+                (SELECT CASE
+                    WHEN convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,type}' = 'null'
+                    THEN 0
+                    ELSE (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint
+                 END FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 5)",
             &[],
         )
         .expect("query scalar results");
     Durable {
         scalar: (scalar.get(0), scalar.get(1)),
-        keyed: pairs(
-            client,
-            "SELECT result_key_bigint, result_value_bigint
-             FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 6 ORDER BY 1",
-        ),
+        keyed: keyed_int8_results(client, 1, 6)
+            .into_iter()
+            .map(|(key, value)| (key.expect("project key is non-null"), value))
+            .collect(),
         source: pairs(
             client,
             "SELECT source_row_id, payload_int8

@@ -1,7 +1,6 @@
 use shiba_compiler::{
     IdentityIndexDescriptor, POSTGRES_INT8_TYPE_OID, POSTGRES_TEXT_TYPE_OID, QueryInputV1,
-    QueryOperationV1, QueryResultShapeV1, QuerySelectorV1, SourceColumnDescriptor,
-    SourceDescriptor, compile_query,
+    QueryOperationV1, QuerySelectorV1, SourceColumnDescriptor, SourceDescriptor, compile_query,
 };
 use shiba_operator::ObjectAddress;
 use shiba_protocol::{GraphId, SourceId};
@@ -123,15 +122,14 @@ fn cross_schema_join_binds_exact_fields_and_right_identity() {
             matches!(&field.selector, QuerySelectorV1::Name { name: actual, quoted: false } if actual == name)
         );
     }
-    assert_eq!(
-        spec.results[0].shape,
-        QueryResultShapeV1::Keyed {
-            key_slot: 0,
-            key_nullable: false,
-            value_slot: 1,
-            value_nullable: true,
-        }
-    );
+    assert_eq!(spec.results[0].key_ordinals, vec![1]);
+    assert_eq!(spec.results[0].fields.len(), 2);
+    assert_eq!(spec.results[0].fields[0].name, "id");
+    assert_eq!(spec.results[0].fields[0].value_slot, 0);
+    assert!(!spec.results[0].fields[0].nullable);
+    assert_eq!(spec.results[0].fields[1].name, "payload");
+    assert_eq!(spec.results[0].fields[1].value_slot, 1);
+    assert!(spec.results[0].fields[1].nullable);
     assert_compiles(&spec, &sources);
 }
 
@@ -152,7 +150,11 @@ fn aliases_quoted_identifiers_and_reversed_equality_are_canonical() {
          ON rhs.\"Id\" = lhs.\"ForeignId\"",
         &quoted,
     );
-    assert_eq!(first, second);
+    assert_eq!(first.sources, second.sources);
+    assert_eq!(first.nodes, second.nodes);
+    assert_ne!(first.results[0].fields, second.results[0].fields);
+    assert_eq!(second.results[0].fields[0].name, "visible_id");
+    assert_eq!(second.results[0].fields[1].name, "visible_payload");
     let QueryOperationV1::InnerJoin { left_id, .. } = &first.nodes[0].operation else {
         panic!()
     };

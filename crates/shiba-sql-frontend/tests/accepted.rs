@@ -49,7 +49,7 @@ fn accepts_cross_schema_inner_join_with_exact_qualified_columns() {
 }
 
 #[test]
-fn whitespace_case_parentheses_and_aliases_have_one_canonical_identity() {
+fn formatting_is_canonical_but_result_aliases_are_schema_semantics() {
     let variants = [
         "SELECT e.id, e.payload FROM source.events e",
         " select X.ID as key, (((X.payload))) AS value from SOURCE.EVENTS AS X ",
@@ -57,7 +57,7 @@ fn whitespace_case_parentheses_and_aliases_have_one_canonical_identity() {
         "SELECT /*ignored*/ q.id, q.payload FROM source.events AS q",
     ];
     let queries = variants.map(|sql| parse_sql(sql).unwrap());
-    assert_eq!(
+    assert_ne!(
         queries[0].canonical_payload(),
         queries[1].canonical_payload()
     );
@@ -77,8 +77,8 @@ fn canonical_payload_has_a_fixed_golden_prefix_and_ignores_spans() {
     assert_eq!(
         query.canonical_digest().unwrap(),
         [
-            118, 24, 18, 239, 248, 94, 210, 132, 0, 198, 176, 176, 60, 9, 166, 213, 191, 141, 1,
-            40, 56, 161, 208, 244, 60, 168, 89, 244, 236, 201, 127, 8,
+            227, 235, 237, 109, 1, 88, 28, 224, 207, 218, 53, 4, 28, 205, 68, 120, 109, 85, 91,
+            192, 66, 231, 229, 247, 119, 203, 35, 167, 88, 38, 47, 237,
         ]
     );
     assert_eq!(&payload[..4], &[b'U', b'Q', b'1', 1]);

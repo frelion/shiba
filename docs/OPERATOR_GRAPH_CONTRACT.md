@@ -1,9 +1,9 @@
 # M14 Operator SDK and graph contract
 
-## M16.1 planned aggregate and result extension
+## M16.2 wide terminal result contract
 
-The implemented M14/M15 graph remains current. M16.1 only freezes a future
-extension: aggregate nodes refer to exact `AggregateCallId` values and closed
+M16.1 freezes the aggregate extension: aggregate nodes refer to exact
+`AggregateCallId` values and closed
 function descriptors, state access is expressed as generic bounded exact/range
 reads, and terminal output carries canonical `ResultSchemaV1` plus typed rows.
 Only the Operator kernel dispatches CountStar, Count(nullable `int8`), SumInt8,
@@ -12,8 +12,13 @@ Runtime continues to schedule the graph and persist generic deltas without
 matching a function name. See
 [AGGREGATE_FUNCTION_CONTRACT.md](AGGREGATE_FUNCTION_CONTRACT.md).
 
-No M16 graph codec, node execution, wide sink or Catalog cutover is implemented
-or proved by the M16.1 database-free reference slice.
+M16.2 implements canonical wide terminal output. Each `OutputContract` contains
+one validated schema and, for scalar output, its canonical initial row.
+Materialize projects an ordered field-slot list and emits complete typed rows;
+scalar and keyed outputs share generic ResultDelta mutations. Runtime/Catalog
+persist these bytes without node/function dispatch. The fixed key/value delta
+and output-shape contracts are deleted. Aggregate nodes and their ABI remain
+M16.3 work.
 
 M14.2 implements the typed stateless graph path. M14.3 adds the sole generic
 keyed-state authority plus KeyBy, GroupedCount and GroupedSumInt8. Runtime uses

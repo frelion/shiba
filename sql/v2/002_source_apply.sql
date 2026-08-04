@@ -12,7 +12,7 @@ CREATE TABLE shiba_internal.source_row_state (
 CREATE TABLE shiba_internal.graph_definition (
     graph_id bigint PRIMARY KEY CHECK (graph_id > 0),
     source_count smallint NOT NULL CHECK (source_count IN (1, 2)),
-    compiler_version integer NOT NULL CHECK (compiler_version = 2),
+    compiler_version integer NOT NULL CHECK (compiler_version = 3),
     spec_payload bytea NOT NULL CHECK (pg_catalog.octet_length(spec_payload) > 0),
     graph_format_version integer NOT NULL CHECK (graph_format_version = 1),
     graph_payload bytea NOT NULL CHECK (pg_catalog.octet_length(graph_payload) > 0),
@@ -39,30 +39,17 @@ CREATE TABLE shiba_internal.graph_continuation (
 CREATE TABLE shiba.graph_result (
     graph_id bigint NOT NULL CHECK (graph_id > 0),
     result_id bigint NOT NULL CHECK (result_id > 0),
-    output_shape text NOT NULL CHECK (output_shape IN ('scalar', 'keyed')),
-    output_key_type text,
-    output_key_nullable boolean NOT NULL,
-    output_value_type text NOT NULL CHECK (output_value_type = 'int8'),
-    output_value_nullable boolean NOT NULL,
     result_status text NOT NULL DEFAULT 'active'
         CHECK (result_status IN ('building', 'active')),
-    value_payload bytea,
-    value_bigint bigint,
-    CONSTRAINT graph_result_primary PRIMARY KEY (graph_id, result_id),
-    CONSTRAINT graph_result_sink_identity UNIQUE (graph_id, result_id, output_shape),
-    CONSTRAINT graph_result_output_contract CHECK (
-        (output_shape = 'scalar' AND output_key_type IS NULL
-         AND NOT output_key_nullable)
-        OR (output_shape = 'keyed' AND output_key_type = 'int8')
+    schema_payload bytea NOT NULL CHECK (
+        pg_catalog.octet_length(schema_payload) BETWEEN 1 AND 16384
     ),
-    CONSTRAINT graph_result_visibility CHECK (
-        (result_status = 'building' AND value_payload IS NULL AND value_bigint IS NULL)
-        OR (result_status = 'active' AND (
-            (output_shape = 'scalar' AND value_payload IS NOT NULL
-             AND (value_bigint IS NOT NULL OR output_value_nullable))
-            OR (output_shape = 'keyed' AND value_payload IS NULL
-                AND value_bigint IS NULL)
-        ))
+    schema_digest bytea NOT NULL CHECK (
+        pg_catalog.octet_length(schema_digest) = 32
+    ),
+    CONSTRAINT graph_result_primary PRIMARY KEY (graph_id, result_id),
+    CONSTRAINT graph_result_schema_identity UNIQUE (
+        graph_id, result_id, schema_digest
     ),
     CONSTRAINT graph_result_definition FOREIGN KEY (graph_id)
         REFERENCES shiba_internal.graph_definition (graph_id)
@@ -81,4 +68,4 @@ COMMENT ON TABLE shiba_internal.graph_definition IS
 COMMENT ON TABLE shiba_internal.graph_continuation IS
     'Exact committed graph-generation replay authority';
 COMMENT ON TABLE shiba.graph_result IS
-    'Read-only generic graph result header; building rows expose no partial value';
+    'Read-only graph result identity, visibility status and exact canonical schema';

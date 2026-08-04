@@ -1,6 +1,6 @@
 use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryFieldV1, QueryInputV1, QueryNodeV1, QueryOperationV1,
-    QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1, SourceColumnDescriptor,
+    QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1, SourceColumnDescriptor,
 };
 use shiba_protocol::GraphId;
 
@@ -66,12 +66,19 @@ pub(crate) fn bind(
         }],
         results: vec![QueryResultV1 {
             input_node: 1,
-            shape: QueryResultShapeV1::Keyed {
-                key_slot: 0,
-                key_nullable: false,
-                value_slot: 1,
-                value_nullable: right_payload.nullable,
-            },
+            fields: vec![
+                QueryResultFieldV1 {
+                    name: crate::bind::result_name(left_item, &left_id.name),
+                    value_slot: 0,
+                    nullable: false,
+                },
+                QueryResultFieldV1 {
+                    name: crate::bind::result_name(right_item, &right_payload.name),
+                    value_slot: 1,
+                    nullable: right_payload.nullable,
+                },
+            ],
+            key_ordinals: vec![1],
         }],
     };
     spec.to_canonical_json()

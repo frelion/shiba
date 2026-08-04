@@ -87,8 +87,7 @@ pub enum OperatorNodeKind {
         right_payload_slot: u16,
     },
     Materialize {
-        key_slot: u16,
-        value_slot: u16,
+        field_slots: Vec<u16>,
         output: OutputContract,
     },
 }

@@ -2,9 +2,10 @@ use core::num::NonZeroU32;
 
 use shiba_operator::{
     ColumnBinding, DeltaBatch, EffectOrigin, GraphEffectOrigin, MultiInputBatch, NodeId, NodeInput,
-    ObjectAddress, OperatorGraph, OperatorNode, OperatorNodeKind, OutputContract, RowDelta,
-    SourceDeltaBatch, SourcePort, StateContract, StateEntry, StateSnapshot, TypedRow, TypedValue,
-    ValueType, apply_graph_plan, graph_state_read_set, source_typed_layout,
+    ObjectAddress, OperatorGraph, OperatorNode, OperatorNodeKind, OutputContract, ResultField,
+    ResultMutation, ResultSchemaV1, RowDelta, SourceDeltaBatch, SourcePort, StateContract,
+    StateEntry, StateSnapshot, TypedResultRowV1, TypedRow, TypedValue, ValueType, apply_graph_plan,
+    graph_state_read_set, source_typed_layout,
 };
 use shiba_protocol::{BootstrapBatchId, BootstrapId, GraphId, SourceId};
 
@@ -54,17 +55,33 @@ fn graph(nullable: bool) -> OperatorGraph {
                 input: NodeInput::Node(node(1)),
                 state_contract: None,
                 kind: OperatorNodeKind::Materialize {
-                    key_slot: 0,
-                    value_slot: 0,
-                    output: OutputContract::Scalar {
-                        value_type: ValueType::Int8,
-                        nullable,
-                    },
+                    field_slots: vec![0],
+                    output: scalar_output(nullable),
                 },
             },
         ],
     )
     .unwrap()
+}
+
+fn scalar_output(nullable: bool) -> OutputContract {
+    let schema = ResultSchemaV1::new(
+        vec![ResultField {
+            ordinal: 1,
+            name: "sum".into(),
+            value_type: ValueType::Int8,
+            nullable,
+        }],
+        vec![],
+    )
+    .unwrap();
+    let value = if nullable {
+        TypedValue::Null(ValueType::Int8)
+    } else {
+        TypedValue::Int8(0)
+    };
+    let initial_row = TypedResultRowV1::new(&schema, vec![value]).unwrap();
+    OutputContract::new(schema, Some(initial_row)).unwrap()
 }
 
 fn batch(
@@ -118,10 +135,9 @@ fn nullable_scalar_sum_distinguishes_all_null_from_zero() {
     assert_eq!(transition.state_deltas.len(), 2);
     assert!(matches!(
         transition.results.as_slice(),
-        [shiba_operator::ResultDelta::Scalar {
-            value: TypedValue::Null(ValueType::Int8),
-            ..
-        }]
+        [shiba_operator::ResultDelta { mutations, .. }]
+            if matches!(mutations.as_slice(), [ResultMutation::ReplaceScalar { row }]
+                if row.values == [TypedValue::Null(ValueType::Int8)])
     ));
 
     let legacy = graph(false);
@@ -129,9 +145,8 @@ fn nullable_scalar_sum_distinguishes_all_null_from_zero() {
     let transition = apply_graph_plan(&legacy, &empty_snapshot(&legacy, &input), &input).unwrap();
     assert!(matches!(
         transition.results.as_slice(),
-        [shiba_operator::ResultDelta::Scalar {
-            value: TypedValue::Int8(0),
-            ..
-        }]
+        [shiba_operator::ResultDelta { mutations, .. }]
+            if matches!(mutations.as_slice(), [ResultMutation::ReplaceScalar { row }]
+                if row.values == [TypedValue::Int8(0)])
     ));
 }

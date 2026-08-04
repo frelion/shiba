@@ -12,10 +12,8 @@ pub(crate) struct GroupSpec {
     pub(crate) aggregate: Aggregate,
     pub(crate) aggregate_layout: TypedLayout,
     pub(crate) materialize_id: NodeId,
-    pub(crate) materialize_key_slot: u16,
-    pub(crate) materialize_value_slot: u16,
-    pub(crate) key_nullable: bool,
-    pub(crate) value_nullable: bool,
+    pub(crate) materialize_field_slots: Vec<u16>,
+    pub(crate) output: crate::OutputContract,
 }
 
 pub(crate) fn specs(graph: &OperatorGraph) -> Result<Vec<GroupSpec>, KernelError> {
@@ -61,18 +59,15 @@ fn build_spec(
         .find(|candidate| candidate.input == NodeInput::Node(node.node_id))
         .ok_or(KernelError::InvalidGraph)?;
     let OperatorNodeKind::Materialize {
-        key_slot,
-        value_slot,
-        output:
-            crate::OutputContract::KeyedRows {
-                key_nullable,
-                nullable,
-                ..
-            },
-    } = materialize.kind
+        field_slots,
+        output,
+    } = &materialize.kind
     else {
         return Err(KernelError::InvalidGraph);
     };
+    if output.schema.is_scalar() {
+        return Err(KernelError::InvalidGraph);
+    }
     Ok(GroupSpec {
         node_id: node.node_id,
         key_node_id,
@@ -83,10 +78,8 @@ fn build_spec(
             .ok_or(KernelError::InvalidGraph)?
             .clone(),
         materialize_id: materialize.node_id,
-        materialize_key_slot: key_slot,
-        materialize_value_slot: value_slot,
-        key_nullable,
-        value_nullable: nullable,
+        materialize_field_slots: field_slots.clone(),
+        output: output.clone(),
     })
 }
 

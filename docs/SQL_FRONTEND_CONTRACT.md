@@ -1,17 +1,21 @@
 # M15 SQL frontend and QuerySpec contract
 
-## M16.1 planned aggregate frontend extension
+## M16.2 result-schema frontend cutover
 
-M15's implemented aggregate subset remains unchanged. M16.1 freezes the next
+M15's aggregate function subset remains unchanged. M16.1 freezes the next
 lowering boundary: admitted CountStar, Count(nullable `int8`), SumInt8, MinInt8
 and MaxInt8 calls map to
 closed aggregate descriptors and deterministic call identities. An output
 alias becomes the durable public ResultSchema field name and participates in
 QuerySpec/schema/graph digests, but does not change aggregate call identity;
 grouped HAVING refers to typed aggregate call results.
-SQL recipes never enter Runtime or Catalog execution authority. Parsing,
-binding, compilation and PG17.10/PG18.4 lifecycle proof for this extension are
-not part of the M16.1 contract/reference slice.
+M16.2 implements durable result presentation: Binder writes ordered result
+field names, slots/nullability and key ordinals into QuerySpec. Aliases now
+change canonical unbound semantics and QuerySpec/schema/graph digests;
+whitespace and source aliases remain nonsemantic. Compiler turns this
+declaration into the single ResultSchema, not a query-shape recipe. Aggregate
+function descriptors, multi-call and HAVING lowering remain later M16 slices.
+SQL recipes never enter Runtime or Catalog execution authority.
 
 ## Scope
 

@@ -1,6 +1,6 @@
 # Testing strategy
 
-## M16.1 contract and reference gates
+## M16.2 wide-result gates
 
 Markdown/diff review freezes the aggregate descriptor ABI, call identity,
 result-schema/row codecs, generic ordered-state read contract, HAVING old/new
@@ -11,11 +11,21 @@ multiplicity, grouped create/delete/key change, HAVING visibility, fixed-seed
 randomized I/U/D, codecs/corruption and exact bound/bound+1 behavior. This is
 reference evidence, not production or PostgreSQL evidence.
 
-Later M16 slices must add production codec/kernel tests beyond this independent
-reference model. PG17.10 and PG18.4 gates must compare complete scalar/keyed
-wide rows with SQL, and re-prove rollback, replay, crash, bootstrap, rebuild,
-least privilege and performance. None of that production/PG evidence is
-counted as M16.1 evidence.
+M16.2 adds strict production schema/row/key codec tests, one-field scalar and
+two-field keyed/wide rows, NULL/type/arity/version/digest rejection, generic
+sink failure rollback/retry/replay and full-row decoding through the public
+active-only API. Existing M15 registration, aggregate, Join, bootstrap and
+rebuild gates are rerun on PG17.10 and PG18.4 after replacing their fixed-column
+oracles with complete canonical row oracles. These tests do not count as
+Aggregate ABI, MIN/MAX, multi-call or HAVING evidence.
+
+The M16.2 release run is green on PostgreSQL 17.10 and 18.4: 57 uniquely
+enrolled scripts and 114 successful versioned invocations, including the new
+`scripts/test-m16-wide-results.sh` gate. The inherited million-row rebuild
+remained below its frozen limits: PG17/PG18 total time was 8.418541416/
+7.764510792 seconds, RSS growth 5,984/6,224 KiB, and retained WAL
+253,008,000/253,084,256 bytes (limit 268,435,456). This closes only the
+canonical wide-result cutover; generic Aggregate execution remains M16.3.
 
 ## M15.1 SQL frontend contract gates
 

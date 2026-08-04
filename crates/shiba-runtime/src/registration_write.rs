@@ -1,6 +1,6 @@
 use postgres::Transaction;
 use shiba_compiler::{CompilerError, QuerySpecV1};
-use shiba_operator::{OperatorGraph, OutputContract, TypedValue, ValueType};
+use shiba_operator::{OperatorGraph, ResultRowKey};
 
 use crate::{
     M2Error,
@@ -21,7 +21,7 @@ pub(super) fn insert_graph(
         "INSERT INTO shiba_internal.graph_definition (
              graph_id, source_count, compiler_version, spec_payload,
              graph_format_version, graph_payload, graph_digest, state_codec_version)
-         VALUES ($1, $2, 2, $3, $4, $5, $6, 1)",
+         VALUES ($1, $2, 3, $3, $4, $5, $6, 1)",
         &[
             &graph_id,
             &i16::try_from(graph.sources.len()).map_err(|_| M2Error::InvalidOperatorDefinition)?,
@@ -44,8 +44,7 @@ pub(super) fn insert_graph(
             ],
         )?;
     }
-    insert_results(transaction, graph, status)?;
-    Ok(())
+    insert_results(transaction, graph, status)
 }
 
 fn insert_results(
@@ -55,46 +54,42 @@ fn insert_results(
 ) -> Result<(), RegistrationError> {
     let graph_id = bigint(graph.graph_id.get())?;
     for (result_id, output) in graph.result_contracts() {
-        let (shape, key_type, key_nullable, value_type, value_nullable) = metadata(output);
-        let initial = match output {
-            OutputContract::Scalar { nullable: true, .. } => {
-                Some(TypedValue::Null(ValueType::Int8))
-            }
-            OutputContract::Scalar {
-                nullable: false, ..
-            } => Some(TypedValue::Int8(0)),
-            OutputContract::KeyedRows { .. } => None,
-        };
-        let payload = initial
-            .as_ref()
-            .map(TypedValue::to_canonical_json)
-            .transpose()
+        output
+            .validate()
             .map_err(|_| M2Error::InvalidOperatorDefinition)?;
-        let scalar_nullable = matches!(output, OutputContract::Scalar { nullable: true, .. });
-        let value = initial
-            .as_ref()
-            .map(|value| crate::result_sink::scalar_value(value, scalar_nullable))
-            .transpose()?
-            .flatten();
+        let result_id = i64::from(result_id.get());
         transaction.execute(
             "INSERT INTO shiba.graph_result (
-                 graph_id, result_id, output_shape, output_key_type,
-                 output_key_nullable, output_value_type, output_value_nullable,
-                 result_status, value_payload, value_bigint)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                 graph_id, result_id, result_status, schema_payload, schema_digest)
+             VALUES ($1, $2, $3, $4, $5)",
             &[
                 &graph_id,
-                &i64::from(result_id.get()),
-                &shape,
-                &key_type,
-                &key_nullable,
-                &value_type,
-                &value_nullable,
+                &result_id,
                 &status,
-                &if status == "active" { payload } else { None },
-                &if status == "active" { value } else { None },
+                &output.schema.canonical_payload,
+                &&output.schema.digest[..],
             ],
         )?;
+        if let Some(row) = &output.initial_row {
+            let identity = ResultRowKey::scalar(&output.schema)
+                .and_then(|key| key.to_canonical_payload())
+                .map_err(|_| M2Error::InvalidOperatorDefinition)?;
+            let payload = row
+                .to_canonical_payload()
+                .map_err(|_| M2Error::InvalidOperatorDefinition)?;
+            transaction.execute(
+                "INSERT INTO shiba_internal.graph_result_row (
+                     graph_id, result_id, schema_digest, row_identity, row_payload)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &graph_id,
+                    &result_id,
+                    &&output.schema.digest[..],
+                    &identity,
+                    &payload,
+                ],
+            )?;
+        }
     }
     Ok(())
 }
@@ -102,47 +97,12 @@ fn insert_results(
 pub(super) fn result_contracts(graph: &OperatorGraph) -> Vec<GraphResultContract> {
     graph
         .result_contracts()
-        .map(|(result_id, output)| {
-            let (shape, _, key_nullable, _, value_nullable) = metadata(output);
-            GraphResultContract {
-                result_id: i64::from(result_id.get()),
-                output_shape: shape,
-                key_nullable,
-                value_nullable,
-            }
+        .map(|(result_id, output)| GraphResultContract {
+            result_id: i64::from(result_id.get()),
+            schema_payload: output.schema.canonical_payload.clone(),
+            schema_digest: output.schema.digest,
         })
         .collect()
-}
-
-fn metadata(
-    contract: &OutputContract,
-) -> (&'static str, Option<&'static str>, bool, &'static str, bool) {
-    match contract {
-        OutputContract::Scalar {
-            value_type,
-            nullable,
-        } => ("scalar", None, false, type_name(*value_type), *nullable),
-        OutputContract::KeyedRows {
-            key_type,
-            key_nullable,
-            value_type,
-            nullable,
-        } => (
-            "keyed",
-            Some(type_name(*key_type)),
-            *key_nullable,
-            type_name(*value_type),
-            *nullable,
-        ),
-    }
-}
-
-fn type_name(value: ValueType) -> &'static str {
-    match value {
-        ValueType::Bool => "bool",
-        ValueType::Int8 => "int8",
-        ValueType::Text => "text",
-    }
 }
 
 pub(super) fn bigint(value: u64) -> Result<i64, M2Error> {

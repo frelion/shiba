@@ -44,12 +44,37 @@ for forbidden in ("postgres::", "pgrx::", "tokio_postgres", "sqlx::"):
     if forbidden in combined:
         raise SystemExit(f"M16.1 database-free reference model uses {forbidden}")
 
-fake_pg_gates = sorted(pathlib.Path("scripts").glob("test-m16*.sh"))
-if fake_pg_gates:
+pg_gates = sorted(path.name for path in pathlib.Path("scripts").glob("test-m16*.sh"))
+if pg_gates != ["test-m16-wide-results.sh"]:
     raise SystemExit(
-        "M16.1 must not claim PostgreSQL production evidence: "
-        + ", ".join(map(str, fake_pg_gates))
+        "M16 PostgreSQL gate enrollment must be exact: " + ", ".join(pg_gates)
     )
+
+wide = "\n".join(
+    pathlib.Path(path).read_text()
+    for path in (
+        "crates/shiba-runtime/tests/m16_wide_results.rs",
+        "crates/shiba-runtime/tests/support/mod.rs",
+    )
+)
+for marker in (
+    "canonical_result_rows", "scalar_int8_result", "keyed_int8_results",
+    "schema_payload", "schema_digest", "row_identity", "row_payload",
+    "reject wide sink", "AlreadyApplied", "result_status='building'",
+):
+    if marker not in wide:
+        raise SystemExit(f"M16.2 wide-result gate is missing: {marker}")
+
+legacy_columns = (
+    "value_bigint", "value_payload", "output_shape", "result_key_bigint",
+    "result_value_bigint", "result_key_is_null", "result_value_is_null",
+)
+ingress_tests = "\n".join(
+    path.read_text() for path in pathlib.Path("crates/shiba-ingress/tests").rglob("*.rs")
+)
+found = [column for column in legacy_columns if column in ingress_tests]
+if found:
+    raise SystemExit(f"M16.2 ingress tests retain fixed result columns: {found}")
 
 contract = pathlib.Path("docs/AGGREGATE_FUNCTION_CONTRACT.md").read_text()
 contract_markers = (

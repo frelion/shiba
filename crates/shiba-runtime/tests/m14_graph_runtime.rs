@@ -1,7 +1,7 @@
 use postgres::{Client, NoTls};
 use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryFieldV1, QueryInputV1, QueryNodeV1, QueryOperationV1,
-    QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
 use shiba_protocol::{GraphId, SlotGeneration, SourceId};
 use shiba_runtime::{
@@ -137,12 +137,19 @@ fn singleton_and_two_source_join_share_one_graph_runtime() {
         }],
         results: vec![QueryResultV1 {
             input_node: 1,
-            shape: QueryResultShapeV1::Keyed {
-                key_slot: 0,
-                key_nullable: false,
-                value_slot: 1,
-                value_nullable: true,
-            },
+            fields: vec![
+                QueryResultFieldV1 {
+                    name: "id".into(),
+                    value_slot: 0,
+                    nullable: false,
+                },
+                QueryResultFieldV1 {
+                    name: "payload".into(),
+                    value_slot: 1,
+                    nullable: true,
+                },
+            ],
+            key_ordinals: vec![1],
         }],
     };
     compile_and_register(&mut client, &graph_spec).expect("register two-source join graph");

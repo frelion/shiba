@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use shiba_operator::{
     ColumnBinding, DeltaBatch, EffectOrigin, Expression, GraphError, NodeId, NodeInput,
     ObjectAddress, OperatorGraph, OperatorNode, OperatorNodeKind, OutputContract, ResultDelta,
-    ResultMutation, RowDelta, SourcePort, TypedLayout, TypedRow, TypedValue, ValueType,
-    apply_graph, source_typed_layout,
+    ResultField, ResultMutation, ResultRowKey, ResultSchemaV1, RowDelta, SourcePort, TypedLayout,
+    TypedResultRowV1, TypedRow, TypedValue, ValueType, apply_graph, source_typed_layout,
 };
 use shiba_protocol::{BootstrapBatchId, BootstrapId, GraphId, SourceId};
 
@@ -30,6 +30,32 @@ fn origin() -> EffectOrigin {
 
 fn row(layout: &TypedLayout, key: i64, value: TypedValue) -> TypedRow {
     TypedRow::new(layout, vec![TypedValue::Int8(key), value]).unwrap()
+}
+
+fn keyed_output() -> OutputContract {
+    let schema = ResultSchemaV1::new(
+        vec![
+            ResultField {
+                ordinal: 1,
+                name: "key".into(),
+                value_type: ValueType::Int8,
+                nullable: false,
+            },
+            ResultField {
+                ordinal: 2,
+                name: "value".into(),
+                value_type: ValueType::Int8,
+                nullable: true,
+            },
+        ],
+        vec![1],
+    )
+    .unwrap();
+    OutputContract::new(schema, None).unwrap()
+}
+
+fn result_row(schema: &ResultSchemaV1, key: i64, value: TypedValue) -> TypedResultRowV1 {
+    TypedResultRowV1::new(schema, vec![TypedValue::Int8(key), value]).unwrap()
 }
 
 fn graph(predicate: Expression, compute: bool) -> OperatorGraph {
@@ -72,14 +98,8 @@ fn graph(predicate: Expression, compute: bool) -> OperatorGraph {
         input: NodeInput::Node(mapped),
         state_contract: None,
         kind: OperatorNodeKind::Materialize {
-            key_slot: 0,
-            value_slot: 1,
-            output: OutputContract::KeyedRows {
-                key_type: ValueType::Int8,
-                key_nullable: false,
-                value_type: ValueType::Int8,
-                nullable: true,
-            },
+            field_slots: vec![0, 1],
+            output: keyed_output(),
         },
     });
     OperatorGraph::build(
@@ -163,24 +183,33 @@ fn filter_compute_project_and_materialize_emit_exact_retractions() {
             },
         ],
     };
+    let schema = keyed_output().schema;
+    let row1 = result_row(&schema, 1, TypedValue::Int8(5));
+    let row3 = result_row(&schema, 3, TypedValue::Int8(9));
     assert_eq!(
         apply_graph(&graph, &batch).unwrap().results,
-        vec![ResultDelta::Keyed {
+        vec![ResultDelta {
             node_id: node(4),
             mutations: vec![
                 ResultMutation::Upsert {
-                    key: TypedValue::Int8(1),
-                    value: TypedValue::Int8(5),
+                    key: ResultRowKey::from_row(&schema, &row1).unwrap(),
+                    row: row1,
                 },
                 ResultMutation::Delete {
-                    key: TypedValue::Int8(2),
+                    key: ResultRowKey {
+                        schema_digest: schema.digest,
+                        values: vec![TypedValue::Int8(2)]
+                    },
                 },
                 ResultMutation::Upsert {
-                    key: TypedValue::Int8(3),
-                    value: TypedValue::Int8(9),
+                    key: ResultRowKey::from_row(&schema, &row3).unwrap(),
+                    row: row3,
                 },
                 ResultMutation::Delete {
-                    key: TypedValue::Int8(4),
+                    key: ResultRowKey {
+                        schema_digest: schema.digest,
+                        values: vec![TypedValue::Int8(4)]
+                    },
                 },
             ],
         }]
@@ -261,28 +290,27 @@ fn fixed_seed_project_differential_matches_keyed_reference_model() {
             },
         )
         .unwrap();
-        let ResultDelta::Keyed { mutations, .. } = &transition.results[0] else {
-            panic!("expected keyed terminal")
-        };
+        let mutations = &transition.results[0].mutations;
         for mutation in mutations {
             match mutation {
-                ResultMutation::Delete {
-                    key: TypedValue::Int8(key),
-                } => {
-                    result.remove(key);
+                ResultMutation::Delete { key } => {
+                    let TypedValue::Int8(key) = key.values[0] else {
+                        panic!("unexpected key")
+                    };
+                    result.remove(&key);
                 }
-                ResultMutation::Upsert {
-                    key: TypedValue::Int8(key),
-                    value,
-                } => {
-                    let value = match value {
+                ResultMutation::Upsert { key, row } => {
+                    let TypedValue::Int8(key) = key.values[0] else {
+                        panic!("unexpected key")
+                    };
+                    let value = match &row.values[1] {
                         TypedValue::Int8(value) => Some(*value),
                         TypedValue::Null(ValueType::Int8) => None,
                         _ => panic!("unexpected projected value"),
                     };
-                    result.insert(*key, value);
+                    result.insert(key, value);
                 }
-                _ => panic!("unexpected projected key"),
+                ResultMutation::ReplaceScalar { .. } => panic!("unexpected projected key"),
             }
         }
         assert_eq!(result, source);

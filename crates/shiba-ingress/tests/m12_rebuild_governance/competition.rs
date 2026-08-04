@@ -66,7 +66,7 @@ pub(crate) fn prove_same_source_exclusion_and_other_source_progress(
         .expect("query source-two SQL oracle");
     let result = admin
         .query(
-            "SELECT value_bigint FROM shiba.graph_result
+            "SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint FROM shiba.graph_result_rows
              WHERE graph_id = 2 AND result_id IN (3, 4) ORDER BY result_id",
             &[],
         )

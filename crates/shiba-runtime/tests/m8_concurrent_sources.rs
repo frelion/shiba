@@ -78,7 +78,8 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT sum(value_bigint)::bigint FROM shiba.graph_result),
+                (SELECT sum((convert_from(row_payload, 'UTF8')::jsonb
+                    #>> '{values,0,value}')::bigint)::bigint FROM shiba.graph_result_rows),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
@@ -109,8 +110,9 @@ fn continuations(client: &mut Client) -> Vec<(i64, i64)> {
 fn graph_results(client: &mut Client) -> Vec<(i64, i64)> {
     client
         .query(
-            "SELECT graph_id, value_bigint
-             FROM shiba.graph_result ORDER BY graph_id",
+            "SELECT graph_id, (convert_from(row_payload, 'UTF8')::jsonb
+                    #>> '{values,0,value}')::bigint
+             FROM shiba.graph_result_rows ORDER BY graph_id",
             &[],
         )
         .expect("query singleton-graph results")

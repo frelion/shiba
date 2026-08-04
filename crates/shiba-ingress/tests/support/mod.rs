@@ -6,7 +6,7 @@ use std::{
 use postgres::Client;
 use shiba_compiler::{
     QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultShapeV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
 use shiba_operator::TypedValue;
 use shiba_protocol::{GraphId, SourceId};
@@ -43,7 +43,10 @@ pub fn count_sum_spec(source_id: u64) -> QuerySpecV1 {
                 true,
             ),
         ],
-        results: vec![scalar_result(1), scalar_result(2)],
+        results: vec![
+            scalar_result(1, "count", false),
+            scalar_result(2, "sum", true),
+        ],
     }
 }
 
@@ -60,12 +63,19 @@ pub fn count_sum_project_spec(source_id: u64) -> QuerySpecV1 {
     });
     spec.results.push(QueryResultV1 {
         input_node: 3,
-        shape: QueryResultShapeV1::Keyed {
-            key_slot: 0,
-            key_nullable: false,
-            value_slot: 1,
-            value_nullable: true,
-        },
+        fields: vec![
+            QueryResultFieldV1 {
+                name: "id".into(),
+                value_slot: 0,
+                nullable: false,
+            },
+            QueryResultFieldV1 {
+                name: "payload".into(),
+                value_slot: 1,
+                nullable: true,
+            },
+        ],
+        key_ordinals: vec![1],
     });
     spec
 }
@@ -78,7 +88,7 @@ pub fn count_spec(source_id: u64) -> QuerySpecV1 {
         graph_id: GraphId::new(TEST_GRAPH_ID).expect("graph ID"),
         sources: vec![source_id],
         nodes: vec![query_node(source_id, QueryOperationV1::CountRows, true)],
-        results: vec![scalar_result(1)],
+        results: vec![scalar_result(1, "count", false)],
     }
 }
 
@@ -102,13 +112,15 @@ fn column(input: u8, name: &str) -> QueryExpressionV1 {
     }
 }
 
-fn scalar_result(input_node: u16) -> QueryResultV1 {
+fn scalar_result(input_node: u16, name: &str, nullable: bool) -> QueryResultV1 {
     QueryResultV1 {
         input_node,
-        shape: QueryResultShapeV1::Scalar {
+        fields: vec![QueryResultFieldV1 {
+            name: name.into(),
             value_slot: 0,
-            value_nullable: false,
-        },
+            nullable,
+        }],
+        key_ordinals: vec![],
     }
 }
 

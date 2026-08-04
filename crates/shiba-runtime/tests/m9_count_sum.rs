@@ -5,7 +5,7 @@ use shiba_runtime::{M2Error, PgoutputSource, ProcessOutcome, decode_committed_ch
 
 mod support;
 
-use support::PgoutputCapture;
+use support::{PgoutputCapture, set_scalar_int8_result};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m9-count-sum.sh",
@@ -32,8 +32,12 @@ fn values(client: &mut Client) -> (i64, i64, i64) {
     let row = client
         .query_one(
             "SELECT
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 3),
-                (SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 4),
+                (SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 3),
+                (SELECT CASE
+                    WHEN convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,type}' = 'null'
+                    THEN 0
+                    ELSE (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint
+                 END FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 4),
                 (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
         )
@@ -94,7 +98,7 @@ fn install_crash_after_count(client: &mut Client) {
              END
              $$;
              CREATE TRIGGER m9_crash_after_count
-             AFTER UPDATE ON shiba.graph_result
+             AFTER UPDATE ON shiba_internal.graph_result_row
              FOR EACH ROW EXECUTE FUNCTION m9_count_sum_test.crash_after_count();",
         )
         .expect("install crash after first operator result");
@@ -221,10 +225,10 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
             "UPDATE shiba_internal.graph_node_state
                 SET state_payload = decode('7fffffffffffffff', 'hex')
                WHERE graph_id = 1 AND node_id = 2 AND namespace = 0;
-             UPDATE shiba.graph_result SET value_bigint = 9223372036854775807
-               WHERE graph_id = 1 AND result_id = 4;",
+             ",
         )
         .expect("inject sum overflow boundary");
+    set_scalar_int8_result(&mut client, 1, 4, Some(i64::MAX));
     assert!(matches!(
         process(&mut client, &overflow),
         Err(M2Error::Kernel(_))
@@ -236,10 +240,10 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
             "UPDATE shiba_internal.graph_node_state
                 SET state_payload = decode('0000000000000000', 'hex')
               WHERE graph_id = 1 AND node_id = 2 AND namespace = 0;
-             UPDATE shiba.graph_result SET value_bigint = 0
-              WHERE graph_id = 1 AND result_id = 4;",
+             ",
         )
         .expect("remove overflow injection");
+    set_scalar_int8_result(&mut client, 1, 4, Some(0));
     assert_eq!(
         process(&mut client, &overflow).unwrap(),
         ProcessOutcome::Applied

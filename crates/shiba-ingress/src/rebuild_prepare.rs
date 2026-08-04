@@ -93,20 +93,15 @@ pub(crate) fn invoke_prepare_writer(
         .iter()
         .map(|result| result.result_id)
         .collect::<Vec<_>>();
-    let shapes = artifact
+    let schema_payloads = artifact
         .results
         .iter()
-        .map(|result| result.output_shape)
+        .map(|result| result.schema_payload.clone())
         .collect::<Vec<_>>();
-    let key_nullable = artifact
+    let schema_digests = artifact
         .results
         .iter()
-        .map(|result| result.key_nullable)
-        .collect::<Vec<_>>();
-    let value_nullable = artifact
-        .results
-        .iter()
-        .map(|result| result.value_nullable)
+        .map(|result| result.schema_digest.to_vec())
         .collect::<Vec<_>>();
     transaction.query_one(
         "SELECT shiba_internal.prepare_graph_rebuild(
@@ -115,7 +110,7 @@ pub(crate) fn invoke_prepare_writer(
           $6::bigint::oid,$7::text::name,$8,$9,$10,
           ARRAY(SELECT value::oid FROM unnest($11::bigint[]) AS value),
           ARRAY(SELECT value::oid FROM unnest($12::bigint[]) AS value),
-          $13::bigint::oid,$14::text::name,$15,$16,$17,$18,$19,$20,$21,$22)",
+          $13::bigint::oid,$14::text::name,$15,$16,$17,$18,$19,$20,$21)",
         &[
             &as_bigint(spec.graph_id.get())?,
             &spec.expected.graph_digest.as_slice(),
@@ -136,9 +131,8 @@ pub(crate) fn invoke_prepare_writer(
             &artifact.graph_payload,
             &artifact.graph_digest.as_slice(),
             &result_ids,
-            &shapes,
-            &key_nullable,
-            &value_nullable,
+            &schema_payloads,
+            &schema_digests,
         ],
     )?;
     Ok(())

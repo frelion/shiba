@@ -36,7 +36,7 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
             "REVOKE EXECUTE ON FUNCTION shiba_internal.prepare_graph_rebuild(
                  bigint, bytea, bigint, oid[], oid[], oid, name, bigint,
                  bigint, bigint[], oid[], oid[], oid, name, bigint,
-                 bytea, bytea, bytea, bigint[], text[], boolean[], boolean[]
+                 bytea, bytea, bytea, bigint[], bytea[], bytea[]
              ) FROM {CONTROL_ROLE};"
         ))
         .expect("remove rebuild admission EXECUTE");
@@ -50,7 +50,7 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
             "GRANT EXECUTE ON FUNCTION shiba_internal.prepare_graph_rebuild(
                  bigint, bytea, bigint, oid[], oid[], oid, name, bigint,
                  bigint, bigint[], oid[], oid[], oid, name, bigint,
-                 bytea, bytea, bytea, bigint[], text[], boolean[], boolean[]
+                 bytea, bytea, bytea, bigint[], bytea[], bytea[]
              ) TO {CONTROL_ROLE};
              REVOKE SELECT ON target.events FROM {CONTROL_ROLE};"
         ))
@@ -76,7 +76,7 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
         .expect("restore exact receiver read privilege");
     let active_value: Option<i64> = admin
         .query_one(
-            "SELECT value_bigint FROM shiba.graph_result WHERE graph_id = 1 AND result_id = 4",
+            "SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 4",
             &[],
         )
         .expect("read unchanged old result")
@@ -105,7 +105,10 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
     );
     assert!(
         reader
-            .execute("UPDATE shiba.graph_result SET value_bigint = 1", &[])
+            .execute(
+                "UPDATE shiba.graph_result SET schema_payload = schema_payload",
+                &[]
+            )
             .is_err()
     );
     let mut bootstrap = prepared
@@ -172,7 +175,13 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
     );
     let rows = reader
         .query(
-            "SELECT result_status, value_bigint FROM shiba.graph_result WHERE graph_id = 1 ORDER BY result_id",
+            "SELECT result.result_status,
+                    (SELECT CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,type}'='null'
+                                 THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint END
+                     FROM shiba.graph_result_rows row
+                     WHERE row.graph_id=result.graph_id AND row.result_id=result.result_id
+                       AND result.result_id IN (4,5))
+             FROM shiba.graph_result result WHERE graph_id = 1 ORDER BY result_id",
             &[],
         )
         .expect("read atomically activated public result");
@@ -182,13 +191,15 @@ pub(crate) fn prove_rebuild_roles_and_fail_closed_permission_loss(
             .collect::<Vec<_>>(),
         vec![
             ("active".to_owned(), Some(1)),
-            ("active".to_owned(), Some(0)),
+            ("active".to_owned(), None),
             ("active".to_owned(), None),
         ]
     );
     let projected = reader
         .query(
-            "SELECT result_key_bigint, result_value_bigint
+            "SELECT (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint,
+                    CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,type}'='null'
+                         THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,value}')::bigint END
              FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 6 ORDER BY 1",
             &[],
         )

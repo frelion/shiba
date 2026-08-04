@@ -82,8 +82,10 @@ BEGIN
     INSERT INTO shiba_internal.graph_bootstrap_checkpoint (graph_id, source_id)
       SELECT graph_id, source_id FROM shiba_internal.graph_source_member
       WHERE graph_id = requested_graph_id;
-    UPDATE shiba.graph_result SET result_status = 'building',
-        value_payload = NULL, value_bigint = NULL WHERE graph_id = requested_graph_id;
+    DELETE FROM shiba_internal.graph_result_row
+      WHERE graph_id = requested_graph_id;
+    UPDATE shiba.graph_result SET result_status = 'building'
+      WHERE graph_id = requested_graph_id;
 END
 $function$;
 

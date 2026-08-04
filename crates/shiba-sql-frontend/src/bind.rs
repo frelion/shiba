@@ -1,6 +1,6 @@
 use shiba_compiler::{
     IdentityIndexDescriptor, POSTGRES_INT8_TYPE_OID, QUERY_SPEC_VERSION, QueryExpressionV1,
-    QueryFieldV1, QueryInputV1, QueryNodeV1, QueryOperationV1, QueryResultShapeV1, QueryResultV1,
+    QueryFieldV1, QueryInputV1, QueryNodeV1, QueryOperationV1, QueryResultFieldV1, QueryResultV1,
     QuerySelectorV1, QuerySpecV1, SourceColumnDescriptor, SourceDescriptor,
 };
 use shiba_protocol::GraphId;
@@ -132,17 +132,30 @@ fn bind_projection(
         nodes,
         results: vec![QueryResultV1 {
             input_node: result_node,
-            shape: QueryResultShapeV1::Keyed {
-                key_slot: 0,
-                key_nullable: false,
-                value_slot: 1,
-                value_nullable: value.nullable,
-            },
+            fields: vec![
+                QueryResultFieldV1 {
+                    name: result_name(key_item, &key_ref.name.value),
+                    value_slot: 0,
+                    nullable: false,
+                },
+                QueryResultFieldV1 {
+                    name: result_name(value_item, "expression"),
+                    value_slot: 1,
+                    nullable: value.nullable,
+                },
+            ],
+            key_ordinals: vec![1],
         }],
     };
     spec.to_canonical_json()
         .map_err(|_| binding(ErrorCode::CanonicalizationFailed, query.span))?;
     Ok(spec)
+}
+
+pub(crate) fn result_name(item: &crate::UnboundSelectItem, fallback: &str) -> String {
+    item.presentation_alias
+        .as_ref()
+        .map_or_else(|| fallback.to_owned(), |alias| alias.value.clone())
 }
 
 pub(crate) fn validate_identity(
