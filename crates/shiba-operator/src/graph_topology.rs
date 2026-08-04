@@ -128,19 +128,54 @@ fn validate_join_topology(graph: &CanonicalGraph) -> Result<(), GraphError> {
 fn validate_stateful_topology(graph: &CanonicalGraph) -> Result<(), GraphError> {
     for aggregate in &graph.nodes {
         let valid_input = match aggregate.kind {
-            OperatorNodeKind::Aggregate { .. } => matches!(
-                aggregate.input,
-                NodeInput::SourcePort(_) | NodeInput::Node(_)
-            ),
+            OperatorNodeKind::Aggregate { .. } => aggregate_input_is_linear(graph, aggregate),
             _ => continue,
         };
-        let materialized = graph.nodes.iter().any(|node| {
-            node.input == NodeInput::Node(aggregate.node_id)
-                && matches!(node.kind, OperatorNodeKind::Materialize { .. })
-        });
-        if !valid_input || !materialized {
+        let materialized = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.input == NodeInput::Node(aggregate.node_id)
+                    && matches!(node.kind, OperatorNodeKind::Materialize { .. })
+            })
+            .count();
+        let fanout = graph
+            .nodes
+            .iter()
+            .filter(|node| node.input == NodeInput::Node(aggregate.node_id))
+            .count();
+        if !valid_input || materialized != 1 || fanout != 1 {
             return Err(GraphError::InvalidTopology);
         }
     }
     Ok(())
+}
+
+fn aggregate_input_is_linear(graph: &CanonicalGraph, aggregate: &crate::OperatorNode) -> bool {
+    let mut input = aggregate.input;
+    loop {
+        match input {
+            NodeInput::SourcePort(source_id) => {
+                return graph
+                    .sources
+                    .iter()
+                    .any(|source| source.source_id == source_id);
+            }
+            NodeInput::Node(id) => {
+                let Some(node) = graph.nodes.iter().find(|node| node.node_id == id) else {
+                    return false;
+                };
+                if !matches!(
+                    node.kind,
+                    OperatorNodeKind::Filter { .. }
+                        | OperatorNodeKind::Project { .. }
+                        | OperatorNodeKind::Compute { .. }
+                        | OperatorNodeKind::KeyBy { .. }
+                ) {
+                    return false;
+                }
+                input = node.input;
+            }
+        }
+    }
 }

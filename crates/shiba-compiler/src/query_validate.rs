@@ -31,7 +31,8 @@ pub(crate) fn validate_query<E: de::Error>(
     {
         return Err(E::custom("invalid query envelope"));
     }
-    validate_references::<E>(sources, nodes, results)
+    validate_references::<E>(sources, nodes, results)?;
+    validate_runtime_topology::<E>(nodes, results)
 }
 
 fn validate_references<E: de::Error>(
@@ -89,6 +90,60 @@ fn validate_references<E: de::Error>(
     if terminals.windows(2).any(|pair| pair[0] == pair[1]) || referenced.iter().any(|value| !value)
     {
         return Err(E::custom("duplicate terminal or disconnected node"));
+    }
+    Ok(())
+}
+
+fn validate_runtime_topology<E: de::Error>(
+    nodes: &[QueryNodeV1],
+    results: &[QueryResultV1],
+) -> Result<(), E> {
+    for (index, node) in nodes.iter().enumerate() {
+        if !matches!(node.operation, QueryOperationV1::Aggregate { .. }) {
+            continue;
+        }
+        let node_number = u16::try_from(index + 1).map_err(|_| E::custom("invalid node id"))?;
+        if results
+            .iter()
+            .filter(|result| result.input_node == node_number)
+            .count()
+            != 1
+            || nodes.iter().enumerate().any(|(child_index, child)| {
+                child_index > index
+                    && child.inputs.iter().any(|input| {
+                        matches!(input, QueryInputV1::Node { node } if *node == node_number)
+                    })
+            })
+        {
+            return Err(E::custom("aggregate must have one terminal result"));
+        }
+        let mut input = node
+            .inputs
+            .first()
+            .ok_or_else(|| E::custom("invalid aggregate input"))?;
+        loop {
+            match input {
+                QueryInputV1::Source { .. } => break,
+                QueryInputV1::Node { node } => {
+                    let upstream = nodes
+                        .get(usize::from(*node).saturating_sub(1))
+                        .ok_or_else(|| E::custom("invalid aggregate upstream"))?;
+                    if !matches!(
+                        upstream.operation,
+                        QueryOperationV1::Filter { .. }
+                            | QueryOperationV1::Project { .. }
+                            | QueryOperationV1::Compute { .. }
+                            | QueryOperationV1::KeyBy { .. }
+                    ) {
+                        return Err(E::custom("unsupported aggregate topology"));
+                    }
+                    input = upstream
+                        .inputs
+                        .first()
+                        .ok_or_else(|| E::custom("invalid upstream input"))?;
+                }
+            }
+        }
     }
     Ok(())
 }

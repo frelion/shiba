@@ -63,11 +63,15 @@ fn build(
         }
         NodeInput::Node(id) => layouts.get(&id).ok_or(KernelError::InvalidGraph)?.clone(),
     };
-    let terminal = graph
+    let terminals = graph
         .nodes
         .iter()
-        .find(|candidate| candidate.input == NodeInput::Node(node.node_id))
-        .ok_or(KernelError::InvalidGraph)?;
+        .filter(|candidate| candidate.input == NodeInput::Node(node.node_id))
+        .collect::<Vec<_>>();
+    if terminals.len() != 1 {
+        return Err(KernelError::InvalidGraph);
+    }
+    let terminal = terminals[0];
     let OperatorNodeKind::Materialize {
         field_slots,
         output,
