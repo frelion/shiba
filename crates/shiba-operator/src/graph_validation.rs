@@ -21,6 +21,49 @@ pub(crate) fn validate_graph(graph: &CanonicalGraph) -> Result<(), GraphError> {
     if layouts.len() + materialized != graph.nodes.len() {
         return Err(GraphError::MissingResult);
     }
+    validate_aggregate_outputs(graph)?;
+    Ok(())
+}
+
+fn validate_aggregate_outputs(graph: &CanonicalGraph) -> Result<(), GraphError> {
+    for node in &graph.nodes {
+        let OperatorNodeKind::Aggregate {
+            group_expressions,
+            calls,
+        } = &node.kind
+        else {
+            continue;
+        };
+        let terminal = graph
+            .nodes
+            .iter()
+            .find(|candidate| candidate.input == NodeInput::Node(node.node_id))
+            .ok_or(GraphError::MissingResult)?;
+        let OperatorNodeKind::Materialize {
+            field_slots,
+            output,
+        } = &terminal.kind
+        else {
+            return Err(GraphError::MissingResult);
+        };
+        if output.schema.is_scalar() != group_expressions.is_empty() {
+            return Err(GraphError::WrongType);
+        }
+        for (index, call) in calls.iter().enumerate() {
+            let aggregate_slot = group_expressions.len() + index;
+            let Some(field_index) = field_slots
+                .iter()
+                .position(|slot| usize::from(*slot) == aggregate_slot)
+            else {
+                return Err(GraphError::WrongType);
+            };
+            if output.schema.fields[field_index].nullable
+                != crate::aggregate_function_descriptor(call.function).output_nullable
+            {
+                return Err(GraphError::WrongType);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -45,11 +88,7 @@ pub(crate) fn layout_graph(
         previous = Some(node.node_id);
         let stateful = matches!(
             node.kind,
-            OperatorNodeKind::CountRows
-                | OperatorNodeKind::SumInt8 { .. }
-                | OperatorNodeKind::GroupedCount { .. }
-                | OperatorNodeKind::GroupedSumInt8 { .. }
-                | OperatorNodeKind::InnerJoin { .. }
+            OperatorNodeKind::Aggregate { .. } | OperatorNodeKind::InnerJoin { .. }
         );
         if node
             .state_contract
@@ -135,20 +174,10 @@ fn node_output_types(
     input: &TypedLayout,
 ) -> Result<Option<Vec<ValueType>>, GraphError> {
     Ok(match &node.kind {
-        OperatorNodeKind::CountRows => {
-            if node.state_contract.is_none() {
-                return Err(GraphError::InvalidStateContract);
-            }
-            Some(vec![ValueType::Int8])
-        }
-        OperatorNodeKind::SumInt8 { input_slot } => {
-            if node.state_contract.is_none()
-                || input.value_types.get(usize::from(*input_slot)) != Some(&ValueType::Int8)
-            {
-                return Err(GraphError::WrongType);
-            }
-            Some(vec![ValueType::Int8])
-        }
+        OperatorNodeKind::Aggregate {
+            group_expressions,
+            calls,
+        } => aggregate_types(node, input, group_expressions, calls)?,
         OperatorNodeKind::Filter { predicate } if predicate.validate(input)? == ValueType::Bool => {
             Some(input.value_types.clone())
         }
@@ -163,32 +192,6 @@ fn node_output_types(
             let mut values = input.value_types.clone();
             values.push(key.validate(input)?);
             Some(values)
-        }
-        OperatorNodeKind::GroupedCount { key_slot } => {
-            if node.state_contract.is_none() {
-                return Err(GraphError::InvalidStateContract);
-            }
-            let key = *input
-                .value_types
-                .get(usize::from(*key_slot))
-                .ok_or(GraphError::WrongType)?;
-            Some(vec![key, ValueType::Int8])
-        }
-        OperatorNodeKind::GroupedSumInt8 {
-            key_slot,
-            value_slot,
-        } => {
-            if node.state_contract.is_none() {
-                return Err(GraphError::InvalidStateContract);
-            }
-            let key = *input
-                .value_types
-                .get(usize::from(*key_slot))
-                .ok_or(GraphError::WrongType)?;
-            if input.value_types.get(usize::from(*value_slot)) != Some(&ValueType::Int8) {
-                return Err(GraphError::WrongType);
-            }
-            Some(vec![key, ValueType::Int8])
         }
         OperatorNodeKind::InnerJoin { .. } => return Err(GraphError::InvalidNode),
         OperatorNodeKind::Materialize {
@@ -209,6 +212,42 @@ fn node_output_types(
             None
         }
     })
+}
+
+fn aggregate_types(
+    node: &OperatorNode,
+    input: &TypedLayout,
+    groups: &[Expression],
+    calls: &[crate::AggregateCall],
+) -> Result<Option<Vec<ValueType>>, GraphError> {
+    if node.state_contract.is_none()
+        || groups.len() > crate::MAX_GROUP_EXPRESSIONS
+        || calls.is_empty()
+        || calls.len() > crate::MAX_AGGREGATE_CALLS
+    {
+        return Err(GraphError::InvalidStateContract);
+    }
+    let mut output = groups
+        .iter()
+        .map(|expression| expression.validate(input).map_err(Into::into))
+        .collect::<Result<Vec<_>, GraphError>>()?;
+    for (index, call) in calls.iter().enumerate() {
+        if usize::from(call.ordinal) != index + 1 {
+            return Err(GraphError::InvalidNode);
+        }
+        let descriptor = crate::aggregate_function_descriptor(call.function);
+        if call.ordinal == 0 || call.function_version != descriptor.semantic_version {
+            return Err(GraphError::InvalidNode);
+        }
+        match (descriptor.input, &call.expression) {
+            (crate::AggregateInputContract::None, None) => {}
+            (crate::AggregateInputContract::Nullable(expected), Some(expression))
+                if expression.validate(input)? == expected => {}
+            _ => return Err(GraphError::WrongType),
+        }
+        output.push(descriptor.output_type);
+    }
+    Ok(Some(output))
 }
 
 fn expression_types(

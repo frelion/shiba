@@ -5,10 +5,10 @@ use std::{
 
 use postgres::Client;
 use shiba_compiler::{
-    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QUERY_SPEC_VERSION, QueryAggregateCallV1, QueryExpressionV1, QueryFieldV1, QueryInputV1,
+    QueryNodeV1, QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
-use shiba_operator::TypedValue;
+use shiba_operator::{AggregateFunctionV1, TypedValue};
 use shiba_protocol::{GraphId, SourceId};
 
 #[allow(dead_code)]
@@ -34,14 +34,8 @@ pub fn count_sum_spec(source_id: u64) -> QuerySpecV1 {
         graph_id: GraphId::new(TEST_GRAPH_ID).expect("graph ID"),
         sources: vec![source_id],
         nodes: vec![
-            query_node(source_id, QueryOperationV1::CountRows, true),
-            query_node(
-                source_id,
-                QueryOperationV1::SumInt8 {
-                    value: column(0, "payload"),
-                },
-                true,
-            ),
+            query_node(source_id, count_rows(), true),
+            query_node(source_id, sum_int8(column(0, "payload")), true),
         ],
         results: vec![
             scalar_result(1, "count", false),
@@ -87,8 +81,31 @@ pub fn count_spec(source_id: u64) -> QuerySpecV1 {
         version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(TEST_GRAPH_ID).expect("graph ID"),
         sources: vec![source_id],
-        nodes: vec![query_node(source_id, QueryOperationV1::CountRows, true)],
+        nodes: vec![query_node(source_id, count_rows(), true)],
         results: vec![scalar_result(1, "count", false)],
+    }
+}
+
+pub fn count_rows() -> QueryOperationV1 {
+    aggregate(AggregateFunctionV1::CountStar, None)
+}
+
+pub fn sum_int8(expression: QueryExpressionV1) -> QueryOperationV1 {
+    aggregate(AggregateFunctionV1::SumInt8, Some(expression))
+}
+
+fn aggregate(
+    function: AggregateFunctionV1,
+    expression: Option<QueryExpressionV1>,
+) -> QueryOperationV1 {
+    QueryOperationV1::Aggregate {
+        group_expressions: Vec::new(),
+        calls: vec![QueryAggregateCallV1 {
+            ordinal: 1,
+            function,
+            function_version: 1,
+            expression,
+        }],
     }
 }
 

@@ -351,3 +351,18 @@ functions. Building rows remain private and activation publishes the complete
 set. Fixed scalar/key/value columns and the keyed-only sink were removed in
 place; no compatibility view, dual write or second result authority exists.
 Generic Aggregate, multi-call, MIN/MAX and HAVING remain later M16 slices.
+
+## M16.3 generic Aggregate kernel
+
+M16.3 deletes the concrete scalar/grouped Count and Sum node variants. One
+versioned Aggregate node now covers empty-group scalar and one-key grouped
+execution with ordered calls. The initial production function ABI implements
+CountStar, Count(nullable `int8`) and checked SumInt8 through immutable
+descriptors, strict state codecs and retract/apply/finalize behavior owned only
+by `shiba-operator`.
+
+QuerySpec and OperatorGraph advance to formats 2/2 and Catalog compiler version
+4; old bytes fail closed without compatibility. Runtime and every lifecycle
+component remain function-independent and reuse the sole generic state, wide
+result, continuation and post-commit ACK authorities. M16.4 adds multi-call SQL
+and Count(expr); MIN/MAX and HAVING remain M16.5/M16.6.

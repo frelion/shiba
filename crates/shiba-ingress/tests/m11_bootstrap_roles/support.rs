@@ -1,9 +1,10 @@
 use postgres::Client;
 use shiba_compiler::{
-    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QUERY_SPEC_VERSION, QueryAggregateCallV1, QueryExpressionV1, QueryFieldV1, QueryInputV1,
+    QueryNodeV1, QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
 use shiba_ingress::BootstrapSpec;
+use shiba_operator::AggregateFunctionV1;
 use shiba_protocol::{BootstrapId, GraphId, SlotGeneration, SourceId};
 use shiba_runtime::compile_and_register;
 
@@ -98,15 +99,16 @@ fn graph_spec(source_id: u64) -> QuerySpecV1 {
                     source_id: source_id_value,
                 }],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::CountRows,
+                operation: aggregate(AggregateFunctionV1::CountStar, None),
             },
             QueryNodeV1 {
                 inputs: vec![QueryInputV1::Source {
                     source_id: source_id_value,
                 }],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::SumInt8 {
-                    value: QueryExpressionV1::Column {
+                operation: aggregate(
+                    AggregateFunctionV1::SumInt8,
+                    Some(QueryExpressionV1::Column {
                         field: QueryFieldV1 {
                             input: 0,
                             selector: QuerySelectorV1::Name {
@@ -114,8 +116,8 @@ fn graph_spec(source_id: u64) -> QuerySpecV1 {
                                 quoted: false,
                             },
                         },
-                    },
-                },
+                    }),
+                ),
             },
         ],
         results: vec![
@@ -138,6 +140,21 @@ fn graph_spec(source_id: u64) -> QuerySpecV1 {
                 key_ordinals: vec![],
             },
         ],
+    }
+}
+
+fn aggregate(
+    function: AggregateFunctionV1,
+    expression: Option<QueryExpressionV1>,
+) -> QueryOperationV1 {
+    QueryOperationV1::Aggregate {
+        group_expressions: Vec::new(),
+        calls: vec![QueryAggregateCallV1 {
+            ordinal: 1,
+            function,
+            function_version: 1,
+            expression,
+        }],
     }
 }
 

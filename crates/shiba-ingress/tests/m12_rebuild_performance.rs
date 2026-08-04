@@ -59,6 +59,7 @@ fn million_row_active_source_rebuild_is_bounded_and_catches_up_exactly() {
         .query(
             "SELECT state_payload FROM shiba_internal.graph_node_state
              WHERE graph_id = 1 AND node_id IN (1, 2)
+               AND namespace = 1
                AND partition_key_payload = $1 AND item_key_payload = $2
              ORDER BY node_id",
             &[
@@ -72,7 +73,8 @@ fn million_row_active_source_rebuild_is_bounded_and_catches_up_exactly() {
     assert_eq!(old_state.len(), 2);
     assert!(old_state.iter().all(|row| {
         let payload: Vec<u8> = row.get(0);
-        i64::from_be_bytes(payload.try_into().expect("int8 node state")) > 0
+        let offset = payload.len().saturating_sub(8);
+        i64::from_be_bytes(payload[offset..].try_into().expect("aggregate int8 state")) > 0
     }));
     let old_continuations: i64 = admin
         .query_one(

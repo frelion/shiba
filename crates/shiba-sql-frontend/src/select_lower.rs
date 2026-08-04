@@ -117,8 +117,8 @@ fn lower_aggregate(
             span,
         ));
     };
-    let aggregate = match (name.value.as_str(), argument) {
-        ("count", FunctionArgExpr::Wildcard) => Aggregate::CountStar { span },
+    let argument = match (name.value.as_str(), argument) {
+        ("count", FunctionArgExpr::Wildcard) => crate::AggregateArgument::Star,
         ("sum", FunctionArgExpr::Expr(expression)) => {
             let input = lower_expression(expression, context, budget, 2)?;
             if !matches!(input, UnboundExpression::Column(_)) {
@@ -127,7 +127,7 @@ fn lower_aggregate(
                     span,
                 ));
             }
-            Aggregate::Sum { input, span }
+            crate::AggregateArgument::Expression(input)
         }
         _ => {
             return Err(FrontendError::unsupported(
@@ -136,7 +136,11 @@ fn lower_aggregate(
             ));
         }
     };
-    Ok(SelectExpression::Aggregate(aggregate))
+    Ok(SelectExpression::Aggregate(Aggregate {
+        function: name.value,
+        argument,
+        span,
+    }))
 }
 
 pub(crate) fn lower_group_by(

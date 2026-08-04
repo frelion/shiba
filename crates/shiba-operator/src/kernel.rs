@@ -45,11 +45,7 @@ pub fn graph_state_read_set(
         return crate::join::state_read_set(graph, batch)?.ok_or(KernelError::InvalidGraph);
     }
     let input = singleton_batch(graph, batch)?;
-    let scalar = crate::scalar::state_read_set(graph)?;
-    let grouped = crate::grouped::state_read_set(graph, input)?;
-    let mut keys = scalar.keys;
-    keys.extend(grouped.keys);
-    StateReadSet::canonical(keys).map_err(|_| KernelError::InvalidState)
+    crate::aggregate::state_read_set(graph, input)
 }
 
 /// Applies one canonical graph against its exact generic state snapshot.
@@ -73,12 +69,9 @@ pub fn apply_graph_plan(
     }
     let input = singleton_batch(graph, batch)?;
     let mut transition = crate::apply_graph(graph, input).map_err(|_| KernelError::InvalidGraph)?;
-    let (scalar_state, scalar_results) = crate::scalar::apply(graph, snapshot, input)?;
-    transition.state_deltas.extend(scalar_state);
-    transition.results.extend(scalar_results);
-    let grouped = crate::grouped::apply(graph, snapshot, input)?;
-    transition.state_deltas.extend(grouped.state_deltas);
-    transition.results.extend(grouped.results);
+    let aggregate = crate::aggregate::apply(graph, snapshot, input)?;
+    transition.state_deltas.extend(aggregate.state_deltas);
+    transition.results.extend(aggregate.results);
     transition
         .state_deltas
         .sort_by(|left, right| left.key.cmp(&right.key));

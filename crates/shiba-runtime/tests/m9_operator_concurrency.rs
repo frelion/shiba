@@ -190,7 +190,7 @@ fn results(client: &mut Client) -> Vec<(i64, Option<i64>, i64)> {
              LEFT JOIN shiba_internal.graph_node_state AS state
               ON state.graph_id = result.graph_id
               AND state.node_id = result.result_id - 2
-              AND state.namespace = 0
+              AND state.namespace = 1
               AND state.partition_key_payload = $1
               AND state.item_key_payload = $2
              ORDER BY result.graph_id, result.result_id",
@@ -221,10 +221,17 @@ fn results(client: &mut Client) -> Vec<(i64, Option<i64>, i64)> {
             (
                 (graph_id - 1) * 2 + result_id - 2,
                 value,
-                support::decode_optional_scalar_state(row.get::<_, Option<Vec<u8>>>(5).as_deref()),
+                aggregate_state(row.get::<_, Option<Vec<u8>>>(5)),
             )
         })
         .collect()
+}
+
+fn aggregate_state(payload: Option<Vec<u8>>) -> i64 {
+    payload.map_or(0, |payload| {
+        let offset = payload.len().saturating_sub(8);
+        i64::from_be_bytes(payload[offset..].try_into().expect("aggregate int8 state"))
+    })
 }
 
 fn continuations(client: &mut Client) -> Vec<(i64, i64)> {

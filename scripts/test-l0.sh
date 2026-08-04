@@ -18,25 +18,36 @@ if [[ "$pg_major" != "17" && "$pg_major" != "18" ]]; then
 fi
 feature="pg$pg_major"
 
-cargo fmt --all -- --check
-PG_CONFIG="$pg_config" cargo check -p shiba-protocol --all-targets
-PG_CONFIG="$pg_config" cargo check -p shiba-operator --all-targets
-PG_CONFIG="$pg_config" cargo check -p shiba-compiler --all-targets
-PG_CONFIG="$pg_config" cargo check -p shiba-catalog --no-default-features --features "$feature" --all-targets
-PG_CONFIG="$pg_config" cargo check -p shiba-runtime --all-targets
-PG_CONFIG="$pg_config" cargo check -p shiba-ingress --all-targets
-PG_CONFIG="$pg_config" cargo test -p shiba-protocol
-PG_CONFIG="$pg_config" cargo test -p shiba-operator
-PG_CONFIG="$pg_config" cargo test -p shiba-compiler
-PG_CONFIG="$pg_config" cargo test -p shiba-catalog --no-default-features --features "$feature"
-PG_CONFIG="$pg_config" cargo test -p shiba-runtime --lib
-PG_CONFIG="$pg_config" cargo test -p shiba-ingress
-PG_CONFIG="$pg_config" cargo clippy -p shiba-protocol --all-targets -- -D warnings
-PG_CONFIG="$pg_config" cargo clippy -p shiba-operator --all-targets -- -D warnings
-PG_CONFIG="$pg_config" cargo clippy -p shiba-compiler --all-targets -- -D warnings
-PG_CONFIG="$pg_config" cargo clippy -p shiba-catalog --no-default-features --features "$feature" --all-targets -- -D warnings
-PG_CONFIG="$pg_config" cargo clippy -p shiba-runtime --all-targets -- -D warnings
-PG_CONFIG="$pg_config" cargo clippy -p shiba-ingress --all-targets -- -D warnings
+if [[ "${SHIBA_L0_SKIP_RUST:-0}" == "1" ]]; then
+  # release-matrix phase 1/2 already ran the workspace Rust checks, tests, and
+  # clippy. Keep the PG-version-specific catalog feature proof here; all
+  # ingress integration behavior remains enrolled in the real PG scripts.
+  PG_CONFIG="$pg_config" cargo check -p shiba-catalog --no-default-features --features "$feature" --all-targets
+  PG_CONFIG="$pg_config" cargo test -p shiba-catalog --no-default-features --features "$feature"
+  PG_CONFIG="$pg_config" cargo clippy -p shiba-catalog --no-default-features --features "$feature" --all-targets -- -D warnings
+else
+  cargo fmt --all -- --check
+  PG_CONFIG="$pg_config" cargo check -p shiba-protocol --all-targets
+  PG_CONFIG="$pg_config" cargo check -p shiba-operator --all-targets
+  PG_CONFIG="$pg_config" cargo check -p shiba-compiler --all-targets
+  PG_CONFIG="$pg_config" cargo check -p shiba-catalog --no-default-features --features "$feature" --all-targets
+  PG_CONFIG="$pg_config" cargo check -p shiba-runtime --all-targets
+  PG_CONFIG="$pg_config" cargo check -p shiba-ingress --all-targets
+  PG_CONFIG="$pg_config" cargo test -p shiba-protocol
+  PG_CONFIG="$pg_config" cargo test -p shiba-operator
+  PG_CONFIG="$pg_config" cargo test -p shiba-compiler
+  PG_CONFIG="$pg_config" cargo test -p shiba-catalog --no-default-features --features "$feature"
+  PG_CONFIG="$pg_config" cargo test -p shiba-runtime --lib
+  # Integration scripts own all PostgreSQL integration tests. L0 only needs
+  # the ingress library tests and must not launch every ignored binary again.
+  PG_CONFIG="$pg_config" cargo test -p shiba-ingress --lib
+  PG_CONFIG="$pg_config" cargo clippy -p shiba-protocol --all-targets -- -D warnings
+  PG_CONFIG="$pg_config" cargo clippy -p shiba-operator --all-targets -- -D warnings
+  PG_CONFIG="$pg_config" cargo clippy -p shiba-compiler --all-targets -- -D warnings
+  PG_CONFIG="$pg_config" cargo clippy -p shiba-catalog --no-default-features --features "$feature" --all-targets -- -D warnings
+  PG_CONFIG="$pg_config" cargo clippy -p shiba-runtime --all-targets -- -D warnings
+  PG_CONFIG="$pg_config" cargo clippy -p shiba-ingress --all-targets -- -D warnings
+fi
 git diff --check
 scripts/check-m15-contract.sh
 scripts/check-m15-parser.sh
@@ -549,6 +560,19 @@ if rg -n \
   '\b(CountRows|SumInt8|ProjectRows|GroupedCount|GroupedSumInt8|InnerJoin|GraphOutputSpecV1)\b|operator_kind' \
   crates/shiba-runtime/src crates/shiba-ingress/src sql/v2; then
   echo "M14 concrete operator kind leaked outside Operator/Compiler" >&2
+  exit 1
+fi
+
+if rg -n \
+  'QueryOperationV1::(CountRows|SumInt8|GroupedCount|GroupedSumInt8)|OperatorNodeKind::(CountRows|SumInt8|GroupedCount|GroupedSumInt8)' \
+  crates/shiba-operator/src crates/shiba-compiler/src crates/shiba-sql-frontend/src; then
+  echo "M16.3 removed concrete aggregate node remains in production" >&2
+  exit 1
+fi
+
+if rg -n '\bAggregateFunctionV1\b' \
+  crates/shiba-runtime/src crates/shiba-ingress/src crates/shiba-catalog/src sql/v2; then
+  echo "M16.3 aggregate function dispatch leaked outside Operator/Compiler/SQL Binder" >&2
   exit 1
 fi
 

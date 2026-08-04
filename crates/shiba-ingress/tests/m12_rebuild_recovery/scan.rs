@@ -144,10 +144,10 @@ pub(crate) fn prove_snapshot_restarts(
                     .to_canonical_json()
                     .expect("canonical scalar partition"),
                 &b"null".as_slice(),
-                &(i64::MAX - 50).to_be_bytes().as_slice(),
+                &b"\0".as_slice(),
             ],
         )
-        .expect("inject first-batch operator rollback");
+        .expect("inject first-batch corrupt operator state");
     assert!(bootstrap.scan_next().is_err());
     admin
         .execute(

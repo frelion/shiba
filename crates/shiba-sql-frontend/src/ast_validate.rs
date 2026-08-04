@@ -3,8 +3,8 @@ use crate::bounds::{
     MAX_SOURCES,
 };
 use crate::{
-    Aggregate, BinaryOperator, ColumnRef, ErrorCode, FrontendError, Identifier, SelectExpression,
-    Span, UnaryOperator, UnboundExpression, UnboundQuery,
+    AggregateArgument, BinaryOperator, ColumnRef, ErrorCode, FrontendError, Identifier,
+    SelectExpression, Span, UnaryOperator, UnboundExpression, UnboundQuery,
 };
 
 pub(crate) fn validate(query: &UnboundQuery) -> Result<(), FrontendError> {
@@ -35,10 +35,20 @@ pub(crate) fn validate(query: &UnboundQuery) -> Result<(), FrontendError> {
         }
         match &item.expression {
             SelectExpression::Expression(expression) => expressions.push((expression, 1usize)),
-            SelectExpression::Aggregate(Aggregate::Sum { input, .. }) => {
-                expressions.push((input, 1));
+            SelectExpression::Aggregate(aggregate) => {
+                if aggregate.function.is_empty()
+                    || aggregate.function.len() > 63
+                    || aggregate
+                        .function
+                        .bytes()
+                        .any(|byte| byte.is_ascii_uppercase())
+                {
+                    return Err(canonical(aggregate.span));
+                }
+                if let AggregateArgument::Expression(input) = &aggregate.argument {
+                    expressions.push((input, 1));
+                }
             }
-            SelectExpression::Aggregate(Aggregate::CountStar { .. }) => {}
         }
     }
     if let Some(selection) = &query.selection {

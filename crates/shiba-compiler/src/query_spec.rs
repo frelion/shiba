@@ -1,9 +1,10 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
+use shiba_operator::AggregateFunctionV1;
 use shiba_protocol::{GraphId, SourceId};
 
-pub const QUERY_SPEC_VERSION: u32 = 1;
-const QUERY_SPEC_DOMAIN: &[u8] = b"shiba.query.spec.v1\0";
+pub const QUERY_SPEC_VERSION: u32 = 2;
+const QUERY_SPEC_DOMAIN: &[u8] = b"shiba.query.spec.v2\0";
 const MAX_CANONICAL_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -118,9 +119,9 @@ pub enum QueryInputV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryOperationV1 {
-    CountRows,
-    SumInt8 {
-        value: QueryExpressionV1,
+    Aggregate {
+        group_expressions: Vec<QueryExpressionV1>,
+        calls: Vec<QueryAggregateCallV1>,
     },
     Filter {
         predicate: QueryExpressionV1,
@@ -134,19 +135,21 @@ pub enum QueryOperationV1 {
     KeyBy {
         key: QueryExpressionV1,
     },
-    GroupedCount {
-        key: QueryFieldV1,
-    },
-    GroupedSumInt8 {
-        key: QueryFieldV1,
-        value: QueryFieldV1,
-    },
     InnerJoin {
         left_id: QueryFieldV1,
         left_key: QueryFieldV1,
         right_id: QueryFieldV1,
         right_payload: QueryFieldV1,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryAggregateCallV1 {
+    pub ordinal: u16,
+    pub function: AggregateFunctionV1,
+    pub function_version: u32,
+    pub expression: Option<QueryExpressionV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

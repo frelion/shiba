@@ -1,5 +1,16 @@
 # Catalog contract
 
+## M16.3 aggregate plan authority
+
+M16.3 changes no Catalog table or writer. `graph_definition` now admits only
+compiler version 4 and OperatorGraph format 2 because the persisted QuerySpec
+and node wire shape changed. The cutover is deletion-only: version 1 aggregate
+node bytes and compiler version 3 definitions are rejected, with no decoder,
+adapter or dual format. Function identity and descriptors are opaque graph
+payload facts to Catalog; no function registry or function-specific state table
+exists. `graph_node_state` and the M16.2 wide-result tables remain the sole
+state/result authorities.
+
 ## M16.2 canonical wide-result authority
 
 M16.2 replaces the fixed scalar/key/value result shape in place. The only
@@ -23,8 +34,8 @@ publishes the same authority only at activation.
 
 The old shape, scalar bigint/payload, result key/value columns and keyed-only
 sink are deleted. There is no compatibility view, adapter, dual write, function
-registry or second result authority. MIN/MAX and generic Aggregate execution
-remain subsequent M16 slices and must reuse these tables unchanged.
+registry or second result authority. Generic Count/CountStar/Sum execution now
+reuses these tables; MIN/MAX and HAVING remain subsequent M16 slices.
 
 ## M14.6 graph execution authority
 

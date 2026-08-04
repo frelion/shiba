@@ -1,11 +1,12 @@
 use core::num::NonZeroU32;
 
 use shiba_operator::{
-    ColumnBinding, DeltaBatch, EffectOrigin, GraphEffectOrigin, MultiInputBatch, NodeId, NodeInput,
-    ObjectAddress, OperatorGraph, OperatorNode, OperatorNodeKind, OutputContract, ResultField,
-    ResultMutation, ResultSchemaV1, RowDelta, SourceDeltaBatch, SourcePort, StateContract,
-    StateEntry, StateSnapshot, TypedResultRowV1, TypedRow, TypedValue, ValueType, apply_graph_plan,
-    graph_state_read_set, source_typed_layout,
+    AggregateCall, AggregateFunctionV1, ColumnBinding, DeltaBatch, EffectOrigin, Expression,
+    GraphEffectOrigin, MultiInputBatch, NodeId, NodeInput, ObjectAddress, OperatorGraph,
+    OperatorNode, OperatorNodeKind, OutputContract, ResultField, ResultMutation, ResultSchemaV1,
+    RowDelta, SourceDeltaBatch, SourcePort, StateContract, StateEntry, StateSnapshot,
+    TypedResultRowV1, TypedRow, TypedValue, ValueType, apply_graph_plan, graph_state_read_set,
+    source_typed_layout,
 };
 use shiba_protocol::{BootstrapBatchId, BootstrapId, GraphId, SourceId};
 
@@ -48,7 +49,15 @@ fn graph(nullable: bool) -> OperatorGraph {
                 node_id: node(1),
                 input: NodeInput::SourcePort(source_id),
                 state_contract: Some(StateContract { codec_version: 1 }),
-                kind: OperatorNodeKind::SumInt8 { input_slot: 1 },
+                kind: OperatorNodeKind::Aggregate {
+                    group_expressions: vec![],
+                    calls: vec![AggregateCall {
+                        ordinal: 1,
+                        function_version: 1,
+                        function: AggregateFunctionV1::SumInt8,
+                        expression: Some(Expression::Column { slot: 1 }),
+                    }],
+                },
             },
             OperatorNode {
                 node_id: node(2),
@@ -139,14 +148,5 @@ fn nullable_scalar_sum_distinguishes_all_null_from_zero() {
             if matches!(mutations.as_slice(), [ResultMutation::ReplaceScalar { row }]
                 if row.values == [TypedValue::Null(ValueType::Int8)])
     ));
-
-    let legacy = graph(false);
-    let input = batch(&legacy, None, Some(TypedValue::Null(ValueType::Int8)));
-    let transition = apply_graph_plan(&legacy, &empty_snapshot(&legacy, &input), &input).unwrap();
-    assert!(matches!(
-        transition.results.as_slice(),
-        [shiba_operator::ResultDelta { mutations, .. }]
-            if matches!(mutations.as_slice(), [ResultMutation::ReplaceScalar { row }]
-                if row.values == [TypedValue::Int8(0)])
-    ));
+    assert!(std::panic::catch_unwind(|| graph(false)).is_err());
 }

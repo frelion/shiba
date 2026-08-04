@@ -24,11 +24,7 @@ pub fn apply_graph(
     for node in &graph.nodes {
         if matches!(
             node.kind,
-            OperatorNodeKind::CountRows
-                | OperatorNodeKind::SumInt8 { .. }
-                | OperatorNodeKind::GroupedCount { .. }
-                | OperatorNodeKind::GroupedSumInt8 { .. }
-                | OperatorNodeKind::InnerJoin { .. }
+            OperatorNodeKind::Aggregate { .. } | OperatorNodeKind::InnerJoin { .. }
         ) {
             continue;
         }
@@ -79,11 +75,9 @@ pub fn apply_graph(
                 budget.charge(&output, &mut emitted_rows)?;
                 batches.insert(node.node_id, output);
             }
-            OperatorNodeKind::CountRows
-            | OperatorNodeKind::SumInt8 { .. }
-            | OperatorNodeKind::GroupedCount { .. }
-            | OperatorNodeKind::GroupedSumInt8 { .. }
-            | OperatorNodeKind::InnerJoin { .. } => unreachable!(),
+            OperatorNodeKind::Aggregate { .. } | OperatorNodeKind::InnerJoin { .. } => {
+                unreachable!()
+            }
             OperatorNodeKind::Materialize {
                 field_slots,
                 output,

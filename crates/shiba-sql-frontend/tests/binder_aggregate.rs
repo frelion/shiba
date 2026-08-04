@@ -2,7 +2,7 @@ use shiba_compiler::{
     IdentityIndexDescriptor, POSTGRES_INT8_TYPE_OID, POSTGRES_TEXT_TYPE_OID, QueryOperationV1,
     QuerySelectorV1, SourceColumnDescriptor, SourceDescriptor, compile_query,
 };
-use shiba_operator::ObjectAddress;
+use shiba_operator::{AggregateFunctionV1, ObjectAddress};
 use shiba_protocol::{GraphId, SourceId};
 use shiba_sql_frontend::{ErrorClass, ErrorCode, ResolvedSource, bind_query, parse_sql};
 
@@ -76,10 +76,11 @@ fn scalar_count_and_sum_use_generic_stateful_nodes() {
     let source = source();
     let count = bind("SELECT count(*) FROM app.events", &source);
     assert_eq!(count.nodes.len(), 1);
-    assert!(matches!(
-        count.nodes[0].operation,
-        QueryOperationV1::CountRows
-    ));
+    assert!(
+        matches!(&count.nodes[0].operation, QueryOperationV1::Aggregate { group_expressions, calls }
+        if group_expressions.is_empty() && calls.len() == 1
+            && calls[0].function == AggregateFunctionV1::CountStar)
+    );
     assert_eq!(count.nodes[0].state_codec_version, Some(1));
     assert!(count.results[0].key_ordinals.is_empty());
     assert_eq!(count.results[0].fields.len(), 1);
@@ -89,9 +90,16 @@ fn scalar_count_and_sum_use_generic_stateful_nodes() {
     assert_compiles(&count, &source);
 
     let sum = bind("SELECT sum(payload) FROM app.events", &source);
-    let QueryOperationV1::SumInt8 { value } = &sum.nodes[0].operation else {
+    let QueryOperationV1::Aggregate {
+        group_expressions,
+        calls,
+    } = &sum.nodes[0].operation
+    else {
         panic!("SUM must use the generic scalar sum node")
     };
+    assert!(group_expressions.is_empty());
+    assert_eq!(calls[0].function, AggregateFunctionV1::SumInt8);
+    let value = calls[0].expression.as_ref().unwrap();
     assert!(matches!(
         value,
         shiba_compiler::QueryExpressionV1::Column { field }
@@ -126,7 +134,7 @@ fn grouped_count_lowers_filter_keyby_aggregate_and_keyed_result() {
     ));
     assert!(matches!(
         spec.nodes[3].operation,
-        QueryOperationV1::GroupedCount { .. }
+        QueryOperationV1::Aggregate { .. }
     ));
     assert_eq!(spec.nodes[3].state_codec_version, Some(1));
     assert_eq!(spec.results[0].key_ordinals, vec![1]);
@@ -145,7 +153,7 @@ fn grouped_sum_preserves_nullable_key_and_all_null_value_contract() {
     );
     assert!(matches!(
         spec.nodes.last().unwrap().operation,
-        QueryOperationV1::GroupedSumInt8 { .. }
+        QueryOperationV1::Aggregate { .. }
     ));
     assert_eq!(spec.results[0].key_ordinals, vec![1]);
     assert!(spec.results[0].fields[0].nullable);

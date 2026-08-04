@@ -2,6 +2,11 @@
 
 #![forbid(unsafe_code)]
 
+mod aggregate;
+mod aggregate_contract;
+mod aggregate_group;
+mod aggregate_plan;
+mod aggregate_state;
 mod expression;
 mod graph;
 mod graph_budget;
@@ -9,9 +14,6 @@ mod graph_eval;
 mod graph_topology;
 mod graph_transition;
 mod graph_validation;
-mod grouped;
-mod grouped_plan;
-mod grouped_state;
 mod join;
 mod join_codec;
 mod join_plan;
@@ -23,10 +25,15 @@ mod plan;
 mod result_delta;
 mod result_row;
 mod result_schema;
-mod scalar;
 mod state;
 mod typed;
 
+pub use aggregate_contract::{
+    AGGREGATE_FUNCTION_SEMANTIC_VERSION, AGGREGATE_STATE_CODEC_VERSION, AggregateCall,
+    AggregateCodecError, AggregateFunctionDescriptor, AggregateFunctionV1, AggregateInputContract,
+    EmptyResultV1, MAX_AGGREGATE_CALLS, MAX_GROUP_EXPRESSIONS,
+    aggregate_function_canonical_payload, aggregate_function_descriptor, aggregate_function_digest,
+};
 pub use expression::{Expression, ExpressionError};
 pub use graph::{
     ColumnBinding, GraphError, NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind,

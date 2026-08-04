@@ -53,7 +53,7 @@ fn values(client: &mut Client) -> (i64, i64, i64) {
              LEFT JOIN shiba_internal.graph_node_state AS state
               ON state.graph_id = result.graph_id
               AND state.node_id = result.result_id - 2
-              AND state.namespace = 0
+              AND state.namespace = 1
               AND state.partition_key_payload = $1
               AND state.item_key_payload = $2
              WHERE result.graph_id = 1 ORDER BY result.result_id",
@@ -63,7 +63,8 @@ fn values(client: &mut Client) -> (i64, i64, i64) {
         .into_iter()
         .map(|row| {
             row.get::<_, Option<Vec<u8>>>(0).map_or(0, |payload| {
-                i64::from_be_bytes(payload.try_into().expect("int8 operator state"))
+                let offset = payload.len().saturating_sub(8);
+                i64::from_be_bytes(payload[offset..].try_into().expect("aggregate int8 state"))
             })
         })
         .collect::<Vec<_>>();
@@ -223,8 +224,8 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
     client
         .batch_execute(
             "UPDATE shiba_internal.graph_node_state
-                SET state_payload = decode('7fffffffffffffff', 'hex')
-               WHERE graph_id = 1 AND node_id = 2 AND namespace = 0;
+                SET state_payload = decode('00000000000000017fffffffffffffff', 'hex')
+               WHERE graph_id = 1 AND node_id = 2 AND namespace = 1;
              ",
         )
         .expect("inject sum overflow boundary");
@@ -238,8 +239,8 @@ fn m9_count_and_sum_share_one_atomic_effect_batch() {
     client
         .batch_execute(
             "UPDATE shiba_internal.graph_node_state
-                SET state_payload = decode('0000000000000000', 'hex')
-              WHERE graph_id = 1 AND node_id = 2 AND namespace = 0;
+                SET state_payload = decode('00000000000000000000000000000000', 'hex')
+              WHERE graph_id = 1 AND node_id = 2 AND namespace = 1;
              ",
         )
         .expect("remove overflow injection");

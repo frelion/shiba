@@ -238,10 +238,12 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     admin
         .execute(
             "UPDATE shiba_internal.graph_node_state SET state_payload = $1
-             WHERE graph_id = 1 AND node_id = 2
+             WHERE graph_id = 1 AND node_id = 2 AND namespace = 1
                AND partition_key_payload = $2 AND item_key_payload = $3",
             &[
-                &(i64::MAX - 5).to_be_bytes().as_slice(),
+                &[2_i64.to_be_bytes(), (i64::MAX - 5).to_be_bytes()]
+                    .concat()
+                    .as_slice(),
                 &scalar_state_partition(),
                 &scalar_state_item(),
             ],
@@ -264,10 +266,12 @@ fn bootstrap_batches_workers_restart_feedback_and_cutover_recover() {
     admin
         .execute(
             "UPDATE shiba_internal.graph_node_state SET state_payload = $1
-             WHERE graph_id = 1 AND node_id = 2
+             WHERE graph_id = 1 AND node_id = 2 AND namespace = 1
                AND partition_key_payload = $2 AND item_key_payload = $3",
             &[
-                &30_i64.to_be_bytes().as_slice(),
+                &[2_i64.to_be_bytes(), 30_i64.to_be_bytes()]
+                    .concat()
+                    .as_slice(),
                 &scalar_state_partition(),
                 &scalar_state_item(),
             ],

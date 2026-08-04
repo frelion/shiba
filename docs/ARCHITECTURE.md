@@ -1,5 +1,23 @@
 # Architecture boundary
 
+## M16.3 generic Aggregate kernel
+
+M16.3 replaces the four concrete Count/Sum scalar/grouped graph nodes with one
+`Aggregate { group_expressions, calls }` node. Scalar aggregation is exactly
+the empty-group-expression case. Each call carries a nonzero canonical ordinal,
+an explicit function semantic version and the closed `AggregateFunctionV1` tag;
+the sole descriptor API fixes arity, types, nullability, empty semantics,
+retraction and state codec. Concrete dispatch exists only in
+`shiba-operator`.
+
+QuerySpec format 2 compiles to OperatorGraph format 2 under compiler version 4.
+Old bytes are rejected rather than reinterpreted. CountStar, Count(nullable
+`int8`) and checked SumInt8 share the same group membership/state transition
+path and complete-row sink. Runtime, Catalog, Ingress, Bootstrap and Rebuild
+remain opaque to function identity and retain the same transaction,
+continuation and ACK authorities. MIN/MAX, multi-call SQL and HAVING remain
+later M16 slices.
+
 ## M16.2 canonical wide-result cutover
 
 M16.1 freezes the generic aggregate ABI and wide-result boundary in
@@ -23,9 +41,9 @@ private and activation publishes the complete row set atomically.
 
 The fixed scalar/key/value authority and keyed-only sink are removed in the
 same cutover. No second registry, result writer, persistent intermediate delta,
-dual write or compatibility path is introduced. Generic Aggregate execution,
-multi-call state, MIN/MAX and HAVING remain M16.3--M16.6 work and must use this
-result authority unchanged.
+dual write or compatibility path is introduced. M16.3 now runs Count/CountStar/
+Sum through Generic Aggregate; multi-call SQL, MIN/MAX and HAVING remain
+M16.4--M16.6 work and must use this result authority unchanged.
 
 M15.1 freezes a bounded SQL declaration frontend in
 [SQL_FRONTEND_CONTRACT.md](SQL_FRONTEND_CONTRACT.md) and

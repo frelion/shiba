@@ -7,7 +7,7 @@ pub(super) struct Durable {
     pub(super) scalar: (i64, i64),
     pub(super) keyed: Vec<(i64, Option<i64>)>,
     pub(super) source: Vec<(i64, Option<i64>)>,
-    pub(super) states: Vec<(i64, String)>,
+    pub(super) states: Vec<(i64, i32, String)>,
     pub(super) continuations: i64,
 }
 
@@ -37,14 +37,15 @@ pub(super) fn durable(client: &mut Client) -> Durable {
         ),
         states: client
             .query(
-                "SELECT node_id, encode(state_payload, 'hex')
+                "SELECT node_id, namespace, encode(state_payload, 'hex')
                  FROM shiba_internal.graph_node_state
-                 WHERE graph_id = 1 AND namespace = 0 ORDER BY node_id",
+                 WHERE graph_id = 1
+                 ORDER BY node_id, namespace, partition_key_payload, item_key_payload",
                 &[],
             )
             .expect("query opaque states")
             .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
             .collect(),
         continuations: client
             .query_one(

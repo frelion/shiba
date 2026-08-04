@@ -5,6 +5,7 @@ use shiba_runtime::{
     decode_streamed_changes_in_session, process,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static NEXT_RECEIVER_AUTHORIZATION: AtomicU64 = AtomicU64::new(1);
 
@@ -205,11 +206,51 @@ impl SourceReceiver {
         {
             return Err(IngressError::FeedbackMismatch);
         }
-        let outcome = match process(apply, input.raw_transaction()) {
+        // Committed transactions take the fast synchronous path: a feedback
+        // round-trip before every small Apply would dominate the throughput
+        // budget. Streamed transactions use the heartbeat path because their
+        // bounded assembly can legitimately keep the replication connection
+        // open while Runtime applies a large transaction.
+        let outcome = if matches!(&self.assembly, Assembly::Streamed(_)) {
+            // Keep the replication connection alive while a bounded but slow
+            // Runtime transaction executes. Every heartbeat repeats only the
+            // last durable LSN; the outstanding transaction remains
+            // unauthorized until this call returns successfully and
+            // `acknowledge` sends its exact end_lsn.
+            let durable_lsn = self.feedback.last_acknowledged_lsn();
+            if let Err(error) = self.transport.send_feedback(durable_lsn) {
+                self.failed = true;
+                return Err(error);
+            }
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| process(apply, input.raw_transaction()));
+                let mut heartbeat_error = None;
+                while !worker.is_finished() {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if worker.is_finished() {
+                        break;
+                    }
+                    if let Err(error) = self.transport.send_feedback(durable_lsn) {
+                        heartbeat_error = Some(error);
+                        break;
+                    }
+                }
+                let result = worker
+                    .join()
+                    .map_err(|_| IngressError::Governance("runtime apply worker panicked"))?;
+                if let Some(error) = heartbeat_error {
+                    return Err(error);
+                }
+                result.map_err(IngressError::from)
+            })
+        } else {
+            process(apply, input.raw_transaction()).map_err(IngressError::from)
+        };
+        let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.failed = true;
-                return Err(error.into());
+                return Err(error);
             }
         };
         self.outstanding_lsn = None;

@@ -47,6 +47,7 @@ fn private_state(client: &mut Client) -> Vec<(i64, i64)> {
             "SELECT node_id, state_payload
              FROM shiba_internal.graph_node_state
              WHERE graph_id = 1 AND node_id IN (1, 2)
+               AND namespace = 1
                AND partition_key_payload = $1 AND item_key_payload = $2
              ORDER BY node_id",
             &[&scalar_partition, &support::scalar_state_item()],
@@ -55,10 +56,10 @@ fn private_state(client: &mut Client) -> Vec<(i64, i64)> {
         .into_iter()
         .map(|row| {
             let payload: Vec<u8> = row.get(1);
-            (
-                row.get(0),
-                i64::from_be_bytes(payload.try_into().expect("int8 node state")),
-            )
+            (row.get(0), {
+                let offset = payload.len().saturating_sub(8);
+                i64::from_be_bytes(payload[offset..].try_into().expect("aggregate int8 state"))
+            })
         })
         .collect()
 }

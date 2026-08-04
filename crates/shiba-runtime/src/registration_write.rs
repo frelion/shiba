@@ -21,7 +21,7 @@ pub(super) fn insert_graph(
         "INSERT INTO shiba_internal.graph_definition (
              graph_id, source_count, compiler_version, spec_payload,
              graph_format_version, graph_payload, graph_digest, state_codec_version)
-         VALUES ($1, $2, 3, $3, $4, $5, $6, 1)",
+         VALUES ($1, $2, 4, $3, $4, $5, $6, 1)",
         &[
             &graph_id,
             &i16::try_from(graph.sources.len()).map_err(|_| M2Error::InvalidOperatorDefinition)?,

@@ -397,7 +397,7 @@ Result Sink production paths; concrete dispatch is confined to
 namespace `0` is kernel membership, call namespaces are ordinal-derived, and
 there is no function registry table, dual codec or compatibility path.
 
-At M16.2 the production result path is generic and wide, while aggregate nodes
-remain the specialized M15 implementations pending their deletion in M16.3.
-This contract does not claim that the generic ABI, MIN/MAX, multi-call
-aggregation or HAVING exists in production yet.
+At M16.3 the production result path is generic and wide and CountStar,
+Count(nullable `int8`) and SumInt8 run through the versioned Aggregate ABI.
+The specialized M15 node variants are deleted. This contract does not yet claim
+production MIN/MAX, multi-call SQL aggregation or HAVING.

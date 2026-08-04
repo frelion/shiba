@@ -1,5 +1,16 @@
 # M15 QuerySpecV1 contract
 
+## M16.3 generic Aggregate declaration
+
+The current canonical declaration is QuerySpec format 2. One generic
+`Aggregate` operation owns zero or one group expression and one or more ordered
+`AggregateCall` values. Each call includes canonical ordinal, function semantic
+version, closed function tag and optional bound expression. Compiler validates
+arity and types through `shiba-operator`'s sole descriptor API and emits
+OperatorGraph format 2; it does not duplicate function semantics. Compiler
+version 4 is the only accepted Catalog writer format. Prior QuerySpec/graph
+formats are historical evidence and fail closed without a compatibility path.
+
 ## M16.2 result declaration cutover
 
 M16.1 freezes a strict QuerySpec extension in which each normalized
@@ -16,10 +27,13 @@ durable public schema names and therefore change QuerySpec/schema/graph digest;
 formatting and spans do not. Compiler emits one canonical `ResultSchemaV1` and
 generic Materialize field-slot list. The old Scalar/Keyed result-shape enum is
 deleted with no parallel decoder, adapter or dual format. AggregateCall
-declarations remain M16.3 work.
+declarations and Count/CountStar/Sum compilation are implemented by M16.3;
+multi-call SQL, MIN/MAX and HAVING remain later slices.
 
-This in-place format cutover is stored by compiler version `3`; compiler
-version `2` remains historical M15 evidence, not an accepted current decoder.
+That result-only cutover was stored by compiler version `3`. M16.3's breaking
+Aggregate declaration uses compiler version `4`, QuerySpec format `2` and
+OperatorGraph format `2`; earlier versions remain historical evidence, not
+accepted current decoders.
 
 ## M15 declaration cutover and completion status
 

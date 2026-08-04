@@ -1,6 +1,4 @@
-use shiba_sql_frontend::{
-    Aggregate, BinaryOperator, SelectExpression, UnboundExpression, parse_sql,
-};
+use shiba_sql_frontend::{BinaryOperator, SelectExpression, UnboundExpression, parse_sql};
 
 #[test]
 fn accepts_each_frozen_single_source_shape() {
@@ -20,7 +18,7 @@ fn accepts_each_frozen_single_source_shape() {
     let sum = parse_sql("SELECT SUM(payload) FROM SOURCE.EVENTS").unwrap();
     assert!(matches!(
         sum.projection[0].expression,
-        SelectExpression::Aggregate(Aggregate::Sum { .. })
+        SelectExpression::Aggregate(ref aggregate) if aggregate.function == "sum"
     ));
     let computed = parse_sql("SELECT id, payload + 7 FROM source.events").unwrap();
     assert!(matches!(

@@ -1,8 +1,9 @@
 use postgres::{Client, NoTls};
 use shiba_compiler::{
-    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QUERY_SPEC_VERSION, QueryAggregateCallV1, QueryExpressionV1, QueryFieldV1, QueryInputV1,
+    QueryNodeV1, QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
+use shiba_operator::AggregateFunctionV1;
 use shiba_protocol::{GraphId, SlotGeneration, SourceId};
 use shiba_runtime::{
     M2Error, PgoutputSource, ProcessOutcome, compile_and_register, decode_committed_changes,
@@ -46,25 +47,27 @@ fn spec() -> QuerySpecV1 {
             QueryNodeV1 {
                 inputs: vec![QueryInputV1::Node { node: 1 }],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::GroupedCount { key: slot_field(2) },
+                operation: grouped(AggregateFunctionV1::CountStar, slot_field(2), None),
             },
             key_by("payload"),
             QueryNodeV1 {
                 inputs: vec![QueryInputV1::Node { node: 3 }],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::GroupedSumInt8 {
-                    key: slot_field(2),
-                    value: slot_field(0),
-                },
+                operation: grouped(
+                    AggregateFunctionV1::SumInt8,
+                    slot_field(2),
+                    Some(slot_field(0)),
+                ),
             },
             key_by("id"),
             QueryNodeV1 {
                 inputs: vec![QueryInputV1::Node { node: 5 }],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::GroupedSumInt8 {
-                    key: slot_field(2),
-                    value: slot_field(1),
-                },
+                operation: grouped(
+                    AggregateFunctionV1::SumInt8,
+                    slot_field(2),
+                    Some(slot_field(1)),
+                ),
             },
         ],
         results: (2..=6)
@@ -80,12 +83,28 @@ fn spec() -> QuerySpecV1 {
                     QueryResultFieldV1 {
                         name: "value".into(),
                         value_slot: 1,
-                        nullable: input_node == 6,
+                        nullable: input_node != 2,
                     },
                 ],
                 key_ordinals: vec![1],
             })
             .collect(),
+    }
+}
+
+fn grouped(
+    function: AggregateFunctionV1,
+    key: QueryFieldV1,
+    expression: Option<QueryFieldV1>,
+) -> QueryOperationV1 {
+    QueryOperationV1::Aggregate {
+        group_expressions: vec![QueryExpressionV1::Column { field: key }],
+        calls: vec![QueryAggregateCallV1 {
+            ordinal: 1,
+            function,
+            function_version: 1,
+            expression: expression.map(|field| QueryExpressionV1::Column { field }),
+        }],
     }
 }
 
@@ -266,7 +285,6 @@ fn grouped_count_and_sum_are_atomic_and_sql_equal() {
     );
     let operator2 = node_state_payload(&mut client, 4, 20);
     let mut overflow = 2_i64.to_be_bytes().to_vec();
-    overflow.extend_from_slice(&2_i64.to_be_bytes());
     overflow.extend_from_slice(&i64::MAX.to_be_bytes());
     set_node_state_payload(&mut client, 4, 20, &overflow);
     let before_overflow = durable_snapshot(&mut client);

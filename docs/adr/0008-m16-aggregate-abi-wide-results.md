@@ -1,7 +1,8 @@
 # ADR 0008: versioned aggregate ABI and canonical wide results
 
-Status: accepted; canonical wide-result half implemented in M16.2, Aggregate
-Function ABI execution remains M16.3--M16.6.
+Status: accepted; canonical wide results landed in M16.2 and the
+Count/CountStar/Sum Aggregate ABI execution landed in M16.3. Multi-call,
+MIN/MAX and HAVING remain M16.4--M16.6.
 
 ## Context
 

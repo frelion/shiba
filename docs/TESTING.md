@@ -1,5 +1,31 @@
 # Testing strategy
 
+## M16.3 generic Aggregate gates
+
+The production `Aggregate` kernel replaces the four concrete Count/Sum node
+families. A shared database-free harness drives CountStar, Count(nullable
+`int8`) and SumInt8 through 1,000 fixed-seed INSERT/UPDATE/DELETE transitions
+against an independent row model. It also proves exact function/state version
+rejection, normalized transaction deltas, exact `i64::MIN` retraction, checked
+overflow and complete state removal when a group becomes empty. Compiler tests
+bind declaration bounds directly to the Operator ABI constants.
+
+`scripts/check-m16-aggregate-contract.sh` additionally rejects concrete
+function dispatch outside `shiba-operator` aggregate modules and any function
+knowledge in Runtime, Ingress or Catalog. Directed PG17.10/PG18.4 gates for M9
+Count/Sum, M13 generic kernel, M14 grouped execution and M15 aggregate SQL prove
+the migrated scalar/grouped lifecycle and full SQL oracles. The final release
+matrix remains 57 uniquely enrolled scripts and 114 versioned invocations;
+M16.4 adds multi-call SQL and Count(expr), while MIN/MAX and HAVING remain
+M16.5/M16.6.
+
+The full PG17 matrix exposed the existing two-second walsender timeout while a
+10,000-row generic Aggregate retry was synchronously applying. The receiver now
+refreshes only the prior durable coordinate before and during Apply. The M10 streaming
+gate proves that the retry still advances slot feedback only after Runtime
+commit; Runtime failure continues to leave slot progress, state, result and
+continuation unchanged. The same directed gate is run on PG17 and PG18.
+
 ## M16.2 wide-result gates
 
 Markdown/diff review freezes the aggregate descriptor ABI, call identity,
@@ -25,7 +51,8 @@ enrolled scripts and 114 successful versioned invocations, including the new
 remained below its frozen limits: PG17/PG18 total time was 8.418541416/
 7.764510792 seconds, RSS growth 5,984/6,224 KiB, and retained WAL
 253,008,000/253,084,256 bytes (limit 268,435,456). This closes only the
-canonical wide-result cutover; generic Aggregate execution remains M16.3.
+canonical wide-result cutover. M16.3 subsequently supplies generic
+Count/CountStar/Sum execution; multi-call, MIN/MAX and HAVING remain open.
 
 ## M15.1 SQL frontend contract gates
 

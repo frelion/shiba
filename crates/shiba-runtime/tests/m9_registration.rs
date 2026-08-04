@@ -1,9 +1,9 @@
 use postgres::{Client, NoTls};
 use shiba_compiler::{
     CompilerError, QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
-use shiba_operator::{ObjectAddress, OperatorGraph, OperatorNodeKind};
+use shiba_operator::{AggregateFunctionV1, ObjectAddress, OperatorGraph, OperatorNodeKind};
 use shiba_protocol::{GraphId, SourceId};
 use shiba_runtime::{
     M2Error, RegistrationError, compile_and_register, compile_and_register_in_transaction,
@@ -11,7 +11,7 @@ use shiba_runtime::{
 
 mod support;
 
-use support::PgoutputCapture;
+use support::{PgoutputCapture, count_rows, sum_int8};
 
 const ENVIRONMENT: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m9-registration.sh",
@@ -30,22 +30,20 @@ fn spec(graph_id: u64, source_id: u64, input_column: &str) -> QuerySpecV1 {
             QueryNodeV1 {
                 inputs: vec![QueryInputV1::Source { source_id }],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::CountRows,
+                operation: count_rows(),
             },
             QueryNodeV1 {
                 inputs: vec![QueryInputV1::Source { source_id }],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::SumInt8 {
-                    value: QueryExpressionV1::Column {
-                        field: QueryFieldV1 {
-                            input: 0,
-                            selector: QuerySelectorV1::Name {
-                                name: input_column.into(),
-                                quoted: false,
-                            },
+                operation: sum_int8(QueryExpressionV1::Column {
+                    field: QueryFieldV1 {
+                        input: 0,
+                        selector: QuerySelectorV1::Name {
+                            name: input_column.into(),
+                            quoted: false,
                         },
                     },
-                },
+                }),
             },
         ],
         results: vec![
@@ -92,7 +90,7 @@ fn durable_graph(client: &mut Client) -> OperatorGraph {
             &[],
         )
         .expect("query durable graph definition");
-    assert_eq!(row.get::<_, i32>(0), 1);
+    assert_eq!(row.get::<_, i32>(0), 2);
     let payload: Vec<u8> = row.get(1);
     let digest: Vec<u8> = row.get(2);
     OperatorGraph::from_canonical_payload(
@@ -124,12 +122,11 @@ fn assert_sum_binding(client: &mut Client, graph: &OperatorGraph) {
             .iter()
             .any(|column| column.address == expected)
     );
-    assert!(
-        graph
-            .nodes
-            .iter()
-            .any(|node| matches!(node.kind, OperatorNodeKind::SumInt8 { .. }))
-    );
+    assert!(graph.nodes.iter().any(|node| matches!(
+        &node.kind,
+        OperatorNodeKind::Aggregate { calls, .. }
+            if calls.iter().any(|call| call.function == AggregateFunctionV1::SumInt8)
+    )));
 }
 
 fn install_result_failure(client: &mut Client) {

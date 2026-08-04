@@ -143,7 +143,7 @@ pub(crate) fn prepared_snapshot(client: &mut Client, target_slot: &str) -> Vec<S
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_binding ORDER BY binding_kind, address_objsubid) x",
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_bootstrap WHERE graph_id = 1) x",
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_ingress_config WHERE graph_id = 1) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_node_state ORDER BY graph_id, node_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_node_state ORDER BY graph_id, node_id, namespace, partition_key_payload, item_key_payload) x",
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.graph_result ORDER BY graph_id, result_id) x",
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_continuation ORDER BY commit_lsn) x",
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.source_invalidation ORDER BY source_id) x",

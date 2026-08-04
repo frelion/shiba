@@ -1,10 +1,10 @@
 use shiba_compiler::{
-    CompilerError, IdentityIndexDescriptor, QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1,
-    QueryInputV1, QueryNodeV1, QueryOperationV1, QueryResultFieldV1, QueryResultV1,
-    QuerySelectorV1, QuerySpecV1, SourceColumnDescriptor, SourceDescriptor, compile_query,
-    compile_query_with_optional_identities,
+    CompilerError, IdentityIndexDescriptor, QUERY_SPEC_VERSION, QueryAggregateCallV1,
+    QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1, QueryOperationV1,
+    QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1, SourceColumnDescriptor,
+    SourceDescriptor, compile_query, compile_query_with_optional_identities,
 };
-use shiba_operator::{ObjectAddress, OperatorNodeKind};
+use shiba_operator::{AggregateFunctionV1, ObjectAddress, OperatorNodeKind};
 use shiba_protocol::{GraphId, SourceId};
 
 fn address(object_id: u32, sub_id: i32) -> ObjectAddress {
@@ -92,6 +92,30 @@ fn stateless(inputs: Vec<QueryInputV1>, operation: QueryOperationV1) -> QueryNod
     }
 }
 
+fn aggregate(
+    group_expressions: Vec<QueryExpressionV1>,
+    function: AggregateFunctionV1,
+    expression: Option<QueryExpressionV1>,
+) -> QueryOperationV1 {
+    QueryOperationV1::Aggregate {
+        group_expressions,
+        calls: vec![QueryAggregateCallV1 {
+            ordinal: 1,
+            function,
+            function_version: 1,
+            expression,
+        }],
+    }
+}
+
+fn count() -> QueryOperationV1 {
+    aggregate(vec![], AggregateFunctionV1::CountStar, None)
+}
+
+fn sum(value: QueryExpressionV1) -> QueryOperationV1 {
+    aggregate(vec![], AggregateFunctionV1::SumInt8, Some(value))
+}
+
 fn scalar(input_node: u16, nullable: bool) -> QueryResultV1 {
     QueryResultV1 {
         input_node,
@@ -123,6 +147,12 @@ fn keyed(input_node: u16) -> QueryResultV1 {
     }
 }
 
+fn keyed_non_null(input_node: u16) -> QueryResultV1 {
+    let mut result = keyed(input_node);
+    result.fields[1].nullable = false;
+    result
+}
+
 #[test]
 fn generic_query_preserves_all_single_source_graph_shapes() {
     let source = source(1, 10_000);
@@ -132,13 +162,8 @@ fn generic_query_preserves_all_single_source_graph_shapes() {
         graph_id: GraphId::new(9).unwrap(),
         sources: vec![source.source_id],
         nodes: vec![
-            stateful(source_input(source.source_id), QueryOperationV1::CountRows),
-            stateful(
-                source_input(source.source_id),
-                QueryOperationV1::SumInt8 {
-                    value: name("payload"),
-                },
-            ),
+            stateful(source_input(source.source_id), count()),
+            stateful(source_input(source.source_id), sum(name("payload"))),
             stateless(
                 source_input(source.source_id),
                 QueryOperationV1::Project {
@@ -151,12 +176,7 @@ fn generic_query_preserves_all_single_source_graph_shapes() {
             ),
             stateful(
                 node_input(4),
-                QueryOperationV1::GroupedCount {
-                    key: QueryFieldV1 {
-                        input: 0,
-                        selector: QuerySelectorV1::Slot { slot: 2 },
-                    },
-                },
+                aggregate(vec![slot(2)], AggregateFunctionV1::CountStar, None),
             ),
             stateless(
                 source_input(source.source_id),
@@ -164,23 +184,14 @@ fn generic_query_preserves_all_single_source_graph_shapes() {
             ),
             stateful(
                 node_input(6),
-                QueryOperationV1::GroupedSumInt8 {
-                    key: QueryFieldV1 {
-                        input: 0,
-                        selector: QuerySelectorV1::Slot { slot: 2 },
-                    },
-                    value: QueryFieldV1 {
-                        input: 0,
-                        selector: QuerySelectorV1::Slot { slot: 1 },
-                    },
-                },
+                aggregate(vec![slot(2)], AggregateFunctionV1::SumInt8, Some(slot(1))),
             ),
         ],
         results: vec![
             scalar(1, false),
             scalar(2, true),
             keyed(3),
-            keyed(5),
+            keyed_non_null(5),
             keyed(7),
         ],
     };
@@ -213,12 +224,7 @@ fn source_column_type_error_preserves_exact_catalog_coordinate() {
         version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(10).unwrap(),
         sources: vec![source.source_id],
-        nodes: vec![stateful(
-            source_input(source.source_id),
-            QueryOperationV1::SumInt8 {
-                value: name("label"),
-            },
-        )],
+        nodes: vec![stateful(source_input(source.source_id), sum(name("label")))],
         results: vec![scalar(1, false)],
     };
     assert_eq!(
@@ -247,7 +253,7 @@ fn filter_compute_and_project_are_generic_nodes() {
         right: Box::new(QueryExpressionV1::Int8Literal { value: 1 }),
     };
     let spec = QuerySpecV1 {
-        version: 1,
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(2).unwrap(),
         sources: vec![source.source_id],
         nodes: vec![
@@ -299,7 +305,7 @@ fn join_binds_exact_effective_right_identity_without_recipe_oid() {
         },
     };
     let spec = QuerySpecV1 {
-        version: 1,
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(3).unwrap(),
         sources: vec![left.source_id, right.source_id],
         nodes: vec![stateful(
@@ -333,13 +339,10 @@ fn strict_json_digest_and_input_selector_boundaries_fail_closed() {
     let source = source(1, 10_000);
     let index = identity(&source, 11_000);
     let valid = QuerySpecV1 {
-        version: 1,
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(4).unwrap(),
         sources: vec![source.source_id],
-        nodes: vec![stateful(
-            source_input(source.source_id),
-            QueryOperationV1::CountRows,
-        )],
+        nodes: vec![stateful(source_input(source.source_id), count())],
         results: vec![scalar(1, false)],
     };
     let bytes = valid.to_canonical_json().unwrap();
@@ -353,11 +356,40 @@ fn strict_json_digest_and_input_selector_boundaries_fail_closed() {
     unknown.extend_from_slice(b",\"alias\":1}");
     assert!(QuerySpecV1::from_json(&unknown).is_err());
 
+    let mut wrong_function_version = valid.clone();
+    let QueryOperationV1::Aggregate { calls, .. } = &mut wrong_function_version.nodes[0].operation
+    else {
+        panic!("fixture must remain a generic aggregate")
+    };
+    calls[0].function_version = 2;
+    assert!(wrong_function_version.to_canonical_json().is_err());
+
+    let mut too_many_calls = valid.clone();
+    let QueryOperationV1::Aggregate { calls, .. } = &mut too_many_calls.nodes[0].operation else {
+        unreachable!()
+    };
+    *calls = (1..=shiba_operator::MAX_AGGREGATE_CALLS + 1)
+        .map(|ordinal| QueryAggregateCallV1 {
+            ordinal: u16::try_from(ordinal).unwrap(),
+            function: AggregateFunctionV1::CountStar,
+            function_version: 1,
+            expression: None,
+        })
+        .collect();
+    assert!(too_many_calls.to_canonical_json().is_err());
+
+    let mut too_many_groups = valid.clone();
+    let QueryOperationV1::Aggregate {
+        group_expressions, ..
+    } = &mut too_many_groups.nodes[0].operation
+    else {
+        unreachable!()
+    };
+    *group_expressions = vec![slot(0); shiba_operator::MAX_GROUP_EXPRESSIONS + 1];
+    assert!(too_many_groups.to_canonical_json().is_err());
+
     let invalid = QuerySpecV1 {
-        nodes: vec![stateful(
-            source_input(source.source_id),
-            QueryOperationV1::SumInt8 { value: slot(1) },
-        )],
+        nodes: vec![stateful(source_input(source.source_id), sum(slot(1)))],
         ..valid.clone()
     };
     assert_eq!(
@@ -381,13 +413,10 @@ fn identity_free_zero_column_count_remains_the_only_exception() {
         columns: vec![],
     };
     let spec = QuerySpecV1 {
-        version: 1,
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(5).unwrap(),
         sources: vec![source.source_id],
-        nodes: vec![stateful(
-            source_input(source.source_id),
-            QueryOperationV1::CountRows,
-        )],
+        nodes: vec![stateful(source_input(source.source_id), count())],
         results: vec![scalar(1, false)],
     };
     assert!(compile_query_with_optional_identities(&spec, &[source], &[None]).is_ok());
@@ -417,7 +446,7 @@ fn boolean_predicate() -> QueryExpressionV1 {
 fn bounded_spec() -> QuerySpecV1 {
     let source_id = SourceId::new(1).unwrap();
     QuerySpecV1 {
-        version: 1,
+        version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(6).unwrap(),
         sources: vec![source_id],
         nodes: vec![stateless(

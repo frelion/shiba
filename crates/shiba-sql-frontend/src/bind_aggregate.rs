@@ -1,17 +1,19 @@
 use shiba_compiler::{
-    QUERY_SPEC_VERSION, QueryNodeV1, QueryOperationV1, QueryResultFieldV1, QueryResultV1,
-    QuerySpecV1,
+    QUERY_SPEC_VERSION, QueryAggregateCallV1, QueryNodeV1, QueryOperationV1, QueryResultFieldV1,
+    QueryResultV1, QuerySpecV1, SourceColumnDescriptor,
 };
+use shiba_operator::{AggregateFunctionV1, aggregate_function_descriptor};
 use shiba_protocol::GraphId;
 
 use crate::bind::{ResolvedSource, binding, source_column};
 use crate::bind_aggregate_support::{
-    aggregate_span, grouped_columns, node_input, predicate_span, slot_expression, slot_field,
-    slot_for, slots, source_input, validate_source_identity,
+    aggregate_span, grouped_columns, node_input, predicate_span, slot_expression, slot_for, slots,
+    source_input, validate_source_identity,
 };
 use crate::bind_expression::{ExpressionType, lower, resolve_column};
 use crate::{
-    Aggregate, ErrorCode, FrontendError, SelectExpression, UnboundExpression, UnboundQuery,
+    Aggregate, AggregateArgument, ErrorCode, FrontendError, SelectExpression, UnboundExpression,
+    UnboundQuery,
 };
 
 pub(crate) fn bind(
@@ -40,37 +42,40 @@ fn bind_scalar(
     let [item] = query.projection.as_slice() else {
         return Err(binding(ErrorCode::UnsupportedSyntax, query.span));
     };
-    let (operation, value_nullable, default_name) = match &item.expression {
-        SelectExpression::Aggregate(Aggregate::CountStar { .. }) => {
-            (QueryOperationV1::CountRows, false, "count")
-        }
-        SelectExpression::Aggregate(Aggregate::Sum { input, .. }) => {
+    let SelectExpression::Aggregate(aggregate) = &item.expression else {
+        return Err(binding(ErrorCode::UnsupportedSyntax, item.span));
+    };
+    let (function, expression, default_name) = match aggregate_call(aggregate)? {
+        (function, None) => (function, None, "count"),
+        (function, Some(input)) => {
             let UnboundExpression::Column(column) = input else {
                 return Err(binding(ErrorCode::UnsupportedSyntax, input.span()));
             };
             let descriptor = resolve_column(&source.descriptor, column)?;
-            (
-                QueryOperationV1::SumInt8 {
-                    value: source_column(descriptor),
-                },
-                true,
-                "sum",
-            )
+            (function, Some(source_column(descriptor)), "sum")
         }
-        _ => return Err(binding(ErrorCode::UnsupportedSyntax, item.span)),
     };
+    let descriptor = aggregate_function_descriptor(function);
     finish(
         graph_id,
         source,
         vec![QueryNodeV1 {
             inputs: vec![source_input(source)],
             state_codec_version: Some(1),
-            operation,
+            operation: QueryOperationV1::Aggregate {
+                group_expressions: vec![],
+                calls: vec![QueryAggregateCallV1 {
+                    ordinal: 1,
+                    function,
+                    function_version: descriptor.semantic_version,
+                    expression,
+                }],
+            },
         }],
         vec![QueryResultFieldV1 {
             name: crate::bind::result_name(item, default_name),
             value_slot: 0,
-            nullable: value_nullable,
+            nullable: descriptor.output_nullable,
         }],
         vec![],
         query.span,
@@ -103,16 +108,51 @@ fn bind_grouped(
         return Err(binding(ErrorCode::UnknownColumn, group_by.span));
     }
 
-    let sum = match aggregate {
-        Aggregate::CountStar { .. } => None,
-        Aggregate::Sum { input, .. } => {
+    let (function, argument) = aggregate_call(aggregate)?;
+    let value = match argument {
+        None => None,
+        Some(input) => {
             let UnboundExpression::Column(column) = input else {
                 return Err(binding(ErrorCode::UnsupportedSyntax, input.span()));
             };
             Some(resolve_column(&source.descriptor, column)?)
         }
     };
-    let columns = grouped_columns(query, source, group, sum)?;
+    let nodes = grouped_nodes(query, source, group, group_ref, aggregate, function, value)?;
+    finish(
+        graph_id,
+        source,
+        nodes,
+        vec![
+            QueryResultFieldV1 {
+                name: crate::bind::result_name(group_item, &group.name),
+                value_slot: 0,
+                nullable: group.nullable,
+            },
+            QueryResultFieldV1 {
+                name: crate::bind::result_name(
+                    aggregate_item,
+                    if value.is_some() { "sum" } else { "count" },
+                ),
+                value_slot: 1,
+                nullable: aggregate_function_descriptor(function).output_nullable,
+            },
+        ],
+        vec![1],
+        query.span,
+    )
+}
+
+fn grouped_nodes(
+    query: &UnboundQuery,
+    source: &ResolvedSource,
+    group: &SourceColumnDescriptor,
+    group_ref: &crate::ColumnRef,
+    aggregate: &Aggregate,
+    function: AggregateFunctionV1,
+    value: Option<&SourceColumnDescriptor>,
+) -> Result<Vec<QueryNodeV1>, FrontendError> {
+    let columns = grouped_columns(query, source, group, value)?;
     let slots = slots(&columns, query)?;
     let mut nodes = vec![QueryNodeV1 {
         inputs: vec![source_input(source)],
@@ -147,42 +187,35 @@ fn bind_grouped(
     input_node += 1;
     let appended_key = u16::try_from(columns.len())
         .map_err(|_| binding(ErrorCode::QueryTooComplex, query.span))?;
-    let operation = match sum {
-        None => QueryOperationV1::GroupedCount {
-            key: slot_field(appended_key),
-        },
-        Some(value) => QueryOperationV1::GroupedSumInt8 {
-            key: slot_field(appended_key),
-            value: slot_field(slot_for(&slots, value, aggregate_span(aggregate))?),
-        },
-    };
+    let expression = value
+        .map(|value| slot_for(&slots, value, aggregate_span(aggregate)).map(slot_expression))
+        .transpose()?;
     nodes.push(QueryNodeV1 {
         inputs: vec![node_input(input_node)],
         state_codec_version: Some(1),
-        operation,
+        operation: QueryOperationV1::Aggregate {
+            group_expressions: vec![slot_expression(appended_key)],
+            calls: vec![QueryAggregateCallV1 {
+                ordinal: 1,
+                function,
+                function_version: aggregate_function_descriptor(function).semantic_version,
+                expression,
+            }],
+        },
     });
-    finish(
-        graph_id,
-        source,
-        nodes,
-        vec![
-            QueryResultFieldV1 {
-                name: crate::bind::result_name(group_item, &group.name),
-                value_slot: 0,
-                nullable: group.nullable,
-            },
-            QueryResultFieldV1 {
-                name: crate::bind::result_name(
-                    aggregate_item,
-                    if sum.is_some() { "sum" } else { "count" },
-                ),
-                value_slot: 1,
-                nullable: sum.is_some(),
-            },
-        ],
-        vec![1],
-        query.span,
-    )
+    Ok(nodes)
+}
+
+fn aggregate_call(
+    aggregate: &Aggregate,
+) -> Result<(AggregateFunctionV1, Option<&UnboundExpression>), FrontendError> {
+    match (aggregate.function.as_str(), &aggregate.argument) {
+        ("count", AggregateArgument::Star) => Ok((AggregateFunctionV1::CountStar, None)),
+        ("sum", AggregateArgument::Expression(input)) => {
+            Ok((AggregateFunctionV1::SumInt8, Some(input)))
+        }
+        _ => Err(binding(ErrorCode::UnsupportedSyntax, aggregate.span)),
+    }
 }
 
 fn finish(

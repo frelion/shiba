@@ -2,10 +2,10 @@ use std::process::Command;
 
 use postgres::Client;
 use shiba_compiler::{
-    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QUERY_SPEC_VERSION, QueryAggregateCallV1, QueryExpressionV1, QueryFieldV1, QueryInputV1,
+    QueryNodeV1, QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
-use shiba_operator::TypedValue;
+use shiba_operator::{AggregateFunctionV1, TypedValue};
 use shiba_protocol::{GraphId, SourceId};
 use shiba_runtime::compile_and_register;
 
@@ -51,13 +51,14 @@ fn graph_spec() -> QuerySpecV1 {
             QueryNodeV1 {
                 inputs: vec![QueryInputV1::Source { source_id }],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::CountRows,
+                operation: aggregate(AggregateFunctionV1::CountStar, None),
             },
             QueryNodeV1 {
                 inputs: vec![QueryInputV1::Source { source_id }],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::SumInt8 {
-                    value: QueryExpressionV1::Column {
+                operation: aggregate(
+                    AggregateFunctionV1::SumInt8,
+                    Some(QueryExpressionV1::Column {
                         field: QueryFieldV1 {
                             input: 0,
                             selector: QuerySelectorV1::Name {
@@ -65,8 +66,8 @@ fn graph_spec() -> QuerySpecV1 {
                                 quoted: false,
                             },
                         },
-                    },
-                },
+                    }),
+                ),
             },
         ],
         results: vec![
@@ -89,6 +90,21 @@ fn graph_spec() -> QuerySpecV1 {
                 key_ordinals: vec![],
             },
         ],
+    }
+}
+
+fn aggregate(
+    function: AggregateFunctionV1,
+    expression: Option<QueryExpressionV1>,
+) -> QueryOperationV1 {
+    QueryOperationV1::Aggregate {
+        group_expressions: Vec::new(),
+        calls: vec![QueryAggregateCallV1 {
+            ordinal: 1,
+            function,
+            function_version: 1,
+            expression,
+        }],
     }
 }
 
@@ -121,6 +137,7 @@ pub(crate) fn states(client: &mut Client) -> Vec<(i64, i64)> {
             "SELECT node_id, state_payload
              FROM shiba_internal.graph_node_state
              WHERE graph_id = 1 AND node_id IN (1, 2)
+               AND namespace = 1
                AND partition_key_payload = $1 AND item_key_payload = $2
              ORDER BY node_id",
             &[&scalar_partition, &b"null".as_slice()],
@@ -129,10 +146,12 @@ pub(crate) fn states(client: &mut Client) -> Vec<(i64, i64)> {
         .into_iter()
         .map(|row| {
             let payload: Vec<u8> = row.get(1);
-            (
-                row.get(0),
-                i64::from_be_bytes(payload.try_into().expect("int8 node state")),
-            )
+            let value = match payload.as_slice() {
+                bytes if bytes.len() == 8 => i64::from_be_bytes(bytes.try_into().unwrap()),
+                bytes if bytes.len() == 16 => i64::from_be_bytes(bytes[8..].try_into().unwrap()),
+                _ => panic!("invalid aggregate state payload"),
+            };
+            (row.get(0), value)
         })
         .collect()
 }

@@ -1,11 +1,12 @@
 use core::num::NonZeroU32;
 
 use shiba_operator::{
-    ColumnBinding, DeltaBatch, EffectOrigin, Expression, GraphEffectOrigin, MultiInputBatch,
-    NodeId, NodeInput, ObjectAddress, OperatorGraph, OperatorNode, OperatorNodeKind,
-    OutputContract, ResultDelta, ResultField, ResultMutation, ResultSchemaV1, RowDelta,
-    SourceDeltaBatch, SourcePort, StateContract, StateEntry, StateSnapshot, TypedResultRowV1,
-    TypedRow, TypedValue, ValueType, apply_graph_plan, graph_state_read_set, source_typed_layout,
+    AggregateCall, AggregateFunctionV1, ColumnBinding, DeltaBatch, EffectOrigin, Expression,
+    GraphEffectOrigin, MultiInputBatch, NodeId, NodeInput, ObjectAddress, OperatorGraph,
+    OperatorNode, OperatorNodeKind, OutputContract, ResultDelta, ResultField, ResultMutation,
+    ResultSchemaV1, RowDelta, SourceDeltaBatch, SourcePort, StateContract, StateEntry,
+    StateSnapshot, TypedResultRowV1, TypedRow, TypedValue, ValueType, apply_graph_plan,
+    graph_state_read_set, source_typed_layout,
 };
 use shiba_protocol::{BootstrapBatchId, BootstrapId, GraphId, SourceId};
 
@@ -15,8 +16,10 @@ fn node(value: u32) -> NodeId {
 
 fn graph() -> OperatorGraph {
     let source_id = SourceId::new(1).unwrap();
-    let scalar = scalar_output(false);
-    let keyed = keyed_output();
+    let count_scalar = scalar_output(false);
+    let sum_scalar = scalar_output(true);
+    let keyed = keyed_output(true);
+    let keyed_count = keyed_output(false);
     OperatorGraph::build(
         GraphId::new(7).unwrap(),
         vec![SourcePort {
@@ -29,10 +32,22 @@ fn graph() -> OperatorGraph {
             }),
         }],
         vec![
-            stateful(1, source_id, OperatorNodeKind::CountRows),
-            terminal(2, 1, scalar.clone(), 0, 0),
-            stateful(3, source_id, OperatorNodeKind::SumInt8 { input_slot: 1 }),
-            terminal(4, 3, scalar, 0, 0),
+            stateful(
+                1,
+                source_id,
+                aggregate(vec![], AggregateFunctionV1::CountStar, None),
+            ),
+            terminal(2, 1, count_scalar, 0, 0),
+            stateful(
+                3,
+                source_id,
+                aggregate(
+                    vec![],
+                    AggregateFunctionV1::SumInt8,
+                    Some(Expression::Column { slot: 1 }),
+                ),
+            ),
+            terminal(4, 3, sum_scalar, 0, 0),
             OperatorNode {
                 node_id: node(5),
                 input: NodeInput::SourcePort(source_id),
@@ -57,9 +72,13 @@ fn graph() -> OperatorGraph {
                 node_id: node(8),
                 input: NodeInput::Node(node(7)),
                 state_contract: Some(StateContract { codec_version: 1 }),
-                kind: OperatorNodeKind::GroupedCount { key_slot: 2 },
+                kind: aggregate(
+                    vec![Expression::Column { slot: 2 }],
+                    AggregateFunctionV1::CountStar,
+                    None,
+                ),
             },
-            terminal(9, 8, keyed.clone(), 0, 1),
+            terminal(9, 8, keyed_count, 0, 1),
             OperatorNode {
                 node_id: node(10),
                 input: NodeInput::SourcePort(source_id),
@@ -72,15 +91,32 @@ fn graph() -> OperatorGraph {
                 node_id: node(11),
                 input: NodeInput::Node(node(10)),
                 state_contract: Some(StateContract { codec_version: 1 }),
-                kind: OperatorNodeKind::GroupedSumInt8 {
-                    key_slot: 2,
-                    value_slot: 1,
-                },
+                kind: aggregate(
+                    vec![Expression::Column { slot: 2 }],
+                    AggregateFunctionV1::SumInt8,
+                    Some(Expression::Column { slot: 1 }),
+                ),
             },
             terminal(12, 11, keyed, 0, 1),
         ],
     )
     .unwrap()
+}
+
+fn aggregate(
+    groups: Vec<Expression>,
+    function: AggregateFunctionV1,
+    expression: Option<Expression>,
+) -> OperatorNodeKind {
+    OperatorNodeKind::Aggregate {
+        group_expressions: groups,
+        calls: vec![AggregateCall {
+            ordinal: 1,
+            function_version: 1,
+            function,
+            expression,
+        }],
+    }
 }
 
 fn binding(sub_id: i32) -> ColumnBinding {
@@ -114,7 +150,7 @@ fn scalar_output(nullable: bool) -> OutputContract {
     OutputContract::new(schema, Some(row)).unwrap()
 }
 
-fn keyed_output() -> OutputContract {
+fn keyed_output(nullable: bool) -> OutputContract {
     let schema = ResultSchemaV1::new(
         vec![
             ResultField {
@@ -127,7 +163,7 @@ fn keyed_output() -> OutputContract {
                 ordinal: 2,
                 name: "value".into(),
                 value_type: ValueType::Int8,
-                nullable: true,
+                nullable,
             },
         ],
         vec![1],
@@ -199,7 +235,7 @@ fn multiple_terminals_share_one_batch_and_generic_state() {
     let graph = graph();
     let input = input(&graph);
     let read_set = graph_state_read_set(&graph, &input).unwrap();
-    assert_eq!(read_set.keys.len(), 7);
+    assert_eq!(read_set.keys.len(), 12);
     let snapshot = StateSnapshot::new(
         &read_set,
         read_set
@@ -213,7 +249,7 @@ fn multiple_terminals_share_one_batch_and_generic_state() {
     )
     .unwrap();
     let transition = apply_graph_plan(&graph, &snapshot, &input).unwrap();
-    assert_eq!(transition.state_deltas.len(), 7);
+    assert_eq!(transition.state_deltas.len(), 12);
     assert_eq!(transition.results.len(), 5);
     assert_eq!(
         transition.results[0],
@@ -230,11 +266,8 @@ fn multiple_terminals_share_one_batch_and_generic_state() {
         ResultDelta {
             node_id: node(4),
             mutations: vec![ResultMutation::ReplaceScalar {
-                row: TypedResultRowV1::new(
-                    &scalar_output(false).schema,
-                    vec![TypedValue::Int8(10)]
-                )
-                .unwrap()
+                row: TypedResultRowV1::new(&scalar_output(true).schema, vec![TypedValue::Int8(10)])
+                    .unwrap()
             }]
         }
     );

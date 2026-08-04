@@ -30,7 +30,9 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
         .query_one(
             "SELECT bootstrap.phase, bootstrap.bootstrap_id, config.slot_generation,
                     (SELECT count(*) FROM shiba_internal.source_row_state WHERE source_id = 1),
-                    (SELECT array_agg(encode(state.state_payload, 'hex') ORDER BY state.node_id)
+                    (SELECT array_agg(encode(state.state_payload, 'hex')
+                                      ORDER BY state.node_id, state.namespace,
+                                               state.partition_key_payload, state.item_key_payload)
                      FROM shiba_internal.graph_node_state state
                      WHERE state.graph_id = 1
                        AND state.partition_key_payload = $1
@@ -61,7 +63,12 @@ fn active_source_rejects_pristine_replacement_without_mutation() {
     assert!(active_fact.get::<_, i64>(3) > 0);
     assert_eq!(
         active_fact.get::<_, Vec<String>>(4),
-        vec!["0000000000000004", "0000000000000020"]
+        vec![
+            "0000000000000004",
+            "0000000000000004",
+            "0000000000000004",
+            "00000000000000030000000000000020",
+        ]
     );
     assert_eq!(
         active_fact.get::<_, Vec<Option<i64>>>(5),

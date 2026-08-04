@@ -11,7 +11,9 @@ use shiba_runtime::{
 
 mod support;
 
-use support::{PgoutputCapture, canonical_result_rows, keyed_int8_results, scalar_int8_result};
+use support::{
+    PgoutputCapture, canonical_result_rows, count_rows, keyed_int8_results, scalar_int8_result,
+};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m16-wide-results.sh",
@@ -39,7 +41,7 @@ fn spec() -> QuerySpecV1 {
             QueryNodeV1 {
                 inputs: vec![QueryInputV1::Source { source_id }],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::CountRows,
+                operation: count_rows(),
             },
             QueryNodeV1 {
                 inputs: vec![QueryInputV1::Source { source_id }],

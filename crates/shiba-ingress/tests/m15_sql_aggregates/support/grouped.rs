@@ -81,7 +81,7 @@ pub(crate) fn exercise_sum_and_recovery(
         .query_one(
             "SELECT node_id,state_payload
              FROM shiba_internal.graph_node_state
-             WHERE graph_id=4
+             WHERE graph_id=4 AND namespace=1
                AND (convert_from(partition_key_payload,'UTF8')::jsonb
                     #>> '{value}')::bigint=20
                AND convert_from(partition_key_payload,'UTF8')::jsonb
@@ -92,12 +92,11 @@ pub(crate) fn exercise_sum_and_recovery(
     let node: i64 = state.get(0);
     let original: Vec<u8> = state.get(1);
     let mut overflow = 1_i64.to_be_bytes().to_vec();
-    overflow.extend_from_slice(&1_i64.to_be_bytes());
     overflow.extend_from_slice(&i64::MAX.to_be_bytes());
     client
         .execute(
             "UPDATE shiba_internal.graph_node_state SET state_payload=$2
-             WHERE graph_id=4 AND node_id=$1
+             WHERE graph_id=4 AND node_id=$1 AND namespace=1
                AND (convert_from(partition_key_payload,'UTF8')::jsonb
                     #>> '{value}')::bigint=20
                AND convert_from(partition_key_payload,'UTF8')::jsonb
@@ -119,7 +118,7 @@ pub(crate) fn exercise_sum_and_recovery(
     client
         .execute(
             "UPDATE shiba_internal.graph_node_state SET state_payload=$2
-             WHERE graph_id=4 AND node_id=$1
+             WHERE graph_id=4 AND node_id=$1 AND namespace=1
                AND (convert_from(partition_key_payload,'UTF8')::jsonb
                     #>> '{value}')::bigint=20
                AND convert_from(partition_key_payload,'UTF8')::jsonb

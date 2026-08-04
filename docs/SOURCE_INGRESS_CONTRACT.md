@@ -84,6 +84,14 @@ The replication connection and Apply connection are distinct. Waiting for WAL
 therefore cannot hold an Apply transaction or database lock. Ingress delivers
 at most one complete transaction to Runtime at a time and does not read more
 WAL until Runtime returns, so a slow Runtime directly backpressures transport.
+For a streamed transaction whose bounded Apply may outlast the walsender
+timeout, the receiver sends a status update immediately before Apply and
+repeats the same last already-durable LSN at a fixed interval. This refreshes
+the timeout without authorizing the outstanding transaction; its `end_lsn`
+remains unavailable to feedback until Runtime commits and returns an exact
+durable token. A heartbeat failure poisons the receiver and cannot turn the
+outstanding transaction into an ACK. Small committed transactions use the
+direct synchronous path and do not add a pre-Apply feedback round trip.
 
 ## Data path
 

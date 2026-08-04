@@ -136,7 +136,7 @@ run() {
 run_foundation_matrix() {
   local label="$1"
   local pg_config="$2"
-  run "$label/test-l0" env PG_CONFIG="$pg_config" scripts/test-l0.sh
+  run "$label/test-l0" env PG_CONFIG="$pg_config" SHIBA_L0_SKIP_RUST=1 scripts/test-l0.sh
   local gate
   for gate in "${foundation_gates[@]}"; do
     run "$label/${gate%.sh}" "scripts/$gate" "$pg_config"
@@ -213,7 +213,13 @@ cargo test -p shiba-runtime --lib
 cargo test -p shiba-ingress --lib
 
 echo "==> phase 2/9: workspace tests and warning-free clippy"
-cargo test --workspace
+# Phase 1's all-target check compiles every integration target, and the
+# enrolled PostgreSQL scripts execute those integration bodies. Running
+# `cargo test --workspace` here only launches each ignored integration binary
+# again to print "ignored". Keep library and doctest coverage without that
+# redundant process fan-out; clippy still checks every target below.
+cargo test --workspace --lib
+cargo test --workspace --doc
 cargo clippy --workspace --all-targets -- -D warnings
 
 echo "==> phase 3/9: PostgreSQL 17 M1--M11 matrix"

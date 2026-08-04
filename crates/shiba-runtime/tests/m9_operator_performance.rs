@@ -47,10 +47,10 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
                 (SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint FROM shiba.graph_result_rows WHERE graph_id=1 AND result_id=3),
                 (SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint FROM shiba.graph_result_rows WHERE graph_id=1 AND result_id=4),
                 (SELECT state_payload FROM shiba_internal.graph_node_state
-                 WHERE graph_id=1 AND node_id=1 AND namespace=0
+                 WHERE graph_id=1 AND node_id=1 AND namespace=1
                    AND partition_key_payload=$1 AND item_key_payload=$2),
                 (SELECT state_payload FROM shiba_internal.graph_node_state
-                 WHERE graph_id=1 AND node_id=2 AND namespace=0
+                 WHERE graph_id=1 AND node_id=2 AND namespace=1
                    AND partition_key_payload=$1 AND item_key_payload=$2),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.graph_continuation)",
@@ -60,11 +60,18 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
     (
         row.get(0),
         row.get(1),
-        support::decode_optional_scalar_state(row.get::<_, Option<Vec<u8>>>(2).as_deref()),
-        support::decode_optional_scalar_state(row.get::<_, Option<Vec<u8>>>(3).as_deref()),
+        aggregate_state(row.get::<_, Option<Vec<u8>>>(2)),
+        aggregate_state(row.get::<_, Option<Vec<u8>>>(3)),
         row.get(4),
         row.get(5),
     )
+}
+
+fn aggregate_state(payload: Option<Vec<u8>>) -> i64 {
+    payload.map_or(0, |payload| {
+        let offset = payload.len().saturating_sub(8);
+        i64::from_be_bytes(payload[offset..].try_into().expect("aggregate int8 state"))
+    })
 }
 
 fn assert_within(operation: &str, measured: Duration, limit: Duration) {

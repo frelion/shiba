@@ -5,15 +5,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shiba_protocol::{GraphId, SourceId};
 
-use crate::{Expression, ObjectAddress, OutputContract, StateContract, TypedLayout, ValueType};
+use crate::{
+    AggregateCall, Expression, ObjectAddress, OutputContract, StateContract, TypedLayout, ValueType,
+};
 
-pub const GRAPH_FORMAT_VERSION: u32 = 1;
+pub const GRAPH_FORMAT_VERSION: u32 = 2;
 pub const MAX_GRAPH_NODES: usize = 32;
 pub const MAX_INPUT_DELTA_ROWS: usize = 10_000;
 pub const MAX_NODE_DELTA_ROWS: usize = 20_000;
 pub const MAX_GRAPH_DELTA_ROWS: usize = 200_000;
 pub const MAX_GRAPH_WORK_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const GRAPH_DOMAIN: &[u8] = b"shiba.operator.graph.v1\0";
+pub(crate) const GRAPH_DOMAIN: &[u8] = b"shiba.operator.graph.v2\0";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -55,9 +57,9 @@ pub enum NodeInput {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperatorNodeKind {
-    CountRows,
-    SumInt8 {
-        input_slot: u16,
+    Aggregate {
+        group_expressions: Vec<Expression>,
+        calls: Vec<AggregateCall>,
     },
     Filter {
         predicate: Expression,
@@ -70,13 +72,6 @@ pub enum OperatorNodeKind {
     },
     KeyBy {
         key: Expression,
-    },
-    GroupedCount {
-        key_slot: u16,
-    },
-    GroupedSumInt8 {
-        key_slot: u16,
-        value_slot: u16,
     },
     InnerJoin {
         left_source_id: SourceId,

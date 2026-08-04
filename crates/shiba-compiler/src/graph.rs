@@ -1,9 +1,9 @@
 use core::num::NonZeroU32;
 
 use shiba_operator::{
-    NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind, OutputContract, ResultField,
-    ResultSchemaV1, StateContract, TypedLayout, TypedResultRowV1, TypedValue, ValueType,
-    source_typed_layout,
+    EmptyResultV1, NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind,
+    OutputContract, ResultField, ResultSchemaV1, StateContract, TypedLayout, TypedResultRowV1,
+    TypedValue, ValueType, aggregate_function_descriptor, source_typed_layout,
 };
 
 use crate::binding::{identity_for, source, source_port};
@@ -33,7 +33,7 @@ pub fn compile_query(
     compile_query_with_optional_identities(spec, descriptors, &indexes)
 }
 
-/// Compiles a query while permitting only the proven identity-free empty-layout `CountRows` shape.
+/// Compiles a query while permitting only the proven identity-free scalar aggregate shape.
 ///
 /// # Errors
 ///
@@ -173,13 +173,35 @@ fn result_contract(
     let schema = ResultSchemaV1::new(fields, result.key_ordinals.clone())
         .map_err(|_| CompilerError::GraphEncoding)?;
     let initial_row = if schema.is_scalar() {
-        let values = match operation {
-            crate::QueryOperationV1::CountRows => vec![TypedValue::Int8(0)],
-            crate::QueryOperationV1::SumInt8 { .. } => {
-                vec![TypedValue::Null(shiba_operator::ValueType::Int8)]
-            }
-            _ => return Err(CompilerError::InvalidSpec),
+        let crate::QueryOperationV1::Aggregate {
+            group_expressions,
+            calls,
+        } = operation
+        else {
+            return Err(CompilerError::InvalidSpec);
         };
+        if !group_expressions.is_empty() {
+            return Err(CompilerError::InvalidSpec);
+        }
+        let aggregate_values = calls
+            .iter()
+            .map(
+                |call| match aggregate_function_descriptor(call.function).empty_result {
+                    EmptyResultV1::Int8Zero => TypedValue::Int8(0),
+                    EmptyResultV1::Null(value_type) => TypedValue::Null(value_type),
+                },
+            )
+            .collect::<Vec<_>>();
+        let values = result
+            .fields
+            .iter()
+            .map(|field| {
+                aggregate_values
+                    .get(usize::from(field.value_slot))
+                    .cloned()
+                    .ok_or(CompilerError::WrongType)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Some(TypedResultRowV1::new(&schema, values).map_err(|_| CompilerError::WrongType)?)
     } else {
         None

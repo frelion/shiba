@@ -79,14 +79,16 @@ impl UnboundExpression {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Aggregate {
-    CountStar {
-        span: Span,
-    },
-    Sum {
-        input: UnboundExpression,
-        span: Span,
-    },
+pub struct Aggregate {
+    pub function: String,
+    pub argument: AggregateArgument,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AggregateArgument {
+    Star,
+    Expression(UnboundExpression),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,10 +164,17 @@ fn write_select(out: &mut Vec<u8>, item: &UnboundSelectItem) -> Result<(), Front
             out.push(0);
             write_expr(out, expr)?;
         }
-        SelectExpression::Aggregate(Aggregate::CountStar { .. }) => out.push(1),
-        SelectExpression::Aggregate(Aggregate::Sum { input, .. }) => {
-            out.push(2);
-            write_expr(out, input)?;
+        SelectExpression::Aggregate(aggregate) => {
+            out.push(1);
+            write_len(out, aggregate.function.len(), aggregate.span)?;
+            out.extend_from_slice(aggregate.function.as_bytes());
+            match &aggregate.argument {
+                AggregateArgument::Star => out.push(0),
+                AggregateArgument::Expression(input) => {
+                    out.push(1);
+                    write_expr(out, input)?;
+                }
+            }
         }
     }
     write_option(out, item.presentation_alias.as_ref(), write_ident)

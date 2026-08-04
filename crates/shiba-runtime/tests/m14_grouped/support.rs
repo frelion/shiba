@@ -122,6 +122,7 @@ pub(crate) fn node_state_payload(client: &mut Client, operator_id: i64, key: i64
             "SELECT state.state_payload
              FROM shiba_internal.graph_node_state AS state
              WHERE state.graph_id = 1 AND state.node_id = $1
+               AND state.namespace = 1
                AND state.partition_key_payload = $2",
             &[&operator_id, &partition],
         )
@@ -144,6 +145,7 @@ pub(crate) fn set_node_state_payload(
                 "UPDATE shiba_internal.graph_node_state
                  SET state_payload = $3
                  WHERE graph_id = 1 AND node_id = $1
+                   AND namespace = 1
                    AND partition_key_payload = $2",
                 &[&operator_id, &partition, &payload],
             )

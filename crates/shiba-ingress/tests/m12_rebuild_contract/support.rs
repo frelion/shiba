@@ -120,7 +120,7 @@ pub(crate) fn shiba_authority_snapshot(client: &mut Client) -> Vec<Vec<String>> 
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_ingress_config ORDER BY graph_id) x",
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_bootstrap ORDER BY graph_id) x",
         "SELECT row_to_json(x)::text FROM (SELECT source_id, source_row_id, source_row_sub_id, payload_int8, payload_text FROM shiba_internal.source_row_state ORDER BY source_row_id) x",
-        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_node_state ORDER BY graph_id, node_id) x",
+        "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba_internal.graph_node_state ORDER BY graph_id, node_id, namespace, partition_key_payload, item_key_payload) x",
         "SELECT row_to_json(x)::text FROM (SELECT * FROM shiba.graph_result ORDER BY graph_id, result_id) x",
         "SELECT row_to_json(x)::text FROM (SELECT graph_id, slot_generation, commit_lsn::text, ingress_transaction_id FROM shiba_internal.graph_continuation ORDER BY slot_generation, commit_lsn) x",
     ]

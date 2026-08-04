@@ -17,8 +17,9 @@ one validated schema and, for scalar output, its canonical initial row.
 Materialize projects an ordered field-slot list and emits complete typed rows;
 scalar and keyed outputs share generic ResultDelta mutations. Runtime/Catalog
 persist these bytes without node/function dispatch. The fixed key/value delta
-and output-shape contracts are deleted. Aggregate nodes and their ABI remain
-M16.3 work.
+and output-shape contracts are deleted. M16.3 subsequently replaces concrete
+Count/Sum nodes with one versioned Aggregate node for CountStar, Count and Sum;
+MIN/MAX, multi-call SQL and HAVING remain later slices.
 
 M14.2 implements the typed stateless graph path. M14.3 adds the sole generic
 keyed-state authority plus KeyBy, GroupedCount and GroupedSumInt8. Runtime uses

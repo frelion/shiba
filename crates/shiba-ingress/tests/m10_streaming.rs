@@ -29,8 +29,8 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
             "SELECT
                 (SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 2),
                 COALESCE((SELECT (convert_from(row_payload, 'UTF8')::jsonb #>> '{values,0,value}')::bigint FROM shiba.graph_result_rows WHERE graph_id = 1 AND result_id = 4), 0),
-                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1),
-                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 3),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 1 AND namespace = 1),
+                (SELECT state_payload FROM shiba_internal.graph_node_state WHERE graph_id = 1 AND node_id = 3 AND namespace = 1),
                 (SELECT count(*) FROM shiba_internal.source_row_state),
                 (SELECT count(*) FROM shiba_internal.graph_continuation)",
             &[],
@@ -40,16 +40,17 @@ fn durable_state(client: &mut Client) -> (i64, i64, i64, i64, i64, i64) {
         row.get(0),
         row.get(1),
         row.get::<_, Option<Vec<u8>>>(2)
-            .map_or(0, decode_int8_state),
+            .map_or(0, |payload| decode_int8_state(&payload)),
         row.get::<_, Option<Vec<u8>>>(3)
-            .map_or(0, decode_int8_state),
+            .map_or(0, |payload| decode_int8_state(&payload)),
         row.get(4),
         row.get(5),
     )
 }
 
-fn decode_int8_state(payload: Vec<u8>) -> i64 {
-    i64::from_be_bytes(payload.try_into().expect("int8 node state"))
+fn decode_int8_state(payload: &[u8]) -> i64 {
+    let offset = payload.len().saturating_sub(8);
+    i64::from_be_bytes(payload[offset..].try_into().expect("aggregate int8 state"))
 }
 
 fn attach_session(database_url: &str, replication_url: &str) -> GovernedGraphSession {

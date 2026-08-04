@@ -1,5 +1,21 @@
 # Transaction and recovery contract
 
+## M16.3 generic aggregate recovery
+
+The generic Aggregate kernel requests membership plus call-state keys once per
+touched group in canonical order. UPDATE retracts the before image and applies
+the after image inside one pure transition; INSERT and DELETE are the respective
+halves. CountStar, Count(nullable `int8`) and SumInt8 use the same read,
+transition, normalized state-delta and complete-row result path. A wrong
+function/state version, corrupt state, underflow or checked Sum overflow aborts
+the entire processor-owned transaction. Source rows, every call state, wide
+results and continuation roll back together, so ACK remains unauthorized.
+
+No recovery authority changed: exact replay still short-circuits before Source
+Apply, bootstrap/rebuild load the persisted graph opaquely, continuation is
+written last, and ACK is post-commit. Runtime and lifecycle code do not dispatch
+aggregate functions.
+
 ## M16.2 wide-result recovery boundary
 
 M16 does not change the proven transaction or ACK rule. A generic aggregate
@@ -17,7 +33,8 @@ row/key digest and persists all normalized row mutations in the processor-owned
 transaction before continuation. Bootstrap/rebuild write hidden building rows
 through the same sink and activation exposes the complete set atomically. A
 schema/row/sink failure rolls source state, graph state, results and continuation
-back; ACK remains unauthorized. Aggregate state/retraction remains M16.3--M16.6.
+back; ACK remains unauthorized. Count/CountStar/Sum retraction is implemented
+in M16.3; MIN/MAX ordered retraction and HAVING remain M16.5--M16.6.
 
 ## M14.6 graph transaction and recovery boundary
 
@@ -146,6 +163,14 @@ WAL position. Decoder, Apply, or Operator failure stops at the failed
 transaction. PostgreSQL retains transport history through the slot;
 `source_continuation` independently prevents duplicate computation. Neither
 authority mirrors or repairs the other.
+
+Synchronous Apply may refresh the replication connection immediately before
+entering Runtime and at fixed intervals while Runtime is running, but every
+status carries only the previous durable LSN. A refresh transport failure
+poisons the receiver and the outstanding transaction remains unacknowledged;
+a successful refresh does not authorize it. This preserves the same crash
+windows while preventing bounded slow Apply from inheriting an almost-expired
+walsender timeout.
 
 M10.2 proves each committed window on real PG17 and PG18. Dropping the receiver
 after `receive_one` leaves all Shiba state and slot progress old. Restart then

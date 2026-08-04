@@ -18,8 +18,8 @@ mod relation;
 mod select_lower;
 
 pub use ast::{
-    Aggregate, BinaryOperator, ColumnRef, Identifier, Join, QualifiedRelation, SelectExpression,
-    UnaryOperator, UnboundExpression, UnboundQuery, UnboundSelectItem,
+    Aggregate, AggregateArgument, BinaryOperator, ColumnRef, Identifier, Join, QualifiedRelation,
+    SelectExpression, UnaryOperator, UnboundExpression, UnboundQuery, UnboundSelectItem,
 };
 pub use bind::{ResolvedSource, bind_query};
 pub use error::{ErrorClass, ErrorCode, FrontendError, Span};

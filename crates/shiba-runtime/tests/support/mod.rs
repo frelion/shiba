@@ -7,10 +7,12 @@ use std::{fs, num::NonZeroU32, path::PathBuf, process::Command};
 
 use postgres::{Client, GenericClient};
 use shiba_compiler::{
-    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QUERY_SPEC_VERSION, QueryAggregateCallV1, QueryExpressionV1, QueryFieldV1, QueryInputV1,
+    QueryNodeV1, QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
-use shiba_operator::{NodeId, ResultSchemaV1, TypedResultRowV1, TypedValue, ValueType};
+use shiba_operator::{
+    AggregateFunctionV1, NodeId, ResultSchemaV1, TypedResultRowV1, TypedValue, ValueType,
+};
 use shiba_protocol::{GraphId, SourceId};
 use shiba_runtime::{PgoutputGraph, PgoutputSource, compile_and_register};
 
@@ -30,7 +32,7 @@ pub(super) fn register_count_operator(client: &mut Client, source_id: u64, _oper
         version: QUERY_SPEC_VERSION,
         graph_id: GraphId::new(source_id.get()).expect("source-backed graph ID"),
         sources: vec![source_id],
-        nodes: vec![query_node(source_id, QueryOperationV1::CountRows, true)],
+        nodes: vec![query_node(source_id, count_rows(), true)],
         results: vec![scalar_result(1, false)],
     };
     compile_and_register(client, &spec).expect("compile and register CountRows graph");
@@ -43,18 +45,36 @@ pub(super) fn register_count_sum_graph(client: &mut Client, source_id: u64) {
         graph_id: GraphId::new(source_id.get()).expect("source-backed graph ID"),
         sources: vec![source_id],
         nodes: vec![
-            query_node(source_id, QueryOperationV1::CountRows, true),
-            query_node(
-                source_id,
-                QueryOperationV1::SumInt8 {
-                    value: column(0, "payload"),
-                },
-                true,
-            ),
+            query_node(source_id, count_rows(), true),
+            query_node(source_id, sum_int8(column(0, "payload")), true),
         ],
         results: vec![scalar_result(1, false), scalar_result(2, true)],
     };
     compile_and_register(client, &spec).expect("compile and register CountRows + SumInt8 graph");
+}
+
+pub(super) fn count_rows() -> QueryOperationV1 {
+    aggregate(AggregateFunctionV1::CountStar, None, Vec::new())
+}
+
+pub(super) fn sum_int8(expression: QueryExpressionV1) -> QueryOperationV1 {
+    aggregate(AggregateFunctionV1::SumInt8, Some(expression), Vec::new())
+}
+
+pub(super) fn aggregate(
+    function: AggregateFunctionV1,
+    expression: Option<QueryExpressionV1>,
+    group_expressions: Vec<QueryExpressionV1>,
+) -> QueryOperationV1 {
+    QueryOperationV1::Aggregate {
+        group_expressions,
+        calls: vec![QueryAggregateCallV1 {
+            ordinal: 1,
+            function,
+            function_version: 1,
+            expression,
+        }],
+    }
 }
 
 pub(super) fn singleton_graph(graph_id: u64, source: PgoutputSource) -> PgoutputGraph {

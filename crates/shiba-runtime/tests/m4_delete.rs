@@ -82,25 +82,23 @@ fn assert_apply_row(client: &mut Client, row_id: i64) {
 fn prove_count_underflow(client: &mut Client, delete: &GraphTransaction) {
     client
         .batch_execute(
-            "UPDATE shiba_internal.graph_node_state
-                 SET state_payload = decode('0000000000000000', 'hex')
-                 WHERE graph_id = 1 AND node_id = 1 AND namespace = 0;
-             ",
+            "CREATE TEMP TABLE m4_delete_state_backup AS
+                 SELECT * FROM shiba_internal.graph_node_state
+                 WHERE graph_id = 1 AND node_id = 1;
+             DELETE FROM shiba_internal.graph_node_state
+                 WHERE graph_id = 1 AND node_id = 1;",
         )
         .expect("install count underflow precondition");
     set_scalar_int8_result(client, 1, 2, Some(0));
-    assert!(matches!(
-        process(client, delete),
-        Err(M2Error::Kernel(KernelError::Underflow))
-    ));
+    let error = process(client, delete).expect_err("count underflow must fail");
+    assert!(matches!(error, M2Error::Kernel(KernelError::Underflow)));
     assert_eq!(durable_state(client), (0, 0, 2, 1));
     assert_apply_row(client, 401);
     client
         .batch_execute(
-            "UPDATE shiba_internal.graph_node_state
-                 SET state_payload = decode('0000000000000002', 'hex')
-                 WHERE graph_id = 1 AND node_id = 1 AND namespace = 0;
-             ",
+            "INSERT INTO shiba_internal.graph_node_state
+                 SELECT * FROM m4_delete_state_backup;
+             DROP TABLE m4_delete_state_backup;",
         )
         .expect("restore count after underflow proof");
     set_scalar_int8_result(client, 1, 2, Some(2));

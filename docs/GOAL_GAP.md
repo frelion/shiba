@@ -1,5 +1,15 @@
 # V2 goal gap during M16
 
+## M16.3 generic Aggregate status
+
+M16.3 replaces CountRows, SumInt8, GroupedCount and GroupedSumInt8 execution
+nodes with one versioned Aggregate node. CountStar, Count(nullable `int8`) and
+checked SumInt8 share the same scalar/grouped state and wide-result path;
+Runtime and lifecycle production code contain no function dispatch. QuerySpec
+format 2, OperatorGraph format 2 and compiler version 4 reject the superseded
+wire shapes without adapters. Multi-call SQL/Count(expr), MIN/MAX, HAVING and
+final M16 performance/release evidence remain M16.4--M16.7.
+
 ## M16.2 wide-result implementation status
 
 M16.1 freezes one closed aggregate descriptor ABI

@@ -15,7 +15,7 @@ mod state;
 mod support;
 
 use state::{durable, pairs};
-use support::{PgoutputCapture, set_scalar_int8_result};
+use support::{PgoutputCapture, count_rows, set_scalar_int8_result, sum_int8};
 
 const CAPTURE: PgoutputCapture = PgoutputCapture {
     script: "scripts/test-m13-operator-kernel.sh",
@@ -44,14 +44,12 @@ fn spec() -> QuerySpecV1 {
             QueryNodeV1 {
                 inputs: vec![source()],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::CountRows,
+                operation: count_rows(),
             },
             QueryNodeV1 {
                 inputs: vec![source()],
                 state_codec_version: Some(1),
-                operation: QueryOperationV1::SumInt8 {
-                    value: column("payload"),
-                },
+                operation: sum_int8(column("payload")),
             },
             QueryNodeV1 {
                 inputs: vec![source()],
@@ -305,8 +303,8 @@ fn generic_kernel_persists_scalar_and_keyed_outputs_atomically() {
     client
         .execute(
             "UPDATE shiba_internal.graph_node_state
-         SET state_payload=decode('7fffffffffffffff','hex')
-         WHERE graph_id=1 AND node_id=2 AND namespace=0
+         SET state_payload=decode('00000000000000017fffffffffffffff','hex')
+         WHERE graph_id=1 AND node_id=2 AND namespace=1
            AND partition_key_payload=$1 AND item_key_payload=$2",
             &[&scalar_partition, &scalar_item],
         )
@@ -321,8 +319,8 @@ fn generic_kernel_persists_scalar_and_keyed_outputs_atomically() {
     client
         .execute(
             "UPDATE shiba_internal.graph_node_state
-         SET state_payload=decode('0000000000000028','hex')
-         WHERE graph_id=1 AND node_id=2 AND namespace=0
+         SET state_payload=decode('00000000000000010000000000000028','hex')
+         WHERE graph_id=1 AND node_id=2 AND namespace=1
            AND partition_key_payload=$1 AND item_key_payload=$2",
             &[&scalar_partition, &scalar_item],
         )

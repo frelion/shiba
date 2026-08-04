@@ -115,7 +115,5 @@ pub(crate) fn predicate_span(query: &UnboundQuery) -> crate::Span {
 }
 
 pub(crate) fn aggregate_span(aggregate: &Aggregate) -> crate::Span {
-    match aggregate {
-        Aggregate::CountStar { span } | Aggregate::Sum { span, .. } => *span,
-    }
+    aggregate.span
 }

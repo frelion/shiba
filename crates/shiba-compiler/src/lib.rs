@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod aggregate_compile;
 mod binding;
 mod expression;
 mod graph;
@@ -17,8 +18,8 @@ use shiba_protocol::SourceId;
 
 pub use graph::{compile_query, compile_query_with_optional_identities};
 pub use query_spec::{
-    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
+    QUERY_SPEC_VERSION, QueryAggregateCallV1, QueryExpressionV1, QueryFieldV1, QueryInputV1,
+    QueryNodeV1, QueryOperationV1, QueryResultFieldV1, QueryResultV1, QuerySelectorV1, QuerySpecV1,
 };
 
 pub const POSTGRES_INT8_TYPE_OID: u32 = 20;

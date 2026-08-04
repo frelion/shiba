@@ -34,11 +34,21 @@ fn validate_identity_free_source(graph: &CanonicalGraph) -> Result<(), GraphErro
         source.identity_index.is_none() && (graph.sources.len() != 1 || !source.layout.is_empty())
     }) || graph.sources.iter().any(|source| {
         source.identity_index.is_none()
-            && graph.nodes.iter().any(|node| {
-                !matches!(
-                    node.kind,
-                    OperatorNodeKind::CountRows | OperatorNodeKind::Materialize { .. }
-                )
+            && graph.nodes.iter().any(|node| match &node.kind {
+                OperatorNodeKind::Aggregate {
+                    group_expressions,
+                    calls,
+                } => {
+                    !group_expressions.is_empty()
+                        || !calls.iter().all(|call| {
+                            matches!(
+                                crate::aggregate_function_descriptor(call.function).input,
+                                crate::AggregateInputContract::None
+                            )
+                        })
+                }
+                OperatorNodeKind::Materialize { .. } => false,
+                _ => true,
             })
     }) {
         return Err(GraphError::InvalidTopology);
@@ -117,12 +127,10 @@ fn validate_join_topology(graph: &CanonicalGraph) -> Result<(), GraphError> {
 fn validate_stateful_topology(graph: &CanonicalGraph) -> Result<(), GraphError> {
     for aggregate in &graph.nodes {
         let valid_input = match aggregate.kind {
-            OperatorNodeKind::CountRows | OperatorNodeKind::SumInt8 { .. } => {
-                matches!(aggregate.input, NodeInput::SourcePort(_))
-            }
-            OperatorNodeKind::GroupedCount { .. } | OperatorNodeKind::GroupedSumInt8 { .. } => {
-                matches!(aggregate.input, NodeInput::Node(id) if graph.nodes.iter().any(|node| node.node_id == id && matches!(node.kind, OperatorNodeKind::KeyBy { .. })))
-            }
+            OperatorNodeKind::Aggregate { .. } => matches!(
+                aggregate.input,
+                NodeInput::SourcePort(_) | NodeInput::Node(_)
+            ),
             _ => continue,
         };
         let materialized = graph.nodes.iter().any(|node| {

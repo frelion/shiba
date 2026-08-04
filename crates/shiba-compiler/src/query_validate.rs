@@ -99,21 +99,39 @@ fn validate_operation<E: de::Error>(
     boolean_terms: &mut usize,
 ) -> Result<(), E> {
     let expressions: Vec<&QueryExpressionV1> = match operation {
-        QueryOperationV1::SumInt8 { value } => vec![value],
+        QueryOperationV1::Aggregate {
+            group_expressions,
+            calls,
+        } => {
+            if calls.is_empty()
+                || calls.len() > shiba_operator::MAX_AGGREGATE_CALLS
+                || group_expressions.len() > shiba_operator::MAX_GROUP_EXPRESSIONS
+                || calls.iter().enumerate().any(|(index, call)| {
+                    let descriptor = shiba_operator::aggregate_function_descriptor(call.function);
+                    usize::from(call.ordinal) != index + 1
+                        || call.function_version != descriptor.semantic_version
+                        || match descriptor.input {
+                            shiba_operator::AggregateInputContract::None => {
+                                call.expression.is_some()
+                            }
+                            shiba_operator::AggregateInputContract::Nullable(_) => {
+                                call.expression.is_none()
+                            }
+                        }
+                })
+            {
+                return Err(E::custom("invalid aggregate calls"));
+            }
+            group_expressions
+                .iter()
+                .chain(calls.iter().filter_map(|call| call.expression.as_ref()))
+                .collect()
+        }
         QueryOperationV1::Filter { predicate } => vec![predicate],
         QueryOperationV1::Project { expressions } | QueryOperationV1::Compute { expressions } => {
             expressions.iter().collect()
         }
         QueryOperationV1::KeyBy { key } => vec![key],
-        QueryOperationV1::GroupedCount { key } => {
-            validate_field::<E>(key)?;
-            vec![]
-        }
-        QueryOperationV1::GroupedSumInt8 { key, value } => {
-            validate_field::<E>(key)?;
-            validate_field::<E>(value)?;
-            vec![]
-        }
         QueryOperationV1::InnerJoin {
             left_id,
             left_key,
@@ -125,7 +143,6 @@ fn validate_operation<E: de::Error>(
             }
             vec![]
         }
-        QueryOperationV1::CountRows => vec![],
     };
     for expression in expressions {
         validate_expression::<E>(expression, 1, nodes, boolean_terms)?;

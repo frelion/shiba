@@ -181,7 +181,7 @@ pub(crate) fn assert_registration_contracts(client: &mut Client) {
     for (ordinal, row) in rows.iter().enumerate() {
         assert_eq!(row.get::<_, i64>(0), i64::try_from(ordinal + 1).unwrap());
         assert_eq!(row.get::<_, i16>(1), 1);
-        assert_eq!(row.get::<_, i32>(2), 3);
+        assert_eq!(row.get::<_, i32>(2), 4);
         assert!(!row.get::<_, bool>(3));
     }
 }

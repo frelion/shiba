@@ -90,6 +90,51 @@ contract_markers = (
 missing_contract = [marker for marker in contract_markers if marker not in contract]
 if missing_contract:
     raise SystemExit(f"M16.1 aggregate contract ABI markers are missing: {missing_contract}")
+
+operator = "\n".join(
+    path.read_text() for path in pathlib.Path("crates/shiba-operator/src").glob("*.rs")
+)
+compiler = "\n".join(
+    path.read_text() for path in pathlib.Path("crates/shiba-compiler/src").glob("*.rs")
+)
+frontend = "\n".join(
+    path.read_text() for path in pathlib.Path("crates/shiba-sql-frontend/src").glob("*.rs")
+)
+runtime_scopes = "\n".join(
+    path.read_text()
+    for root in ("crates/shiba-runtime/src", "crates/shiba-ingress/src", "crates/shiba-catalog/src")
+    for path in pathlib.Path(root).glob("*.rs")
+) + pathlib.Path("sql/v2/002_source_apply.sql").read_text()
+
+production_markers = (
+    "pub enum AggregateFunctionV1", "pub struct AggregateFunctionDescriptor",
+    "aggregate_function_descriptor", "function_version", "canonical_payload",
+    "pub struct AggregateCall", "OperatorNodeKind::Aggregate",
+    "QueryOperationV1::Aggregate", "AggregateFunctionV1::CountStar",
+    "AggregateFunctionV1::Count", "AggregateFunctionV1::SumInt8",
+)
+combined_production = operator + compiler + frontend
+missing_production = [marker for marker in production_markers if marker not in combined_production]
+if missing_production:
+    raise SystemExit(f"M16.3 generic aggregate ABI markers are missing: {missing_production}")
+
+old_nodes = ("CountRows", "GroupedCount", "GroupedSumInt8")
+found_old = [name for name in old_nodes if name in combined_production]
+if found_old:
+    raise SystemExit(f"M16.3 removed aggregate nodes remain in production: {found_old}")
+if "AggregateFunctionV1" in runtime_scopes:
+    raise SystemExit("M16.3 aggregate function dispatch leaked outside Operator/Compiler/SQL Binder")
+
+operator_dispatch = [
+    str(path)
+    for path in pathlib.Path("crates/shiba-operator/src").glob("*.rs")
+    if "AggregateFunctionV1::" in path.read_text() and not path.name.startswith("aggregate")
+]
+if operator_dispatch:
+    raise SystemExit(
+        "M16.3 concrete function dispatch escaped Operator aggregate modules: "
+        + ", ".join(operator_dispatch)
+    )
 PY
 
 echo "M16.1 database-free aggregate reference-contract gate passed"
