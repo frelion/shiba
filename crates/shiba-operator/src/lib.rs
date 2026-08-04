@@ -41,8 +41,8 @@ pub use graph::{
     SourcePort,
 };
 pub use graph_budget::{
-    MAX_ESTIMATED_WORK_BYTES, MAX_EXTREMA_VALUES, MAX_PARTITION_ENTRIES, MAX_STATE_KEYS,
-    MAX_STATE_MUTATIONS, MAX_TOUCHED_GROUPS,
+    MAX_ESTIMATED_WORK_BYTES, MAX_EXTREMA_VALUES, MAX_PARTITION_ENTRIES, MAX_RESULT_MUTATIONS,
+    MAX_STATE_KEYS, MAX_STATE_MUTATIONS, MAX_TOUCHED_GROUPS,
 };
 pub use graph_eval::apply_graph;
 pub use graph_transition::{
@@ -52,7 +52,7 @@ pub use graph_validation::source_typed_layout;
 pub use having::{
     HavingError, HavingExpression, MAX_HAVING_BOOLEAN_TERMS, MAX_HAVING_DEPTH, MAX_HAVING_NODES,
 };
-pub use kernel::{KernelError, apply_graph_plan, graph_state_read_set};
+pub use kernel::{KernelError, apply_graph_plan, graph_state_read_set, validate_transition_budget};
 pub use model::{EffectOrigin, EncodedOperatorState, ObjectAddress};
 pub use plan::{OutputContract, StateContract};
 pub use result_delta::{ResultDelta, ResultMutation, ResultRowKey};

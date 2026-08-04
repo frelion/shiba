@@ -12,6 +12,18 @@ pub(crate) fn materialize(
     field_slots: &[u16],
     output: &OutputContract,
 ) -> Result<ResultDelta, GraphError> {
+    let mut budget = crate::graph_budget::GraphBudget::new();
+    materialize_with_budget(node_id, batch, layout, field_slots, output, &mut budget)
+}
+
+pub(crate) fn materialize_with_budget(
+    node_id: NodeId,
+    batch: &DeltaBatch,
+    layout: &TypedLayout,
+    field_slots: &[u16],
+    output: &OutputContract,
+    budget: &mut crate::graph_budget::GraphBudget,
+) -> Result<ResultDelta, GraphError> {
     output.schema.validate().map_err(|_| GraphError::Codec)?;
     if field_slots.len() != output.schema.fields.len() || output.schema.is_scalar() {
         return Err(GraphError::WrongType);
@@ -52,21 +64,33 @@ pub(crate) fn materialize(
         match (before, after) {
             (Some((old_key, _)), Some((new_key, row))) if old_key == new_key => {
                 insert_key(&mut keys, &old_key)?;
-                push(&mut mutations, ResultMutation::Upsert { key: old_key, row })?;
+                push(
+                    &mut mutations,
+                    ResultMutation::Upsert { key: old_key, row },
+                    budget,
+                )?;
             }
             (Some((old_key, _)), Some((new_key, row))) => {
                 insert_key(&mut keys, &old_key)?;
                 insert_key(&mut keys, &new_key)?;
-                push(&mut mutations, ResultMutation::Delete { key: old_key })?;
-                push(&mut mutations, ResultMutation::Upsert { key: new_key, row })?;
+                push(
+                    &mut mutations,
+                    ResultMutation::Delete { key: old_key },
+                    budget,
+                )?;
+                push(
+                    &mut mutations,
+                    ResultMutation::Upsert { key: new_key, row },
+                    budget,
+                )?;
             }
             (Some((key, _)), None) => {
                 insert_key(&mut keys, &key)?;
-                push(&mut mutations, ResultMutation::Delete { key })?;
+                push(&mut mutations, ResultMutation::Delete { key }, budget)?;
             }
             (None, Some((key, row))) => {
                 insert_key(&mut keys, &key)?;
-                push(&mut mutations, ResultMutation::Upsert { key, row })?;
+                push(&mut mutations, ResultMutation::Upsert { key, row }, budget)?;
             }
             (None, None) => {}
         }
@@ -87,10 +111,15 @@ fn result_row(
     TypedResultRowV1::new(&output.schema, values).map_err(|_| GraphError::WrongType)
 }
 
-fn push(mutations: &mut Vec<ResultMutation>, mutation: ResultMutation) -> Result<(), GraphError> {
+fn push(
+    mutations: &mut Vec<ResultMutation>,
+    mutation: ResultMutation,
+    budget: &mut crate::graph_budget::GraphBudget,
+) -> Result<(), GraphError> {
     if mutations.len() == MAX_NODE_DELTA_ROWS {
         return Err(GraphError::OutputLimit);
     }
+    budget.charge_result_mutation()?;
     mutations.push(mutation);
     Ok(())
 }

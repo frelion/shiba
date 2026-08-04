@@ -37,15 +37,21 @@ pub fn graph_state_read_set(
     batch: &MultiInputBatch,
 ) -> Result<StateReadSet, KernelError> {
     graph.validate().map_err(|_| KernelError::InvalidGraph)?;
+    let mut budget = crate::graph_budget::GraphBudget::new();
     if graph
         .nodes
         .iter()
         .any(|node| matches!(node.kind, crate::OperatorNodeKind::InnerJoin { .. }))
     {
-        return crate::join::state_read_set(graph, batch)?.ok_or(KernelError::InvalidGraph);
+        let read_set =
+            crate::join::state_read_set(graph, batch)?.ok_or(KernelError::InvalidGraph)?;
+        budget
+            .charge_read_set(&read_set)
+            .map_err(|_| KernelError::InvalidTransition)?;
+        return Ok(read_set);
     }
     let input = singleton_batch(graph, batch)?;
-    crate::aggregate::state_read_set(graph, input)
+    crate::aggregate::state_read_set(graph, input, &mut budget)
 }
 
 /// Applies one canonical graph against its exact generic state snapshot.
@@ -65,11 +71,14 @@ pub fn apply_graph_plan(
         .validate_exact(&read_set)
         .map_err(|_| KernelError::InvalidState)?;
     if let Some(transition) = crate::join::apply(graph, snapshot, batch)? {
+        validate_transition_budget(&transition)?;
         return Ok(transition);
     }
     let input = singleton_batch(graph, batch)?;
-    let mut transition = crate::apply_graph(graph, input).map_err(|_| KernelError::InvalidGraph)?;
-    let aggregate = crate::aggregate::apply(graph, snapshot, input)?;
+    let mut budget = crate::graph_budget::GraphBudget::new();
+    let mut transition = crate::graph_eval::apply_graph_with_budget(graph, input, &mut budget)
+        .map_err(|_| KernelError::InvalidGraph)?;
+    let aggregate = crate::aggregate::apply(graph, snapshot, input, &mut budget)?;
     transition.state_deltas.extend(aggregate.state_deltas);
     transition.results.extend(aggregate.results);
     transition
@@ -87,7 +96,18 @@ pub fn apply_graph_plan(
     {
         return Err(KernelError::InvalidTransition);
     }
+    budget
+        .charge_transition(&transition)
+        .map_err(|_| KernelError::InvalidTransition)?;
     Ok(transition)
+}
+
+/// Validates graph-wide state/result/work limits before Runtime persistence.
+pub fn validate_transition_budget(transition: &GraphTransition) -> Result<(), KernelError> {
+    let mut budget = crate::graph_budget::GraphBudget::new();
+    budget
+        .charge_transition(transition)
+        .map_err(|_| KernelError::InvalidTransition)
 }
 
 fn singleton_batch<'a>(

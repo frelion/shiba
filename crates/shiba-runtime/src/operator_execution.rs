@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use postgres::Transaction;
 use shiba_operator::{
     DeltaBatch, EffectOrigin, GraphEffectOrigin, MultiInputBatch, OperatorGraph, SourceDeltaBatch,
-    apply_graph_plan, source_typed_layout,
+    apply_graph_plan, source_typed_layout, validate_transition_budget,
 };
 use shiba_protocol::{BootstrapBatchId, BootstrapId, GraphId, SourceId};
 
@@ -81,6 +81,7 @@ fn execute_mode(
         batch,
     )?;
     let transition = apply_graph_plan(&locked_graph.graph, &state.snapshot, batch)?;
+    validate_transition_budget(&transition)?;
     let results = result_sink::lock(
         transaction,
         locked_graph.graph_id,

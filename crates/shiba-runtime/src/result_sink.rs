@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use postgres::Transaction;
-use shiba_operator::{OperatorGraph, ResultDelta, ResultSchemaV1};
+use shiba_operator::{MAX_RESULT_MUTATIONS, OperatorGraph, ResultDelta, ResultSchemaV1};
 
 use crate::M2Error;
 
 mod rows;
-
-const MAX_GRAPH_RESULT_MUTATIONS: usize = 100_000;
 
 pub(crate) struct LockedResults {
     contracts: BTreeMap<i64, ResultSchemaV1>,
@@ -76,7 +74,7 @@ pub(crate) fn persist(
         mutation_count = mutation_count
             .checked_add(result.mutations.len())
             .ok_or(M2Error::TransactionLimitExceeded)?;
-        if mutation_count > MAX_GRAPH_RESULT_MUTATIONS {
+        if mutation_count > MAX_RESULT_MUTATIONS {
             return Err(M2Error::TransactionLimitExceeded);
         }
         rows::persist(transaction, graph_id, result_id, schema, result.mutations)?;

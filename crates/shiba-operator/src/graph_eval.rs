@@ -16,8 +16,17 @@ pub fn apply_graph(
     graph: &OperatorGraph,
     input: &DeltaBatch,
 ) -> Result<GraphTransition, GraphError> {
+    let mut budget = crate::graph_budget::GraphBudget::new();
+    apply_graph_with_budget(graph, input, &mut budget)
+}
+
+pub(crate) fn apply_graph_with_budget(
+    graph: &OperatorGraph,
+    input: &DeltaBatch,
+    budget: &mut crate::graph_budget::GraphBudget,
+) -> Result<GraphTransition, GraphError> {
     let (source_layout, layouts) = validated_layouts(graph, input)?;
-    let mut budget = EvaluationBudget::new(input)?;
+    let mut evaluation_budget = EvaluationBudget::new(input)?;
     let mut batches = BTreeMap::<NodeId, DeltaBatch>::new();
     let mut results = Vec::new();
     let mut emitted_rows = 0_usize;
@@ -48,19 +57,22 @@ pub fn apply_graph(
         match &node.kind {
             OperatorNodeKind::Filter { predicate } => {
                 let output = filter_batch(batch, layout, predicate)?;
-                budget.charge(&output, &mut emitted_rows)?;
+                evaluation_budget.charge(&output, &mut emitted_rows)?;
+                budget.charge_work_bytes(crate::graph_budget::estimated_batch_bytes(&output)?)?;
                 batches.insert(node.node_id, output);
             }
             OperatorNodeKind::Project { expressions } => {
                 let output_layout = layouts.get(&node.node_id).ok_or(GraphError::Layout)?;
                 let output = map_batch(batch, layout, output_layout, expressions, false)?;
-                budget.charge(&output, &mut emitted_rows)?;
+                evaluation_budget.charge(&output, &mut emitted_rows)?;
+                budget.charge_work_bytes(crate::graph_budget::estimated_batch_bytes(&output)?)?;
                 batches.insert(node.node_id, output);
             }
             OperatorNodeKind::Compute { expressions } => {
                 let output_layout = layouts.get(&node.node_id).ok_or(GraphError::Layout)?;
                 let output = map_batch(batch, layout, output_layout, expressions, true)?;
-                budget.charge(&output, &mut emitted_rows)?;
+                evaluation_budget.charge(&output, &mut emitted_rows)?;
+                budget.charge_work_bytes(crate::graph_budget::estimated_batch_bytes(&output)?)?;
                 batches.insert(node.node_id, output);
             }
             OperatorNodeKind::KeyBy { key } => {
@@ -72,7 +84,8 @@ pub fn apply_graph(
                     core::slice::from_ref(key),
                     true,
                 )?;
-                budget.charge(&output, &mut emitted_rows)?;
+                evaluation_budget.charge(&output, &mut emitted_rows)?;
+                budget.charge_work_bytes(crate::graph_budget::estimated_batch_bytes(&output)?)?;
                 batches.insert(node.node_id, output);
             }
             OperatorNodeKind::Aggregate { .. } | OperatorNodeKind::InnerJoin { .. } => {
@@ -85,12 +98,13 @@ pub fn apply_graph(
                 if output.schema.is_scalar() {
                     return Err(GraphError::WrongType);
                 }
-                results.push(crate::materialize::materialize(
+                results.push(crate::materialize::materialize_with_budget(
                     node.node_id,
                     batch,
                     layout,
                     field_slots,
                     output,
+                    budget,
                 )?);
             }
         }

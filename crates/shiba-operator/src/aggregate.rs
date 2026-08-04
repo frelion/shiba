@@ -17,6 +17,7 @@ struct GroupDelta {
 pub(crate) fn state_read_set(
     graph: &crate::OperatorGraph,
     batch: &DeltaBatch,
+    budget: &mut crate::graph_budget::GraphBudget,
 ) -> Result<StateReadSet, KernelError> {
     let mut keys = Vec::new();
     let mut partitions = Vec::new();
@@ -24,10 +25,16 @@ pub(crate) fn state_read_set(
         let prepared = prepare(graph, batch, &spec)?;
         crate::graph_budget::EvaluationBudget::check_batch(&prepared)
             .map_err(|_| KernelError::InvalidTransition)?;
-        let local = crate::aggregate_group::read_set(
-            &spec,
-            touched_groups(&spec, &prepared)?.into_values(),
-        )?;
+        let prepared_bytes = crate::graph_budget::estimated_batch_bytes(&prepared)
+            .map_err(|_| KernelError::InvalidTransition)?;
+        budget
+            .charge_work_bytes(prepared_bytes)
+            .map_err(|_| KernelError::InvalidTransition)?;
+        let touched = touched_groups(&spec, &prepared, budget)?;
+        let local = crate::aggregate_group::read_set(&spec, touched.into_values(), budget)?;
+        budget
+            .charge_read_set_work(&local)
+            .map_err(|_| KernelError::InvalidTransition)?;
         keys.extend(local.keys);
         partitions.extend(local.partitions);
     }
@@ -38,6 +45,7 @@ pub(crate) fn apply(
     graph: &crate::OperatorGraph,
     snapshot: &StateSnapshot,
     batch: &DeltaBatch,
+    budget: &mut crate::graph_budget::GraphBudget,
 ) -> Result<GraphTransition, KernelError> {
     let mut transition = GraphTransition {
         state_deltas: Vec::new(),
@@ -45,7 +53,12 @@ pub(crate) fn apply(
     };
     for spec in specs(graph)? {
         let prepared = prepare(graph, batch, &spec)?;
-        let touched = touched_groups(&spec, &prepared)?;
+        let prepared_bytes = crate::graph_budget::estimated_batch_bytes(&prepared)
+            .map_err(|_| KernelError::InvalidTransition)?;
+        budget
+            .charge_work_bytes(prepared_bytes)
+            .map_err(|_| KernelError::InvalidTransition)?;
+        let touched = touched_groups(&spec, &prepared, budget)?;
         let estimated_mutations = touched
             .len()
             .checked_mul(spec.calls.len().saturating_add(1))
@@ -92,7 +105,7 @@ pub(crate) fn apply(
                 delta,
             )?;
         }
-        let (states, result) = finish(&spec, prepared.origin, &initial, &final_state)?;
+        let (states, result) = finish(&spec, prepared.origin, &initial, &final_state, budget)?;
         transition.state_deltas.extend(states);
         transition.results.push(result);
     }
@@ -102,9 +115,13 @@ pub(crate) fn apply(
 fn touched_groups(
     spec: &AggregateSpec,
     batch: &DeltaBatch,
+    budget: &mut crate::graph_budget::GraphBudget,
 ) -> Result<BTreeMap<TypedValue, Vec<TypedValue>>, KernelError> {
     let mut groups = BTreeMap::new();
     if spec.groups.is_empty() {
+        budget
+            .charge_touched_groups(1)
+            .map_err(|_| KernelError::InvalidTransition)?;
         groups.insert(TypedValue::Bool(true), Vec::new());
     }
     for row in batch
@@ -113,11 +130,12 @@ fn touched_groups(
         .flat_map(|delta| delta.before.iter().chain(delta.after.iter()))
     {
         let (key, values) = group_identity(spec, row)?;
-        if groups.insert(key, values).is_some() {
-            // The same canonical key must always represent the same typed values.
-        } else if groups.len() > crate::MAX_TOUCHED_GROUPS {
-            return Err(KernelError::InvalidTransition);
+        if !groups.contains_key(&key) {
+            budget
+                .charge_touched_groups(1)
+                .map_err(|_| KernelError::InvalidTransition)?;
         }
+        groups.insert(key, values);
     }
     Ok(groups)
 }
@@ -187,6 +205,7 @@ fn finish(
     origin: crate::EffectOrigin,
     initial: &BTreeMap<TypedValue, GroupState>,
     final_state: &BTreeMap<TypedValue, GroupState>,
+    budget: &mut crate::graph_budget::GraphBudget,
 ) -> Result<(Vec<StateDelta>, ResultDelta), KernelError> {
     let mut states = Vec::new();
     let mut rows = Vec::new();
@@ -195,7 +214,9 @@ fn finish(
         if before == after {
             continue;
         }
-        states.extend(crate::aggregate_group::deltas(spec, key, before, after)?);
+        states.extend(crate::aggregate_group::deltas(
+            spec, key, before, after, budget,
+        )?);
         rows.push(crate::RowDelta {
             before: output_row(spec, before)?,
             after: output_row(spec, after)?,
@@ -220,12 +241,13 @@ fn finish(
             layout_identity: spec.output_layout.identity,
             rows,
         };
-        crate::materialize::materialize(
+        crate::materialize::materialize_with_budget(
             spec.materialize_id,
             &batch,
             &spec.output_layout,
             &spec.field_slots,
             &spec.output,
+            budget,
         )
         .map_err(|_| KernelError::InvalidTransition)?
     };

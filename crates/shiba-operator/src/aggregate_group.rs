@@ -16,6 +16,7 @@ pub(crate) struct GroupState {
 pub(crate) fn read_set(
     spec: &AggregateSpec,
     groups: impl IntoIterator<Item = Vec<TypedValue>>,
+    budget: &mut crate::graph_budget::GraphBudget,
 ) -> Result<StateReadSet, KernelError> {
     let mut keys = Vec::new();
     let mut partitions = Vec::new();
@@ -27,21 +28,24 @@ pub(crate) fn read_set(
         if keys.len() >= crate::MAX_STATE_KEYS {
             return Err(KernelError::InvalidTransition);
         }
+        budget
+            .charge_state_key()
+            .map_err(|_| KernelError::InvalidTransition)?;
         keys.push(state_key(spec, partition_key.clone(), MEMBERSHIP_NAMESPACE));
         for call in &spec.calls {
             if is_extrema(call.function) {
-                if partitions.len() >= crate::MAX_PARTITION_ENTRIES {
-                    return Err(KernelError::InvalidTransition);
-                }
+                budget
+                    .charge_partition_entry()
+                    .map_err(|_| KernelError::InvalidTransition)?;
                 partitions.push(StatePartition {
                     node_id: spec.node_id,
                     namespace: call.ordinal,
                     partition_key: partition_key.clone(),
                 });
             } else {
-                if keys.len() >= crate::MAX_STATE_KEYS {
-                    return Err(KernelError::InvalidTransition);
-                }
+                budget
+                    .charge_state_key()
+                    .map_err(|_| KernelError::InvalidTransition)?;
                 keys.push(state_key(spec, partition_key.clone(), call.ordinal));
             }
         }
@@ -104,9 +108,13 @@ pub(crate) fn deltas(
     key: &TypedValue,
     before: &GroupState,
     after: &GroupState,
+    budget: &mut crate::graph_budget::GraphBudget,
 ) -> Result<Vec<StateDelta>, KernelError> {
     let mut deltas = Vec::new();
     if before.membership != after.membership {
+        budget
+            .charge_state_mutation()
+            .map_err(|_| KernelError::InvalidTransition)?;
         deltas.push(delta(
             spec,
             key,
@@ -146,6 +154,9 @@ pub(crate) fn deltas(
                     },
                     aggregate_state::encode_extreme_value,
                 );
+                budget
+                    .charge_state_mutation()
+                    .map_err(|_| KernelError::InvalidTransition)?;
                 deltas.push(StateDelta {
                     key: state_key_with_item(spec, key.clone(), call.ordinal, candidate),
                     mutation: if new_count.is_some() {
@@ -158,6 +169,9 @@ pub(crate) fn deltas(
             continue;
         }
         if old != new || group_created || group_deleted {
+            budget
+                .charge_state_mutation()
+                .map_err(|_| KernelError::InvalidTransition)?;
             deltas.push(delta(
                 spec,
                 key,
