@@ -3,7 +3,7 @@ use core::num::NonZeroU32;
 use shiba_operator::{
     EmptyResultV1, NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind,
     OutputContract, ResultField, ResultSchemaV1, StateContract, TypedLayout, TypedResultRowV1,
-    TypedValue, ValueType, aggregate_function_descriptor, source_typed_layout,
+    TypedValue, aggregate_function_descriptor, source_typed_layout,
 };
 
 use crate::binding::{identity_for, source, source_port};
@@ -89,13 +89,24 @@ pub fn compile_query_with_optional_identities(
         if declaration.state_codec_version != stateful.then_some(1) {
             return Err(CompilerError::InvalidSpec);
         }
+        let input_layout = inputs
+            .first()
+            .ok_or(CompilerError::InvalidTopology)?
+            .layout
+            .clone();
+        let output_layout = if matches!(kind, OperatorNodeKind::Filter { .. }) {
+            input_layout
+        } else {
+            TypedLayout::derive(&input_layout, node_id, output_types, nullable)
+                .map_err(|_| CompilerError::GraphEncoding)?
+        };
         nodes.push(OperatorNode {
             node_id,
             input,
             state_contract: stateful.then_some(StateContract { codec_version: 1 }),
             kind,
         });
-        layouts.push(layout(index + 1, output_types, nullable)?);
+        layouts.push(output_layout);
     }
 
     for (index, result) in spec.results.iter().enumerate() {
@@ -226,15 +237,4 @@ fn node_id(value: usize) -> Result<NodeId, CompilerError> {
         .and_then(NonZeroU32::new)
         .ok_or(CompilerError::GraphEncoding)?;
     Ok(NodeId::new(value))
-}
-
-fn layout(
-    ordinal: usize,
-    value_types: Vec<ValueType>,
-    nullable: Vec<bool>,
-) -> Result<TypedLayout, CompilerError> {
-    let mut identity = [0; 32];
-    identity[..8].copy_from_slice(&u64::try_from(ordinal).unwrap_or(u64::MAX).to_be_bytes());
-    TypedLayout::with_nullability(identity, value_types, nullable)
-        .map_err(|_| CompilerError::GraphEncoding)
 }

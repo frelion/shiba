@@ -138,9 +138,7 @@ pub(crate) fn layout_graph(
             let output = if matches!(node.kind, OperatorNodeKind::Filter { .. }) {
                 input.clone()
             } else {
-                let bytes = serde_json::to_vec(&(input.identity, node.node_id, &types))
-                    .map_err(|_| GraphError::Codec)?;
-                TypedLayout::with_nullability(hash(&bytes), types, nullability)?
+                TypedLayout::derive(input, node.node_id, types, nullability)?
             };
             layouts.insert(node.node_id, output);
         }

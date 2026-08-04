@@ -59,6 +59,48 @@ fn result_row(schema: &ResultSchemaV1, key: i64, value: TypedValue) -> TypedResu
     TypedResultRowV1::new(schema, vec![TypedValue::Int8(key), value]).unwrap()
 }
 
+#[test]
+fn derived_layout_identity_includes_nullable_for_each_node_shape() {
+    let input = TypedLayout::with_nullability(
+        [7; 32],
+        vec![ValueType::Int8, ValueType::Int8],
+        vec![false, true],
+    )
+    .unwrap();
+    for (node_id, value_types, nullable) in [
+        (node(1), vec![ValueType::Int8], vec![false]),
+        (node(2), vec![ValueType::Int8], vec![true]),
+        (
+            node(3),
+            vec![ValueType::Int8, ValueType::Int8],
+            vec![false, true],
+        ),
+        (
+            node(4),
+            vec![ValueType::Int8, ValueType::Int8],
+            vec![true, true],
+        ),
+        (
+            node(5),
+            vec![ValueType::Int8, ValueType::Int8],
+            vec![false, false],
+        ),
+    ] {
+        let nullable_identity =
+            TypedLayout::derive(&input, node_id, value_types.clone(), nullable.clone()).unwrap();
+        let nonnullable_identity = TypedLayout::derive(
+            &input,
+            node_id,
+            value_types.clone(),
+            nullable.iter().map(|value| !value).collect(),
+        )
+        .unwrap();
+        assert_ne!(nullable_identity.identity, nonnullable_identity.identity);
+        assert_eq!(nullable_identity.value_types, value_types);
+        assert_eq!(nullable_identity.nullable, nullable);
+    }
+}
+
 fn graph(predicate: Expression, compute: bool) -> OperatorGraph {
     let source_id = SourceId::new(1).unwrap();
     let mut nodes = vec![OperatorNode {

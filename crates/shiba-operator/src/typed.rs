@@ -1,6 +1,11 @@
 use core::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::NodeId;
+
+const LAYOUT_DOMAIN: &[u8] = b"shiba.operator.layout.v1\0";
 
 pub const MAX_ROW_VALUES: usize = 16;
 pub const MAX_TEXT_BYTES: usize = 1 << 20;
@@ -130,6 +135,23 @@ impl TypedLayout {
         let mut layout = Self::new(identity, value_types)?;
         layout.nullable = nullable;
         Ok(layout)
+    }
+
+    /// Derives a node output identity from its exact input layout, node id,
+    /// value types, and nullable bits.
+    pub fn derive(
+        input: &Self,
+        node_id: NodeId,
+        value_types: Vec<ValueType>,
+        nullable: Vec<bool>,
+    ) -> Result<Self, TypedError> {
+        let payload = serde_json::to_vec(&(input.identity, node_id, &value_types, &nullable))
+            .map_err(|_| TypedError::Codec)?;
+        let mut digest = Sha256::new();
+        digest.update(LAYOUT_DOMAIN);
+        digest.update(payload);
+        let identity = digest.finalize().into();
+        Self::with_nullability(identity, value_types, nullable)
     }
 }
 
