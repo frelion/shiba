@@ -1,4 +1,5 @@
 use core::fmt;
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -130,12 +131,6 @@ impl StatePartition {
             .map(|_| ())
             .map_err(|_| StateError::InvalidKey)
     }
-
-    fn contains(&self, key: &StateKey) -> bool {
-        self.node_id == key.node_id
-            && self.namespace == key.namespace
-            && self.partition_key == key.partition_key
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -168,13 +163,6 @@ impl StateRange {
             return Err(StateError::Limit);
         }
         Ok(())
-    }
-
-    pub(crate) fn contains(&self, key: &StateKey) -> bool {
-        self.node_id == key.node_id
-            && self.namespace == key.namespace
-            && self.partition_key == key.partition_key
-            && matches!(key.item_key, Some(TypedValue::Int8(_)))
     }
 }
 
@@ -213,22 +201,48 @@ impl StateSnapshot {
             .entries
             .windows(2)
             .any(|pair| pair[0].key >= pair[1].key)
-            || read_set
-                .keys
-                .iter()
-                .any(|required| !self.entries.iter().any(|entry| &entry.key == required))
-            || self.entries.iter().any(|entry| {
-                !read_set.keys.contains(&entry.key)
-                    && !read_set
-                        .partitions
-                        .iter()
-                        .any(|partition| partition.contains(&entry.key))
-                    && !read_set
-                        .ranges
-                        .iter()
-                        .any(|range| range.contains(&entry.key))
-            })
         {
+            return Err(StateError::SnapshotMismatch);
+        }
+        let entry_keys = self
+            .entries
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect::<BTreeSet<_>>();
+        if !read_set.keys.iter().all(|key| entry_keys.contains(key)) {
+            return Err(StateError::SnapshotMismatch);
+        }
+        let exact_keys = read_set.keys.iter().cloned().collect::<BTreeSet<_>>();
+        let partition_coordinates = read_set
+            .partitions
+            .iter()
+            .map(|partition| {
+                (
+                    partition.node_id,
+                    partition.namespace,
+                    partition.partition_key.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let range_coordinates = read_set
+            .ranges
+            .iter()
+            .map(|range| (range.node_id, range.namespace, range.partition_key.clone()))
+            .collect::<BTreeSet<_>>();
+        if !self.entries.iter().all(|entry| {
+            exact_keys.contains(&entry.key)
+                || partition_coordinates.contains(&(
+                    entry.key.node_id,
+                    entry.key.namespace,
+                    entry.key.partition_key.clone(),
+                ))
+                || (matches!(entry.key.item_key, Some(TypedValue::Int8(_)))
+                    && range_coordinates.contains(&(
+                        entry.key.node_id,
+                        entry.key.namespace,
+                        entry.key.partition_key.clone(),
+                    )))
+        }) {
             return Err(StateError::SnapshotMismatch);
         }
         Ok(())
