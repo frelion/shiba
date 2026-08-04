@@ -9,6 +9,7 @@ use shiba_runtime::{ProcessOutcome, RebuildSourceTarget, compile_rebuild_graph};
 use super::{Fixtures, GraphFixture, assert_building, assert_oracle, options, wait_for_slot_lsn};
 
 const TARGET_SLOT: &str = "m15_agg_group_sum_2";
+const MULTI_TARGET_SLOT: &str = "m15_agg_multi_2";
 
 pub(crate) fn rebuild_grouped_sum(
     database_url: &str,
@@ -89,6 +90,76 @@ pub(crate) fn rebuild_grouped_sum(
     live.detach().expect("detach rebuilt aggregate graph");
 }
 
+pub(crate) fn rebuild_multi_call(
+    database_url: &str,
+    replication_url: &str,
+    client: &mut Client,
+    fixtures: &Fixtures,
+) {
+    let old = &fixtures.graphs[4];
+    let spec = multi_spec(client, old, fixtures);
+    let prepared = PreparedRebuild::prepare(database_url, replication_url, &spec, options())
+        .expect("prepare multi-call changed-ObjectAddress rebuild");
+    assert_building(client, old.graph);
+    let mut bootstrap = prepared
+        .into_bootstrap()
+        .expect("export multi-call target snapshot");
+    client
+        .batch_execute(
+            "BEGIN;
+             UPDATE agg_multi_target.rows SET payload=200 WHERE id=12;
+             INSERT INTO agg_multi_target.rows VALUES (13,NULL);
+             DELETE FROM agg_multi_target.rows WHERE id=10;
+             COMMIT;",
+        )
+        .expect("commit multi-call rebuild catch-up WAL");
+    while let SnapshotProgress::BatchApplied { .. } =
+        bootstrap.scan_next().expect("scan multi-call target")
+    {
+        assert_building(client, old.graph);
+    }
+    let mut catchup = bootstrap
+        .into_catchup()
+        .expect("enter multi-call rebuild catch-up");
+    assert_eq!(
+        catchup
+            .catch_up_next()
+            .expect("apply multi-call target WAL"),
+        BootstrapCatchupProgress::TransactionApplied
+    );
+    assert_eq!(
+        catchup.catch_up_next().expect("activate multi-call target"),
+        BootstrapCatchupProgress::Active
+    );
+    let target = GraphFixture {
+        schema: "agg_multi_target",
+        publication_oid: fixtures.multi_target_publication,
+        slot: MULTI_TARGET_SLOT,
+        ..old.clone()
+    };
+    assert_oracle(client, &target);
+    let mut live = catchup
+        .into_live()
+        .expect("enter rebuilt multi-call live receiver");
+    client
+        .batch_execute(
+            "BEGIN;
+             UPDATE agg_multi_target.rows SET payload=300 WHERE id=12;
+             UPDATE agg_multi_target.rows SET id=14 WHERE id=13;
+             COMMIT;",
+        )
+        .expect("commit post-rebuild multi-call WAL");
+    let token = live
+        .receive_and_apply_one()
+        .expect("apply post-rebuild multi-call transaction");
+    assert_eq!(token.outcome(), ProcessOutcome::Applied);
+    assert_oracle(client, &target);
+    live.acknowledge(&token)
+        .expect("ACK rebuilt multi-call transaction");
+    wait_for_slot_lsn(client, MULTI_TARGET_SLOT, token.end_lsn());
+    live.detach().expect("detach rebuilt multi-call graph");
+}
+
 fn spec(client: &mut Client, old: &GraphFixture, fixtures: &Fixtures) -> RebuildSpec {
     let old_digest: Vec<u8> = client
         .query_one(
@@ -126,13 +197,68 @@ fn spec(client: &mut Client, old: &GraphFixture, fixtures: &Fixtures) -> Rebuild
             1,
         ),
         target: identity(
-            old.graph + 1,
+            // Graph 5 is the M16 multi-call fixture in this shared lifecycle
+            // test; keep the rebuild bootstrap identity disjoint from it.
+            old.graph + 2,
             artifact.graph_digest,
             old.source,
             fixtures.target_relation,
             fixtures.target_identity,
             fixtures.target_publication,
             TARGET_SLOT,
+            2,
+        ),
+    }
+}
+
+fn multi_spec(client: &mut Client, old: &GraphFixture, fixtures: &Fixtures) -> RebuildSpec {
+    let old_digest: Vec<u8> = client
+        .query_one(
+            "SELECT graph_digest FROM shiba_internal.graph_definition WHERE graph_id=5",
+            &[],
+        )
+        .expect("read multi-call graph digest")
+        .get(0);
+    let old_digest: [u8; 32] = old_digest.try_into().expect("32-byte graph digest");
+    let old_relation = relation_oid(client, old.source);
+    let old_identity = identity_oid(client, old.source);
+    let target = RebuildSourceTarget {
+        source_id: SourceId::new(old.source).expect("source ID"),
+        relation_id: fixtures.multi_target_relation,
+        identity_index_id: fixtures.multi_target_identity,
+    };
+    let mut transaction = client
+        .transaction()
+        .expect("open multi-call target compilation");
+    let artifact = compile_rebuild_graph(
+        &mut transaction,
+        GraphId::new(old.graph).expect("graph ID"),
+        core::slice::from_ref(&target),
+    )
+    .expect("rebind durable multi-call QuerySpec");
+    transaction
+        .rollback()
+        .expect("rollback read-only multi-call compile");
+    RebuildSpec {
+        graph_id: GraphId::new(old.graph).expect("graph ID"),
+        expected: identity(
+            old.graph,
+            old_digest,
+            old.source,
+            old_relation,
+            old_identity,
+            old.publication_oid,
+            old.slot,
+            1,
+        ),
+        target: identity(
+            7,
+            artifact.graph_digest,
+            old.source,
+            fixtures.multi_target_relation,
+            fixtures.multi_target_identity,
+            fixtures.multi_target_publication,
+            MULTI_TARGET_SLOT,
             2,
         ),
     }

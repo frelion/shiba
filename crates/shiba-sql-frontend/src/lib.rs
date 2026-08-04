@@ -6,6 +6,7 @@ mod ast;
 mod ast_validate;
 mod bind;
 mod bind_aggregate;
+mod bind_aggregate_nodes;
 mod bind_aggregate_support;
 mod bind_expression;
 mod bind_join;

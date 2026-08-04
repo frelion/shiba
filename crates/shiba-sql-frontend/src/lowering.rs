@@ -1,6 +1,6 @@
-use sqlparser::ast::{Query, Select, SelectFlavor, Spanned, Statement};
+use sqlparser::ast::{Expr, Query, Select, SelectFlavor, SelectItem, Spanned, Statement};
 
-use crate::bounds::{Budget, MAX_PROJECTION, MAX_SOURCES};
+use crate::bounds::{Budget, MAX_PLAIN_PROJECTION, MAX_PROJECTION, MAX_SOURCES};
 use crate::expression::lower_expression;
 use crate::parser::SourceMap;
 use crate::relation::{LoweringContext, lower_join, sources};
@@ -58,7 +58,19 @@ fn lower_select(
             map.span(select.span()),
         ));
     }
-    if select.projection.len() > MAX_PROJECTION {
+    let has_aggregate = select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::UnnamedExpr(Expr::Function(_))
+                | SelectItem::ExprWithAlias {
+                    expr: Expr::Function(_),
+                    ..
+                }
+        )
+    });
+    if select.projection.len() > MAX_PROJECTION
+        || (select.projection.len() > MAX_PLAIN_PROJECTION && !has_aggregate)
+    {
         return Err(FrontendError::limit(
             ErrorCode::QueryTooComplex,
             map.span(select.span()),

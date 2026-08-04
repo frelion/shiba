@@ -23,13 +23,16 @@ pub(crate) fn grouped_columns<'a>(
     query: &UnboundQuery,
     source: &'a ResolvedSource,
     group: &'a SourceColumnDescriptor,
-    sum: Option<&'a SourceColumnDescriptor>,
+    values: &[Option<&'a SourceColumnDescriptor>],
 ) -> Result<Vec<&'a SourceColumnDescriptor>, FrontendError> {
     let mut columns = vec![group];
-    if let Some(sum) = sum
-        && sum.address != group.address
-    {
-        columns.push(sum);
+    for value in values.iter().flatten() {
+        if !columns
+            .iter()
+            .any(|current| current.address == value.address)
+        {
+            columns.push(value);
+        }
     }
     let mut stack = query.selection.iter().collect::<Vec<_>>();
     while let Some(expression) = stack.pop() {

@@ -10,6 +10,12 @@ ABI, wide Result Sink, `MIN`/`MAX`, `HAVING`, or PostgreSQL evidence is claimed
 at this boundary. M1--M15 authority, transaction, recovery, bootstrap, rebuild,
 ACK and bounded SQL evidence remains unchanged.
 
+M16.4 subsequently proves the first multi-call use of this ABI: one Aggregate
+node carries ordered CountStar/Count(nullable-int8)/SumInt8 calls and one
+complete wide result row through Binder, Compiler, bootstrap, live Apply/ACK,
+replay and rebuild on PostgreSQL 17.10 and 18.4. This does not claim the
+MIN/MAX or HAVING slices that remain later M16 work.
+
 M16 replaces aggregate-kind knowledge outside `shiba-operator` with one stable,
 versioned function ABI and replaces the scalar-or-key/value result assumption
 with a canonical typed row schema. The first implementation scope is:

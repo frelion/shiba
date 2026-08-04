@@ -42,8 +42,8 @@ private and activation publishes the complete row set atomically.
 The fixed scalar/key/value authority and keyed-only sink are removed in the
 same cutover. No second registry, result writer, persistent intermediate delta,
 dual write or compatibility path is introduced. M16.3 now runs Count/CountStar/
-Sum through Generic Aggregate; multi-call SQL, MIN/MAX and HAVING remain
-M16.4--M16.6 work and must use this result authority unchanged.
+Sum through Generic Aggregate; M16.4 multi-call SQL and Count(expr) use this
+same result authority. MIN/MAX and HAVING remain M16.5--M16.6 work.
 
 M15.1 freezes a bounded SQL declaration frontend in
 [SQL_FRONTEND_CONTRACT.md](SQL_FRONTEND_CONTRACT.md) and

@@ -91,6 +91,24 @@ missing_contract = [marker for marker in contract_markers if marker not in contr
 if missing_contract:
     raise SystemExit(f"M16.1 aggregate contract ABI markers are missing: {missing_contract}")
 
+multicall = pathlib.Path("crates/shiba-sql-frontend/src/bind_aggregate.rs").read_text()
+multicall_nodes = pathlib.Path("crates/shiba-sql-frontend/src/bind_aggregate_nodes.rs").read_text()
+multicall_tests = pathlib.Path("crates/shiba-sql-frontend/tests/binder_aggregate.rs").read_text()
+required_multicall = (
+    "AggregateFunctionV1::Count",
+    "MAX_AGGREGATE_CALLS",
+    "calls: calls",
+    "enumerate()",
+    "value_slot",
+    "scalar_multi_call_aggregate_uses_one_node",
+    "grouped_multi_call_aggregate_preserves_group",
+    "duplicate_default_output_identity_is_rejected",
+)
+multicall_text = multicall + multicall_nodes + multicall_tests
+missing_multicall = [marker for marker in required_multicall if marker not in multicall_text]
+if missing_multicall:
+    raise SystemExit(f"M16.4 multi-call contract markers are missing: {missing_multicall}")
+
 operator = "\n".join(
     path.read_text() for path in pathlib.Path("crates/shiba-operator/src").glob("*.rs")
 )

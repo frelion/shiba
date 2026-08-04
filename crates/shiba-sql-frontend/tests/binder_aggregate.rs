@@ -113,6 +113,101 @@ fn scalar_count_and_sum_use_generic_stateful_nodes() {
 }
 
 #[test]
+fn scalar_multi_call_aggregate_uses_one_node_and_count_expression() {
+    let source = source();
+    let spec = bind(
+        "SELECT count(*) AS rows, count(payload) AS non_null, sum(payload) AS total \
+         FROM app.events",
+        &source,
+    );
+    let QueryOperationV1::Aggregate {
+        group_expressions,
+        calls,
+    } = &spec.nodes[0].operation
+    else {
+        panic!("multi-call scalar query must use one Aggregate node")
+    };
+    assert!(group_expressions.is_empty());
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls.iter().map(|call| call.ordinal).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(calls[0].function, AggregateFunctionV1::CountStar);
+    assert_eq!(calls[1].function, AggregateFunctionV1::Count);
+    assert!(calls[1].expression.is_some());
+    assert_eq!(calls[2].function, AggregateFunctionV1::SumInt8);
+    assert_eq!(
+        spec.results[0]
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.value_slot, field.nullable))
+            .collect::<Vec<_>>(),
+        vec![
+            ("rows", 0, false),
+            ("non_null", 1, false),
+            ("total", 2, true),
+        ]
+    );
+    assert_compiles(&spec, &source);
+}
+
+#[test]
+fn grouped_multi_call_aggregate_preserves_group_and_call_ordinals() {
+    let source = source();
+    let spec = bind(
+        "SELECT id AS region, count(*) AS rows, count(payload) AS non_null, \
+         sum(payload) AS total FROM app.events GROUP BY id",
+        &source,
+    );
+    let QueryOperationV1::Aggregate { calls, .. } = &spec.nodes[2].operation else {
+        panic!("grouped multi-call query must end in one Aggregate node")
+    };
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls.iter().map(|call| call.ordinal).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(calls[0].function, AggregateFunctionV1::CountStar);
+    assert_eq!(calls[1].function, AggregateFunctionV1::Count);
+    assert_eq!(calls[2].function, AggregateFunctionV1::SumInt8);
+    assert_eq!(spec.results[0].key_ordinals, vec![1]);
+    assert_eq!(
+        spec.results[0]
+            .fields
+            .iter()
+            .map(|field| field.value_slot)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    assert_compiles(&spec, &source);
+}
+
+#[test]
+fn duplicate_default_output_identity_is_rejected() {
+    let source = source();
+    assert_error(
+        "SELECT count(*), count(payload) FROM app.events",
+        &source,
+        ErrorCode::DuplicateAlias,
+    );
+}
+
+#[test]
+fn aggregate_call_bound_is_fail_closed() {
+    let source = source();
+    let projection = (0..17)
+        .map(|index| format!("count(*) AS c{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_error(
+        &format!("SELECT {projection} FROM app.events"),
+        &source,
+        ErrorCode::QueryTooComplex,
+    );
+}
+
+#[test]
 fn grouped_count_lowers_filter_keyby_aggregate_and_keyed_result() {
     let source = source();
     let spec = bind(

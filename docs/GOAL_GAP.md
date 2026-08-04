@@ -7,8 +7,26 @@ nodes with one versioned Aggregate node. CountStar, Count(nullable `int8`) and
 checked SumInt8 share the same scalar/grouped state and wide-result path;
 Runtime and lifecycle production code contain no function dispatch. QuerySpec
 format 2, OperatorGraph format 2 and compiler version 4 reject the superseded
-wire shapes without adapters. Multi-call SQL/Count(expr), MIN/MAX, HAVING and
-final M16 performance/release evidence remain M16.4--M16.7.
+wire shapes without adapters. M16.4 now adds multi-call SQL and Count(expr)
+through the same Aggregate node and wide result authority, with PG17/18
+bootstrap, live, ACK and rebuild evidence. MIN/MAX, HAVING and final M16
+performance/release evidence remain M16.5--M16.7.
+
+## M16.4 multi-call Aggregate status
+
+The Binder accepts bounded scalar and one-key grouped lists of AggregateCall
+values. `COUNT(*)`, nullable-int8 `COUNT(expr)` and checked `SUM(expr)` receive
+stable ordinals and one complete result row; duplicate output identities and
+more than 16 calls fail closed. Compiler validation and Runtime persistence
+remain generic: one EffectBatch feeds all calls, and state, wide result and
+continuation commit together.
+
+The PG17.10 and PG18.4 SQL aggregate gate compares all three fields against
+PostgreSQL for existing rows, NULL transitions, INSERT/UPDATE/DELETE, exact
+ACK/replay, snapshot bootstrap, and changed-ObjectAddress rebuild followed by
+live Apply. No new authority, state table, result sink, or transaction path was
+introduced. MIN/MAX, HAVING, and M16 performance/extensibility closure remain
+unproved.
 
 ## M16.2 wide-result implementation status
 
@@ -30,9 +48,9 @@ Registration, bootstrap and rebuild carry the exact schema payload/digest;
 building output remains hidden until atomic activation. The superseded columns
 and keyed-only sink are deleted without an adapter, dual write or fallback.
 
-Generic Aggregate execution, MIN/MAX retraction, multiple calls and HAVING are
-still open for M16.3--M16.6. M16.2 does not claim those functions or final M16
-release/performance evidence.
+Generic Aggregate execution is closed by M16.3 and multiple calls by M16.4;
+MIN/MAX retraction and HAVING remain open for M16.5--M16.6. M16.2 does not
+claim those functions or final M16 release/performance evidence.
 
 ## M15.1--M15.7 SQL frontend status
 

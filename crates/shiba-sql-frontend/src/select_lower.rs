@@ -119,7 +119,7 @@ fn lower_aggregate(
     };
     let argument = match (name.value.as_str(), argument) {
         ("count", FunctionArgExpr::Wildcard) => crate::AggregateArgument::Star,
-        ("sum", FunctionArgExpr::Expr(expression)) => {
+        ("count" | "sum", FunctionArgExpr::Expr(expression)) => {
             let input = lower_expression(expression, context, budget, 2)?;
             if !matches!(input, UnboundExpression::Column(_)) {
                 return Err(FrontendError::unsupported(
@@ -191,10 +191,11 @@ pub(crate) fn validate_shape(
             && matches!(&projection[0].expression, SelectExpression::Expression(UnboundExpression::Column(column)) if column.source == 0)
             && matches!(&projection[1].expression, SelectExpression::Expression(UnboundExpression::Column(column)) if column.source == 1)
     } else if let Some(group) = group {
-        projection.len() == 2 && aggregates == 1
-            && projection.iter().any(|item| matches!(&item.expression, SelectExpression::Expression(value) if same_expression(value, group)))
+        projection.len() >= 2
+            && aggregates == projection.len() - 1
+            && matches!(&projection[0].expression, SelectExpression::Expression(value) if same_expression(value, group))
     } else if aggregates > 0 {
-        projection.len() == 1 && aggregates == 1
+        projection.len() == aggregates && aggregates > 0
     } else {
         projection.len() == 2
     };

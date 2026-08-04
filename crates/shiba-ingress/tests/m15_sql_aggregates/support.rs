@@ -32,6 +32,9 @@ pub(crate) struct Fixtures {
     pub(crate) target_relation: u32,
     pub(crate) target_identity: u32,
     pub(crate) target_publication: u32,
+    pub(crate) multi_target_relation: u32,
+    pub(crate) multi_target_identity: u32,
+    pub(crate) multi_target_publication: u32,
 }
 
 pub(crate) fn required(name: &str) -> String {
@@ -98,7 +101,21 @@ pub(crate) fn install(client: &mut Client) -> Fixtures {
              INSERT INTO agg_group_sum_target.rows VALUES (10,100),(11,NULL),(12,100);
              CREATE PUBLICATION m15_agg_group_sum_target_pub
                  FOR TABLE agg_group_sum_target.rows
-                 WITH (publish='insert,update,delete');",
+                 WITH (publish='insert,update,delete');
+
+             CREATE SCHEMA agg_multi_target;
+             CREATE TABLE agg_multi_target.rows (id bigint PRIMARY KEY, payload bigint NULL);
+             INSERT INTO agg_multi_target.rows VALUES (10,100),(11,NULL),(12,100);
+             CREATE PUBLICATION m15_agg_multi_target_pub
+                 FOR TABLE agg_multi_target.rows
+                 WITH (publish='insert,update,delete');
+
+             CREATE SCHEMA agg_multi;
+             CREATE TABLE agg_multi.rows (id bigint PRIMARY KEY, payload bigint NULL);
+             INSERT INTO agg_multi.rows VALUES (1,10),(2,NULL),(3,10);
+             CREATE PUBLICATION m15_agg_multi_pub FOR TABLE agg_multi.rows
+                 WITH (publish='insert,update,delete');
+             SELECT shiba_internal.register_source(5, 'agg_multi.rows'::regclass);",
         )
         .expect("install aggregate sources and target");
     let mut fixture = |graph, schema, publication, slot| GraphFixture {
@@ -124,10 +141,14 @@ pub(crate) fn install(client: &mut Client) -> Fixtures {
                 "m15_agg_group_sum_pub",
                 "m15_agg_group_sum_1",
             ),
+            fixture(5, "agg_multi", "m15_agg_multi_pub", "m15_agg_multi_1"),
         ],
         target_relation: oid(client, "agg_group_sum_target.rows"),
         target_identity: oid(client, "agg_group_sum_target.rows_pkey"),
         target_publication: publication_oid(client, "m15_agg_group_sum_target_pub"),
+        multi_target_relation: oid(client, "agg_multi_target.rows"),
+        multi_target_identity: oid(client, "agg_multi_target.rows_pkey"),
+        multi_target_publication: publication_oid(client, "m15_agg_multi_target_pub"),
     }
 }
 
@@ -177,7 +198,7 @@ pub(crate) fn assert_registration_contracts(client: &mut Client) {
             &[],
         )
         .expect("query registered aggregate contracts");
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 5);
     for (ordinal, row) in rows.iter().enumerate() {
         assert_eq!(row.get::<_, i64>(0), i64::try_from(ordinal + 1).unwrap());
         assert_eq!(row.get::<_, i16>(1), 1);
@@ -214,6 +235,7 @@ pub(crate) fn assert_oracle(client: &mut Client, fixture: &GraphFixture) {
         2 => scalar::assert_sum(client, fixture),
         3 => grouped::assert_count(client, fixture),
         4 => grouped::assert_sum(client, fixture),
+        5 => scalar::assert_multi_call(client, fixture),
         _ => panic!("unknown aggregate graph"),
     }
 }

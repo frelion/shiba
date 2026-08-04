@@ -77,6 +77,65 @@ pub(crate) fn exercise_nullable_sum(
     session.detach().expect("detach SQL SUM");
 }
 
+pub(crate) fn assert_multi_call(client: &mut Client, fixture: &GraphFixture) {
+    let expected = client
+        .query_one(
+            &format!(
+                "SELECT count(*)::bigint, count(payload)::bigint, sum(payload)::bigint
+                 FROM {}.rows",
+                fixture.schema
+            ),
+            &[],
+        )
+        .map(|row| {
+            (
+                row.get::<_, i64>(0),
+                row.get::<_, i64>(1),
+                row.get::<_, Option<i64>>(2),
+            )
+        })
+        .expect("query multi-call SQL oracle");
+    assert_eq!(multi_row(client, fixture.graph), expected);
+}
+
+pub(crate) fn exercise_multi_call(
+    database_url: &str,
+    replication_url: &str,
+    client: &mut Client,
+    fixture: &GraphFixture,
+) {
+    assert_multi_call(client, fixture);
+    let mut session = attach(database_url, replication_url, fixture, 1);
+    for (sql, expected) in [
+        (
+            "BEGIN;
+             UPDATE agg_multi.rows SET payload=7 WHERE id=2;
+             INSERT INTO agg_multi.rows VALUES (4,NULL);
+             COMMIT;",
+            (4_i64, 3_i64, Some(27_i64)),
+        ),
+        (
+            "DELETE FROM agg_multi.rows WHERE id=1",
+            (3_i64, 2_i64, Some(17_i64)),
+        ),
+    ] {
+        client
+            .batch_execute(sql)
+            .expect("commit multi-call transition");
+        let token = session
+            .receive_and_apply_one()
+            .expect("apply multi-call transition");
+        assert_eq!(token.outcome(), ProcessOutcome::Applied);
+        assert_eq!(multi_row(client, fixture.graph), expected);
+        assert_oracle(client, fixture);
+        session
+            .acknowledge(&token)
+            .expect("ACK multi-call transition");
+        wait_for_slot_lsn(client, fixture.slot, token.end_lsn());
+    }
+    session.detach().expect("detach multi-call aggregate");
+}
+
 fn scalar(client: &mut Client, graph: u64) -> Option<i64> {
     client
         .query_one(
@@ -91,4 +150,21 @@ fn scalar(client: &mut Client, graph: u64) -> Option<i64> {
         )
         .expect("query scalar aggregate result")
         .get(0)
+}
+
+fn multi_row(client: &mut Client, graph: u64) -> (i64, i64, Option<i64>) {
+    client
+        .query_one(
+            "SELECT
+                (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint,
+                (convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,value}')::bigint,
+                CASE WHEN convert_from(row_payload,'UTF8')::jsonb
+                              #>> '{values,2,type}' = 'null'
+                     THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb
+                              #>> '{values,2,value}')::bigint END
+             FROM shiba.graph_result_rows WHERE graph_id=$1",
+            &[&i64::try_from(graph).expect("graph ID fits")],
+        )
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .expect("query multi-call result row")
 }

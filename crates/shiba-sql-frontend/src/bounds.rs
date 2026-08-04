@@ -7,7 +7,10 @@ pub(crate) const MAX_EXPRESSION_NODES: usize = 256;
 pub(crate) const MAX_EXPRESSION_DEPTH: usize = 32;
 pub(crate) const MAX_BOOLEAN_TERMS: usize = 64;
 pub(crate) const MAX_SOURCES: usize = 2;
-pub(crate) const MAX_PROJECTION: usize = 2;
+// A grouped aggregate may contain one key plus the bounded aggregate-call set.
+// Non-aggregate and join shapes remain restricted by `validate_shape`.
+pub(crate) const MAX_PROJECTION: usize = 17;
+pub(crate) const MAX_PLAIN_PROJECTION: usize = 2;
 
 #[derive(Default)]
 pub(crate) struct Budget {

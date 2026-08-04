@@ -19,6 +19,17 @@ matrix remains 57 uniquely enrolled scripts and 114 versioned invocations;
 M16.4 adds multi-call SQL and Count(expr), while MIN/MAX and HAVING remain
 M16.5/M16.6.
 
+## M16.4 multi-call SQL gates
+
+The M16.4 Binder tests prove one generic Aggregate node for multiple calls,
+stable ordinals and result slots, `COUNT(expr)` nullable-input semantics,
+duplicate output rejection, and the 16-call bound. The directed SQL aggregate
+gate runs on PostgreSQL 17.10 and 18.4 and compares the complete
+`count(*)`/`count(payload)`/`sum(payload)` row with SQL after snapshot
+bootstrap, live I/U/D, explicit feedback, exact replay, and changed-target
+rebuild plus post-rebuild live Apply. It does not claim MIN/MAX, HAVING or
+final M16 performance closure.
+
 The full PG17 matrix exposed the existing two-second walsender timeout while a
 10,000-row generic Aggregate retry was synchronously applying. The receiver now
 refreshes only the prior durable coordinate before and during Apply. The M10 streaming
