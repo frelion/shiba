@@ -10,7 +10,7 @@ use crate::M2Error;
 
 mod write;
 
-const MAX_GRAPH_STATE_ENTRIES: usize = 100_000;
+use shiba_operator::MAX_STATE_KEYS;
 
 type Coordinate = (i64, i32, Vec<u8>, Vec<u8>);
 type PartitionCoordinate = (i64, i32, Vec<u8>);
@@ -41,7 +41,7 @@ pub(crate) fn load(
         .map(partition_coordinate)
         .collect::<Result<BTreeSet<_>, _>>()?;
     let rows = query_rows(transaction, graph_id, &exact, &partitions)?;
-    if rows.len() > MAX_GRAPH_STATE_ENTRIES {
+    if rows.len() > MAX_STATE_KEYS {
         return Err(M2Error::TransactionLimitExceeded);
     }
 
@@ -107,8 +107,8 @@ fn query_rows(
     let partition_nodes: Vec<i64> = partitions.iter().map(|value| value.0).collect();
     let partition_namespaces: Vec<i32> = partitions.iter().map(|value| value.1).collect();
     let partition_payloads: Vec<Vec<u8>> = partitions.iter().map(|value| value.2.clone()).collect();
-    let limit = i64::try_from(MAX_GRAPH_STATE_ENTRIES + 1)
-        .map_err(|_| M2Error::InvalidOperatorDefinition)?;
+    let limit =
+        i64::try_from(MAX_STATE_KEYS + 1).map_err(|_| M2Error::InvalidOperatorDefinition)?;
     Ok(transaction.query(
         "WITH exact AS (
              SELECT * FROM unnest($2::bigint[], $3::integer[], $4::bytea[], $5::bytea[])
@@ -152,7 +152,7 @@ pub(crate) fn persist(
     locked: &LockedState,
     deltas: Vec<StateDelta>,
 ) -> Result<(), M2Error> {
-    if deltas.len() > MAX_GRAPH_STATE_ENTRIES {
+    if deltas.len() > MAX_STATE_KEYS {
         return Err(M2Error::TransactionLimitExceeded);
     }
     let mut ordered = deltas

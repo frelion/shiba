@@ -3,6 +3,13 @@ use crate::{
     graph::{MAX_GRAPH_DELTA_ROWS, MAX_GRAPH_WORK_BYTES, MAX_NODE_DELTA_ROWS},
 };
 
+pub const MAX_TOUCHED_GROUPS: usize = 100_000;
+pub const MAX_STATE_KEYS: usize = 100_000;
+pub const MAX_PARTITION_ENTRIES: usize = 100_000;
+pub const MAX_EXTREMA_VALUES: usize = 100_000;
+pub const MAX_STATE_MUTATIONS: usize = 100_000;
+pub const MAX_ESTIMATED_WORK_BYTES: usize = MAX_GRAPH_WORK_BYTES;
+
 pub(crate) struct EvaluationBudget {
     work_bytes: usize,
 }
@@ -12,6 +19,14 @@ impl EvaluationBudget {
         Ok(Self {
             work_bytes: batch_bytes(input)?,
         })
+    }
+
+    pub(crate) fn check_batch(batch: &DeltaBatch) -> Result<(), GraphError> {
+        if batch_bytes(batch)? > MAX_ESTIMATED_WORK_BYTES {
+            Err(GraphError::OutputLimit)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn charge(

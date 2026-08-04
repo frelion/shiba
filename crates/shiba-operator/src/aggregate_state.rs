@@ -143,6 +143,9 @@ pub(crate) fn accumulate(
             if next == 0 {
                 values.remove(input);
             } else {
+                if !values.contains_key(input) && values.len() >= crate::MAX_EXTREMA_VALUES {
+                    return Err(KernelError::InvalidTransition);
+                }
                 values.insert(*input, next);
             }
         }
@@ -240,6 +243,9 @@ pub(crate) fn decode_extrema<'a>(
 ) -> Result<CallState, KernelError> {
     let mut values = BTreeMap::new();
     for entry in entries {
+        if values.len() >= crate::MAX_EXTREMA_VALUES {
+            return Err(KernelError::InvalidState);
+        }
         let Some(TypedValue::Int8(candidate)) = entry.key.item_key.as_ref() else {
             return Err(KernelError::InvalidState);
         };

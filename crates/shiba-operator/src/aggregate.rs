@@ -22,6 +22,8 @@ pub(crate) fn state_read_set(
     let mut partitions = Vec::new();
     for spec in specs(graph)? {
         let prepared = prepare(graph, batch, &spec)?;
+        crate::graph_budget::EvaluationBudget::check_batch(&prepared)
+            .map_err(|_| KernelError::InvalidTransition)?;
         let local = crate::aggregate_group::read_set(
             &spec,
             touched_groups(&spec, &prepared)?.into_values(),
@@ -44,6 +46,13 @@ pub(crate) fn apply(
     for spec in specs(graph)? {
         let prepared = prepare(graph, batch, &spec)?;
         let touched = touched_groups(&spec, &prepared)?;
+        let estimated_mutations = touched
+            .len()
+            .checked_mul(spec.calls.len().saturating_add(1))
+            .ok_or(KernelError::InvalidTransition)?;
+        if estimated_mutations > crate::MAX_STATE_MUTATIONS {
+            return Err(KernelError::InvalidTransition);
+        }
         let mut initial = BTreeMap::new();
         for (key, values) in &touched {
             initial.insert(
@@ -106,6 +115,8 @@ fn touched_groups(
         let (key, values) = group_identity(spec, row)?;
         if groups.insert(key, values).is_some() {
             // The same canonical key must always represent the same typed values.
+        } else if groups.len() > crate::MAX_TOUCHED_GROUPS {
+            return Err(KernelError::InvalidTransition);
         }
     }
     Ok(groups)
@@ -184,11 +195,14 @@ fn finish(
         if before == after {
             continue;
         }
-        states.extend(crate::aggregate_group::deltas(spec, key, before, after));
+        states.extend(crate::aggregate_group::deltas(spec, key, before, after)?);
         rows.push(crate::RowDelta {
             before: output_row(spec, before)?,
             after: output_row(spec, after)?,
         });
+    }
+    if states.len() > crate::MAX_STATE_MUTATIONS {
+        return Err(KernelError::InvalidTransition);
     }
     let result = if spec.groups.is_empty() {
         let group = final_state

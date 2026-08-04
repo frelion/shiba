@@ -40,6 +40,9 @@ impl StateReadSet {
     ///
     /// Rejects absent or otherwise non-persistable typed keys.
     pub fn canonical(mut keys: Vec<StateKey>) -> Result<Self, StateError> {
+        if keys.len() > crate::MAX_STATE_KEYS {
+            return Err(StateError::Limit);
+        }
         for key in &keys {
             key.validate()?;
         }
@@ -61,6 +64,9 @@ impl StateReadSet {
         mut partitions: Vec<StatePartition>,
     ) -> Result<Self, StateError> {
         let mut read_set = Self::canonical(keys)?;
+        if partitions.len() > crate::MAX_PARTITION_ENTRIES {
+            return Err(StateError::Limit);
+        }
         for partition in &partitions {
             partition.validate()?;
         }
@@ -164,6 +170,7 @@ pub struct StateDelta {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateError {
     InvalidKey,
+    Limit,
     SnapshotMismatch,
 }
 

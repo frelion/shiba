@@ -40,6 +40,10 @@ pub use graph::{
     ColumnBinding, GraphError, NodeId, NodeInput, OperatorGraph, OperatorNode, OperatorNodeKind,
     SourcePort,
 };
+pub use graph_budget::{
+    MAX_ESTIMATED_WORK_BYTES, MAX_EXTREMA_VALUES, MAX_PARTITION_ENTRIES, MAX_STATE_KEYS,
+    MAX_STATE_MUTATIONS, MAX_TOUCHED_GROUPS,
+};
 pub use graph_eval::apply_graph;
 pub use graph_transition::{
     DeltaBatch, GraphEffectOrigin, GraphTransition, MultiInputBatch, RowDelta, SourceDeltaBatch,

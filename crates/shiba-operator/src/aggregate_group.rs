@@ -19,17 +19,29 @@ pub(crate) fn read_set(
 ) -> Result<StateReadSet, KernelError> {
     let mut keys = Vec::new();
     let mut partitions = Vec::new();
-    for values in groups {
+    for (index, values) in groups.into_iter().enumerate() {
+        if index >= crate::MAX_TOUCHED_GROUPS {
+            return Err(KernelError::InvalidTransition);
+        }
         let partition_key = values.first().cloned().unwrap_or(TypedValue::Bool(true));
+        if keys.len() >= crate::MAX_STATE_KEYS {
+            return Err(KernelError::InvalidTransition);
+        }
         keys.push(state_key(spec, partition_key.clone(), MEMBERSHIP_NAMESPACE));
         for call in &spec.calls {
             if is_extrema(call.function) {
+                if partitions.len() >= crate::MAX_PARTITION_ENTRIES {
+                    return Err(KernelError::InvalidTransition);
+                }
                 partitions.push(StatePartition {
                     node_id: spec.node_id,
                     namespace: call.ordinal,
                     partition_key: partition_key.clone(),
                 });
             } else {
+                if keys.len() >= crate::MAX_STATE_KEYS {
+                    return Err(KernelError::InvalidTransition);
+                }
                 keys.push(state_key(spec, partition_key.clone(), call.ordinal));
             }
         }
@@ -92,7 +104,7 @@ pub(crate) fn deltas(
     key: &TypedValue,
     before: &GroupState,
     after: &GroupState,
-) -> Vec<StateDelta> {
+) -> Result<Vec<StateDelta>, KernelError> {
     let mut deltas = Vec::new();
     if before.membership != after.membership {
         deltas.push(delta(
@@ -118,6 +130,9 @@ pub(crate) fn deltas(
             let mut candidates = std::collections::BTreeSet::new();
             candidates.extend(old_values.keys().copied());
             candidates.extend(new_values.keys().copied());
+            if candidates.len() > crate::MAX_EXTREMA_VALUES {
+                return Err(KernelError::InvalidTransition);
+            }
             for candidate in candidates {
                 let old_count = old_values.get(&candidate).copied();
                 let new_count = new_values.get(&candidate).copied();
@@ -152,7 +167,10 @@ pub(crate) fn deltas(
             ));
         }
     }
-    deltas
+    if deltas.len() > crate::MAX_STATE_MUTATIONS {
+        return Err(KernelError::InvalidTransition);
+    }
+    Ok(deltas)
 }
 
 pub(crate) fn state_key(
