@@ -35,7 +35,8 @@ publishes the same authority only at activation.
 The old shape, scalar bigint/payload, result key/value columns and keyed-only
 sink are deleted. There is no compatibility view, adapter, dual write, function
 registry or second result authority. Generic Count/CountStar/Sum execution now
-reuses these tables; MIN/MAX and HAVING remain subsequent M16 slices.
+reuses these tables; MinInt8/MaxInt8 now use the same authority, and HAVING
+remains the subsequent M16 slice.
 
 ## M14.6 graph execution authority
 

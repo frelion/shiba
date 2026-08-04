@@ -115,7 +115,14 @@ pub(crate) fn install(client: &mut Client) -> Fixtures {
              INSERT INTO agg_multi.rows VALUES (1,10),(2,NULL),(3,10);
              CREATE PUBLICATION m15_agg_multi_pub FOR TABLE agg_multi.rows
                  WITH (publish='insert,update,delete');
-             SELECT shiba_internal.register_source(5, 'agg_multi.rows'::regclass);",
+             SELECT shiba_internal.register_source(5, 'agg_multi.rows'::regclass);
+
+             CREATE SCHEMA agg_extrema;
+             CREATE TABLE agg_extrema.rows (id bigint PRIMARY KEY, payload bigint NULL);
+             INSERT INTO agg_extrema.rows VALUES (1,10),(2,10),(3,5),(4,NULL);
+             CREATE PUBLICATION m15_agg_extrema_pub FOR TABLE agg_extrema.rows
+                 WITH (publish='insert,update,delete');
+             SELECT shiba_internal.register_source(6, 'agg_extrema.rows'::regclass);",
         )
         .expect("install aggregate sources and target");
     let mut fixture = |graph, schema, publication, slot| GraphFixture {
@@ -142,6 +149,7 @@ pub(crate) fn install(client: &mut Client) -> Fixtures {
                 "m15_agg_group_sum_1",
             ),
             fixture(5, "agg_multi", "m15_agg_multi_pub", "m15_agg_multi_1"),
+            fixture(6, "agg_extrema", "m15_agg_extrema_pub", "m15_agg_extrema_1"),
         ],
         target_relation: oid(client, "agg_group_sum_target.rows"),
         target_identity: oid(client, "agg_group_sum_target.rows_pkey"),
@@ -198,7 +206,7 @@ pub(crate) fn assert_registration_contracts(client: &mut Client) {
             &[],
         )
         .expect("query registered aggregate contracts");
-    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.len(), 6);
     for (ordinal, row) in rows.iter().enumerate() {
         assert_eq!(row.get::<_, i64>(0), i64::try_from(ordinal + 1).unwrap());
         assert_eq!(row.get::<_, i16>(1), 1);
@@ -236,6 +244,7 @@ pub(crate) fn assert_oracle(client: &mut Client, fixture: &GraphFixture) {
         3 => grouped::assert_count(client, fixture),
         4 => grouped::assert_sum(client, fixture),
         5 => scalar::assert_multi_call(client, fixture),
+        6 => scalar::assert_min_max(client, fixture),
         _ => panic!("unknown aggregate graph"),
     }
 }

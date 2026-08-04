@@ -28,7 +28,8 @@ formatting and spans do not. Compiler emits one canonical `ResultSchemaV1` and
 generic Materialize field-slot list. The old Scalar/Keyed result-shape enum is
 deleted with no parallel decoder, adapter or dual format. AggregateCall
 declarations and Count/CountStar/Sum compilation are implemented by M16.3;
-multi-call SQL, MIN/MAX and HAVING remain later slices.
+multi-call SQL and MIN/MAX are now implemented by M16.4/M16.5; HAVING remains
+the next slice.
 
 That result-only cutover was stored by compiler version `3`. M16.3's breaking
 Aggregate declaration uses compiler version `4`, QuerySpec format `2` and

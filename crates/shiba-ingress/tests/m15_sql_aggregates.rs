@@ -13,6 +13,8 @@ const GROUPED_SUM_SQL: &str =
     "SELECT r.payload, sum(r.id) FROM agg_group_sum.rows AS r GROUP BY r.payload";
 const MULTI_CALL_SQL: &str = "SELECT count(*) AS rows, count(payload) AS non_null, sum(payload) AS total \
      FROM agg_multi.rows";
+const MIN_MAX_SQL: &str = "SELECT min(payload) AS minimum, max(payload) AS maximum \
+     FROM agg_extrema.rows";
 
 #[test]
 #[ignore = "requires scripts/test-m15-sql-aggregates.sh"]
@@ -28,6 +30,7 @@ fn sql_aggregates_share_production_lifecycle_and_postgresql_semantics() {
         (3, GROUPED_COUNT_SQL),
         (4, GROUPED_SUM_SQL),
         (5, MULTI_CALL_SQL),
+        (6, MIN_MAX_SQL),
     ] {
         compile_sql_and_register(&mut admin, GraphId::new(graph).expect("graph ID"), sql)
             .unwrap_or_else(|error| {
@@ -58,6 +61,12 @@ fn sql_aggregates_share_production_lifecycle_and_postgresql_semantics() {
         &replication_url,
         &mut admin,
         &fixtures.graphs[4],
+    );
+    support::scalar::exercise_min_max(
+        &database_url,
+        &replication_url,
+        &mut admin,
+        &fixtures.graphs[5],
     );
     support::grouped::exercise_filtered_count(
         &database_url,

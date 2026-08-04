@@ -153,6 +153,23 @@ fn scalar_multi_call_aggregate_uses_one_node_and_count_expression() {
 }
 
 #[test]
+fn scalar_min_max_use_nullable_int8_function_abi() {
+    let source = source();
+    let spec = bind(
+        "SELECT min(payload) AS minimum, max(payload) AS maximum FROM app.events",
+        &source,
+    );
+    let QueryOperationV1::Aggregate { calls, .. } = &spec.nodes[0].operation else {
+        panic!("MIN/MAX must use the generic Aggregate node")
+    };
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].function, AggregateFunctionV1::MinInt8);
+    assert_eq!(calls[1].function, AggregateFunctionV1::MaxInt8);
+    assert!(spec.results[0].fields.iter().all(|field| field.nullable));
+    assert_compiles(&spec, &source);
+}
+
+#[test]
 fn grouped_multi_call_aggregate_preserves_group_and_call_ordinals() {
     let source = source();
     let spec = bind(

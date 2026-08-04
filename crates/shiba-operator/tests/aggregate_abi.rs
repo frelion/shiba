@@ -6,10 +6,12 @@ use shiba_operator::{
     aggregate_function_descriptor, aggregate_function_digest,
 };
 
-const FUNCTIONS: [AggregateFunctionV1; 3] = [
+const FUNCTIONS: [AggregateFunctionV1; 5] = [
     AggregateFunctionV1::CountStar,
     AggregateFunctionV1::Count,
     AggregateFunctionV1::SumInt8,
+    AggregateFunctionV1::MinInt8,
+    AggregateFunctionV1::MaxInt8,
 ];
 
 #[test]
@@ -55,4 +57,17 @@ fn descriptors_freeze_input_nullability_and_empty_semantics() {
     assert_eq!(sum.input, AggregateInputContract::Nullable(ValueType::Int8));
     assert_eq!(sum.empty_result, EmptyResultV1::Null(ValueType::Int8));
     assert!(sum.output_nullable);
+
+    for function in [AggregateFunctionV1::MinInt8, AggregateFunctionV1::MaxInt8] {
+        let descriptor = aggregate_function_descriptor(function);
+        assert_eq!(
+            descriptor.input,
+            AggregateInputContract::Nullable(ValueType::Int8)
+        );
+        assert_eq!(
+            descriptor.empty_result,
+            EmptyResultV1::Null(ValueType::Int8)
+        );
+        assert!(descriptor.output_nullable);
+    }
 }

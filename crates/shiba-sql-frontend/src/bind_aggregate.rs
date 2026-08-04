@@ -188,6 +188,12 @@ fn aggregate_call(
         ("sum", AggregateArgument::Expression(input)) => {
             Ok((AggregateFunctionV1::SumInt8, Some(input)))
         }
+        ("min", AggregateArgument::Expression(input)) => {
+            Ok((AggregateFunctionV1::MinInt8, Some(input)))
+        }
+        ("max", AggregateArgument::Expression(input)) => {
+            Ok((AggregateFunctionV1::MaxInt8, Some(input)))
+        }
         _ => Err(binding(ErrorCode::UnsupportedSyntax, aggregate.span)),
     }
 }
@@ -196,6 +202,8 @@ fn default_name(function: AggregateFunctionV1) -> &'static str {
     match function {
         AggregateFunctionV1::CountStar | AggregateFunctionV1::Count => "count",
         AggregateFunctionV1::SumInt8 => "sum",
+        AggregateFunctionV1::MinInt8 => "min",
+        AggregateFunctionV1::MaxInt8 => "max",
     }
 }
 

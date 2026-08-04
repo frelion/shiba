@@ -1,18 +1,24 @@
+use std::collections::BTreeMap;
+
 use crate::{
     AGGREGATE_STATE_CODEC_VERSION, AggregateFunctionV1, EncodedOperatorState, KernelError,
     StateEntry, TypedValue, ValueType,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CallState {
     Count(i64),
     Sum { non_null: i64, value: i64 },
+    Min(BTreeMap<i64, i64>),
+    Max(BTreeMap<i64, i64>),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CallDelta {
     Count(i64),
     Sum { non_null: i64, value: i128 },
+    Min(BTreeMap<i64, i64>),
+    Max(BTreeMap<i64, i64>),
 }
 
 pub(crate) fn decode(
@@ -41,9 +47,11 @@ pub(crate) fn decode(
                     .map_err(|_| KernelError::InvalidState)?,
             ),
         },
-        AggregateFunctionV1::SumInt8 => return Err(KernelError::InvalidState),
+        AggregateFunctionV1::SumInt8
+        | AggregateFunctionV1::MinInt8
+        | AggregateFunctionV1::MaxInt8 => return Err(KernelError::InvalidState),
     };
-    validate(state)?;
+    validate(&state)?;
     Ok(state)
 }
 
@@ -54,10 +62,12 @@ pub(crate) const fn empty(function: AggregateFunctionV1) -> CallState {
             non_null: 0,
             value: 0,
         },
+        AggregateFunctionV1::MinInt8 => CallState::Min(BTreeMap::new()),
+        AggregateFunctionV1::MaxInt8 => CallState::Max(BTreeMap::new()),
     }
 }
 
-pub(crate) fn encode(state: CallState) -> EncodedOperatorState {
+pub(crate) fn encode(state: &CallState) -> EncodedOperatorState {
     let payload = match state {
         CallState::Count(value) => value.to_be_bytes().to_vec(),
         CallState::Sum { non_null, value } => {
@@ -65,6 +75,7 @@ pub(crate) fn encode(state: CallState) -> EncodedOperatorState {
             bytes.extend_from_slice(&value.to_be_bytes());
             bytes
         }
+        CallState::Min(_) | CallState::Max(_) => unreachable!("extrema use keyed state"),
     };
     EncodedOperatorState {
         codec_version: AGGREGATE_STATE_CODEC_VERSION,
@@ -72,10 +83,20 @@ pub(crate) fn encode(state: CallState) -> EncodedOperatorState {
     }
 }
 
-pub(crate) fn output(state: CallState) -> TypedValue {
+pub(crate) fn output(state: &CallState) -> TypedValue {
     match state {
         CallState::Sum { non_null: 0, .. } => TypedValue::Null(ValueType::Int8),
-        CallState::Count(value) | CallState::Sum { value, .. } => TypedValue::Int8(value),
+        CallState::Count(value) | CallState::Sum { value, .. } => TypedValue::Int8(*value),
+        CallState::Min(values) => values
+            .first_key_value()
+            .map_or(TypedValue::Null(ValueType::Int8), |(value, _)| {
+                TypedValue::Int8(*value)
+            }),
+        CallState::Max(values) => values
+            .last_key_value()
+            .map_or(TypedValue::Null(ValueType::Int8), |(value, _)| {
+                TypedValue::Int8(*value)
+            }),
     }
 }
 
@@ -86,6 +107,8 @@ pub(crate) const fn empty_delta(function: AggregateFunctionV1) -> CallDelta {
             non_null: 0,
             value: 0,
         },
+        AggregateFunctionV1::MinInt8 => CallDelta::Min(BTreeMap::new()),
+        AggregateFunctionV1::MaxInt8 => CallDelta::Max(BTreeMap::new()),
     }
 }
 
@@ -100,16 +123,8 @@ pub(crate) fn accumulate(
         | (AggregateFunctionV1::Count, CallDelta::Count(count), Some(TypedValue::Int8(_))) => {
             *count = count.checked_add(delta).ok_or(KernelError::Overflow)?;
         }
-        (
-            AggregateFunctionV1::Count,
-            CallDelta::Count(_),
-            Some(TypedValue::Null(ValueType::Int8)),
-        )
-        | (
-            AggregateFunctionV1::SumInt8,
-            CallDelta::Sum { .. },
-            Some(TypedValue::Null(ValueType::Int8)),
-        ) => {}
+        (function, change, Some(TypedValue::Null(ValueType::Int8)))
+            if accepts_null(function, &*change) => {}
         (
             AggregateFunctionV1::SumInt8,
             CallDelta::Sum { non_null, value },
@@ -121,6 +136,21 @@ pub(crate) fn accumulate(
                 .checked_add(contribution)
                 .ok_or(KernelError::Overflow)?;
         }
+        (AggregateFunctionV1::MinInt8, CallDelta::Min(values), Some(TypedValue::Int8(input)))
+        | (AggregateFunctionV1::MaxInt8, CallDelta::Max(values), Some(TypedValue::Int8(input))) => {
+            let current = values.get(input).copied().unwrap_or(0);
+            let next = current.checked_add(delta).ok_or(KernelError::Overflow)?;
+            if next == 0 {
+                values.remove(input);
+            } else {
+                values.insert(*input, next);
+            }
+        }
+        (
+            AggregateFunctionV1::MinInt8 | AggregateFunctionV1::MaxInt8,
+            CallDelta::Min(_) | CallDelta::Max(_),
+            Some(TypedValue::Null(ValueType::Int8)),
+        ) => {}
         _ => return Err(KernelError::WrongType),
     }
     Ok(())
@@ -147,6 +177,18 @@ pub(crate) fn apply_delta(state: &mut CallState, delta: CallDelta) -> Result<(),
                 *value = 0;
             }
         }
+        (CallState::Min(values), CallDelta::Min(delta))
+        | (CallState::Max(values), CallDelta::Max(delta)) => {
+            for (candidate, change) in delta {
+                let current = values.get(&candidate).copied().unwrap_or(0);
+                let next = checked_nonnegative(current, change)?;
+                if next == 0 {
+                    values.remove(&candidate);
+                } else {
+                    values.insert(candidate, next);
+                }
+            }
+        }
         _ => return Err(KernelError::InvalidState),
     }
     Ok(())
@@ -159,11 +201,16 @@ fn read_i64(payload: &[u8]) -> Result<i64, KernelError> {
         .map_err(|_| KernelError::InvalidState)
 }
 
-fn validate(state: CallState) -> Result<(), KernelError> {
+fn validate(state: &CallState) -> Result<(), KernelError> {
     match state {
-        CallState::Count(value) if value < 0 => Err(KernelError::InvalidState),
-        CallState::Sum { non_null, .. } if non_null < 0 => Err(KernelError::InvalidState),
-        CallState::Sum { non_null: 0, value } if value != 0 => Err(KernelError::InvalidState),
+        CallState::Count(value) if *value < 0 => Err(KernelError::InvalidState),
+        CallState::Sum { non_null, .. } if *non_null < 0 => Err(KernelError::InvalidState),
+        CallState::Sum { non_null: 0, value } if *value != 0 => Err(KernelError::InvalidState),
+        CallState::Min(values) | CallState::Max(values)
+            if values.values().any(|count| *count <= 0) =>
+        {
+            Err(KernelError::InvalidState)
+        }
         _ => Ok(()),
     }
 }
@@ -174,5 +221,55 @@ fn checked_nonnegative(value: i64, delta: i64) -> Result<i64, KernelError> {
         Err(KernelError::Underflow)
     } else {
         Ok(next)
+    }
+}
+
+fn accepts_null(function: AggregateFunctionV1, change: &CallDelta) -> bool {
+    matches!(
+        (function, change),
+        (AggregateFunctionV1::Count, CallDelta::Count(_))
+            | (AggregateFunctionV1::SumInt8, CallDelta::Sum { .. })
+            | (AggregateFunctionV1::MinInt8, CallDelta::Min(_))
+            | (AggregateFunctionV1::MaxInt8, CallDelta::Max(_))
+    )
+}
+
+pub(crate) fn decode_extrema<'a>(
+    function: AggregateFunctionV1,
+    entries: impl Iterator<Item = &'a crate::StateEntry>,
+) -> Result<CallState, KernelError> {
+    let mut values = BTreeMap::new();
+    for entry in entries {
+        let Some(TypedValue::Int8(candidate)) = entry.key.item_key.as_ref() else {
+            return Err(KernelError::InvalidState);
+        };
+        let Some(state) = &entry.state else {
+            return Err(KernelError::InvalidState);
+        };
+        if state.codec_version != AGGREGATE_STATE_CODEC_VERSION {
+            return Err(KernelError::InvalidState);
+        }
+        let multiplicity = i64::from_be_bytes(
+            state
+                .payload
+                .as_slice()
+                .try_into()
+                .map_err(|_| KernelError::InvalidState)?,
+        );
+        if multiplicity <= 0 || values.insert(*candidate, multiplicity).is_some() {
+            return Err(KernelError::InvalidState);
+        }
+    }
+    match function {
+        AggregateFunctionV1::MinInt8 => Ok(CallState::Min(values)),
+        AggregateFunctionV1::MaxInt8 => Ok(CallState::Max(values)),
+        _ => Err(KernelError::InvalidState),
+    }
+}
+
+pub(crate) fn encode_extreme_value(multiplicity: i64) -> EncodedOperatorState {
+    EncodedOperatorState {
+        codec_version: AGGREGATE_STATE_CODEC_VERSION,
+        payload: multiplicity.to_be_bytes().to_vec(),
     }
 }

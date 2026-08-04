@@ -119,7 +119,7 @@ fn lower_aggregate(
     };
     let argument = match (name.value.as_str(), argument) {
         ("count", FunctionArgExpr::Wildcard) => crate::AggregateArgument::Star,
-        ("count" | "sum", FunctionArgExpr::Expr(expression)) => {
+        ("count" | "sum" | "min" | "max", FunctionArgExpr::Expr(expression)) => {
             let input = lower_expression(expression, context, budget, 2)?;
             if !matches!(input, UnboundExpression::Column(_)) {
                 return Err(FrontendError::unsupported(

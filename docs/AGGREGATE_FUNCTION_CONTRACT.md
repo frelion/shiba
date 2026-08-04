@@ -14,7 +14,14 @@ M16.4 subsequently proves the first multi-call use of this ABI: one Aggregate
 node carries ordered CountStar/Count(nullable-int8)/SumInt8 calls and one
 complete wide result row through Binder, Compiler, bootstrap, live Apply/ACK,
 replay and rebuild on PostgreSQL 17.10 and 18.4. This does not claim the
-MIN/MAX or HAVING slices that remain later M16 work.
+HAVING slice that remains later M16 work.
+
+M16.5 now proves production MinInt8/MaxInt8. Their state is an ordered
+per-group multiplicity map stored in the existing graph-node state authority;
+NULL is excluded, duplicate extrema retract one copy at a time, and an empty
+multiset finalizes to typed NULL. The same generic binder/compiler/runtime
+path is exercised through PostgreSQL 17.10/18.4 bootstrap and live I/U/D SQL
+oracles. HAVING and final M16 performance/extensibility closure remain later.
 
 M16 replaces aggregate-kind knowledge outside `shiba-operator` with one stable,
 versioned function ABI and replaces the scalar-or-key/value result assumption
@@ -387,9 +394,10 @@ single Catalog header/row authority, generic ResultDelta persistence and the
 registration/bootstrap/rebuild schema handoff. It deliberately does not yet
 implement the Aggregate Function ABI execution path.
 
-Still unproved after M16.2: Aggregate ABI production dispatch, Min/Max ordered
-state reads, multi-call SQL lowering, HAVING deltas, and final M16 performance
-evidence. Also
+At the M16.2 boundary, Aggregate ABI production dispatch, Min/Max ordered state
+reads, multi-call SQL lowering, HAVING deltas, and final M16 performance
+evidence were still unproved. M16.3--M16.5 subsequently close the first three
+items except HAVING and final performance evidence. Also
 outside M16 are Avg/VarPop/VarSamp/StddevPop/StddevSamp and Numeric exactness,
 Count over non-`int8` expressions, CountDistinct/SumDistinct, BoolAnd/BoolOr,
 percentile/median, multi-key grouping, grouping sets, ordered-set aggregates,
@@ -405,5 +413,6 @@ there is no function registry table, dual codec or compatibility path.
 
 At M16.3 the production result path is generic and wide and CountStar,
 Count(nullable `int8`) and SumInt8 run through the versioned Aggregate ABI.
-The specialized M15 node variants are deleted. This contract does not yet claim
-production MIN/MAX, multi-call SQL aggregation or HAVING.
+The specialized M15 node variants are deleted. M16.4 adds multi-call SQL and
+M16.5 adds production MinInt8/MaxInt8 without changing Runtime or Catalog
+authority; HAVING remains the next slice.

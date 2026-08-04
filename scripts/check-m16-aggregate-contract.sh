@@ -109,6 +109,34 @@ missing_multicall = [marker for marker in required_multicall if marker not in mu
 if missing_multicall:
     raise SystemExit(f"M16.4 multi-call contract markers are missing: {missing_multicall}")
 
+minmax_operator = "\n".join(
+    pathlib.Path(path).read_text()
+    for path in (
+        "crates/shiba-operator/src/aggregate_contract.rs",
+        "crates/shiba-operator/src/aggregate_state.rs",
+        "crates/shiba-operator/src/aggregate_group.rs",
+        "crates/shiba-operator/tests/aggregate_kernel_reference.rs",
+    )
+)
+required_minmax = (
+    "AggregateFunctionV1::MinInt8", "AggregateFunctionV1::MaxInt8",
+    "decode_extrema", "encode_extreme_value", "StatePartition",
+    "extrema_multiplicity_corruption_and_missing_retract_fail_closed",
+    "normalized_net_zero_and_min_retraction_are_exact",
+)
+missing_minmax = [marker for marker in required_minmax if marker not in minmax_operator]
+if missing_minmax:
+    raise SystemExit(f"M16.5 MIN/MAX multiplicity markers are missing: {missing_minmax}")
+
+sql_aggregate_test = pathlib.Path(
+    "crates/shiba-ingress/tests/m15_sql_aggregates.rs"
+).read_text() + pathlib.Path(
+    "crates/shiba-ingress/tests/m15_sql_aggregates/support/scalar.rs"
+).read_text()
+for marker in ("MIN_MAX_SQL", "exercise_min_max", "assert_min_max", "minmax_row"):
+    if marker not in sql_aggregate_test:
+        raise SystemExit(f"M16.5 SQL lifecycle marker is missing: {marker}")
+
 operator = "\n".join(
     path.read_text() for path in pathlib.Path("crates/shiba-operator/src").glob("*.rs")
 )
@@ -155,4 +183,4 @@ if operator_dispatch:
     )
 PY
 
-echo "M16.1 database-free aggregate reference-contract gate passed"
+echo "M16 aggregate ABI, wide-result and MIN/MAX contract gate passed"

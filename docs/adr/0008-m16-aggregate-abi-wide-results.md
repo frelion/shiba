@@ -1,8 +1,8 @@
 # ADR 0008: versioned aggregate ABI and canonical wide results
 
-Status: accepted; canonical wide results landed in M16.2 and the
-Count/CountStar/Sum Aggregate ABI execution landed in M16.3. Multi-call,
-MIN/MAX and HAVING remain M16.4--M16.6.
+Status: accepted; canonical wide results landed in M16.2, Count/CountStar/Sum
+in M16.3, multi-call in M16.4, and exact MinInt8/MaxInt8 in M16.5. HAVING
+remains M16.6.
 
 ## Context
 
@@ -62,12 +62,9 @@ golden vectors, per-function
 reference models, state codec corruption tests, bounded ordered state reads,
 wide schema/row canonical tests and full PG17.10/PG18.4 lifecycle evidence.
 
-M16.1 changes no production behavior. Its 12 database-free, test-only
-reference cases prove the frozen CountStar/Count/Sum/Min/Max, grouped/HAVING,
-codec and bound semantics, but are not production or PostgreSQL evidence.
-Until later M16 slices pass those gates, the specialized M15 path remains the
-latest implemented capability and Min/Max, wide rows and HAVING remain
-unavailable. M16.7 must statically prove
+M16.1 changed no production behavior. Its database-free reference cases are
+supplemented by M16.5 production descriptor, multiplicity, corruption and
+PG17.10/PG18.4 SQL lifecycle evidence. M16.7 must statically prove
 concrete aggregate dispatch is confined to `shiba-operator` and that no
 compatibility codec, registry table or function-aware lifecycle/sink path
 survives.

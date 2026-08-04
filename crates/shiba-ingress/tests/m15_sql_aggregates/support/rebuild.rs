@@ -197,9 +197,9 @@ fn spec(client: &mut Client, old: &GraphFixture, fixtures: &Fixtures) -> Rebuild
             1,
         ),
         target: identity(
-            // Graph 5 is the M16 multi-call fixture in this shared lifecycle
-            // test; keep the rebuild bootstrap identity disjoint from it.
-            old.graph + 2,
+            // Graphs 5 and 6 are the M16 multi-call and extrema fixtures in
+            // this shared lifecycle test; keep this rebuild identity disjoint.
+            old.graph + 4,
             artifact.graph_digest,
             old.source,
             fixtures.target_relation,
@@ -252,7 +252,7 @@ fn multi_spec(client: &mut Client, old: &GraphFixture, fixtures: &Fixtures) -> R
             1,
         ),
         target: identity(
-            7,
+            9,
             artifact.graph_digest,
             old.source,
             fixtures.multi_target_relation,

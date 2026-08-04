@@ -19,6 +19,7 @@ pub(crate) fn state_read_set(
     batch: &DeltaBatch,
 ) -> Result<StateReadSet, KernelError> {
     let mut keys = Vec::new();
+    let mut partitions = Vec::new();
     for spec in specs(graph)? {
         let prepared = prepare(graph, batch, &spec)?;
         let local = crate::aggregate_group::read_set(
@@ -26,8 +27,9 @@ pub(crate) fn state_read_set(
             touched_groups(&spec, &prepared)?.into_values(),
         )?;
         keys.extend(local.keys);
+        partitions.extend(local.partitions);
     }
-    StateReadSet::canonical(keys).map_err(|_| KernelError::InvalidState)
+    StateReadSet::with_partitions(keys, partitions).map_err(|_| KernelError::InvalidState)
 }
 
 pub(crate) fn apply(
@@ -221,7 +223,7 @@ fn output_row(spec: &AggregateSpec, group: &GroupState) -> Result<Option<TypedRo
         return Ok(None);
     }
     let mut values = group.values.clone();
-    values.extend(group.calls.iter().copied().map(aggregate_state::output));
+    values.extend(group.calls.iter().map(aggregate_state::output));
     TypedRow::new(&spec.output_layout, values)
         .map(Some)
         .map_err(|_| KernelError::InvalidTransition)

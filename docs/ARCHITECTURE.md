@@ -15,8 +15,8 @@ Old bytes are rejected rather than reinterpreted. CountStar, Count(nullable
 `int8`) and checked SumInt8 share the same group membership/state transition
 path and complete-row sink. Runtime, Catalog, Ingress, Bootstrap and Rebuild
 remain opaque to function identity and retain the same transaction,
-continuation and ACK authorities. MIN/MAX, multi-call SQL and HAVING remain
-later M16 slices.
+continuation and ACK authorities. M16.4 adds multi-call SQL and M16.5 adds
+MinInt8/MaxInt8 through the same ABI; HAVING remains the next M16 slice.
 
 ## M16.2 canonical wide-result cutover
 
@@ -43,7 +43,8 @@ The fixed scalar/key/value authority and keyed-only sink are removed in the
 same cutover. No second registry, result writer, persistent intermediate delta,
 dual write or compatibility path is introduced. M16.3 now runs Count/CountStar/
 Sum through Generic Aggregate; M16.4 multi-call SQL and Count(expr) use this
-same result authority. MIN/MAX and HAVING remain M16.5--M16.6 work.
+same result authority. M16.5 now proves MinInt8/MaxInt8; HAVING remains the
+M16.6 work.
 
 M15.1 freezes a bounded SQL declaration frontend in
 [SQL_FRONTEND_CONTRACT.md](SQL_FRONTEND_CONTRACT.md) and

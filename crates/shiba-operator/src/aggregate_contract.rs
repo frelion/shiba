@@ -16,6 +16,8 @@ pub enum AggregateFunctionV1 {
     CountStar,
     Count,
     SumInt8,
+    MinInt8,
+    MaxInt8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -63,6 +65,18 @@ const SUM: AggregateFunctionDescriptor = descriptor(
     true,
     EmptyResultV1::Null(ValueType::Int8),
 );
+const MIN: AggregateFunctionDescriptor = descriptor(
+    AggregateFunctionV1::MinInt8,
+    AggregateInputContract::Nullable(ValueType::Int8),
+    true,
+    EmptyResultV1::Null(ValueType::Int8),
+);
+const MAX: AggregateFunctionDescriptor = descriptor(
+    AggregateFunctionV1::MaxInt8,
+    AggregateInputContract::Nullable(ValueType::Int8),
+    true,
+    EmptyResultV1::Null(ValueType::Int8),
+);
 
 const fn descriptor(
     function: AggregateFunctionV1,
@@ -90,6 +104,8 @@ pub const fn aggregate_function_descriptor(
         AggregateFunctionV1::CountStar => &COUNT_STAR,
         AggregateFunctionV1::Count => &COUNT,
         AggregateFunctionV1::SumInt8 => &SUM,
+        AggregateFunctionV1::MinInt8 => &MIN,
+        AggregateFunctionV1::MaxInt8 => &MAX,
     }
 }
 

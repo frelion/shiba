@@ -25,6 +25,8 @@ fn graph(function_version: u32) -> Result<OperatorGraph, shiba_operator::GraphEr
             field(1, "rows", false),
             field(2, "non_null", false),
             field(3, "total", true),
+            field(4, "minimum", true),
+            field(5, "maximum", true),
         ],
         vec![],
     )
@@ -34,6 +36,8 @@ fn graph(function_version: u32) -> Result<OperatorGraph, shiba_operator::GraphEr
         vec![
             TypedValue::Int8(0),
             TypedValue::Int8(0),
+            TypedValue::Null(ValueType::Int8),
+            TypedValue::Null(ValueType::Int8),
             TypedValue::Null(ValueType::Int8),
         ],
     )
@@ -77,6 +81,18 @@ fn graph(function_version: u32) -> Result<OperatorGraph, shiba_operator::GraphEr
                             AggregateFunctionV1::SumInt8,
                             Some(Expression::Column { slot: 0 }),
                         ),
+                        call(
+                            4,
+                            function_version,
+                            AggregateFunctionV1::MinInt8,
+                            Some(Expression::Column { slot: 0 }),
+                        ),
+                        call(
+                            5,
+                            function_version,
+                            AggregateFunctionV1::MaxInt8,
+                            Some(Expression::Column { slot: 0 }),
+                        ),
                     ],
                 },
             },
@@ -85,7 +101,7 @@ fn graph(function_version: u32) -> Result<OperatorGraph, shiba_operator::GraphEr
                 input: NodeInput::Node(node(1)),
                 state_contract: None,
                 kind: OperatorNodeKind::Materialize {
-                    field_slots: vec![0, 1, 2],
+                    field_slots: vec![0, 1, 2, 3, 4],
                     output: OutputContract::new(schema, Some(initial)).unwrap(),
                 },
             },
@@ -161,6 +177,21 @@ fn apply(
                 key: key.clone(),
                 state: store.get(key).cloned(),
             })
+            .chain(
+                store
+                    .iter()
+                    .filter(|(key, _)| {
+                        read_set.partitions.iter().any(|partition| {
+                            partition.node_id == key.node_id
+                                && partition.namespace == key.namespace
+                                && partition.partition_key == key.partition_key
+                        })
+                    })
+                    .map(|(key, state)| StateEntry {
+                        key: key.clone(),
+                        state: Some(state.clone()),
+                    }),
+            )
             .collect(),
     )
     .map_err(|_| KernelError::InvalidState)?;
@@ -191,6 +222,16 @@ fn expected(rows: &[Option<i64>]) -> Vec<TypedValue> {
         } else {
             TypedValue::Int8(values.iter().sum())
         },
+        values
+            .iter()
+            .min()
+            .copied()
+            .map_or(TypedValue::Null(ValueType::Int8), TypedValue::Int8),
+        values
+            .iter()
+            .max()
+            .copied()
+            .map_or(TypedValue::Null(ValueType::Int8), TypedValue::Int8),
     ]
 }
 
@@ -216,10 +257,8 @@ fn shared_production_harness_proves_iud_and_fixed_seed_differential() {
             let index = usize::try_from(seed).unwrap() % rows.len();
             (Some(rows.swap_remove(index)), None)
         };
-        assert_eq!(
-            apply(&graph, &mut store, &changes(&graph, ordinal, &[change])).unwrap(),
-            expected(&rows)
-        );
+        let actual = apply(&graph, &mut store, &changes(&graph, ordinal, &[change]));
+        assert_eq!(actual.unwrap(), expected(&rows));
     }
 }
 
@@ -244,6 +283,29 @@ fn versions_and_corrupt_state_fail_closed() {
 }
 
 #[test]
+fn extrema_multiplicity_corruption_and_missing_retract_fail_closed() {
+    let graph = graph(1).unwrap();
+    let insert = changes(&graph, 1, &[(None, Some(Some(7)))]);
+    let delete = changes(&graph, 2, &[(Some(Some(7)), None)]);
+    let mut store = Store::new();
+    apply(&graph, &mut store, &insert).unwrap();
+    let key = store
+        .keys()
+        .find(|key| key.namespace == 4)
+        .cloned()
+        .unwrap();
+    store.get_mut(&key).unwrap().payload = 0_i64.to_be_bytes().to_vec();
+    assert_eq!(
+        apply(&graph, &mut store, &delete),
+        Err(KernelError::InvalidState)
+    );
+    assert_eq!(
+        apply(&graph, &mut Store::new(), &delete),
+        Err(KernelError::Underflow)
+    );
+}
+
+#[test]
 fn normalized_net_zero_and_min_retraction_are_exact() {
     let graph = graph(1).unwrap();
     let mut store = Store::new();
@@ -264,7 +326,9 @@ fn normalized_net_zero_and_min_retraction_are_exact() {
         vec![
             TypedValue::Int8(1),
             TypedValue::Int8(1),
-            TypedValue::Int8(i64::MAX)
+            TypedValue::Int8(i64::MAX),
+            TypedValue::Int8(i64::MAX),
+            TypedValue::Int8(i64::MAX),
         ]
     );
     assert_eq!(store, before);
@@ -286,7 +350,9 @@ fn normalized_net_zero_and_min_retraction_are_exact() {
         vec![
             TypedValue::Int8(0),
             TypedValue::Int8(0),
-            TypedValue::Null(ValueType::Int8)
+            TypedValue::Null(ValueType::Int8),
+            TypedValue::Null(ValueType::Int8),
+            TypedValue::Null(ValueType::Int8),
         ]
     );
 }

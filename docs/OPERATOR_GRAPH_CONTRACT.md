@@ -19,7 +19,8 @@ scalar and keyed outputs share generic ResultDelta mutations. Runtime/Catalog
 persist these bytes without node/function dispatch. The fixed key/value delta
 and output-shape contracts are deleted. M16.3 subsequently replaces concrete
 Count/Sum nodes with one versioned Aggregate node for CountStar, Count and Sum;
-MIN/MAX, multi-call SQL and HAVING remain later slices.
+Multi-call SQL and MinInt8/MaxInt8 are implemented by M16.4/M16.5; HAVING
+remains a later slice.
 
 M14.2 implements the typed stateless graph path. M14.3 adds the sole generic
 keyed-state authority plus KeyBy, GroupedCount and GroupedSumInt8. Runtime uses
