@@ -20,7 +20,7 @@ impl SourceLayout {
         let rows = transaction.query(
             "SELECT binding.address_classid::bigint,
                     binding.address_objid::bigint, binding.address_objsubid,
-                    attribute.atttypid::bigint
+                    attribute.atttypid::bigint, NOT attribute.attnotnull
              FROM shiba_internal.source_binding AS binding
              JOIN pg_catalog.pg_attribute AS attribute
                ON attribute.attrelid = binding.address_objid
@@ -50,6 +50,7 @@ impl SourceLayout {
                 Ok(ColumnBinding {
                     address,
                     value_type,
+                    nullable: row.get(4),
                 })
             })
             .collect::<Result<Vec<_>, M2Error>>()?;

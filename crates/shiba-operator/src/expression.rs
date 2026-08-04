@@ -27,6 +27,34 @@ pub enum Expression {
 }
 
 impl Expression {
+    /// Returns whether this expression may produce a typed NULL.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid input slots and malformed expression layouts.
+    pub fn nullable(&self, layout: &TypedLayout) -> Result<bool, ExpressionError> {
+        let child = |expression: &Self| expression.nullable(layout);
+        Ok(match self {
+            Self::Column { slot } => *layout
+                .nullable
+                .get(usize::from(*slot))
+                .ok_or(ExpressionError::InvalidSlot)?,
+            Self::Int8Literal { .. } | Self::IsNull { .. } => false,
+            Self::NullLiteral { .. } => true,
+            Self::Equal { left, right }
+            | Self::NotEqual { left, right }
+            | Self::Less { left, right }
+            | Self::LessEqual { left, right }
+            | Self::Greater { left, right }
+            | Self::GreaterEqual { left, right }
+            | Self::And { left, right }
+            | Self::Or { left, right }
+            | Self::Add { left, right }
+            | Self::Subtract { left, right } => child(left)? || child(right)?,
+            Self::Not { input } => child(input)?,
+        })
+    }
+
     /// Validates all slots and operand/result types against one input layout.
     ///
     /// # Errors

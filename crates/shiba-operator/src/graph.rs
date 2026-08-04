@@ -38,6 +38,7 @@ impl NodeId {
 pub struct ColumnBinding {
     pub address: ObjectAddress,
     pub value_type: ValueType,
+    pub nullable: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

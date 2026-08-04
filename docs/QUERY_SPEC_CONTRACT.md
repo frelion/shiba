@@ -58,6 +58,15 @@ the existing registration writer.
 
 ## Authority
 
+## Admission hardening
+
+QuerySpec admission shares the operator HAVING node/depth/boolean limits and
+rejects unsupported Aggregate topology before compilation. Result fields must
+have unique bounded names, and key ordinals are the complete ordered prefix
+`1..=k`; compiler layout metadata must agree with every declared field's
+nullability. These checks are boundary validation, not separate authorities,
+and malformed declarations never reach Runtime.
+
 QuerySpecV1 is the sole durable declaration authority.
 OperatorGraph is the sole Runtime execution authority.
 SQL text is non-authoritative provenance.

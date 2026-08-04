@@ -20,6 +20,19 @@ fn calls() -> Vec<AggregateCall> {
     ]
 }
 
+fn boolean_tree(level: usize) -> HavingExpression {
+    if level == 0 {
+        HavingExpression::IsNull {
+            input: Box::new(HavingExpression::Call { ordinal: 1 }),
+        }
+    } else {
+        HavingExpression::And {
+            left: Box::new(boolean_tree(level - 1)),
+            right: Box::new(boolean_tree(level - 1)),
+        }
+    }
+}
+
 #[test]
 fn having_three_valued_visibility_transitions_are_deterministic() {
     let predicate = HavingExpression::And {
@@ -77,18 +90,6 @@ fn having_rejects_depth_node_and_boolean_budget_before_evaluation() {
     }
     assert!(many.validate(&calls()).is_err());
 
-    fn boolean_tree(level: usize) -> HavingExpression {
-        if level == 0 {
-            HavingExpression::IsNull {
-                input: Box::new(HavingExpression::Call { ordinal: 1 }),
-            }
-        } else {
-            HavingExpression::And {
-                left: Box::new(boolean_tree(level - 1)),
-                right: Box::new(boolean_tree(level - 1)),
-            }
-        }
-    }
     let booleans = boolean_tree(6);
     assert_eq!(booleans.validate(&calls()), Err(HavingError::BooleanLimit));
 }

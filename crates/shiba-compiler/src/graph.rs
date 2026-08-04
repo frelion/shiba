@@ -84,7 +84,7 @@ pub fn compile_query_with_optional_identities(
             .iter()
             .map(|input| compile_input(input, descriptors, &ports, &layouts))
             .collect::<Result<Vec<_>, _>>()?;
-        let (input, kind, output_types, stateful) =
+        let (input, kind, output_types, nullable, stateful) =
             crate::node_compile::compile(&declaration.operation, &inputs, indexes, descriptors)?;
         if declaration.state_codec_version != stateful.then_some(1) {
             return Err(CompilerError::InvalidSpec);
@@ -95,7 +95,7 @@ pub fn compile_query_with_optional_identities(
             state_contract: stateful.then_some(StateContract { codec_version: 1 }),
             kind,
         });
-        layouts.push(layout(index + 1, output_types)?);
+        layouts.push(layout(index + 1, output_types, nullable)?);
     }
 
     for (index, result) in spec.results.iter().enumerate() {
@@ -162,11 +162,18 @@ fn result_contract(
                 .value_types
                 .get(usize::from(field.value_slot))
                 .ok_or(CompilerError::WrongType)?;
+            let nullable = *layout
+                .nullable
+                .get(usize::from(field.value_slot))
+                .ok_or(CompilerError::WrongType)?;
+            if nullable != field.nullable {
+                return Err(CompilerError::WrongType);
+            }
             Ok(ResultField {
                 ordinal: u16::try_from(index + 1).map_err(|_| CompilerError::GraphEncoding)?,
                 name: field.name.clone(),
                 value_type,
-                nullable: field.nullable,
+                nullable,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -221,8 +228,13 @@ fn node_id(value: usize) -> Result<NodeId, CompilerError> {
     Ok(NodeId::new(value))
 }
 
-fn layout(ordinal: usize, value_types: Vec<ValueType>) -> Result<TypedLayout, CompilerError> {
+fn layout(
+    ordinal: usize,
+    value_types: Vec<ValueType>,
+    nullable: Vec<bool>,
+) -> Result<TypedLayout, CompilerError> {
     let mut identity = [0; 32];
     identity[..8].copy_from_slice(&u64::try_from(ordinal).unwrap_or(u64::MAX).to_be_bytes());
-    TypedLayout::new(identity, value_types).map_err(|_| CompilerError::GraphEncoding)
+    TypedLayout::with_nullability(identity, value_types, nullable)
+        .map_err(|_| CompilerError::GraphEncoding)
 }

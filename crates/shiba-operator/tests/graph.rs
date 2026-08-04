@@ -21,6 +21,7 @@ fn binding(sub_id: i32) -> ColumnBinding {
             sub_id,
         },
         value_type: ValueType::Int8,
+        nullable: sub_id != 1,
     }
 }
 
@@ -120,7 +121,12 @@ fn graph(predicate: Expression, compute: bool) -> OperatorGraph {
 
 #[test]
 fn expressions_use_three_valued_logic_and_checked_arithmetic() {
-    let layout = TypedLayout::new([7; 32], vec![ValueType::Int8, ValueType::Bool]).unwrap();
+    let layout = TypedLayout::with_nullability(
+        [7; 32],
+        vec![ValueType::Int8, ValueType::Bool],
+        vec![true, false],
+    )
+    .unwrap();
     let row = TypedRow::new(
         &layout,
         vec![TypedValue::Null(ValueType::Int8), TypedValue::Bool(false)],

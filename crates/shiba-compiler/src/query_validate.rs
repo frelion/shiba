@@ -8,7 +8,7 @@ use crate::{
 
 const MAX_QUERY_NODES: usize = 31;
 const MAX_COMPILED_NODES: usize = 32;
-const MAX_IDENTIFIER_BYTES: usize = 63;
+const MAX_IDENTIFIER_BYTES: usize = shiba_operator::MAX_RESULT_IDENTIFIER_BYTES;
 const MAX_EXPRESSION_NODES: usize = 256;
 const MAX_EXPRESSION_DEPTH: usize = 32;
 const MAX_BOOLEAN_TERMS: usize = 64;
@@ -72,6 +72,11 @@ fn validate_references<E: de::Error>(
                 .fields
                 .iter()
                 .any(|field| field.name.is_empty() || field.name.len() > MAX_IDENTIFIER_BYTES)
+            || result.fields.iter().enumerate().any(|(index, field)| {
+                result.fields[..index]
+                    .iter()
+                    .any(|other| other.name == field.name)
+            })
             || result
                 .key_ordinals
                 .iter()
@@ -80,6 +85,11 @@ fn validate_references<E: de::Error>(
                 .key_ordinals
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
+            || result
+                .key_ordinals
+                .iter()
+                .enumerate()
+                .any(|(index, ordinal)| usize::from(*ordinal) != index + 1)
         {
             return Err(E::custom("invalid result input reference"));
         }
@@ -236,6 +246,7 @@ fn validate_having_inner<E: de::Error>(
     nodes: &mut usize,
     boolean_terms: &mut usize,
 ) -> Result<HavingType, E> {
+    use QueryHavingExpressionV1 as H;
     *nodes = nodes
         .checked_add(1)
         .ok_or_else(|| E::custom("HAVING node overflow"))?;
@@ -245,7 +256,6 @@ fn validate_having_inner<E: de::Error>(
     if *nodes > shiba_operator::MAX_HAVING_NODES {
         return Err(E::custom("HAVING node bound exceeded"));
     }
-    use QueryHavingExpressionV1 as H;
     match expression {
         H::Call { ordinal } if *ordinal != 0 && usize::from(*ordinal) <= calls => {
             Ok(HavingType::Int8)

@@ -9,6 +9,7 @@ use crate::ValueType;
 pub const RESULT_SCHEMA_FORMAT_VERSION: u32 = 1;
 pub const MAX_RESULT_FIELDS: usize = 16;
 pub const MAX_RESULT_SCHEMA_BYTES: usize = 16 * 1024;
+pub const MAX_RESULT_IDENTIFIER_BYTES: usize = 63;
 const RESULT_SCHEMA_DOMAIN: &[u8] = b"shiba.result.schema.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -110,13 +111,28 @@ fn validate_fields(fields: &[ResultField], key_ordinals: &[u16]) -> Result<(), R
         return Err(ResultError::FieldLimit);
     }
     for (index, field) in fields.iter().enumerate() {
-        if usize::from(field.ordinal) != index + 1 || field.name.is_empty() {
+        if usize::from(field.ordinal) != index + 1
+            || field.name.is_empty()
+            || field.name.len() > MAX_RESULT_IDENTIFIER_BYTES
+            || field.name.contains('\0')
+        {
             return Err(ResultError::InvalidSchema);
         }
     }
+    if fields
+        .iter()
+        .enumerate()
+        .any(|(index, field)| fields[..index].iter().any(|other| other.name == field.name))
+    {
+        return Err(ResultError::InvalidSchema);
+    }
     let mut keys = BTreeSet::new();
-    for ordinal in key_ordinals {
+    for (index, ordinal) in key_ordinals.iter().enumerate() {
+        let expected = u16::try_from(index + 1).map_err(|_| ResultError::InvalidSchema)?;
         if *ordinal == 0 || usize::from(*ordinal) > fields.len() || !keys.insert(*ordinal) {
+            return Err(ResultError::InvalidSchema);
+        }
+        if *ordinal != expected {
             return Err(ResultError::InvalidSchema);
         }
     }

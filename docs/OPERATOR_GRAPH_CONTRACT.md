@@ -57,6 +57,13 @@ mismatch fail closed. Concrete node dispatch remains private to
 `shiba-operator`. Runtime, Catalog SQL, Ingress, Bootstrap and Rebuild never
 branch on a node kind.
 
+Admission is intentionally narrower than a general DAG executor. An Aggregate
+may consume only Source → Filter/Project/Compute/KeyBy input and must have one
+and only one direct Materialize child. Aggregate-to-Aggregate edges and
+Aggregate fan-out fail during Compiler and OperatorGraph construction, before
+Runtime state or result persistence. ResultSchema field names, key ordinals,
+and source-derived nullability are validated at the same boundary.
+
 The M14.6 schema cutover replaces the flat definition authority; it does not
 mirror it. Likewise, the graph-scoped continuation replaces the source-scoped
 continuation in the same cutover. The two forms never coexist as production

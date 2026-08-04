@@ -1115,3 +1115,14 @@ It emits exactly one performance record for each server version. The M16.7
 static gate additionally verifies that concrete aggregate ABI dispatch is
 absent from Runtime, Ingress, Catalog SQL, Bootstrap, Rebuild and Result Sink,
 and remains confined to operator aggregate modules.
+# M16 admission hardening
+
+The M16 static and unit gates must exercise the shared HAVING node/depth/
+boolean budgets, compiler and graph rejection of unsupported Aggregate
+topologies, and the common aggregate work budget. Limit and limit-plus-one
+cases are checked before maps/read sets/extrema state are built. Result-schema
+tests cover duplicate names, 63-byte identifiers, ordered complete key
+ordinals, canonical digest mismatch, and source-derived nullability. The
+accepted aggregate subset remains strictly Int8: AVG, variance/stddev,
+Numeric/Decimal, DISTINCT, CTEs, window functions, and general DAG execution
+are rejected and remain outside M16.

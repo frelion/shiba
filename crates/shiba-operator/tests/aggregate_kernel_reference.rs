@@ -53,6 +53,7 @@ fn graph(function_version: u32) -> Result<OperatorGraph, shiba_operator::GraphEr
                     sub_id: 1,
                 },
                 value_type: ValueType::Int8,
+                nullable: true,
             }],
             identity_index: Some(ObjectAddress {
                 class_id: 1_259,

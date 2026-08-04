@@ -134,12 +134,13 @@ pub(crate) fn layout_graph(
             node_output_types(node, input)?
         };
         if let Some(types) = node_types {
+            let nullability = node_output_nullability(graph, node, input)?;
             let output = if matches!(node.kind, OperatorNodeKind::Filter { .. }) {
                 input.clone()
             } else {
                 let bytes = serde_json::to_vec(&(input.identity, node.node_id, &types))
                     .map_err(|_| GraphError::Codec)?;
-                TypedLayout::new(hash(&bytes), types)?
+                TypedLayout::with_nullability(hash(&bytes), types, nullability)?
             };
             layouts.insert(node.node_id, output);
         }
@@ -213,12 +214,90 @@ fn node_output_types(
                     .zip(&output.schema.fields)
                     .all(|(slot, field)| {
                         input.value_types.get(usize::from(*slot)) == Some(&field.value_type)
+                            && input.nullable.get(usize::from(*slot)) == Some(&field.nullable)
                     });
             if !valid {
                 return Err(GraphError::WrongType);
             }
             None
         }
+    })
+}
+
+fn node_output_nullability(
+    graph: &CanonicalGraph,
+    node: &OperatorNode,
+    input: &TypedLayout,
+) -> Result<Vec<bool>, GraphError> {
+    Ok(match &node.kind {
+        OperatorNodeKind::Filter { .. } => input.nullable.clone(),
+        OperatorNodeKind::Project { expressions } => expressions
+            .iter()
+            .map(|expression| {
+                expression
+                    .nullable(input)
+                    .map_err(|_| GraphError::WrongType)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        OperatorNodeKind::Compute { expressions } => {
+            let mut values = input.nullable.clone();
+            values.extend(
+                expressions
+                    .iter()
+                    .map(|expression| {
+                        expression
+                            .nullable(input)
+                            .map_err(|_| GraphError::WrongType)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            values
+        }
+        OperatorNodeKind::KeyBy { key } => {
+            let mut values = input.nullable.clone();
+            values.push(key.nullable(input).map_err(|_| GraphError::WrongType)?);
+            values
+        }
+        OperatorNodeKind::Aggregate {
+            group_expressions,
+            calls,
+            ..
+        } => {
+            let mut values = group_expressions
+                .iter()
+                .map(|expression| {
+                    expression
+                        .nullable(input)
+                        .map_err(|_| GraphError::WrongType)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            values.extend(
+                calls.iter().map(|call| {
+                    crate::aggregate_function_descriptor(call.function).output_nullable
+                }),
+            );
+            values
+        }
+        OperatorNodeKind::InnerJoin {
+            right_source_id,
+            right_payload_slot,
+            ..
+        } => {
+            let right = graph
+                .sources
+                .iter()
+                .find(|source| source.source_id == *right_source_id)
+                .ok_or(GraphError::InvalidTopology)?;
+            vec![
+                false,
+                right
+                    .layout
+                    .get(usize::from(*right_payload_slot))
+                    .map(|binding| binding.nullable)
+                    .ok_or(GraphError::WrongType)?,
+            ]
+        }
+        OperatorNodeKind::Materialize { .. } => Vec::new(),
     })
 }
 
@@ -281,9 +360,10 @@ pub fn source_typed_layout(
     bindings: &[ColumnBinding],
 ) -> Result<TypedLayout, GraphError> {
     let source_bytes = serde_json::to_vec(&(source_id, bindings)).map_err(|_| GraphError::Codec)?;
-    TypedLayout::new(
+    TypedLayout::with_nullability(
         hash(&source_bytes),
         bindings.iter().map(|binding| binding.value_type).collect(),
+        bindings.iter().map(|binding| binding.nullable).collect(),
     )
     .map_err(Into::into)
 }

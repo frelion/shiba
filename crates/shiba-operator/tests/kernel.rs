@@ -128,6 +128,7 @@ fn binding(sub_id: i32) -> ColumnBinding {
             sub_id,
         },
         value_type: ValueType::Int8,
+        nullable: sub_id != 1,
     }
 }
 

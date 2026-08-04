@@ -28,6 +28,7 @@ fn graph(nullable: bool) -> OperatorGraph {
                         sub_id: 1,
                     },
                     value_type: ValueType::Int8,
+                    nullable: false,
                 },
                 ColumnBinding {
                     address: ObjectAddress {
@@ -36,6 +37,7 @@ fn graph(nullable: bool) -> OperatorGraph {
                         sub_id: 2,
                     },
                     value_type: ValueType::Int8,
+                    nullable: true,
                 },
             ],
             identity_index: Some(ObjectAddress {

@@ -5,12 +5,13 @@ use crate::expression::{InputBinding, slot};
 use crate::graph::CompiledInput;
 use crate::{CompilerError, IdentityIndexDescriptor, QueryOperationV1, SourceDescriptor};
 
+#[allow(clippy::type_complexity)]
 pub(crate) fn compile(
     operation: &QueryOperationV1,
     inputs: &[CompiledInput<'_>],
     indexes: &[Option<IdentityIndexDescriptor>],
     descriptors: &[SourceDescriptor],
-) -> Result<(NodeInput, OperatorNodeKind, Vec<ValueType>, bool), CompilerError> {
+) -> Result<(NodeInput, OperatorNodeKind, Vec<ValueType>, Vec<bool>, bool), CompilerError> {
     let QueryOperationV1::InnerJoin {
         left_id,
         left_key,
@@ -70,6 +71,10 @@ pub(crate) fn compile(
             right_payload_slot,
         },
         vec![ValueType::Int8, ValueType::Int8],
+        vec![
+            false,
+            right.layout.nullable[usize::from(right_payload_slot)],
+        ],
         true,
     ))
 }

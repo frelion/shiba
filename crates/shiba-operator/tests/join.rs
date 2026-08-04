@@ -26,6 +26,7 @@ fn binding(object: u32, sub: i32) -> ColumnBinding {
             sub_id: sub,
         },
         value_type: ValueType::Int8,
+        nullable: sub != 1,
     }
 }
 

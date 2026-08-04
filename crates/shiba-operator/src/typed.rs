@@ -90,6 +90,7 @@ impl TypedValue {
 pub struct TypedLayout {
     pub identity: [u8; 32],
     pub value_types: Vec<ValueType>,
+    pub nullable: Vec<bool>,
 }
 
 impl TypedLayout {
@@ -105,10 +106,30 @@ impl TypedLayout {
         if value_types.len() > MAX_ROW_VALUES {
             return Err(TypedError::ValueLimit);
         }
+        let width = value_types.len();
         Ok(Self {
             identity,
             value_types,
+            nullable: vec![false; width],
         })
+    }
+
+    /// Constructs a layout with one nullability bit per value slot.
+    ///
+    /// # Errors
+    ///
+    /// Rejects mismatched widths or other invalid layout bounds.
+    pub fn with_nullability(
+        identity: [u8; 32],
+        value_types: Vec<ValueType>,
+        nullable: Vec<bool>,
+    ) -> Result<Self, TypedError> {
+        if nullable.len() != value_types.len() {
+            return Err(TypedError::LayoutMismatch);
+        }
+        let mut layout = Self::new(identity, value_types)?;
+        layout.nullable = nullable;
+        Ok(layout)
     }
 }
 
@@ -129,8 +150,13 @@ impl TypedRow {
         if values.len() != layout.value_types.len() || values.len() > MAX_ROW_VALUES {
             return Err(TypedError::LayoutMismatch);
         }
-        for (value, expected) in values.iter().zip(&layout.value_types) {
+        for ((value, expected), nullable) in
+            values.iter().zip(&layout.value_types).zip(&layout.nullable)
+        {
             value.validate(*expected)?;
+            if matches!(value, TypedValue::Null(_)) && !nullable {
+                return Err(TypedError::WrongType);
+            }
         }
         Ok(Self {
             layout_identity: layout.identity,
@@ -155,6 +181,11 @@ impl TypedRow {
                 .get(index)
                 .ok_or(TypedError::InvalidSlot)?,
         )?;
+        if matches!(value, TypedValue::Null(_))
+            && !layout.nullable.get(index).copied().unwrap_or(false)
+        {
+            return Err(TypedError::WrongType);
+        }
         Ok(value)
     }
 }

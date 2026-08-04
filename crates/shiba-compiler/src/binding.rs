@@ -37,6 +37,7 @@ pub(crate) fn source_port(
                             });
                         }
                     },
+                    nullable: column.nullable,
                 })
             })
             .collect::<Result<_, _>>()?,

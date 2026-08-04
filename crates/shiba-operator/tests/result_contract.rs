@@ -119,3 +119,23 @@ fn scalar_contract_owns_initial_row_and_singleton_identity() {
     assert!(ResultRowKey::scalar(&schema).unwrap().values.is_empty());
     assert!(OutputContract::new(schema, None).is_err());
 }
+
+#[test]
+fn schema_rejects_duplicate_names_noncanonical_keys_and_long_identifiers() {
+    assert_eq!(
+        ResultSchemaV1::new(
+            vec![field(1, "same", false), field(2, "same", false)],
+            vec![]
+        ),
+        Err(ResultError::InvalidSchema)
+    );
+    assert_eq!(
+        ResultSchemaV1::new(vec![field(1, "a", false), field(2, "b", false)], vec![2]),
+        Err(ResultError::InvalidSchema)
+    );
+    let long = "x".repeat(64);
+    assert_eq!(
+        ResultSchemaV1::new(vec![field(1, &long, false)], vec![]),
+        Err(ResultError::InvalidSchema)
+    );
+}

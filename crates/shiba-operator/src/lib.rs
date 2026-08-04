@@ -58,8 +58,8 @@ pub use plan::{OutputContract, StateContract};
 pub use result_delta::{ResultDelta, ResultMutation, ResultRowKey};
 pub use result_row::{MAX_RESULT_ROW_BYTES, RESULT_ROW_FORMAT_VERSION, TypedResultRowV1};
 pub use result_schema::{
-    MAX_RESULT_FIELDS, MAX_RESULT_SCHEMA_BYTES, RESULT_SCHEMA_FORMAT_VERSION, ResultError,
-    ResultField, ResultSchemaV1,
+    MAX_RESULT_FIELDS, MAX_RESULT_IDENTIFIER_BYTES, MAX_RESULT_SCHEMA_BYTES,
+    RESULT_SCHEMA_FORMAT_VERSION, ResultError, ResultField, ResultSchemaV1,
 };
 pub use state::{
     StateDelta, StateEntry, StateError, StateKey, StateMutation, StatePartition, StateReadSet,

@@ -40,6 +40,25 @@ It does not add `AVG`, `COUNT` over non-`int8` expressions, `DISTINCT`, multiple
 grouping sets, ordered-set aggregates, user-defined aggregates, windows,
 spilling, arbitrary numeric types, or a plugin registry.
 
+## Admission and resource bounds
+
+HAVING is admitted with shared limits `MAX_HAVING_NODES=256`,
+`MAX_HAVING_DEPTH=32`, and `MAX_HAVING_BOOLEAN_TERMS=64`. QuerySpec
+deserialization, SQL frontend validation, compiler lowering, and the pure
+operator validator use the same limits; recursive lowering is never entered
+for an over-limit tree. Aggregate work is bounded before state maps or
+extrema multisets are built: touched groups, exact state keys, partition
+entries, distinct extrema values, state mutations, and estimated transaction
+bytes each have a fixed fail-closed limit shared with Runtime. An over-limit
+transition cannot publish a result, continuation, or ACK.
+
+Result schemas reject duplicate or NUL-containing names, names over 63 bytes,
+and non-contiguous key ordinals. Typed layouts carry source-derived
+nullability, and Materialize admission requires every result field to match
+the layout before a graph can be built. The current graph admission accepts
+only a linear stateless chain into one Aggregate and exactly one direct
+Materialize; aggregate fan-out and Aggregate-to-Aggregate edges are rejected.
+
 ## Authority and ownership
 
 The authority chain is singular:
