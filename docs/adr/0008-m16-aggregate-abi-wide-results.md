@@ -1,8 +1,8 @@
 # ADR 0008: versioned aggregate ABI and canonical wide results
 
 Status: accepted; canonical wide results landed in M16.2, Count/CountStar/Sum
-in M16.3, multi-call in M16.4, and exact MinInt8/MaxInt8 in M16.5. HAVING
-remains M16.6.
+in M16.3, multi-call in M16.4, exact MinInt8/MaxInt8 in M16.5, and restricted
+grouped HAVING in M16.6.
 
 ## Context
 

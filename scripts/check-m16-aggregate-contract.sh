@@ -137,6 +137,27 @@ for marker in ("MIN_MAX_SQL", "exercise_min_max", "assert_min_max", "minmax_row"
     if marker not in sql_aggregate_test:
         raise SystemExit(f"M16.5 SQL lifecycle marker is missing: {marker}")
 
+having_operator = pathlib.Path("crates/shiba-operator/src/having.rs").read_text()
+having_compiler = pathlib.Path("crates/shiba-compiler/src/query_spec.rs").read_text()
+having_frontend = pathlib.Path("crates/shiba-sql-frontend/src/lowering.rs").read_text()
+having_tests = pathlib.Path("crates/shiba-operator/tests/having.rs").read_text()
+having_sql = pathlib.Path(
+    "crates/shiba-ingress/tests/m15_sql_aggregates.rs"
+).read_text() + pathlib.Path(
+    "crates/shiba-ingress/tests/m15_sql_aggregates/support/grouped.rs"
+).read_text()
+for marker, text in (
+    ("HavingExpression", having_operator),
+    ("QueryHavingExpressionV1", having_compiler),
+    ("lower_having", having_frontend),
+    ("having_three_valued_visibility_transitions_are_deterministic", having_tests),
+    ("HAVING_SQL", having_sql),
+    ("exercise_having", having_sql),
+    ("assert_having", having_sql),
+):
+    if marker not in text:
+        raise SystemExit(f"M16.6 HAVING contract marker is missing: {marker}")
+
 operator = "\n".join(
     path.read_text() for path in pathlib.Path("crates/shiba-operator/src").glob("*.rs")
 )
@@ -183,4 +204,4 @@ if operator_dispatch:
     )
 PY
 
-echo "M16 aggregate ABI, wide-result and MIN/MAX contract gate passed"
+echo "M16 aggregate ABI, wide-result, MIN/MAX and HAVING contract gate passed"

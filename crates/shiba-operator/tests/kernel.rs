@@ -116,6 +116,7 @@ fn aggregate(
             function,
             expression,
         }],
+        having: None,
     }
 }
 

@@ -143,6 +143,20 @@ fn lower_aggregate(
     }))
 }
 
+pub(crate) fn lower_aggregate_for_having(
+    function: &Function,
+    context: &LoweringContext<'_>,
+    budget: &mut Budget,
+) -> Result<Aggregate, FrontendError> {
+    match lower_aggregate(function, context, budget)? {
+        SelectExpression::Aggregate(aggregate) => Ok(aggregate),
+        SelectExpression::Expression(_) => Err(FrontendError::unsupported(
+            ErrorCode::UnsupportedSyntax,
+            context.map.span(function.span()),
+        )),
+    }
+}
+
 pub(crate) fn lower_group_by(
     group_by: &GroupByExpr,
     context: &LoweringContext<'_>,
@@ -178,6 +192,7 @@ pub(crate) fn validate_shape(
     projection: &[UnboundSelectItem],
     group: Option<&UnboundExpression>,
     join: Option<&Join>,
+    having: Option<&crate::UnboundHavingExpression>,
     span: Span,
 ) -> Result<(), FrontendError> {
     let aggregates = projection
@@ -186,6 +201,7 @@ pub(crate) fn validate_shape(
         .count();
     let valid = if join.is_some() {
         group.is_none()
+            && having.is_none()
             && aggregates == 0
             && projection.len() == 2
             && matches!(&projection[0].expression, SelectExpression::Expression(UnboundExpression::Column(column)) if column.source == 0)

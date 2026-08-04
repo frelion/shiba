@@ -63,6 +63,11 @@ pub(crate) fn grouped_nodes(
                 .enumerate()
                 .map(|(index, call)| query_call_grouped(call, index, &slots, query.span))
                 .collect::<Result<Vec<_>, _>>()?,
+            having: query
+                .having
+                .as_ref()
+                .map(|value| crate::bind_having::bind(value, calls, source))
+                .transpose()?,
         },
     });
     Ok(nodes)

@@ -13,15 +13,15 @@ ACK and bounded SQL evidence remains unchanged.
 M16.4 subsequently proves the first multi-call use of this ABI: one Aggregate
 node carries ordered CountStar/Count(nullable-int8)/SumInt8 calls and one
 complete wide result row through Binder, Compiler, bootstrap, live Apply/ACK,
-replay and rebuild on PostgreSQL 17.10 and 18.4. This does not claim the
-HAVING slice that remains later M16 work.
+replay and rebuild on PostgreSQL 17.10 and 18.4.
 
 M16.5 now proves production MinInt8/MaxInt8. Their state is an ordered
 per-group multiplicity map stored in the existing graph-node state authority;
 NULL is excluded, duplicate extrema retract one copy at a time, and an empty
 multiset finalizes to typed NULL. The same generic binder/compiler/runtime
 path is exercised through PostgreSQL 17.10/18.4 bootstrap and live I/U/D SQL
-oracles. HAVING and final M16 performance/extensibility closure remain later.
+oracles. M16.6 now adds restricted grouped HAVING visibility transitions;
+final M16 performance/extensibility closure remains later.
 
 M16 replaces aggregate-kind knowledge outside `shiba-operator` with one stable,
 versioned function ABI and replaces the scalar-or-key/value result assumption
@@ -413,6 +413,6 @@ there is no function registry table, dual codec or compatibility path.
 
 At M16.3 the production result path is generic and wide and CountStar,
 Count(nullable `int8`) and SumInt8 run through the versioned Aggregate ABI.
-The specialized M15 node variants are deleted. M16.4 adds multi-call SQL and
-M16.5 adds production MinInt8/MaxInt8 without changing Runtime or Catalog
-authority; HAVING remains the next slice.
+The specialized M15 node variants are deleted. M16.4 adds multi-call SQL,
+M16.5 adds production MinInt8/MaxInt8, and M16.6 adds grouped HAVING without
+changing Runtime or Catalog authority.

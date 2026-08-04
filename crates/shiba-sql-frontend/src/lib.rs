@@ -9,10 +9,12 @@ mod bind_aggregate;
 mod bind_aggregate_nodes;
 mod bind_aggregate_support;
 mod bind_expression;
+mod bind_having;
 mod bind_join;
 mod bounds;
 mod error;
 mod expression;
+mod having_ast;
 mod lowering;
 mod parser;
 mod relation;
@@ -24,4 +26,5 @@ pub use ast::{
 };
 pub use bind::{ResolvedSource, bind_query};
 pub use error::{ErrorClass, ErrorCode, FrontendError, Span};
+pub use having_ast::UnboundHavingExpression;
 pub use parser::parse_sql;

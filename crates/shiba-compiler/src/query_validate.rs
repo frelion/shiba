@@ -2,8 +2,8 @@ use serde::de;
 use shiba_protocol::SourceId;
 
 use crate::{
-    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryInputV1, QueryNodeV1,
-    QueryOperationV1, QueryResultV1, QuerySelectorV1,
+    QUERY_SPEC_VERSION, QueryExpressionV1, QueryFieldV1, QueryHavingExpressionV1, QueryInputV1,
+    QueryNodeV1, QueryOperationV1, QueryResultV1, QuerySelectorV1,
 };
 
 const MAX_QUERY_NODES: usize = 31;
@@ -102,6 +102,7 @@ fn validate_operation<E: de::Error>(
         QueryOperationV1::Aggregate {
             group_expressions,
             calls,
+            having,
         } => {
             if calls.is_empty()
                 || calls.len() > shiba_operator::MAX_AGGREGATE_CALLS
@@ -121,6 +122,14 @@ fn validate_operation<E: de::Error>(
                 })
             {
                 return Err(E::custom("invalid aggregate calls"));
+            }
+            if having.is_some() && group_expressions.is_empty() {
+                return Err(E::custom("scalar HAVING is unsupported"));
+            }
+            if let Some(having) = having
+                && validate_having::<E>(having, calls.len())? != HavingType::Bool
+            {
+                return Err(E::custom("HAVING must be boolean"));
             }
             group_expressions
                 .iter()
@@ -148,6 +157,57 @@ fn validate_operation<E: de::Error>(
         validate_expression::<E>(expression, 1, nodes, boolean_terms)?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HavingType {
+    Int8,
+    Bool,
+}
+
+fn validate_having<E: de::Error>(
+    expression: &QueryHavingExpressionV1,
+    calls: usize,
+) -> Result<HavingType, E> {
+    use QueryHavingExpressionV1 as H;
+    let child = |value: &H| validate_having::<E>(value, calls);
+    match expression {
+        H::Call { ordinal } if *ordinal != 0 && usize::from(*ordinal) <= calls => {
+            Ok(HavingType::Int8)
+        }
+        H::Call { .. } => Err(E::custom("invalid HAVING call")),
+        H::Int8Literal { .. } | H::NullLiteral => Ok(HavingType::Int8),
+        H::Equal { left, right }
+        | H::NotEqual { left, right }
+        | H::Less { left, right }
+        | H::LessEqual { left, right }
+        | H::Greater { left, right }
+        | H::GreaterEqual { left, right } => {
+            if child(left)? == HavingType::Int8 && child(right)? == HavingType::Int8 {
+                Ok(HavingType::Bool)
+            } else {
+                Err(E::custom("invalid HAVING comparison"))
+            }
+        }
+        H::IsNull { input } => {
+            child(input)?;
+            Ok(HavingType::Bool)
+        }
+        H::And { left, right } | H::Or { left, right } => {
+            if child(left)? == HavingType::Bool && child(right)? == HavingType::Bool {
+                Ok(HavingType::Bool)
+            } else {
+                Err(E::custom("invalid HAVING boolean"))
+            }
+        }
+        H::Not { input } => {
+            if child(input)? == HavingType::Bool {
+                Ok(HavingType::Bool)
+            } else {
+                Err(E::custom("invalid HAVING negation"))
+            }
+        }
+    }
 }
 
 fn validate_expression<E: de::Error>(

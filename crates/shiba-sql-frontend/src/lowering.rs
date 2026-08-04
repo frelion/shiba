@@ -1,11 +1,17 @@
-use sqlparser::ast::{Expr, Query, Select, SelectFlavor, SelectItem, Spanned, Statement};
+use sqlparser::ast::{
+    BinaryOperator as SqlBinary, Expr, Query, Select, SelectFlavor, SelectItem, Spanned, Statement,
+    UnaryOperator as SqlUnary, Value,
+};
 
 use crate::bounds::{Budget, MAX_PLAIN_PROJECTION, MAX_PROJECTION, MAX_SOURCES};
 use crate::expression::lower_expression;
 use crate::parser::SourceMap;
 use crate::relation::{LoweringContext, lower_join, sources};
 use crate::select_lower::{lower_group_by, lower_projection, validate_shape};
-use crate::{ErrorCode, FrontendError, Span, UnboundQuery};
+use crate::{
+    BinaryOperator, ErrorCode, FrontendError, Span, UnaryOperator, UnboundHavingExpression,
+    UnboundQuery,
+};
 
 pub(crate) fn lower(
     statement: Statement,
@@ -93,13 +99,25 @@ fn lower_select(
         .map(|value| lower_expression(value, &context, &mut budget, 1))
         .transpose()?;
     let group_by = lower_group_by(&select.group_by, &context, &mut budget)?;
-    validate_shape(&projection, group_by.as_ref(), join.as_ref(), query_span)?;
+    let having = select
+        .having
+        .as_ref()
+        .map(|value| lower_having(value, &context, &mut budget))
+        .transpose()?;
+    validate_shape(
+        &projection,
+        group_by.as_ref(),
+        join.as_ref(),
+        having.as_ref(),
+        query_span,
+    )?;
     Ok(UnboundQuery {
         sources,
         join,
         projection,
         selection,
         group_by,
+        having,
         span: query_span,
     })
 }
@@ -118,7 +136,6 @@ fn reject_extensions(select: &Select, map: &SourceMap<'_>) -> Result<(), Fronten
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
         || !select.sort_by.is_empty()
-        || select.having.is_some()
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.window_before_qualify
@@ -131,5 +148,78 @@ fn reject_extensions(select: &Select, map: &SourceMap<'_>) -> Result<(), Fronten
         ))
     } else {
         Ok(())
+    }
+}
+
+fn lower_having(
+    expression: &Expr,
+    context: &LoweringContext<'_>,
+    budget: &mut Budget,
+) -> Result<UnboundHavingExpression, FrontendError> {
+    let span = context.map.span(expression.span());
+    if let Expr::Nested(input) = expression {
+        return lower_having(input, context, budget);
+    }
+    budget.expression(1, span)?;
+    match expression {
+        Expr::Function(function) => Ok(UnboundHavingExpression::Aggregate(
+            crate::select_lower::lower_aggregate_for_having(function, context, budget)?,
+        )),
+        Expr::Value(value) => match &value.value {
+            Value::Number(value, false) => value
+                .parse::<i64>()
+                .map(|value| UnboundHavingExpression::Int8(value, span))
+                .map_err(|_| FrontendError::unsupported(ErrorCode::UnsupportedSyntax, span)),
+            Value::Null => Ok(UnboundHavingExpression::Null(span)),
+            _ => Err(FrontendError::unsupported(
+                ErrorCode::UnsupportedSyntax,
+                span,
+            )),
+        },
+        Expr::UnaryOp {
+            op: SqlUnary::Not,
+            expr,
+        } => Ok(UnboundHavingExpression::Unary {
+            operator: UnaryOperator::Not,
+            input: Box::new(lower_having(expr, context, budget)?),
+            span,
+        }),
+        Expr::IsNull(input) | Expr::IsNotNull(input) => Ok(UnboundHavingExpression::Unary {
+            operator: if matches!(expression, Expr::IsNull(_)) {
+                UnaryOperator::IsNull
+            } else {
+                UnaryOperator::IsNotNull
+            },
+            input: Box::new(lower_having(input, context, budget)?),
+            span,
+        }),
+        Expr::BinaryOp { left, op, right } => {
+            let operator = match op {
+                SqlBinary::Eq => BinaryOperator::Equal,
+                SqlBinary::NotEq => BinaryOperator::NotEqual,
+                SqlBinary::Lt => BinaryOperator::Less,
+                SqlBinary::LtEq => BinaryOperator::LessEqual,
+                SqlBinary::Gt => BinaryOperator::Greater,
+                SqlBinary::GtEq => BinaryOperator::GreaterEqual,
+                SqlBinary::And => BinaryOperator::And,
+                SqlBinary::Or => BinaryOperator::Or,
+                _ => {
+                    return Err(FrontendError::unsupported(
+                        ErrorCode::UnsupportedSyntax,
+                        span,
+                    ));
+                }
+            };
+            Ok(UnboundHavingExpression::Binary {
+                operator,
+                left: Box::new(lower_having(left, context, budget)?),
+                right: Box::new(lower_having(right, context, budget)?),
+                span,
+            })
+        }
+        _ => Err(FrontendError::unsupported(
+            ErrorCode::UnsupportedSyntax,
+            span,
+        )),
     }
 }

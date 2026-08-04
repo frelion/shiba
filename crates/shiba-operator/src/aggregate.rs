@@ -224,6 +224,19 @@ fn output_row(spec: &AggregateSpec, group: &GroupState) -> Result<Option<TypedRo
     }
     let mut values = group.values.clone();
     values.extend(group.calls.iter().map(aggregate_state::output));
+    if let Some(having) = &spec.having {
+        let call_values = group
+            .calls
+            .iter()
+            .map(aggregate_state::output)
+            .collect::<Vec<_>>();
+        if !matches!(
+            having.evaluate(&call_values),
+            Ok(crate::TypedValue::Bool(true))
+        ) {
+            return Ok(None);
+        }
+    }
     TypedRow::new(&spec.output_layout, values)
         .map(Some)
         .map_err(|_| KernelError::InvalidTransition)

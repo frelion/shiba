@@ -1,5 +1,5 @@
 use shiba_operator::{
-    AggregateCall, AggregateInputContract, OperatorNodeKind, ValueType,
+    AggregateCall, AggregateInputContract, HavingExpression, OperatorNodeKind, ValueType,
     aggregate_function_descriptor,
 };
 
@@ -27,9 +27,59 @@ pub(crate) fn compile(
         OperatorNodeKind::Aggregate {
             group_expressions: groups.into_iter().map(|group| group.0).collect(),
             calls,
+            having: None,
         },
         output_types,
     ))
+}
+
+pub(crate) fn compile_having(
+    expression: &crate::QueryHavingExpressionV1,
+) -> Result<HavingExpression, CompilerError> {
+    use crate::QueryHavingExpressionV1 as H;
+    Ok(match expression {
+        H::Call { ordinal } => HavingExpression::Call { ordinal: *ordinal },
+        H::Int8Literal { value } => HavingExpression::Int8Literal { value: *value },
+        H::NullLiteral => HavingExpression::NullLiteral,
+        H::Equal { left, right } => HavingExpression::Equal {
+            left: Box::new(compile_having(left)?),
+            right: Box::new(compile_having(right)?),
+        },
+        H::NotEqual { left, right } => HavingExpression::NotEqual {
+            left: Box::new(compile_having(left)?),
+            right: Box::new(compile_having(right)?),
+        },
+        H::Less { left, right } => HavingExpression::Less {
+            left: Box::new(compile_having(left)?),
+            right: Box::new(compile_having(right)?),
+        },
+        H::LessEqual { left, right } => HavingExpression::LessEqual {
+            left: Box::new(compile_having(left)?),
+            right: Box::new(compile_having(right)?),
+        },
+        H::Greater { left, right } => HavingExpression::Greater {
+            left: Box::new(compile_having(left)?),
+            right: Box::new(compile_having(right)?),
+        },
+        H::GreaterEqual { left, right } => HavingExpression::GreaterEqual {
+            left: Box::new(compile_having(left)?),
+            right: Box::new(compile_having(right)?),
+        },
+        H::IsNull { input } => HavingExpression::IsNull {
+            input: Box::new(compile_having(input)?),
+        },
+        H::And { left, right } => HavingExpression::And {
+            left: Box::new(compile_having(left)?),
+            right: Box::new(compile_having(right)?),
+        },
+        H::Or { left, right } => HavingExpression::Or {
+            left: Box::new(compile_having(left)?),
+            right: Box::new(compile_having(right)?),
+        },
+        H::Not { input } => HavingExpression::Not {
+            input: Box::new(compile_having(input)?),
+        },
+    })
 }
 
 fn compile_call(

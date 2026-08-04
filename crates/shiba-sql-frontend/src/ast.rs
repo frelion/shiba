@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use crate::{ErrorCode, FrontendError, Span};
+use crate::{ErrorCode, FrontendError, Span, UnboundHavingExpression};
 
 const UNBOUND_DOMAIN: &[u8] = b"shiba.sql.unbound.v1\0";
 
@@ -118,6 +118,7 @@ pub struct UnboundQuery {
     pub projection: Vec<UnboundSelectItem>,
     pub selection: Option<UnboundExpression>,
     pub group_by: Option<UnboundExpression>,
+    pub having: Option<UnboundHavingExpression>,
     pub span: Span,
 }
 
@@ -142,6 +143,11 @@ impl UnboundQuery {
         }
         write_option(&mut out, self.selection.as_ref(), write_expr)?;
         write_option(&mut out, self.group_by.as_ref(), write_expr)?;
+        write_option(
+            &mut out,
+            self.having.as_ref(),
+            crate::having_ast::write_canonical,
+        )?;
         Ok(out)
     }
 

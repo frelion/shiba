@@ -11,7 +11,8 @@ wire shapes without adapters. M16.4 now adds multi-call SQL and Count(expr)
 through the same Aggregate node and wide result authority, with PG17/18
 bootstrap, live, ACK and rebuild evidence. M16.5 now adds production
 MinInt8/MaxInt8 with exact multiplicity and PG17/18 SQL differential evidence.
-HAVING and final M16 performance/release evidence remain M16.6--M16.7.
+M16.6 now adds exact grouped HAVING visibility transitions; final M16
+performance/release evidence remains M16.7.
 
 ## M16.4 multi-call Aggregate status
 
@@ -28,7 +29,8 @@ ACK/replay, snapshot bootstrap, and changed-ObjectAddress rebuild followed by
 live Apply. No new authority, state table, result sink, or transaction path was
 introduced. M16.5 extends the same gate with complete MIN/MAX rows, duplicate
 extrema deletion, NULL transitions and SQL oracle comparison on PG17/18.
-HAVING and M16 performance/extensibility closure remain unproved.
+M16.6 extends the same gate with grouped HAVING transitions and complete-row
+SQL oracle comparison; final M16 performance/extensibility closure remains.
 
 ## M16.5 exact MIN/MAX status
 
@@ -63,7 +65,7 @@ building output remains hidden until atomic activation. The superseded columns
 and keyed-only sink are deleted without an adapter, dual write or fallback.
 
 Generic Aggregate execution is closed by M16.3, multiple calls by M16.4 and
-MIN/MAX retraction by M16.5; HAVING remains open for M16.6. M16.2 does not
+MIN/MAX retraction by M16.5 and grouped HAVING by M16.6. M16.2 does not
 claim those functions or final M16 release/performance evidence.
 
 ## M15.1--M15.7 SQL frontend status

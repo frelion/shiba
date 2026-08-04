@@ -6,8 +6,9 @@ The Binder is the only SQL layer that maps admitted function names to the
 closed `AggregateFunctionV1`. It emits QuerySpec format 2 generic Aggregate
 calls with semantic version and canonical ordinal; Compiler validates the call
 through Operator's descriptor API. Existing scalar/grouped `count(*)` and
-`sum(int8)` SQL now use this path. Count(expression), multiple calls and
-MIN/MAX are implemented; HAVING remains explicitly rejected until M16.6; no query-shape recipe
+`sum(int8)` SQL now use this path. Count(expression), multiple calls,
+MIN/MAX and restricted grouped HAVING are implemented; scalar HAVING remains
+rejected; no query-shape recipe
 or old concrete node remains.
 
 ## M16.2 result-schema frontend cutover
@@ -25,7 +26,8 @@ change canonical unbound semantics and QuerySpec/schema/graph digests;
 whitespace and source aliases remain nonsemantic. Compiler turns this
 declaration into the single ResultSchema, not a query-shape recipe. Aggregate
 multi-call, Count(expression) and MIN/MAX lowering are implemented by M16.4/
-M16.5; HAVING remains a later M16 slice. The CountStar/Sum descriptor lowering
+M16.5; restricted grouped HAVING is implemented by M16.6. The CountStar/Sum
+descriptor lowering
 is implemented by M16.3.
 SQL recipes never enter Runtime or Catalog execution authority.
 

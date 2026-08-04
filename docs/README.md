@@ -350,8 +350,9 @@ carry the exact schema bytes and digest without interpreting aggregate
 functions. Building rows remain private and activation publishes the complete
 set. Fixed scalar/key/value columns and the keyed-only sink were removed in
 place; no compatibility view, dual write or second result authority exists.
-Generic Aggregate and multi-call are complete through M16.5, including exact
-MinInt8/MaxInt8; HAVING remains the next M16 slice.
+Generic Aggregate, multi-call, exact MinInt8/MaxInt8 and restricted grouped
+HAVING are complete through M16.6; final performance/extensibility evidence is
+the remaining M16 slice.
 
 ## M16.3 generic Aggregate kernel
 
@@ -366,4 +367,5 @@ QuerySpec and OperatorGraph advance to formats 2/2 and Catalog compiler version
 4; old bytes fail closed without compatibility. Runtime and every lifecycle
 component remain function-independent and reuse the sole generic state, wide
 result, continuation and post-commit ACK authorities. M16.4 adds multi-call SQL
-and Count(expr); M16.5 adds exact MinInt8/MaxInt8, while HAVING remains M16.6.
+and Count(expr); M16.5 adds exact MinInt8/MaxInt8 and M16.6 adds restricted
+grouped HAVING transitions.

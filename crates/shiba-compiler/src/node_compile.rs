@@ -21,8 +21,24 @@ pub(crate) fn compile(
         QueryOperationV1::Aggregate {
             group_expressions,
             calls,
+            having,
         } => {
             let (kind, types) = crate::aggregate_compile::compile(group_expressions, calls, input)?;
+            let kind = match kind {
+                OperatorNodeKind::Aggregate {
+                    group_expressions,
+                    calls,
+                    ..
+                } => OperatorNodeKind::Aggregate {
+                    group_expressions,
+                    calls,
+                    having: having
+                        .as_ref()
+                        .map(crate::aggregate_compile::compile_having)
+                        .transpose()?,
+                },
+                _ => return Err(CompilerError::InvalidSpec),
+            };
             (kind, types, true)
         }
         QueryOperationV1::Filter { predicate } => {

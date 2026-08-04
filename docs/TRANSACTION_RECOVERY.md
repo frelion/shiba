@@ -34,8 +34,8 @@ transaction before continuation. Bootstrap/rebuild write hidden building rows
 through the same sink and activation exposes the complete set atomically. A
 schema/row/sink failure rolls source state, graph state, results and continuation
 back; ACK remains unauthorized. Count/CountStar/Sum retraction is implemented
-in M16.3 and exact MIN/MAX ordered multiplicity retraction in M16.5; HAVING
-remains M16.6.
+in M16.3, exact MIN/MAX ordered multiplicity retraction in M16.5, and grouped
+HAVING visibility deltas in M16.6.
 
 ## M14.6 graph transaction and recovery boundary
 

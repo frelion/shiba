@@ -77,6 +77,7 @@ fn bind_scalar(
                     .enumerate()
                     .map(|(index, call)| query_call_scalar(call, index))
                     .collect::<Result<Vec<_>, _>>()?,
+                having: None,
             },
         }],
         fields,
@@ -177,7 +178,7 @@ fn query_call_scalar(
     })
 }
 
-fn aggregate_call(
+pub(crate) fn aggregate_call(
     aggregate: &Aggregate,
 ) -> Result<(AggregateFunctionV1, Option<&UnboundExpression>), FrontendError> {
     match (aggregate.function.as_str(), &aggregate.argument) {

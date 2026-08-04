@@ -105,6 +105,7 @@ fn grouped(
             function_version: 1,
             expression: expression.map(|field| QueryExpressionV1::Column { field }),
         }],
+        having: None,
     }
 }
 

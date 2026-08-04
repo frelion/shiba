@@ -16,8 +16,8 @@ knowledge in Runtime, Ingress or Catalog. Directed PG17.10/PG18.4 gates for M9
 Count/Sum, M13 generic kernel, M14 grouped execution and M15 aggregate SQL prove
 the migrated scalar/grouped lifecycle and full SQL oracles. The final release
 matrix remains 57 uniquely enrolled scripts and 114 versioned invocations;
-M16.4 adds multi-call SQL and Count(expr), and M16.5 adds exact MIN/MAX while
-HAVING remains M16.6.
+M16.4 adds multi-call SQL and Count(expr), M16.5 adds exact MIN/MAX, and M16.6
+adds restricted grouped HAVING visibility transitions.
 
 ## M16.4 multi-call SQL gates
 
@@ -29,8 +29,8 @@ gate runs on PostgreSQL 17.10 and 18.4 and compares the complete
 bootstrap, live I/U/D, explicit feedback, exact replay, and changed-target
 rebuild plus post-rebuild live Apply. M16.5 extends this production gate with
 `min(payload)`/`max(payload)`, duplicate-extrema and NULL transitions, and
-complete PG17.10/PG18.4 SQL row comparison. HAVING and final M16 performance
-closure remain later gates.
+complete PG17.10/PG18.4 SQL row comparison. M16.6 adds complete-row HAVING
+transitions; final M16 performance closure remains later.
 
 The full PG17 matrix exposed the existing two-second walsender timeout while a
 10,000-row generic Aggregate retry was synchronously applying. The receiver now
@@ -55,8 +55,9 @@ two-field keyed/wide rows, NULL/type/arity/version/digest rejection, generic
 sink failure rollback/retry/replay and full-row decoding through the public
 active-only API. Existing M15 registration, aggregate, Join, bootstrap and
 rebuild gates are rerun on PG17.10 and PG18.4 after replacing their fixed-column
-oracles with complete canonical row oracles. These tests do not count as
-Aggregate ABI, MIN/MAX, multi-call or HAVING evidence.
+oracles with complete canonical row oracles. At that boundary these tests did
+not count as Aggregate ABI, MIN/MAX, multi-call or HAVING evidence; later M16
+stages now supply those proofs.
 
 The M16.2 release run is green on PostgreSQL 17.10 and 18.4: 57 uniquely
 enrolled scripts and 114 successful versioned invocations, including the new
@@ -65,7 +66,8 @@ remained below its frozen limits: PG17/PG18 total time was 8.418541416/
 7.764510792 seconds, RSS growth 5,984/6,224 KiB, and retained WAL
 253,008,000/253,084,256 bytes (limit 268,435,456). This closes only the
 canonical wide-result cutover. M16.3 subsequently supplies generic
-Count/CountStar/Sum execution; multi-call, MIN/MAX and HAVING remain open.
+Count/CountStar/Sum execution; later M16 stages add multi-call, MIN/MAX and
+grouped HAVING.
 
 ## M15.1 SQL frontend contract gates
 

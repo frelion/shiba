@@ -77,7 +77,7 @@ fn scalar_count_and_sum_use_generic_stateful_nodes() {
     let count = bind("SELECT count(*) FROM app.events", &source);
     assert_eq!(count.nodes.len(), 1);
     assert!(
-        matches!(&count.nodes[0].operation, QueryOperationV1::Aggregate { group_expressions, calls }
+        matches!(&count.nodes[0].operation, QueryOperationV1::Aggregate { group_expressions, calls, .. }
         if group_expressions.is_empty() && calls.len() == 1
             && calls[0].function == AggregateFunctionV1::CountStar)
     );
@@ -93,6 +93,7 @@ fn scalar_count_and_sum_use_generic_stateful_nodes() {
     let QueryOperationV1::Aggregate {
         group_expressions,
         calls,
+        ..
     } = &sum.nodes[0].operation
     else {
         panic!("SUM must use the generic scalar sum node")
@@ -123,6 +124,7 @@ fn scalar_multi_call_aggregate_uses_one_node_and_count_expression() {
     let QueryOperationV1::Aggregate {
         group_expressions,
         calls,
+        ..
     } = &spec.nodes[0].operation
     else {
         panic!("multi-call scalar query must use one Aggregate node")
@@ -197,6 +199,21 @@ fn grouped_multi_call_aggregate_preserves_group_and_call_ordinals() {
             .collect::<Vec<_>>(),
         vec![0, 1, 2, 3]
     );
+    assert_compiles(&spec, &source);
+}
+
+#[test]
+fn grouped_having_reuses_existing_call_identity() {
+    let source = source();
+    let spec = bind(
+        "SELECT id, count(*) AS rows, sum(payload) AS total FROM app.events GROUP BY id HAVING count(*) > 1 AND sum(payload) IS NOT NULL",
+        &source,
+    );
+    let QueryOperationV1::Aggregate { calls, having, .. } = &spec.nodes[2].operation else {
+        panic!("grouped HAVING must compile on the generic aggregate")
+    };
+    assert_eq!(calls.len(), 2);
+    assert!(having.is_some());
     assert_compiles(&spec, &source);
 }
 

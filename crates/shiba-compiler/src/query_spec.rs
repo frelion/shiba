@@ -122,6 +122,7 @@ pub enum QueryOperationV1 {
     Aggregate {
         group_expressions: Vec<QueryExpressionV1>,
         calls: Vec<QueryAggregateCallV1>,
+        having: Option<QueryHavingExpressionV1>,
     },
     Filter {
         predicate: QueryExpressionV1,
@@ -141,6 +142,24 @@ pub enum QueryOperationV1 {
         right_id: QueryFieldV1,
         right_payload: QueryFieldV1,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "having", rename_all = "snake_case", deny_unknown_fields)]
+pub enum QueryHavingExpressionV1 {
+    Call { ordinal: u16 },
+    Int8Literal { value: i64 },
+    NullLiteral,
+    Equal { left: Box<Self>, right: Box<Self> },
+    NotEqual { left: Box<Self>, right: Box<Self> },
+    Less { left: Box<Self>, right: Box<Self> },
+    LessEqual { left: Box<Self>, right: Box<Self> },
+    Greater { left: Box<Self>, right: Box<Self> },
+    GreaterEqual { left: Box<Self>, right: Box<Self> },
+    IsNull { input: Box<Self> },
+    And { left: Box<Self>, right: Box<Self> },
+    Or { left: Box<Self>, right: Box<Self> },
+    Not { input: Box<Self> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

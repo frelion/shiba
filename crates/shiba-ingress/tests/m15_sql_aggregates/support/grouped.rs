@@ -4,6 +4,7 @@ use shiba_runtime::ProcessOutcome;
 use super::{GraphFixture, assert_oracle, attach, wait_for_slot_lsn};
 
 type ResultRow = (Option<i64>, Option<i64>, bool, bool);
+type HavingRow = (Option<i64>, i64, Option<i64>);
 
 pub(crate) fn assert_count(client: &mut Client, fixture: &GraphFixture) {
     let expected = rows(
@@ -25,6 +26,47 @@ pub(crate) fn assert_sum(client: &mut Client, fixture: &GraphFixture) {
         ),
     );
     assert_eq!(actual(client, fixture.graph), expected);
+}
+
+pub(crate) fn assert_having(client: &mut Client, fixture: &GraphFixture) {
+    let expected: Vec<HavingRow> = client
+        .query(
+            "SELECT payload, count(*)::bigint, sum(payload)::bigint
+             FROM agg_having.rows WHERE id > 0 GROUP BY payload
+             HAVING count(*) > 1 ORDER BY payload NULLS LAST",
+            &[],
+        )
+        .expect("query HAVING SQL oracle")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    assert_eq!(having_actual(client, fixture.graph), expected);
+}
+
+pub(crate) fn exercise_having(
+    database_url: &str,
+    replication_url: &str,
+    client: &mut Client,
+    fixture: &GraphFixture,
+) {
+    assert_having(client, fixture);
+    let mut session = attach(database_url, replication_url, fixture, 1);
+    for sql in [
+        "UPDATE agg_having.rows SET payload=5 WHERE id=1",
+        "INSERT INTO agg_having.rows VALUES (6,5)",
+        "DELETE FROM agg_having.rows WHERE id IN (3,6)",
+        "UPDATE agg_having.rows SET payload=NULL WHERE id=2",
+    ] {
+        client.batch_execute(sql).expect("commit HAVING transition");
+        let token = session
+            .receive_and_apply_one()
+            .expect("apply HAVING transition");
+        assert_eq!(token.outcome(), ProcessOutcome::Applied);
+        assert_having(client, fixture);
+        session.acknowledge(&token).expect("ACK HAVING transition");
+        wait_for_slot_lsn(client, fixture.slot, token.end_lsn());
+    }
+    session.detach().expect("detach HAVING aggregate");
 }
 
 pub(crate) fn exercise_filtered_count(
@@ -178,6 +220,24 @@ fn actual(client: &mut Client, graph: u64) -> Vec<ResultRow> {
              ORDER BY 3,1"
         ),
     )
+}
+
+fn having_actual(client: &mut Client, graph: u64) -> Vec<HavingRow> {
+    client
+        .query(
+            "SELECT
+                CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,type}' = 'null'
+                     THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb #>> '{values,0,value}')::bigint END,
+                (convert_from(row_payload,'UTF8')::jsonb #>> '{values,1,value}')::bigint,
+                CASE WHEN convert_from(row_payload,'UTF8')::jsonb #>> '{values,2,type}' = 'null'
+                     THEN NULL ELSE (convert_from(row_payload,'UTF8')::jsonb #>> '{values,2,value}')::bigint END
+             FROM shiba.graph_result_rows WHERE graph_id=$1 ORDER BY 1 NULLS LAST",
+            &[&i64::try_from(graph).expect("graph ID fits")],
+        )
+        .expect("query HAVING result rows")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect()
 }
 
 fn rows(client: &mut Client, sql: &str) -> Vec<ResultRow> {

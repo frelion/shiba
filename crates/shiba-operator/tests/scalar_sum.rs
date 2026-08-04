@@ -57,6 +57,7 @@ fn graph(nullable: bool) -> OperatorGraph {
                         function: AggregateFunctionV1::SumInt8,
                         expression: Some(Expression::Column { slot: 1 }),
                     }],
+                    having: None,
                 },
             },
             OperatorNode {

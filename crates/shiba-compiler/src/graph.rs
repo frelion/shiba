@@ -176,6 +176,7 @@ fn result_contract(
         let crate::QueryOperationV1::Aggregate {
             group_expressions,
             calls,
+            ..
         } = operation
         else {
             return Err(CompilerError::InvalidSpec);

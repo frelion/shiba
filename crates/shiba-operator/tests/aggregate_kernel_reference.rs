@@ -94,6 +94,7 @@ fn graph(function_version: u32) -> Result<OperatorGraph, shiba_operator::GraphEr
                             Some(Expression::Column { slot: 0 }),
                         ),
                     ],
+                    having: None,
                 },
             },
             OperatorNode {

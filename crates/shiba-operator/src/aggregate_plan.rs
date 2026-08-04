@@ -1,7 +1,7 @@
 use crate::graph_budget::EvaluationBudget;
 use crate::{
-    AggregateCall, DeltaBatch, Expression, KernelError, NodeId, NodeInput, OperatorGraph,
-    OperatorNodeKind, OutputContract, TypedLayout,
+    AggregateCall, DeltaBatch, Expression, HavingExpression, KernelError, NodeId, NodeInput,
+    OperatorGraph, OperatorNodeKind, OutputContract, TypedLayout,
 };
 
 #[derive(Clone)]
@@ -9,6 +9,7 @@ pub(crate) struct AggregateSpec {
     pub node_id: NodeId,
     pub groups: Vec<Expression>,
     pub calls: Vec<AggregateCall>,
+    pub having: Option<HavingExpression>,
     pub input_layout: TypedLayout,
     pub output_layout: TypedLayout,
     pub materialize_id: NodeId,
@@ -25,11 +26,19 @@ pub(crate) fn specs(graph: &OperatorGraph) -> Result<Vec<AggregateSpec>, KernelE
             let OperatorNodeKind::Aggregate {
                 group_expressions,
                 calls,
+                having,
             } = &node.kind
             else {
                 return None;
             };
-            Some(build(graph, &layouts, node, group_expressions, calls))
+            Some(build(
+                graph,
+                &layouts,
+                node,
+                group_expressions,
+                calls,
+                having.as_ref(),
+            ))
         })
         .collect()
 }
@@ -40,6 +49,7 @@ fn build(
     node: &crate::OperatorNode,
     groups: &[Expression],
     calls: &[AggregateCall],
+    having: Option<&HavingExpression>,
 ) -> Result<AggregateSpec, KernelError> {
     let input_layout = match node.input {
         NodeInput::SourcePort(source_id) => {
@@ -69,6 +79,7 @@ fn build(
         node_id: node.node_id,
         groups: groups.to_vec(),
         calls: calls.to_vec(),
+        having: having.cloned(),
         input_layout,
         output_layout: layouts
             .get(&node.node_id)

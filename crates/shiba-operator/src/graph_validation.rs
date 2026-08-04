@@ -30,6 +30,7 @@ fn validate_aggregate_outputs(graph: &CanonicalGraph) -> Result<(), GraphError> 
         let OperatorNodeKind::Aggregate {
             group_expressions,
             calls,
+            having,
         } = &node.kind
         else {
             continue;
@@ -62,6 +63,12 @@ fn validate_aggregate_outputs(graph: &CanonicalGraph) -> Result<(), GraphError> 
             {
                 return Err(GraphError::WrongType);
             }
+        }
+        if let Some(having) = having
+            && (group_expressions.is_empty()
+                || having.validate(calls).map_err(|_| GraphError::WrongType)? != ValueType::Bool)
+        {
+            return Err(GraphError::WrongType);
         }
     }
     Ok(())
@@ -177,6 +184,7 @@ fn node_output_types(
         OperatorNodeKind::Aggregate {
             group_expressions,
             calls,
+            ..
         } => aggregate_types(node, input, group_expressions, calls)?,
         OperatorNodeKind::Filter { predicate } if predicate.validate(input)? == ValueType::Bool => {
             Some(input.value_types.clone())

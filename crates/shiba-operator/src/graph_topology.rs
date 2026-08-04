@@ -38,6 +38,7 @@ fn validate_identity_free_source(graph: &CanonicalGraph) -> Result<(), GraphErro
                 OperatorNodeKind::Aggregate {
                     group_expressions,
                     calls,
+                    ..
                 } => {
                     !group_expressions.is_empty()
                         || !calls.iter().all(|call| {

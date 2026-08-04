@@ -57,6 +57,14 @@ pub(crate) fn validate(query: &UnboundQuery) -> Result<(), FrontendError> {
     if let Some(group) = &query.group_by {
         expressions.push((group, 1));
     }
+    if let Some(having) = &query.having {
+        validate_having(
+            having,
+            query.sources.len(),
+            &mut identifiers,
+            &mut expressions,
+        )?;
+    }
     if let Some(join) = &query.join {
         ast_nodes = checked_ast(ast_nodes, 1, join.span)?;
         if join.left.source != 0 || join.right.source != 1 {
@@ -69,6 +77,44 @@ pub(crate) fn validate(query: &UnboundQuery) -> Result<(), FrontendError> {
         validate_identifier(identifier)?;
     }
     validate_expressions(query.sources.len(), expressions, ast_nodes)
+}
+
+fn validate_having<'a>(
+    having: &'a crate::UnboundHavingExpression,
+    source_count: usize,
+    identifiers: &mut Vec<&'a Identifier>,
+    expressions: &mut Vec<(&'a UnboundExpression, usize)>,
+) -> Result<(), FrontendError> {
+    use crate::UnboundHavingExpression as H;
+    match having {
+        H::Aggregate(aggregate) => {
+            if aggregate.function.is_empty()
+                || aggregate.function.len() > 63
+                || aggregate
+                    .function
+                    .bytes()
+                    .any(|byte| byte.is_ascii_uppercase())
+            {
+                return Err(canonical(aggregate.span));
+            }
+            if let AggregateArgument::Expression(input) = &aggregate.argument {
+                expressions.push((input, 1));
+            }
+        }
+        H::Int8(..) | H::Null(_) => {}
+        H::Binary { left, right, .. } => {
+            validate_having(left, source_count, identifiers, expressions)?;
+            validate_having(right, source_count, identifiers, expressions)?;
+        }
+        H::Unary { input, .. } => validate_having(input, source_count, identifiers, expressions)?,
+    }
+    if let H::Aggregate(aggregate) = having
+        && let AggregateArgument::Expression(UnboundExpression::Column(column)) =
+            &aggregate.argument
+    {
+        validate_column(column, source_count, identifiers)?;
+    }
+    Ok(())
 }
 
 fn validate_expressions(

@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use shiba_protocol::{GraphId, SourceId};
 
 use crate::{
-    AggregateCall, Expression, ObjectAddress, OutputContract, StateContract, TypedLayout, ValueType,
+    AggregateCall, Expression, HavingExpression, ObjectAddress, OutputContract, StateContract,
+    TypedLayout, ValueType,
 };
 
 pub const GRAPH_FORMAT_VERSION: u32 = 2;
@@ -60,6 +61,7 @@ pub enum OperatorNodeKind {
     Aggregate {
         group_expressions: Vec<Expression>,
         calls: Vec<AggregateCall>,
+        having: Option<HavingExpression>,
     },
     Filter {
         predicate: Expression,
