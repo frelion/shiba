@@ -62,7 +62,8 @@ pub use result_schema::{
     RESULT_SCHEMA_FORMAT_VERSION, ResultError, ResultField, ResultSchemaV1,
 };
 pub use state::{
-    StateDelta, StateEntry, StateError, StateKey, StateMutation, StatePartition, StateReadSet,
-    StateSnapshot,
+    INT8_ORDER_KEY_VERSION, StateDelta, StateEntry, StateError, StateKey, StateMutation,
+    StatePartition, StateRange, StateRangeDirection, StateReadSet, StateSnapshot, int8_order_key,
+    state_item_order_key, validate_int8_order_key,
 };
 pub use typed::{TypedError, TypedLayout, TypedRow, TypedValue, ValueType};
