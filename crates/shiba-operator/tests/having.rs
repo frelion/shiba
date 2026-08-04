@@ -73,6 +73,29 @@ fn having_rejects_unknown_call_and_wrong_boolean_type() {
 }
 
 #[test]
+fn having_evaluate_rejects_zero_out_of_range_and_empty_ordinals() {
+    let valid_calls = calls();
+    for ordinal in [0, 3] {
+        assert_eq!(
+            HavingExpression::Call { ordinal }.evaluate(&[TypedValue::Int8(1)]),
+            Err(HavingError::InvalidCall)
+        );
+        assert_eq!(
+            HavingExpression::Call { ordinal }.validate(&valid_calls),
+            Err(HavingError::InvalidCall)
+        );
+    }
+    assert_eq!(
+        HavingExpression::Call { ordinal: 1 }.evaluate(&[]),
+        Err(HavingError::InvalidCall)
+    );
+    assert_eq!(
+        HavingExpression::Call { ordinal: 1 }.validate(&[]),
+        Err(HavingError::InvalidCall)
+    );
+}
+
+#[test]
 fn having_rejects_depth_node_and_boolean_budget_before_evaluation() {
     let mut deep = HavingExpression::Call { ordinal: 1 };
     for _ in 0..=MAX_HAVING_DEPTH {

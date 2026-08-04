@@ -130,10 +130,12 @@ impl HavingExpression {
             return Err(HavingError::NodeLimit);
         }
         match self {
-            Self::Call { ordinal } => calls
-                .get(usize::from(ordinal.saturating_sub(1)))
-                .cloned()
-                .ok_or(HavingError::InvalidCall),
+            Self::Call { ordinal } => {
+                let index = usize::from(*ordinal)
+                    .checked_sub(1)
+                    .ok_or(HavingError::InvalidCall)?;
+                calls.get(index).cloned().ok_or(HavingError::InvalidCall)
+            }
             Self::Int8Literal { value } => Ok(TypedValue::Int8(*value)),
             Self::NullLiteral => Ok(TypedValue::Null(ValueType::Int8)),
             Self::Equal { left, right } => {
