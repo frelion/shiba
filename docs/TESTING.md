@@ -1,5 +1,29 @@
 # Testing strategy
 
+## M16 admission-hardening gates
+
+The admission tests are failure-first. QuerySpec, SQL frontend, Compiler and
+OperatorGraph reject HAVING trees that exceed the shared node/depth/boolean
+limits before recursive lowering; ordinal zero, out-of-range ordinals and
+empty call lists are rejected consistently by validation, evaluation and graph
+admission. Graph construction rejects Aggregate-to-Aggregate edges, aggregate
+fan-out and aggregates without exactly one direct Materialize, so unsupported
+topologies never reach Runtime.
+
+Typed-layout tests build the same node with equal value types and different
+nullable bits and require different derived identities for Source-derived
+layouts and Materialize/Project/Compute/KeyBy/Aggregate outputs. Direct graph
+construction is covered independently of SQL frontend validation.
+
+Graph-budget tests charge multiple Aggregate nodes cumulatively and exercise
+the inclusive limit and limit-plus-one cases for touched groups, exact state
+keys, partition entries, state mutations, result mutations and estimated work
+bytes. They also cover extrema and multi-result transitions. A budget error
+must return no partial transition; Runtime must therefore write no state or
+result, advance no continuation, and authorize no ACK. These tests are
+database-free in the kernel and are complemented by Runtime rollback/retry
+coverage.
+
 ## M16.3 generic Aggregate gates
 
 The production `Aggregate` kernel replaces the four concrete Count/Sum node

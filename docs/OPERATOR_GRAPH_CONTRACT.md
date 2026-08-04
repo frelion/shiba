@@ -64,6 +64,12 @@ Aggregate fan-out fail during Compiler and OperatorGraph construction, before
 Runtime state or result persistence. ResultSchema field names, key ordinals,
 and source-derived nullability are validated at the same boundary.
 
+Derived non-source `TypedLayout` identity is a versioned digest of the exact
+input layout identity, node id, ordered value types, and ordered nullable bits.
+Compiler temporary layouts and OperatorGraph reconstruction use the same
+derivation. Thus two layouts with equal types but different nullability cannot
+be confused, and a layout mismatch is rejected before Apply or Materialize.
+
 The M14.6 schema cutover replaces the flat definition authority; it does not
 mirror it. Likewise, the graph-scoped continuation replaces the source-scoped
 continuation in the same cutover. The two forms never coexist as production
@@ -225,6 +231,13 @@ out. Exceeding any limit aborts without continuation or ACK. Runtime decodes a
 graph and state payload at most once per transaction, constructs each source
 batch once, loads state by node/partition rather than change-by-node queries,
 and persists keyed mutations in bounded sets rather than per-row round trips.
+
+The aggregate-specific graph budget caps cumulative touched groups, exact
+state keys, partition entries, state mutations, result mutations, and
+estimated work bytes across all Aggregate nodes. The kernel charges it while
+preparing read sets and deltas and validates the complete transition before
+Runtime persists results. Budget failure is fail closed: no partial mutation,
+result, continuation, or feedback authorization exists.
 
 The frozen M13 CountRows/SumInt8 comparison baselines are
 782.302750/787.157125 ms and M14 stop lines are 899.648163/905.230694 ms

@@ -46,11 +46,18 @@ HAVING is admitted with shared limits `MAX_HAVING_NODES=256`,
 `MAX_HAVING_DEPTH=32`, and `MAX_HAVING_BOOLEAN_TERMS=64`. QuerySpec
 deserialization, SQL frontend validation, compiler lowering, and the pure
 operator validator use the same limits; recursive lowering is never entered
-for an over-limit tree. Aggregate work is bounded before state maps or
-extrema multisets are built: touched groups, exact state keys, partition
-entries, distinct extrema values, state mutations, and estimated transaction
-bytes each have a fixed fail-closed limit shared with Runtime. An over-limit
-transition cannot publish a result, continuation, or ACK.
+for an over-limit tree. HAVING call ordinals are strictly one-based: zero,
+out-of-range, and empty-call references fail closed at validation and
+evaluation.
+
+Aggregate work uses one graph-wide budget authority before any large map,
+read set, extrema state, transition, or result delta is constructed. The
+shared budget accumulates touched groups, exact state keys, partition entries,
+state mutations, result mutations, and estimated work bytes across every
+stateful node in the graph. Operator evaluation and Runtime validation import
+the same public limits; neither maintains a second sink-only limit. An
+over-limit transition returns no partial state/result delta and therefore
+cannot publish state, result, continuation, or ACK.
 
 Result schemas reject duplicate or NUL-containing names, names over 63 bytes,
 and non-contiguous key ordinals. Typed layouts carry source-derived
