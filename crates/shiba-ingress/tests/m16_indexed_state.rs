@@ -124,14 +124,18 @@ fn bootstrap_to_live(
 }
 
 fn explain_index(client: &mut Client) -> String {
-    let (node_id, namespace, partition) = client
-        .query_one(
+    let coordinates = client
+        .query(
             "SELECT node_id, namespace, partition_key_payload
              FROM shiba_internal.graph_node_state
              WHERE graph_id=$1 AND item_order_key IS NOT NULL
-             ORDER BY namespace LIMIT 1",
+             GROUP BY node_id, namespace, partition_key_payload
+             ORDER BY namespace, partition_key_payload
+             LIMIT 2",
             &[&i64::try_from(GRAPH_ID).expect("graph ID fits")],
         )
+        .expect("read durable extrema partitions")
+        .into_iter()
         .map(|row| {
             (
                 row.get::<_, i64>(0),
@@ -139,16 +143,26 @@ fn explain_index(client: &mut Client) -> String {
                 row.get::<_, Vec<u8>>(2),
             )
         })
-        .expect("read durable extrema partition");
+        .collect::<Vec<_>>();
+    assert!(
+        coordinates.len() >= 2,
+        "indexed extrema fixture must expose two ordered partitions"
+    );
     let graph_id = i64::try_from(GRAPH_ID).expect("graph ID fits");
-    let nodes = vec![node_id];
-    let namespaces = vec![namespace];
-    let partitions = vec![partition];
-    let limits = vec![2_i64];
-    let indexes = vec![0_i32];
+    let nodes = coordinates.iter().map(|row| row.0).collect::<Vec<_>>();
+    let namespaces = coordinates.iter().map(|row| row.1).collect::<Vec<_>>();
+    let partitions = coordinates
+        .iter()
+        .map(|row| row.2.clone())
+        .collect::<Vec<_>>();
+    let limits = vec![2_i64; coordinates.len()];
+    let indexes = (0..coordinates.len())
+        .map(|index| i32::try_from(index).expect("range index fits"))
+        .collect::<Vec<_>>();
     let query = build_ordered_range_query(StateRangeDirection::Ascending);
     assert!(query.contains("WITH ranges"));
     assert!(query.contains("CROSS JOIN LATERAL"));
+    assert!(query.contains("ORDER BY ranges.range_index, state.item_order_key ASC"));
     assert!(query.contains("LIMIT ranges.range_limit"));
     assert!(query.contains("FOR UPDATE"));
     let plan = client

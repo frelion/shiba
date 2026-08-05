@@ -208,6 +208,19 @@ mod tests {
             StateReadSet::with_ranges(Vec::new(), Vec::new(), vec![range.clone(), range.clone()]);
         assert!(read_set.is_err());
 
+        let opposite_direction = StateRange {
+            direction: StateRangeDirection::Ascending,
+            ..range.clone()
+        };
+        assert!(
+            StateReadSet::with_ranges(
+                Vec::new(),
+                Vec::new(),
+                vec![range.clone(), opposite_direction]
+            )
+            .is_err()
+        );
+
         let read_set = StateReadSet::with_ranges(Vec::new(), Vec::new(), vec![range]).unwrap();
         let entries = vec![
             StateEntry {
@@ -229,6 +242,49 @@ mod tests {
                 }],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn range_identity_allows_distinct_namespace_and_partition_only() {
+        let base = StateRange {
+            node_id: key(0).node_id,
+            namespace: 2,
+            partition_key: TypedValue::Int8(7),
+            direction: StateRangeDirection::Ascending,
+            limit: 1,
+            order_key_version: INT8_ORDER_KEY_VERSION,
+        };
+        let different_namespace = StateRange {
+            namespace: 3,
+            ..base.clone()
+        };
+        let different_partition = StateRange {
+            partition_key: TypedValue::Int8(8),
+            ..base.clone()
+        };
+        let read_set = StateReadSet::with_ranges(
+            Vec::new(),
+            Vec::new(),
+            vec![base.clone(), different_namespace, different_partition],
+        )
+        .unwrap();
+        assert_eq!(read_set.ranges.len(), 3);
+
+        let duplicate_coordinates = StateReadSet {
+            keys: Vec::new(),
+            partitions: Vec::new(),
+            ranges: vec![
+                base.clone(),
+                StateRange {
+                    direction: StateRangeDirection::Descending,
+                    ..base
+                },
+            ],
+        };
+        assert_eq!(
+            StateSnapshot::new(&duplicate_coordinates, Vec::new()),
+            Err(StateError::AmbiguousRange)
         );
     }
 }

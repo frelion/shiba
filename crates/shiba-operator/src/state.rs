@@ -115,12 +115,10 @@ impl StateReadSet {
         }
         let mut range_identities = BTreeSet::new();
         for range in &ranges {
-            let identity = (
-                range.node_id,
-                range.namespace,
-                range.partition_key.clone(),
-                range.direction,
-            );
+            // A flattened snapshot cannot preserve provenance for two
+            // directions of the same partition.  Reject the ambiguity at
+            // read-set construction instead of merging or choosing a limit.
+            let identity = (range.node_id, range.namespace, range.partition_key.clone());
             if !range_identities.insert(identity) {
                 return Err(StateError::AmbiguousRange);
             }

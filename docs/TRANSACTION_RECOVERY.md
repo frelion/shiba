@@ -63,7 +63,11 @@ duplicate, missing or out-of-order range result aborts the same PostgreSQL
 transaction; source rows, graph state, complete result rows and continuation
 remain at their old values and no feedback is authorized. A retry repeats the
 same bounded request, and exact replay still short-circuits at the existing
-continuation boundary. Production and EXPLAIN use one LATERAL query template.
+continuation boundary. Production and EXPLAIN use one LATERAL query template;
+its outer `range_index, item_order_key ASC|DESC` order is explicit, and a single
+base range coordinate cannot be requested twice even with opposite directions.
+No new recovery state, authority, writer or ACK rule is introduced. TopK remains
+unstarted.
 
 ## M14.6 graph transaction and recovery boundary
 

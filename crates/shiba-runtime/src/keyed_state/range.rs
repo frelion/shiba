@@ -47,7 +47,8 @@ pub fn build_ordered_range_query(direction: StateRangeDirection) -> String {
              ORDER BY candidate.item_order_key {order}
              LIMIT ranges.range_limit
              FOR UPDATE OF candidate
-         ) AS state"
+         ) AS state
+         ORDER BY ranges.range_index, state.item_order_key {order}"
     )
 }
 
@@ -241,9 +242,11 @@ mod tests {
         assert!(ascending.contains("WITH ranges"));
         assert!(ascending.contains("CROSS JOIN LATERAL"));
         assert!(ascending.contains("ORDER BY candidate.item_order_key ASC"));
+        assert!(ascending.contains("ORDER BY ranges.range_index, state.item_order_key ASC"));
         assert!(ascending.contains("LIMIT ranges.range_limit"));
         assert!(ascending.contains("FOR UPDATE OF candidate"));
         let descending = build_ordered_range_query(StateRangeDirection::Descending);
         assert!(descending.contains("ORDER BY candidate.item_order_key DESC"));
+        assert!(descending.contains("ORDER BY ranges.range_index, state.item_order_key DESC"));
     }
 }

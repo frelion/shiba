@@ -71,7 +71,12 @@ key before flattening the transaction-local snapshot. Exact/range overlap is
 deduplicated once, while duplicate range requests and limit-plus-one results
 are rejected. The same SQL builder drives production and EXPLAIN evidence, so
 the proof covers the actual dynamic-LIMIT/`FOR UPDATE` shape and ordered index.
-This changes no authority, transaction owner, continuation or ACK rule.
+M16.8.2 tightens range identity to the base coordinate
+`(node_id, namespace, partition_key)`, regardless of direction, and fixes the
+production query's outer order to `range_index, item_order_key ASC|DESC`.
+Runtime and EXPLAIN therefore share both provenance and deterministic result
+ordering. This changes no authority, transaction owner, continuation or ACK
+rule.
 
 M15.1 freezes a bounded SQL declaration frontend in
 [SQL_FRONTEND_CONTRACT.md](SQL_FRONTEND_CONTRACT.md) and

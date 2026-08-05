@@ -85,7 +85,10 @@ SQL result and ACK, and inspects `EXPLAIN (ANALYZE)` for the exact production
 `WITH ranges`/`CROSS JOIN LATERAL`/dynamic `LIMIT`/`FOR UPDATE` shape, ordered
 B-tree and two-row candidate window. It prints batch count, bootstrap/live
 latency and durable state-row count. The gate must not be replaced by a small
-fixture or a full-partition scan.
+fixture or a full-partition scan. M16.8.2 also exercises two same-direction
+ranges on distinct partitions and checks that the production query explicitly
+orders by `range_index` and then `item_order_key` in the requested direction;
+range identity rejects a second direction for the same base coordinate.
 
 ## M16.2 wide-result gates
 
