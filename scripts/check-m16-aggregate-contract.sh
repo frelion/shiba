@@ -45,7 +45,7 @@ for forbidden in ("postgres::", "pgrx::", "tokio_postgres", "sqlx::"):
         raise SystemExit(f"M16.1 database-free reference model uses {forbidden}")
 
 pg_gates = sorted(path.name for path in pathlib.Path("scripts").glob("test-m16*.sh"))
-if pg_gates != ["test-m16-wide-results.sh"]:
+if pg_gates != ["test-m16-indexed-state.sh", "test-m16-wide-results.sh"]:
     raise SystemExit(
         "M16 PostgreSQL gate enrollment must be exact: " + ", ".join(pg_gates)
     )
@@ -120,7 +120,7 @@ minmax_operator = "\n".join(
 )
 required_minmax = (
     "AggregateFunctionV1::MinInt8", "AggregateFunctionV1::MaxInt8",
-    "decode_extrema", "encode_extreme_value", "StatePartition",
+    "decode_extrema", "encode_extreme_value",
     "extrema_multiplicity_corruption_and_missing_retract_fail_closed",
     "normalized_net_zero_and_min_retraction_are_exact",
 )
@@ -136,6 +136,22 @@ sql_aggregate_test = pathlib.Path(
 for marker in ("MIN_MAX_SQL", "exercise_min_max", "assert_min_max", "minmax_row"):
     if marker not in sql_aggregate_test:
         raise SystemExit(f"M16.5 SQL lifecycle marker is missing: {marker}")
+
+indexed_state = (
+    pathlib.Path("crates/shiba-operator/src/state.rs").read_text()
+    + pathlib.Path("crates/shiba-runtime/src/keyed_state.rs").read_text()
+    + pathlib.Path("crates/shiba-runtime/src/keyed_state/write.rs").read_text()
+    + pathlib.Path("sql/v2/018_operator_keyed_state.sql").read_text()
+    + pathlib.Path("crates/shiba-ingress/tests/m16_indexed_state.rs").read_text()
+)
+for marker in (
+    "StateRange", "StateRangeDirection", "INT8_ORDER_KEY_VERSION",
+    "int8_order_key", "validate_int8_order_key", "item_order_key",
+    "graph_node_state_ordered_item", "bounded_ordered_candidates",
+    "generate_series(1, {ROWS})", "actual rows=2",
+):
+    if marker not in indexed_state:
+        raise SystemExit(f"M16.8 IndexedState marker is missing: {marker}")
 
 having_operator = pathlib.Path("crates/shiba-operator/src/having.rs").read_text()
 having_compiler = pathlib.Path("crates/shiba-compiler/src/query_spec.rs").read_text()
@@ -247,8 +263,8 @@ for path in pathlib.Path("crates/shiba-operator/src").glob("*.rs"):
 for marker in (
     "The M16.7 extensibility acceptance test is exact:",
     "M16.7 release and extensibility closure",
-    "57 unique scripts",
-    "114 successful PostgreSQL invocations",
+    "58 unique scripts",
+    "116 successful PostgreSQL invocations",
 ):
     if marker not in contract:
         raise SystemExit(f"M16.7 evidence marker is missing: {marker}")

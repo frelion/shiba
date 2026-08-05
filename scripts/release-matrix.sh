@@ -100,6 +100,7 @@ m15_gates=(
 
 m16_gates=(
   test-m16-wide-results.sh
+  test-m16-indexed-state.sh
 )
 
 cd "$root"
