@@ -56,6 +56,15 @@ reads the same bounded candidates and either applies once or returns
 ordered index is a read accelerator, not a second authority, and the range
 candidate window is never persisted as an intermediate log.
 
+M16.8.1 adds no recovery state. Before the snapshot reaches the kernel, the
+processor validates range provenance, per-range candidate limits, direction,
+partition coordinates and the derived order key. Any limit-plus-one,
+duplicate, missing or out-of-order range result aborts the same PostgreSQL
+transaction; source rows, graph state, complete result rows and continuation
+remain at their old values and no feedback is authorized. A retry repeats the
+same bounded request, and exact replay still short-circuits at the existing
+continuation boundary. Production and EXPLAIN use one LATERAL query template.
+
 ## M14.6 graph transaction and recovery boundary
 
 One PostgreSQL transaction is now the unit of graph computation. Runtime locks

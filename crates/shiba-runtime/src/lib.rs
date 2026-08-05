@@ -34,6 +34,7 @@ pub use bootstrap_activation::{
 };
 pub use bootstrap_model::{BootstrapBatch, MAX_BOOTSTRAP_BATCH_ROWS, SnapshotRow};
 pub use error::M2Error;
+pub use keyed_state::build_ordered_range_query;
 pub use pgoutput::{
     PgoutputError, PgoutputRelationState, decode_committed_changes,
     decode_committed_changes_in_session,

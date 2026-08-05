@@ -50,7 +50,9 @@ mod tests {
     use super::*;
     use core::num::NonZeroU32;
 
-    use super::super::{StateEntry, StateRange, StateRangeDirection, StateReadSet, StateSnapshot};
+    use super::super::{
+        StateEntry, StateRange, StateRangeDirection, StateRangeResult, StateReadSet, StateSnapshot,
+    };
     use crate::NodeId;
 
     fn key(value: i64) -> StateKey {
@@ -131,6 +133,101 @@ mod tests {
                 item_key: Some(TypedValue::Text("x".into())),
                 ..key(1)
             })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn range_limit_is_checked_per_range_and_exact_overlap_counts_once() {
+        let range = StateRange {
+            node_id: key(0).node_id,
+            namespace: 2,
+            partition_key: TypedValue::Int8(7),
+            direction: StateRangeDirection::Ascending,
+            limit: 1,
+            order_key_version: INT8_ORDER_KEY_VERSION,
+        };
+        let read_set = StateReadSet::with_ranges(vec![key(-1)], vec![], vec![range]).unwrap();
+        let entries = vec![
+            StateEntry {
+                key: key(-1),
+                state: None,
+            },
+            StateEntry {
+                key: key(0),
+                state: None,
+            },
+        ];
+        StateSnapshot::new_with_ranges(
+            &read_set,
+            entries.clone(),
+            &[StateRangeResult {
+                range_index: 0,
+                entries: entries.clone(),
+            }],
+        )
+        .unwrap();
+        assert!(
+            StateSnapshot::new_with_ranges(
+                &read_set,
+                vec![
+                    entries[0].clone(),
+                    entries[1].clone(),
+                    StateEntry {
+                        key: key(1),
+                        state: None,
+                    },
+                ],
+                &[StateRangeResult {
+                    range_index: 0,
+                    entries: vec![
+                        entries[0].clone(),
+                        entries[1].clone(),
+                        StateEntry {
+                            key: key(1),
+                            state: None,
+                        }
+                    ],
+                }],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn range_provenance_rejects_conflicts_and_wrong_order() {
+        let range = StateRange {
+            node_id: key(0).node_id,
+            namespace: 2,
+            partition_key: TypedValue::Int8(7),
+            direction: StateRangeDirection::Descending,
+            limit: 2,
+            order_key_version: INT8_ORDER_KEY_VERSION,
+        };
+        let read_set =
+            StateReadSet::with_ranges(Vec::new(), Vec::new(), vec![range.clone(), range.clone()]);
+        assert!(read_set.is_err());
+
+        let read_set = StateReadSet::with_ranges(Vec::new(), Vec::new(), vec![range]).unwrap();
+        let entries = vec![
+            StateEntry {
+                key: key(0),
+                state: None,
+            },
+            StateEntry {
+                key: key(1),
+                state: None,
+            },
+        ];
+        assert!(
+            StateSnapshot::new_with_ranges(
+                &read_set,
+                entries.clone(),
+                &[StateRangeResult {
+                    range_index: 0,
+                    entries,
+                }],
+            )
             .is_err()
         );
     }

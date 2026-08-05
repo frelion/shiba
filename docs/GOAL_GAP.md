@@ -15,7 +15,9 @@ M16.6 adds exact grouped HAVING visibility transitions. M16.7 closes the
 frozen performance, release and extensibility evidence without changing the
 authority or transaction model.
 M16.8 now closes the bounded IndexedState implementation for MIN/MAX without
-changing that authority or the ACK rule.
+changing that authority or the ACK rule. M16.8.1 hardens the range
+contract/provenance and proves that the runtime's actual LATERAL query shape,
+not a simplified EXPLAIN surrogate, uses the ordered index on PG17.10/PG18.4.
 
 ## M16.4 multi-call Aggregate status
 
@@ -80,9 +82,12 @@ candidate log.
 
 The PG17.10/PG18.4 IndexedState gate uses 100,000 distinct values, ten bounded
 10,000-row bootstrap batches, and a current-min deletion whose `EXPLAIN`
-candidate plan returns two rows through the ordered index. Exact/range overlap,
-row/payload-byte/work budgets, stale order keys and codec/multiplicity errors
-fail closed before state, complete result rows, continuation or ACK can move.
+candidate plan returns two rows through the ordered index. M16.8.1 additionally
+proves duplicate/conflicting range rejection, per-range limit-plus-one
+fail-closed validation, ordered candidate provenance and exact/range de-duplication
+before kernel evaluation. Exact/range overlap, row/payload-byte/work budgets,
+stale order keys and codec/multiplicity errors fail closed before state,
+complete result rows, continuation or ACK can move.
 
 ## M16.2 wide-result implementation status
 

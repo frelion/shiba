@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use postgres::{Client, NoTls};
@@ -8,7 +7,9 @@ use shiba_ingress::{
     BootstrapCatchupProgress, BootstrapCatchupSession, BootstrapOptions, BootstrapSession,
     BootstrapSpec, SnapshotProgress,
 };
+use shiba_operator::StateRangeDirection;
 use shiba_protocol::{BootstrapId, GraphId, SlotGeneration};
+use shiba_runtime::build_ordered_range_query;
 use shiba_sql_registration::compile_sql_and_register;
 
 #[path = "m15_sql_aggregates/support.rs"]
@@ -139,20 +140,28 @@ fn explain_index(client: &mut Client) -> String {
             )
         })
         .expect("read durable extrema partition");
+    let graph_id = i64::try_from(GRAPH_ID).expect("graph ID fits");
+    let nodes = vec![node_id];
+    let namespaces = vec![namespace];
+    let partitions = vec![partition];
+    let limits = vec![2_i64];
+    let indexes = vec![0_i32];
+    let query = build_ordered_range_query(StateRangeDirection::Ascending);
+    assert!(query.contains("WITH ranges"));
+    assert!(query.contains("CROSS JOIN LATERAL"));
+    assert!(query.contains("LIMIT ranges.range_limit"));
+    assert!(query.contains("FOR UPDATE"));
     let plan = client
         .query(
-            &format!(
-                "EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)
-                 SELECT item_key_payload
-                 FROM shiba_internal.graph_node_state
-                 WHERE graph_id={GRAPH_ID} AND node_id={node_id}
-                   AND namespace={namespace}
-                   AND partition_key_payload=decode('{}','hex')
-                   AND item_order_key IS NOT NULL
-                 ORDER BY item_order_key ASC LIMIT 2",
-                hex(&partition)
-            ),
-            &[],
+            &format!("EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) {query}"),
+            &[
+                &graph_id,
+                &nodes,
+                &namespaces,
+                &partitions,
+                &limits,
+                &indexes,
+            ],
         )
         .expect("explain indexed candidate read")
         .into_iter()
@@ -194,11 +203,4 @@ fn scalar_extrema(client: &mut Client) -> (Option<i64>, Option<i64>) {
         )
         .map(|row| (row.get(0), row.get(1)))
         .expect("query indexed extrema result")
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut output, byte| {
-        write!(&mut output, "{byte:02x}").expect("write hex");
-        output
-    })
 }

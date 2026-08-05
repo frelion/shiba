@@ -7,9 +7,12 @@ use crate::{EncodedOperatorState, NodeId, TypedValue};
 
 #[path = "state_order.rs"]
 mod state_order;
+#[path = "state_range.rs"]
+mod state_range;
 pub use state_order::{
     INT8_ORDER_KEY_VERSION, int8_order_key, state_item_order_key, validate_int8_order_key,
 };
+pub use state_range::StateRangeResult;
 
 pub const MAX_STATE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
@@ -110,10 +113,40 @@ impl StateReadSet {
         for range in &ranges {
             range.validate()?;
         }
+        let mut range_identities = BTreeSet::new();
+        for range in &ranges {
+            let identity = (
+                range.node_id,
+                range.namespace,
+                range.partition_key.clone(),
+                range.direction,
+            );
+            if !range_identities.insert(identity) {
+                return Err(StateError::AmbiguousRange);
+            }
+        }
+        let partition_identities = partitions
+            .iter()
+            .map(|partition| {
+                (
+                    partition.node_id,
+                    partition.namespace,
+                    partition.partition_key.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        if ranges.iter().any(|range| {
+            partition_identities.contains(&(
+                range.node_id,
+                range.namespace,
+                range.partition_key.clone(),
+            ))
+        }) {
+            return Err(StateError::AmbiguousRange);
+        }
         partitions.sort();
         partitions.dedup();
         ranges.sort();
-        ranges.dedup();
         read_set.partitions = partitions;
         read_set.ranges = ranges;
         Ok(read_set)
@@ -183,76 +216,6 @@ pub struct StateSnapshot {
     pub entries: Vec<StateEntry>,
 }
 
-impl StateSnapshot {
-    /// Constructs a snapshot and verifies one ordered entry per requested key.
-    ///
-    /// # Errors
-    ///
-    /// Rejects missing, extra, duplicate, or out-of-order entries.
-    pub fn new(read_set: &StateReadSet, entries: Vec<StateEntry>) -> Result<Self, StateError> {
-        let snapshot = Self { entries };
-        snapshot.validate_exact(read_set)?;
-        Ok(snapshot)
-    }
-
-    /// Verifies one ordered entry per requested key, with no extras or duplicates.
-    ///
-    /// # Errors
-    ///
-    /// Rejects missing, extra, duplicate, or out-of-order entries.
-    pub fn validate_exact(&self, read_set: &StateReadSet) -> Result<(), StateError> {
-        if self
-            .entries
-            .windows(2)
-            .any(|pair| pair[0].key >= pair[1].key)
-        {
-            return Err(StateError::SnapshotMismatch);
-        }
-        let entry_keys = self
-            .entries
-            .iter()
-            .map(|entry| entry.key.clone())
-            .collect::<BTreeSet<_>>();
-        if !read_set.keys.iter().all(|key| entry_keys.contains(key)) {
-            return Err(StateError::SnapshotMismatch);
-        }
-        let exact_keys = read_set.keys.iter().cloned().collect::<BTreeSet<_>>();
-        let partition_coordinates = read_set
-            .partitions
-            .iter()
-            .map(|partition| {
-                (
-                    partition.node_id,
-                    partition.namespace,
-                    partition.partition_key.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        let range_coordinates = read_set
-            .ranges
-            .iter()
-            .map(|range| (range.node_id, range.namespace, range.partition_key.clone()))
-            .collect::<BTreeSet<_>>();
-        if !self.entries.iter().all(|entry| {
-            exact_keys.contains(&entry.key)
-                || partition_coordinates.contains(&(
-                    entry.key.node_id,
-                    entry.key.namespace,
-                    entry.key.partition_key.clone(),
-                ))
-                || (matches!(entry.key.item_key, Some(TypedValue::Int8(_)))
-                    && range_coordinates.contains(&(
-                        entry.key.node_id,
-                        entry.key.namespace,
-                        entry.key.partition_key.clone(),
-                    )))
-        }) {
-            return Err(StateError::SnapshotMismatch);
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mutation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StateMutation {
@@ -271,6 +234,7 @@ pub struct StateDelta {
 pub enum StateError {
     InvalidKey,
     InvalidOrderKey,
+    AmbiguousRange,
     Limit,
     SnapshotMismatch,
 }

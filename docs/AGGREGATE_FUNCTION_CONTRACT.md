@@ -29,6 +29,16 @@ logical multiplicity semantics remain unchanged, while Runtime now serves exact
 keys plus bounded ordered candidates from the existing `graph_node_state`
 authority. It never materializes a complete extrema partition in Rust.
 
+M16.8.1 hardens the request contract before the extrema kernel sees a flattened
+snapshot. `StateReadSet` rejects duplicate or ambiguous range provenance;
+Runtime returns a range-indexed result and validates each range's non-exact
+candidate count against its declared limit, ordered direction, partition
+coordinates and derived Int8 order key. Exact/range overlap is included in the
+range evidence but counted once. Limit-plus-one, duplicate, missing or
+out-of-order candidates fail closed before any state/result/continuation write.
+The production query and EXPLAIN gate share one `WITH ranges`/LATERAL builder;
+no full-partition fallback or new authority is introduced.
+
 M16 replaces aggregate-kind knowledge outside `shiba-operator` with one stable,
 versioned function ABI and replaces the scalar-or-key/value result assumption
 with a canonical typed row schema. The first implementation scope is:

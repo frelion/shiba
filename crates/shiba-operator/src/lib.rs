@@ -63,7 +63,7 @@ pub use result_schema::{
 };
 pub use state::{
     INT8_ORDER_KEY_VERSION, MAX_STATE_PAYLOAD_BYTES, StateDelta, StateEntry, StateError, StateKey,
-    StateMutation, StatePartition, StateRange, StateRangeDirection, StateReadSet, StateSnapshot,
-    int8_order_key, state_item_order_key, validate_int8_order_key,
+    StateMutation, StatePartition, StateRange, StateRangeDirection, StateRangeResult, StateReadSet,
+    StateSnapshot, int8_order_key, state_item_order_key, validate_int8_order_key,
 };
 pub use typed::{TypedError, TypedLayout, TypedRow, TypedValue, ValueType};

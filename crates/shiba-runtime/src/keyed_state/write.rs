@@ -1,6 +1,7 @@
 use postgres::Transaction;
 
-use super::{Coordinate, coordinate_arrays};
+use super::Coordinate;
+use super::codec::coordinate_arrays;
 use crate::M2Error;
 
 pub(super) fn delete_states(

@@ -64,6 +64,15 @@ state, range/row/byte budget violation or sink error fails closed; no partial
 state/result/continuation is committed and no ACK is authorized. There is no
 full-partition extrema fallback, second state table, or second writer.
 
+M16.8.1 closes the range provenance boundary. Each ordered query carries an
+input range index through the production LATERAL result; Runtime verifies
+per-range limit, ASC/DESC order, partition coordinates and the derived order
+key before flattening the transaction-local snapshot. Exact/range overlap is
+deduplicated once, while duplicate range requests and limit-plus-one results
+are rejected. The same SQL builder drives production and EXPLAIN evidence, so
+the proof covers the actual dynamic-LIMIT/`FOR UPDATE` shape and ordered index.
+This changes no authority, transaction owner, continuation or ACK rule.
+
 M15.1 freezes a bounded SQL declaration frontend in
 [SQL_FRONTEND_CONTRACT.md](SQL_FRONTEND_CONTRACT.md) and
 [ADR 0007](adr/0007-m15-sql-frontend.md). Raw SQL and parser AST are ephemeral;
