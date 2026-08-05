@@ -46,6 +46,24 @@ Sum through Generic Aggregate; M16.4 multi-call SQL and Count(expr) use this
 same result authority. M16.5 proves MinInt8/MaxInt8 and M16.6 proves grouped
 HAVING visibility deltas.
 
+## M16.8 IndexedState for extrema
+
+M16.5's graph-node multiplicity state remains the sole durable MIN/MAX
+authority. M16.8 changes only how Runtime reads it: an aggregate read set asks
+for touched exact keys and a bounded ASC/DESC range keyed by a versioned Int8
+order key. Runtime owns the SQL, transaction, row locks and generic state
+delta; `shiba-operator` receives only a validated snapshot and never executes
+SQL. The range limit is `1 +` the number of distinct non-NULL values touched by
+the current batch, which is sufficient for the next extreme after all touched
+values are retracted. Exact/range duplicates are removed before computation.
+
+`item_order_key` is sign-bit-flipped big-endian Int8 encoding derived from the
+canonical item key. The partial `graph_node_state_ordered_item` index serves
+the ordered candidate query. A stale/missing/non-Int8 order key, malformed
+state, range/row/byte budget violation or sink error fails closed; no partial
+state/result/continuation is committed and no ACK is authorized. There is no
+full-partition extrema fallback, second state table, or second writer.
+
 M15.1 freezes a bounded SQL declaration frontend in
 [SQL_FRONTEND_CONTRACT.md](SQL_FRONTEND_CONTRACT.md) and
 [ADR 0007](adr/0007-m15-sql-frontend.md). Raw SQL and parser AST are ephemeral;

@@ -57,8 +57,9 @@ complete PG17.10/PG18.4 SQL row comparison. M16.6 adds complete-row HAVING
 transitions; M16.7 records the final performance and extensibility evidence
 without changing these semantics.
 
-M16.7 closes the frozen release and extensibility gates: the exact-enrollment
-runner passes 57 scripts and 114 PostgreSQL invocations on PG17.10/PG18.4.
+M16.7 closes the frozen release and extensibility gates; after M16.8 is
+enrolled, the exact-enrollment runner passes 58 scripts and 116 PostgreSQL
+invocations on PG17.10/PG18.4.
 The static audit proves function dispatch remains confined to operator aggregate
 modules. The full PG17 matrix previously exposed the existing two-second walsender timeout while a
 10,000-row generic Aggregate retry was synchronously applying. The receiver now
@@ -66,6 +67,23 @@ refreshes only the prior durable coordinate before and during Apply. The M10 str
 gate proves that the retry still advances slot feedback only after Runtime
 commit; Runtime failure continues to leave slot progress, state, result and
 continuation unchanged. The same directed gate is run on PG17 and PG18.
+
+## M16.8 IndexedState gates
+
+The database-free state contract tests cover signed Int8 order-key vectors,
+version and stale-key rejection, exact/range overlap, duplicate or malformed
+entries, range direction and limit bounds. The aggregate reference harness
+continues to compare I/U/D, NULL, duplicate extrema, current-extreme deletion,
+key changes, empty groups, multiplicity underflow and checked failures against
+an independent model.
+
+`scripts/test-m16-indexed-state.sh` is a real PG17.10/PG18.4 gate. It creates
+100,000 distinct extrema values, registers the normal SQL aggregate, runs the
+production snapshot-to-live path, deletes the current minimum, checks the full
+SQL result and ACK, and inspects `EXPLAIN (ANALYZE)` for the ordered B-tree and a
+two-row candidate window. It prints batch count, bootstrap/live latency and
+durable state-row count. The gate must not be replaced by a small fixture or a
+full-partition scan.
 
 ## M16.2 wide-result gates
 

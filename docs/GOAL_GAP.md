@@ -14,6 +14,8 @@ MinInt8/MaxInt8 with exact multiplicity and PG17/18 SQL differential evidence.
 M16.6 adds exact grouped HAVING visibility transitions. M16.7 closes the
 frozen performance, release and extensibility evidence without changing the
 authority or transaction model.
+M16.8 now closes the bounded IndexedState implementation for MIN/MAX without
+changing that authority or the ACK rule.
 
 ## M16.4 multi-call Aggregate status
 
@@ -36,9 +38,9 @@ the static function-ABI extensibility audit.
 
 ## M16.7 release and extensibility status
 
-M16.7 retains the M15/M12 frozen workload and stop lines and passes the exact
-current release matrix on PostgreSQL 17.10 and 18.4: 57 unique scripts and
-114 successful PostgreSQL invocations. The matrix includes the complete M1–M15
+M16.7 retains the M15/M12 frozen workload and stop lines; with the M16.8 gate,
+the exact current release matrix on PostgreSQL 17.10 and 18.4 has 58 unique
+scripts and 116 successful PostgreSQL invocations. The matrix includes the complete M1–M15
 correctness, recovery, bootstrap, rebuild, concurrency and performance gates,
 plus the M16 wide-result gate. No threshold, workload, ACK rule or recovery
 assertion was relaxed.
@@ -49,7 +51,7 @@ Catalog SQL, Bootstrap, Rebuild and Result Sink remain function-independent;
 adding a future function over an existing `ValueType` requires only its
 versioned descriptor/kernel, Binder mapping and shared reference fixtures.
 
-M16 is complete for the declared Int8 aggregate subset. AVG, variance/stddev,
+M16.8 is complete for the declared Int8 aggregate subset. AVG, variance/stddev,
 Numeric/Decimal, DISTINCT, outer or three-table joins, windows, plugins,
 cross-host failover and long-running production soak remain unproved.
 
@@ -64,6 +66,23 @@ removal are exact and atomic with result/continuation. Database-free randomized
 I/U/D and corruption/underflow tests pass, and the PG17.10/PG18.4 SQL aggregate
 gate proves bootstrap plus live receiver/Apply/ACK against complete MIN/MAX
 oracles.
+
+## M16.8 IndexedState physical-read status
+
+M16.5 established MIN/MAX logical correctness with positive multiplicity. M16.8
+keeps `graph_node_state` as the only durable authority but replaces complete
+partition materialization with exact touched-item reads plus a bounded ordered
+candidate window. A sign-bit-flipped big-endian Int8 `item_order_key` is
+derived from each canonical item key and checked on every row. PostgreSQL's
+`graph_node_state_ordered_item` B-tree serves ASC/DESC `LIMIT` reads under the
+processor transaction; there is no full-partition fallback or persisted
+candidate log.
+
+The PG17.10/PG18.4 IndexedState gate uses 100,000 distinct values, ten bounded
+10,000-row bootstrap batches, and a current-min deletion whose `EXPLAIN`
+candidate plan returns two rows through the ordered index. Exact/range overlap,
+row/payload-byte/work budgets, stale order keys and codec/multiplicity errors
+fail closed before state, complete result rows, continuation or ACK can move.
 
 ## M16.2 wide-result implementation status
 

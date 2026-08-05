@@ -24,6 +24,11 @@ oracles. M16.6 adds restricted grouped HAVING visibility transitions. M16.7
 closes the frozen release, performance and extensibility gates; the remaining
 function families below are deliberately outside this milestone.
 
+M16.8 changes only the physical read strategy for MinInt8/MaxInt8. M16.5's
+logical multiplicity semantics remain unchanged, while Runtime now serves exact
+keys plus bounded ordered candidates from the existing `graph_node_state`
+authority. It never materializes a complete extrema partition in Rust.
+
 M16 replaces aggregate-kind knowledge outside `shiba-operator` with one stable,
 versioned function ABI and replaces the scalar-or-key/value result assumption
 with a canonical typed row schema. The first implementation scope is:
@@ -423,8 +428,8 @@ implement the Aggregate Function ABI execution path.
 
 At the M16.2 boundary, Aggregate ABI production dispatch, Min/Max ordered state
 reads, multi-call SQL lowering, HAVING deltas, and final M16 performance
-evidence were still unproved. M16.3--M16.5 subsequently close the first three
-items except HAVING and final performance evidence. Also
+evidence were still unproved. M16.3--M16.6 subsequently close the logical and
+execution items; M16.8 closes the bounded IndexedState implementation. Also
 outside M16 are Avg/VarPop/VarSamp/StddevPop/StddevSamp and Numeric exactness,
 Count over non-`int8` expressions, CountDistinct/SumDistinct, BoolAnd/BoolOr,
 percentile/median, multi-key grouping, grouping sets, ordered-set aggregates,
@@ -440,8 +445,8 @@ there is no function registry table, dual codec or compatibility path.
 
 ## M16.7 release and extensibility closure
 
-The final M16 gate runs the exact-enrollment release matrix on PostgreSQL
-17.10 and 18.4: 57 unique scripts and 114 successful PostgreSQL invocations.
+The final M16.8 gate runs the exact-enrollment release matrix on PostgreSQL
+17.10 and 18.4: 58 unique scripts and 116 successful PostgreSQL invocations.
 It retains the M15 parser/registration/Apply limits, the 16 MiB and 10,000
 change bounds, the one-million-row bootstrap/rebuild limits and the M12
 retained-WAL limit of 256 MiB. No threshold is widened for M16.
@@ -454,7 +459,7 @@ versioned descriptor/kernel, Binder name mapping and shared reference fixtures;
 it does not change Runtime transaction orchestration, Catalog authority,
 lifecycle, Result Sink, continuation or ACK.
 
-M16 is complete for the closed Int8 aggregate subset once that matrix and
+M16.8 is complete for the closed Int8 aggregate subset once that matrix and
 audit are green. AVG, variance/stddev, Numeric/Decimal, DISTINCT, outer or
 three-table joins, windows, plugins, cross-host failover and long-running
 production soak remain outside this milestone.
@@ -464,3 +469,31 @@ Count(nullable `int8`) and SumInt8 run through the versioned Aggregate ABI.
 The specialized M15 node variants are deleted. M16.4 adds multi-call SQL,
 M16.5 adds production MinInt8/MaxInt8, and M16.6 adds grouped HAVING without
 changing Runtime or Catalog authority.
+
+## M16.8 IndexedState extrema reads
+
+M16.5 proves the logical MIN/MAX state as positive per-value multiplicities.
+M16.8 proves the bounded physical access contract: `StateReadSet` retains
+exact-key reads and adds a versioned `StateRange` containing node, namespace,
+partition, direction, and limit. For each affected group and extrema call,
+Runtime reads every touched non-NULL value exactly and at most
+`1 + touched_distinct_count` ordered candidates. Exact/range overlap is
+deduplicated before the immutable `StateSnapshot` is built; a full-partition
+read is not a fallback for extrema.
+
+The persisted `item_order_key` is derived from the canonical Int8 item key by
+flipping the sign bit and encoding big-endian bytes. Version 1 therefore sorts
+`i64::MIN`, negative values, zero, positive values, and `i64::MAX` in numeric
+order. The key remains derived data, not a second authority: missing, stale, or
+non-Int8 order keys fail closed. PostgreSQL uses the partial B-tree
+`graph_node_state_ordered_item` for ASC/DESC `LIMIT` reads and locks the actual
+candidates in the processor transaction.
+
+The graph budget charges range candidates, exact keys, loaded rows, state
+payload bytes, state/result mutations, and work bytes before transition
+construction. Any limit, codec, order-key, multiplicity, SQL, or sink failure
+rolls back state, complete result rows, continuation, and ACK authorization.
+The PG17.10/PG18.4 IndexedState gate uses 100,000 distinct extrema values;
+bootstrap is ten 10,000-row bounded batches and the candidate plan returns two
+rows for a minimum deletion through the ordered index. M16.8 does not add a
+state table, writer, effect log, fallback, or new function family.

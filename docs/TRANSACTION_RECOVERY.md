@@ -37,6 +37,25 @@ back; ACK remains unauthorized. Count/CountStar/Sum retraction is implemented
 in M16.3, exact MIN/MAX ordered multiplicity retraction in M16.5, and grouped
 HAVING visibility deltas in M16.6.
 
+## M16.8 IndexedState recovery boundary
+
+MIN/MAX logical recovery remains the M16.5 multiplicity contract. M16.8 makes
+the physical read bounded without changing transaction ownership: Runtime
+locks exact touched item keys and a finite ordered candidate window in the
+same processor-owned PostgreSQL transaction. The versioned Int8 order key is
+derived from the canonical item key and validated before the snapshot reaches
+the database-free kernel. Exact/range overlap is removed, and no complete
+partition is loaded as an extrema fallback.
+
+Range, row, payload-byte, state codec, stale-order-key, multiplicity, result
+sink or backend failure aborts the transaction before continuation. Source-row
+state, graph-node state, complete result rows and continuation therefore remain
+at their old values, and receiver feedback remains unauthorized. A retry
+reads the same bounded candidates and either applies once or returns
+`AlreadyApplied`; ACK is still allowed only after the PostgreSQL commit. The
+ordered index is a read accelerator, not a second authority, and the range
+candidate window is never persisted as an intermediate log.
+
 ## M14.6 graph transaction and recovery boundary
 
 One PostgreSQL transaction is now the unit of graph computation. Runtime locks
